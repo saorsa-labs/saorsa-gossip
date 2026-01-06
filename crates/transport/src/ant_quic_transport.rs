@@ -7,14 +7,14 @@
 //! - Post-quantum cryptography (PQC) support via ML-KEM-768
 //! - Connection pooling and management
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use saorsa_gossip_types::PeerId as GossipPeerId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::{BootstrapCache, GossipTransport, StreamType};
@@ -288,6 +288,21 @@ impl AntQuicTransport {
     /// Returns `None` if no external address has been discovered yet.
     pub fn get_external_address(&self) -> Option<SocketAddr> {
         self.node.external_addr()
+    }
+
+    /// Get access to the underlying ant-quic Node for direct operations
+    ///
+    /// This enables using the same QUIC endpoint for:
+    /// - NAT traversal coordination
+    /// - Direct connectivity testing
+    /// - Hole punching
+    /// - All P2P operations
+    ///
+    /// By exposing the node, callers can use a single QUIC endpoint for both
+    /// gossip protocol messages AND direct P2P operations, avoiding the need
+    /// for multiple listening ports.
+    pub fn node(&self) -> Arc<Node> {
+        Arc::clone(&self.node)
     }
 
     /// Spawn background task to receive incoming messages
@@ -633,7 +648,7 @@ mod tests {
     #[ignore] // Integration test - requires running ant-quic nodes
     async fn test_two_node_communication() {
         use std::net::{IpAddr, Ipv4Addr};
-        use tokio::time::{sleep, timeout, Duration};
+        use tokio::time::{Duration, sleep, timeout};
 
         // Dynamic port allocation to avoid conflicts
         let base_port = 20000

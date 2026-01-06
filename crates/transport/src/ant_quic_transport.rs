@@ -198,24 +198,26 @@ impl AntQuicTransport {
         // Start receiving loop
         transport.spawn_receiver();
 
-        // Connect to known peers if any are configured
+        // Connect to known peers in the background (non-blocking)
+        // This allows the transport to start immediately while connections establish
         if !config.known_peers.is_empty() {
+            let peer_count = config.known_peers.len();
+            let node_clone = transport.node.clone();
             info!(
-                "Connecting to {} known peer(s)...",
-                config.known_peers.len()
+                "Spawning background task to connect to {} known peer(s)...",
+                peer_count
             );
 
-            let connected = transport
-                .node
-                .connect_known_peers()
-                .await
-                .map_err(|e| anyhow!("Failed to connect to known peers: {}", e))?;
-
-            info!(
-                "✓ Connected to {}/{} known peer(s)",
-                connected,
-                config.known_peers.len()
-            );
+            tokio::spawn(async move {
+                match node_clone.connect_known_peers().await {
+                    Ok(connected) => {
+                        info!("✓ Connected to {}/{} known peer(s)", connected, peer_count);
+                    }
+                    Err(e) => {
+                        warn!("Failed to connect to known peers: {}", e);
+                    }
+                }
+            });
         }
 
         Ok(transport)

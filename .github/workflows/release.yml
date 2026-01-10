@@ -108,10 +108,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: saorsa-gossip-${{ matrix.target }}
-          path: |
-            saorsa-gossip-${{ matrix.target }}${{ matrix.archive_ext }}
-            target/${{ matrix.target }}/release/saorsa-gossip${{ matrix.suffix }}
-            target/${{ matrix.target }}/release/saorsa-gossip-coordinator${{ matrix.suffix }}
+          path: saorsa-gossip-${{ matrix.target }}${{ matrix.archive_ext }}
 
   create-release:
     name: Create Release

@@ -58,7 +58,7 @@ jobs:
           curl -LO https://www.openssl.org/source/openssl-3.2.1.tar.gz
           tar xzf openssl-3.2.1.tar.gz
           cd openssl-3.2.1
-          CC=musl-gcc ./Configure linux-x86_64 --prefix=/usr/local/musl --openssldir=/usr/local/musl/ssl no-shared no-secure-memory
+          CC=musl-gcc ./Configure linux-x86_64 --prefix=/usr/local/musl --openssldir=/usr/local/musl/ssl no-shared no-secure-memory no-afalgeng
           make -j$(nproc)
           sudo make install_sw
           echo "OPENSSL_DIR=/usr/local/musl" >> $GITHUB_ENV

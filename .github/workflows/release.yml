@@ -119,3 +119,72 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Publish crates (in dependency order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Publish each crate in dependency order with retry logic
+          CRATES=(
+            "crates/types"
+            "crates/identity"
+            "crates/transport"
+            "crates/membership"
+            "crates/pubsub"
+            "crates/crdt-sync"
+            "crates/groups"
+            "crates/presence"
+            "crates/coordinator"
+            "crates/rendezvous"
+            "crates/simulator"
+            "crates/load-test"
+          )
+
+          for crate in "${CRATES[@]}"; do
+            echo "Publishing $crate..."
+            cd "$crate"
+
+            # Try to publish, retry up to 3 times for transient errors
+            for i in 1 2 3; do
+              if cargo publish --no-verify; then
+                echo "Successfully published $crate"
+                break
+              else
+                if [ $i -lt 3 ]; then
+                  echo "Publish failed, retrying in 30 seconds..."
+                  sleep 30
+                else
+                  # Check if it failed because it's already published
+                  if cargo publish --no-verify 2>&1 | grep -q "already uploaded"; then
+                    echo "$crate already published, continuing..."
+                    break
+                  fi
+                  echo "Failed to publish $crate after 3 attempts"
+                  exit 1
+                fi
+              fi
+            done
+
+            cd ../..
+            # Wait for crates.io to index before publishing dependent crates
+            echo "Waiting 30s for crates.io indexing..."
+            sleep 30
+          done
+
+          echo "All crates published successfully!"

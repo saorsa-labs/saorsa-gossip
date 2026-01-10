@@ -19,9 +19,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.19"
+version = "0.1.20"
 edition = "2021"
-authors = ["David Irvine <david@saorsa.com>"]
+authors = ["David Irvine <david@saorsalabs.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dirvine/saorsa-gossip"
 
@@ -40,7 +40,7 @@ saorsa-pqc = "0.3.14"
 saorsa-mls = "0.3.1"
 
 # QUIC transport
-ant-quic = "0.14.136"
+ant-quic = "0.15"
 
 # Hashing
 blake3 = "1.5"

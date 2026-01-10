@@ -44,9 +44,13 @@ pub struct PeerCacheEntry {
 /// Roles a peer can provide
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRoles {
+    /// Acts as bootstrap coordinator
     pub coordinator: bool,
+    /// Provides address reflection
     pub reflector: bool,
+    /// Facilitates rendezvous for hole punching
     pub rendezvous: bool,
+    /// Provides relay services
     pub relay: bool,
 }
 

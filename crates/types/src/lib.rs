@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Core types for Saorsa Gossip overlay network
 //!
 //! This crate provides the fundamental types used throughout the gossip overlay:
@@ -253,11 +255,7 @@ pub struct PresenceRecord {
 impl PresenceRecord {
     /// Create a new presence record
     pub fn new(presence_tag: [u8; 32], addr_hints: Vec<String>, ttl_seconds: u64) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
+        let now = current_unix_secs();
         Self {
             presence_tag,
             addr_hints,
@@ -275,11 +273,7 @@ impl PresenceRecord {
         ttl_seconds: u64,
         four_words: String,
     ) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
+        let now = current_unix_secs();
         Self {
             presence_tag,
             addr_hints,
@@ -292,12 +286,7 @@ impl PresenceRecord {
 
     /// Check if the presence record is expired
     pub fn is_expired(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        now >= self.expires
+        current_unix_secs() >= self.expires
     }
 }
 
@@ -334,6 +323,16 @@ pub struct FoafResponse {
     pub addr_hints: Vec<String>,
     /// Number of hops traversed to find
     pub hops: u8,
+}
+
+/// Get current time as Unix timestamp in seconds
+///
+/// Returns 0 if system time is before Unix epoch (shouldn't happen in practice).
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // Helper module for hex encoding (simplified)

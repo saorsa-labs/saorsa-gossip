@@ -1,0 +1,82 @@
+# VPS Test Configuration for saorsa-gossip
+# Used by /vps-test skill for autonomous deployment and testing
+
+project: saorsa-gossip
+
+binary:
+  name: saorsa-gossip
+  # Adjust based on actual crate structure
+  build: cargo zig build --release --target x86_64-unknown-linux-gnu
+  target: target/x86_64-unknown-linux-gnu/release/saorsa-gossip
+  local_build: cargo build --release
+
+deploy:
+  install_path: /opt/saorsa-gossip/
+  service_name: saorsa-gossip
+  nodes: all
+  post_deploy:
+    - systemctl daemon-reload
+    - systemctl restart saorsa-gossip
+    - sleep 5
+    - systemctl status saorsa-gossip
+
+bootstrap:
+  registry: https://saorsa-1.saorsalabs.com
+  nodes:
+    - saorsa-2.saorsalabs.com:9500
+    - saorsa-3.saorsalabs.com:9500
+  wait_for_registration: 30
+
+tests:
+  # Network connectivity (built on ant-quic)
+  connectivity:
+    enabled: true
+    success_criteria:
+      direct: 99
+      nat_traversed: 85
+      relay: 100
+    nat_cooloff_seconds: 30
+    timeout_seconds: 10
+
+  # Gossip message delivery
+  message_delivery:
+    enabled: true
+    success_rate: 100
+    message_count: 100
+
+  # CRDT/gossip state consistency
+  crdt_consistency:
+    enabled: true
+    max_sync_seconds: 30
+
+  # Gossip protocol specific tests
+  custom:
+    - name: gossip_broadcast
+      command: saorsa-gossip --test broadcast --message "test-$(date +%s)"
+      success_pattern: "broadcast complete"
+      timeout_seconds: 60
+
+    - name: gossip_membership
+      command: saorsa-gossip --test membership --expect-nodes 9
+      success_pattern: "membership verified"
+      timeout_seconds: 30
+
+    - name: gossip_convergence
+      command: saorsa-gossip --test convergence --timeout 30
+      success_pattern: "converged"
+      timeout_seconds: 60
+
+soak:
+  wait_1hr: true
+  wait_6hr: true
+  regression_tolerance: 0
+  check_interval_minutes: 5
+
+notifications:
+  voice: true
+  on_events:
+    - start
+    - test_fail
+    - fix_commit
+    - complete
+    - error

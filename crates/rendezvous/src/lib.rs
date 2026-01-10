@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Rendezvous Shards for global findability without DNS/DHT
 //!
 //! Implements SPEC2 §9 Rendezvous Shards for publisher discovery.
@@ -48,7 +50,9 @@ use std::time::{Duration, SystemTime};
 
 /// Shard space size: k=16 → 2^16 = 65,536 shards per SPEC2 §9
 pub const SHARD_BITS: u32 = 16;
+/// Total number of shards: 2^16 = 65,536
 pub const SHARD_COUNT: u32 = 1 << SHARD_BITS; // 65,536
+/// Bitmask for shard calculation: 0xFFFF
 pub const SHARD_MASK: u32 = SHARD_COUNT - 1; // 0xFFFF
 
 /// Rendezvous prefix for shard calculation per SPEC2 §9

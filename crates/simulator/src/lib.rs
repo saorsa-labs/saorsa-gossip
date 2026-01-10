@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Deterministic Network Simulator for Saorsa Gossip
 //!
 //! This crate provides a deterministic network simulator for testing
@@ -119,13 +121,22 @@ pub enum Topology {
     /// Fully connected mesh (every node connects to every other)
     Mesh,
     /// Star topology (central hub with spokes)
-    Star { center: NodeId },
+    Star {
+        /// Central node ID that acts as the hub
+        center: NodeId,
+    },
     /// Ring topology (circular connections)
     Ring,
     /// Tree topology (hierarchical connections)
-    Tree { branching_factor: usize },
+    Tree {
+        /// Number of children per parent node
+        branching_factor: usize,
+    },
     /// Custom topology with explicit connections
-    Custom { connections: Vec<(NodeId, NodeId)> },
+    Custom {
+        /// List of explicit connections between nodes
+        connections: Vec<(NodeId, NodeId)>,
+    },
 }
 
 /// Transport interface for simulated nodes
@@ -172,9 +183,6 @@ pub struct NetworkSimulator {
     default_link_config: LinkConfig,
     /// Message queue with delivery times
     message_queue: Arc<RwLock<VecDeque<(TokioInstant, SimulatedMessage)>>>,
-    /// Simulator virtual time (for future time manipulation support)
-    #[allow(dead_code)]
-    virtual_time: Arc<RwLock<TokioInstant>>,
     /// Time dilation factor (1.0 = real time, 2.0 = half speed, 0.5 = double speed)
     time_dilation: f64,
     /// Next message ID
@@ -194,7 +202,6 @@ impl Clone for NetworkSimulator {
             link_configs: self.link_configs.clone(),
             default_link_config: self.default_link_config.clone(),
             message_queue: Arc::new(RwLock::new(VecDeque::new())),
-            virtual_time: Arc::new(RwLock::new(TokioInstant::now())),
             time_dilation: self.time_dilation,
             next_message_id: Arc::clone(&self.next_message_id),
             running: Arc::new(RwLock::new(false)),
@@ -202,18 +209,25 @@ impl Clone for NetworkSimulator {
     }
 }
 
+/// Errors that can occur during network simulation
 #[derive(thiserror::Error, Debug)]
 pub enum SimulatorError {
+    /// The specified node was not found in the simulation
     #[error("Node not found: {0}")]
     NodeNotFound(NodeId),
+    /// No link configuration exists between the specified nodes
     #[error("Link not configured between nodes {0} and {1}")]
     LinkNotConfigured(NodeId, NodeId),
+    /// Message delivery to target node failed
     #[error("Message delivery failed: {0}")]
     DeliveryFailed(String),
+    /// Underlying transport layer error
     #[error("Transport error: {0}")]
     TransportError(String),
+    /// Simulation must be running to perform this operation
     #[error("Simulation not running")]
     NotRunning,
+    /// The topology configuration is invalid
     #[error("Invalid topology configuration")]
     InvalidTopology,
 }
@@ -236,7 +250,6 @@ impl NetworkSimulator {
             link_configs: HashMap::new(),
             default_link_config: LinkConfig::default(),
             message_queue: Arc::new(RwLock::new(VecDeque::new())),
-            virtual_time: Arc::new(RwLock::new(TokioInstant::now())),
             time_dilation: 1.0,
             next_message_id: Arc::new(Mutex::new(0)),
             running: Arc::new(RwLock::new(false)),
@@ -449,9 +462,43 @@ impl NetworkSimulator {
                     // Connections are implicit in ring topology
                 }
             }
-            Topology::Tree { .. } => {
-                // TODO: Implement tree topology initialization
-                warn!("Tree topology not yet implemented, using mesh");
+            Topology::Tree { branching_factor } => {
+                // Tree topology: hierarchical connections where each node (except root)
+                // has exactly one parent, and each parent has up to branching_factor children.
+                // Node 0 is the root.
+                // For node i > 0: parent = (i - 1) / branching_factor
+                let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+
+                if node_ids.is_empty() {
+                    return Err(SimulatorError::InvalidTopology);
+                }
+
+                // Validate branching factor
+                if *branching_factor == 0 {
+                    return Err(SimulatorError::InvalidTopology);
+                }
+
+                // Calculate tree connections (for documentation/validation)
+                // Node IDs might not be sequential 0..n, so we work with indices
+                let mut sorted_ids: Vec<NodeId> = node_ids.clone();
+                sorted_ids.sort();
+
+                for (idx, _node_id) in sorted_ids.iter().enumerate() {
+                    if idx > 0 {
+                        let parent_idx = (idx - 1) / branching_factor;
+                        if parent_idx >= sorted_ids.len() {
+                            return Err(SimulatorError::InvalidTopology);
+                        }
+                        // Connections are implicit in tree topology
+                        // Parent: sorted_ids[parent_idx], Child: sorted_ids[idx]
+                    }
+                }
+
+                info!(
+                    branching_factor,
+                    nodes = node_ids.len(),
+                    "Initialized tree topology"
+                );
             }
             Topology::Custom { connections } => {
                 // Validate all nodes exist
@@ -522,8 +569,11 @@ impl NetworkSimulator {
 /// Simulation statistics
 #[derive(Debug, Clone)]
 pub struct SimulatorStats {
+    /// Number of nodes in the simulation
     pub nodes: usize,
+    /// Number of messages currently in the delivery queue
     pub queued_messages: usize,
+    /// Time dilation factor (1.0 = real-time)
     pub time_dilation: f64,
 }
 
@@ -535,44 +585,72 @@ pub struct SimulatorStats {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ChaosEvent {
     /// Node completely fails and stops responding
-    NodeFailure { node_id: NodeId, duration: Duration },
+    NodeFailure {
+        /// ID of the node that will fail
+        node_id: NodeId,
+        /// How long the failure lasts
+        duration: Duration,
+    },
 
     /// Network partition splits nodes into isolated groups
     NetworkPartition {
+        /// First group of isolated nodes
         group_a: Vec<NodeId>,
+        /// Second group of isolated nodes
         group_b: Vec<NodeId>,
+        /// How long the partition lasts
         duration: Duration,
     },
 
     /// Messages are dropped with specified probability
-    MessageLoss { loss_rate: f64, duration: Duration },
+    MessageLoss {
+        /// Probability of message loss (0.0-1.0)
+        loss_rate: f64,
+        /// How long the message loss condition lasts
+        duration: Duration,
+    },
 
     /// Messages are corrupted (payload modified)
     MessageCorruption {
+        /// Probability of message corruption (0.0-1.0)
         corruption_rate: f64,
+        /// How long the corruption condition lasts
         duration: Duration,
     },
 
     /// Network latency spikes to high values
-    LatencySpike { latency_ms: u64, duration: Duration },
+    LatencySpike {
+        /// Additional latency in milliseconds
+        latency_ms: u64,
+        /// How long the latency spike lasts
+        duration: Duration,
+    },
 
     /// Network bandwidth severely reduced
     BandwidthThrottling {
+        /// Maximum bandwidth in bits per second
         bandwidth_bps: u64,
+        /// How long the throttling lasts
         duration: Duration,
     },
 
     /// Clock skew introduced between nodes
     ClockSkew {
+        /// ID of the node with clock skew
         node_id: NodeId,
+        /// Clock offset in milliseconds (positive = ahead, negative = behind)
         offset_ms: i64,
+        /// How long the clock skew lasts
         duration: Duration,
     },
 
     /// Custom chaos event for extensibility
     Custom {
+        /// Name of the custom event
         name: String,
+        /// Event parameters as JSON
         parameters: serde_json::Value,
+        /// How long the event lasts
         duration: Duration,
     },
 }
@@ -900,34 +978,14 @@ impl ChaosInjector {
             active_events: active_count,
         }
     }
-
-    /// Clean up expired chaos events (for future periodic cleanup support)
-    #[allow(dead_code)]
-    async fn cleanup_expired_events(&self) {
-        let now = TokioInstant::now();
-        let mut active = self.active_events.write().await;
-
-        active.retain(|(start_time, event)| {
-            let elapsed = now.duration_since(*start_time);
-            let expired = match event {
-                ChaosEvent::NodeFailure { duration, .. } => elapsed >= *duration,
-                ChaosEvent::NetworkPartition { duration, .. } => elapsed >= *duration,
-                ChaosEvent::MessageLoss { duration, .. } => elapsed >= *duration,
-                ChaosEvent::MessageCorruption { duration, .. } => elapsed >= *duration,
-                ChaosEvent::LatencySpike { duration, .. } => elapsed >= *duration,
-                ChaosEvent::BandwidthThrottling { duration, .. } => elapsed >= *duration,
-                ChaosEvent::ClockSkew { duration, .. } => elapsed >= *duration,
-                ChaosEvent::Custom { duration, .. } => elapsed >= *duration,
-            };
-            !expired
-        });
-    }
 }
 
 /// Chaos injection statistics
 #[derive(Debug, Clone)]
 pub struct ChaosStats {
+    /// Whether chaos injection is currently enabled
     pub enabled: bool,
+    /// Number of currently active chaos events
     pub active_events: usize,
 }
 
@@ -938,6 +996,7 @@ pub struct MockTransport {
 }
 
 impl MockTransport {
+    /// Create a new mock transport for a node
     pub fn new(node_id: NodeId, sender: mpsc::UnboundedSender<SimulatedMessage>) -> Self {
         Self { node_id, sender }
     }
@@ -1096,5 +1155,106 @@ mod tests {
         injector.inject_event(event).await.unwrap();
         let stats = injector.get_stats().await;
         assert_eq!(stats.active_events, 1);
+    }
+
+    #[tokio::test]
+    async fn test_tree_topology_initialization() {
+        // Create simulator with tree topology, branching factor 2
+        let mut simulator = NetworkSimulator::new()
+            .with_topology(Topology::Tree {
+                branching_factor: 2,
+            })
+            .with_nodes(7);
+
+        // Start should succeed
+        let result = simulator.start().await;
+        assert!(
+            result.is_ok(),
+            "Tree topology initialization should succeed"
+        );
+
+        simulator.stop().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_tree_topology_binary_tree() {
+        // Binary tree with 7 nodes:
+        //       0
+        //      / \
+        //     1   2
+        //    /|   |\
+        //   3 4   5 6
+        let mut simulator = NetworkSimulator::new()
+            .with_topology(Topology::Tree {
+                branching_factor: 2,
+            })
+            .with_nodes(7);
+
+        let result = simulator.start().await;
+        assert!(result.is_ok());
+
+        // Verify node count
+        assert_eq!(simulator.nodes.len(), 7);
+
+        simulator.stop().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_tree_topology_ternary() {
+        // Ternary tree (branching factor 3) with 10 nodes:
+        //          0
+        //       /  |  \
+        //      1   2   3
+        //     /|\  |
+        //    4 5 6 7...
+        let mut simulator = NetworkSimulator::new()
+            .with_topology(Topology::Tree {
+                branching_factor: 3,
+            })
+            .with_nodes(10);
+
+        let result = simulator.start().await;
+        assert!(result.is_ok());
+
+        simulator.stop().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_tree_topology_single_node() {
+        // Single node tree should work
+        let mut simulator = NetworkSimulator::new()
+            .with_topology(Topology::Tree {
+                branching_factor: 2,
+            })
+            .with_nodes(1);
+
+        let result = simulator.start().await;
+        assert!(result.is_ok());
+
+        simulator.stop().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_tree_topology_invalid_branching_factor() {
+        // Branching factor 0 should fail
+        let mut simulator = NetworkSimulator::new()
+            .with_topology(Topology::Tree {
+                branching_factor: 0,
+            })
+            .with_nodes(5);
+
+        let result = simulator.start().await;
+        assert!(result.is_err(), "Branching factor 0 should be invalid");
+    }
+
+    #[tokio::test]
+    async fn test_tree_topology_no_nodes() {
+        // Empty tree should fail
+        let mut simulator = NetworkSimulator::new().with_topology(Topology::Tree {
+            branching_factor: 2,
+        });
+
+        let result = simulator.start().await;
+        assert!(result.is_err(), "Empty tree should be invalid");
     }
 }

@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! MLS group management
 //!
 //! Manages MLS groups for secure group communication

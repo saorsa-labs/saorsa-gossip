@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Membership management using HyParView + SWIM
 //!
 //! Provides:
@@ -40,15 +42,69 @@ pub enum SwimMessage {
     Ack,
 }
 
+/// Active random walk length for JOIN (per HyParView paper)
+pub const ACTIVE_RANDOM_WALK_LENGTH: usize = 6;
+/// Passive random walk length for SHUFFLE (per HyParView paper)
+pub const PASSIVE_RANDOM_WALK_LENGTH: usize = 3;
+/// Number of peers to include in shuffle from active view
+pub const SHUFFLE_ACTIVE_SIZE: usize = 3;
+/// Number of peers to include in shuffle from passive view
+pub const SHUFFLE_PASSIVE_SIZE: usize = 4;
+
+/// HyParView neighbor priority
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NeighborPriority {
+    /// High priority - accepting node has empty active view
+    High,
+    /// Low priority - normal neighbor request
+    Low,
+}
+
 /// HyParView protocol messages
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum HyParViewMessage {
-    /// Join request
-    Join(PeerId),
+    /// Join request from new node
+    Join {
+        /// The peer ID of the joining node
+        sender: PeerId,
+        /// Time-to-live for random walk
+        ttl: usize,
+    },
+    /// ForwardJoin - forwarded join request
+    ForwardJoin {
+        /// Original sender who forwarded
+        sender: PeerId,
+        /// The new peer trying to join
+        new_peer: PeerId,
+        /// Remaining TTL for random walk
+        ttl: usize,
+    },
+    /// Neighbor request
+    Neighbor {
+        /// Sender's peer ID
+        sender: PeerId,
+        /// Priority of the request
+        priority: NeighborPriority,
+    },
+    /// Response to Neighbor request
+    NeighborReply {
+        /// Whether the request was accepted
+        accepted: bool,
+    },
     /// Shuffle request with peer list
-    Shuffle(Vec<PeerId>),
-    /// ForwardJoin request
-    ForwardJoin(PeerId, usize),
+    Shuffle {
+        /// Sender's peer ID
+        sender: PeerId,
+        /// List of peers to exchange
+        peers: Vec<PeerId>,
+        /// Remaining TTL for random walk
+        ttl: usize,
+    },
+    /// Response to Shuffle request
+    ShuffleReply {
+        /// List of peers in response
+        peers: Vec<PeerId>,
+    },
     /// Disconnect notification
     Disconnect,
 }
@@ -271,10 +327,14 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
 
 /// HyParView membership implementation
 pub struct HyParViewMembership<T: GossipTransport + 'static> {
+    /// Local peer ID
+    local_peer_id: PeerId,
     /// Active view (for routing)
     active: Arc<RwLock<HashSet<PeerId>>>,
     /// Passive view (for healing)
     passive: Arc<RwLock<HashSet<PeerId>>>,
+    /// Peer addresses for connection
+    peer_addrs: Arc<RwLock<HashMap<PeerId, std::net::SocketAddr>>>,
     /// SWIM failure detector
     swim: SwimDetector<T>,
     /// Active view degree
@@ -287,10 +347,17 @@ pub struct HyParViewMembership<T: GossipTransport + 'static> {
 
 impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     /// Create a new HyParView membership manager
-    pub fn new(active_degree: usize, passive_degree: usize, transport: Arc<T>) -> Self {
+    pub fn new(
+        local_peer_id: PeerId,
+        active_degree: usize,
+        passive_degree: usize,
+        transport: Arc<T>,
+    ) -> Self {
         let membership = Self {
+            local_peer_id,
             active: Arc::new(RwLock::new(HashSet::new())),
             passive: Arc::new(RwLock::new(HashSet::new())),
+            peer_addrs: Arc::new(RwLock::new(HashMap::new())),
             swim: SwimDetector::new(
                 SWIM_PROBE_INTERVAL_SECS,
                 SWIM_SUSPECT_TIMEOUT_SECS,
@@ -308,48 +375,290 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         membership
     }
 
+    /// Get local peer ID
+    pub fn local_peer_id(&self) -> PeerId {
+        self.local_peer_id
+    }
+
+    /// Store peer address
+    pub async fn store_peer_addr(&self, peer: PeerId, addr: std::net::SocketAddr) {
+        let mut addrs = self.peer_addrs.write().await;
+        addrs.insert(peer, addr);
+    }
+
+    /// Get peer address
+    pub async fn get_peer_addr(&self, peer: &PeerId) -> Option<std::net::SocketAddr> {
+        let addrs = self.peer_addrs.read().await;
+        addrs.get(peer).copied()
+    }
+
+    /// Add peer to passive view (without duplicating in active)
+    pub async fn add_to_passive(&self, peer: PeerId) {
+        if peer == self.local_peer_id {
+            return;
+        }
+
+        let active = self.active.read().await;
+        if active.contains(&peer) {
+            return;
+        }
+        drop(active);
+
+        let mut passive = self.passive.write().await;
+        if passive.len() < MAX_PASSIVE_DEGREE {
+            passive.insert(peer);
+            trace!(peer_id = %peer, "Added to passive view");
+        }
+    }
+
+    /// Select random peer from active view (excluding specified peer)
+    pub async fn random_active_peer_except(&self, exclude: PeerId) -> Option<PeerId> {
+        let active = self.active.read().await;
+        active.iter().find(|&&p| p != exclude).copied()
+    }
+
+    /// Sample random peers from active view
+    pub async fn sample_active(&self, count: usize) -> Vec<PeerId> {
+        let active = self.active.read().await;
+        active.iter().take(count).copied().collect()
+    }
+
+    /// Sample random peers from passive view
+    pub async fn sample_passive(&self, count: usize) -> Vec<PeerId> {
+        let passive = self.passive.read().await;
+        passive.iter().take(count).copied().collect()
+    }
+
+    /// Send a HyParView message to a peer
+    async fn send_hyparview_message(&self, peer: PeerId, msg: &HyParViewMessage) -> Result<()> {
+        let bytes = bincode::serialize(msg)
+            .map_err(|e| anyhow!("Failed to serialize HyParView message: {}", e))?;
+        self.transport
+            .send_to_peer(peer, StreamType::Membership, bytes.into())
+            .await
+    }
+
     /// Get the SWIM detector
     pub fn swim(&self) -> &SwimDetector<T> {
         &self.swim
     }
 
-    /// Shuffle the passive view with a random peer
+    /// Shuffle the passive view with a random peer (full HyParView protocol)
     pub async fn shuffle(&self) -> Result<()> {
         let active = self.active.read().await;
-        let passive = self.passive.read().await;
-
         if active.is_empty() {
             return Ok(());
         }
 
-        // Select random active peer for shuffle
+        // Select random active peer for shuffle target
         let target = *active
             .iter()
             .next()
             .ok_or_else(|| anyhow!("No active peers"))?;
-
-        // Select random subset of passive view to exchange
-        let exchange_size = (self.passive_degree / 4).max(1);
-        let to_exchange: Vec<PeerId> = passive.iter().take(exchange_size).copied().collect();
-
         drop(active);
-        drop(passive);
+
+        // Build shuffle list: self + random sample from active + passive
+        let mut shuffle_list = vec![self.local_peer_id];
+        shuffle_list.extend(self.sample_active(SHUFFLE_ACTIVE_SIZE).await);
+        shuffle_list.extend(self.sample_passive(SHUFFLE_PASSIVE_SIZE).await);
 
         debug!(
-            peer_id = %target,
-            exchange_count = to_exchange.len(),
-            "HyParView: Shuffling passive view"
+            target = %target,
+            shuffle_count = shuffle_list.len(),
+            "HyParView: Initiating shuffle"
         );
 
-        // Send SHUFFLE message to target peer via transport
-        let shuffle_msg = HyParViewMessage::Shuffle(to_exchange);
-        if let Ok(bytes) = bincode::serialize(&shuffle_msg) {
-            self.transport
-                .send_to_peer(target, StreamType::Membership, bytes.into())
-                .await?;
+        // Send SHUFFLE message with random walk TTL
+        let shuffle_msg = HyParViewMessage::Shuffle {
+            sender: self.local_peer_id,
+            peers: shuffle_list,
+            ttl: PASSIVE_RANDOM_WALK_LENGTH,
+        };
+        self.send_hyparview_message(target, &shuffle_msg).await
+    }
+
+    /// Handle incoming SHUFFLE message
+    pub async fn handle_shuffle(
+        &self,
+        sender: PeerId,
+        peers: Vec<PeerId>,
+        ttl: usize,
+    ) -> Result<()> {
+        let active = self.active.read().await;
+
+        // If TTL > 0 and we have active peers besides sender, forward
+        if ttl > 0 && active.len() > 1 {
+            if let Some(next) = active.iter().find(|&&p| p != sender).copied() {
+                drop(active);
+                let forward_msg = HyParViewMessage::Shuffle {
+                    sender,
+                    peers,
+                    ttl: ttl - 1,
+                };
+                return self.send_hyparview_message(next, &forward_msg).await;
+            }
         }
-        // Note: Peer will respond with their own passive view subset
-        // We'll merge responses into our passive view via handle_shuffle_response()
+        drop(active);
+
+        // Terminal node: exchange views
+        let reply_peers = self.sample_passive(peers.len()).await;
+
+        // Send shuffle reply
+        let reply_msg = HyParViewMessage::ShuffleReply { peers: reply_peers };
+        self.send_hyparview_message(sender, &reply_msg).await?;
+
+        // Integrate received peers into passive view
+        for peer in peers {
+            if peer != self.local_peer_id {
+                self.add_to_passive(peer).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle incoming SHUFFLE_REPLY message
+    pub async fn handle_shuffle_reply(&self, peers: Vec<PeerId>) {
+        for peer in peers {
+            if peer != self.local_peer_id {
+                self.add_to_passive(peer).await;
+            }
+        }
+    }
+
+    /// Handle incoming JOIN message (as a contact node)
+    pub async fn handle_join(&self, new_peer: PeerId, ttl: usize) -> Result<()> {
+        debug!(
+            new_peer = %new_peer,
+            ttl = ttl,
+            "HyParView: Received JOIN request"
+        );
+
+        // Add new peer to active view
+        self.add_active(new_peer).await?;
+
+        // Forward JOIN to all active peers (except the new peer) with decremented TTL
+        if ttl > 0 {
+            let active = self.active.read().await;
+            let forward_targets: Vec<PeerId> =
+                active.iter().filter(|&&p| p != new_peer).copied().collect();
+            drop(active);
+
+            for target in forward_targets {
+                let forward_msg = HyParViewMessage::ForwardJoin {
+                    sender: self.local_peer_id,
+                    new_peer,
+                    ttl: ttl - 1,
+                };
+                // Best effort - don't fail the whole join if one forward fails
+                let _ = self.send_hyparview_message(target, &forward_msg).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle incoming FORWARDJOIN message
+    pub async fn handle_forward_join(
+        &self,
+        _sender: PeerId,
+        new_peer: PeerId,
+        ttl: usize,
+    ) -> Result<()> {
+        let active = self.active.read().await;
+        let active_count = active.len();
+        drop(active);
+
+        // If TTL is 0 or active view has room, accept the new peer
+        if ttl == 0 || active_count < DEFAULT_ACTIVE_DEGREE {
+            debug!(
+                new_peer = %new_peer,
+                reason = if ttl == 0 { "TTL expired" } else { "active view has room" },
+                "HyParView: Accepting FORWARDJOIN"
+            );
+
+            // Add to active and send NEIGHBOR request
+            self.add_active(new_peer).await?;
+
+            let neighbor_msg = HyParViewMessage::Neighbor {
+                sender: self.local_peer_id,
+                priority: if active_count == 0 {
+                    NeighborPriority::High
+                } else {
+                    NeighborPriority::Low
+                },
+            };
+            self.send_hyparview_message(new_peer, &neighbor_msg).await?;
+        } else {
+            // Forward to random active peer with decremented TTL
+            if let Some(next) = self.random_active_peer_except(new_peer).await {
+                let forward_msg = HyParViewMessage::ForwardJoin {
+                    sender: self.local_peer_id,
+                    new_peer,
+                    ttl: ttl - 1,
+                };
+                self.send_hyparview_message(next, &forward_msg).await?;
+            }
+        }
+
+        // At TTL == PASSIVE_RANDOM_WALK_LENGTH, add to passive view
+        if ttl == PASSIVE_RANDOM_WALK_LENGTH {
+            self.add_to_passive(new_peer).await;
+        }
+
+        Ok(())
+    }
+
+    /// Handle incoming NEIGHBOR request
+    pub async fn handle_neighbor(&self, sender: PeerId, priority: NeighborPriority) -> Result<()> {
+        let active = self.active.read().await;
+        let active_count = active.len();
+        drop(active);
+
+        // Accept if high priority, or if we have room
+        let accepted = priority == NeighborPriority::High || active_count < MAX_ACTIVE_DEGREE;
+
+        if accepted {
+            self.add_active(sender).await?;
+            debug!(peer = %sender, "HyParView: Accepted NEIGHBOR request");
+        } else {
+            debug!(peer = %sender, "HyParView: Rejected NEIGHBOR request (at capacity)");
+        }
+
+        let reply_msg = HyParViewMessage::NeighborReply { accepted };
+        self.send_hyparview_message(sender, &reply_msg).await
+    }
+
+    /// Handle incoming NEIGHBOR_REPLY message
+    pub async fn handle_neighbor_reply(&self, sender: PeerId, accepted: bool) -> Result<()> {
+        if accepted {
+            debug!(peer = %sender, "HyParView: NEIGHBOR accepted");
+            self.swim.mark_alive(sender).await;
+        } else {
+            debug!(peer = %sender, "HyParView: NEIGHBOR rejected");
+            // Move from active to passive
+            {
+                let mut active = self.active.write().await;
+                if active.remove(&sender) {
+                    drop(active);
+                    self.add_to_passive(sender).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle incoming DISCONNECT message
+    pub async fn handle_disconnect(&self, sender: PeerId) -> Result<()> {
+        debug!(peer = %sender, "HyParView: Received DISCONNECT");
+        self.remove_active(sender).await?;
+
+        // Try to promote from passive to maintain active view size
+        let passive = self.passive.read().await;
+        if let Some(&candidate) = passive.iter().next() {
+            drop(passive);
+            self.promote(candidate).await?;
+        }
 
         Ok(())
     }
@@ -489,18 +798,92 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
 #[async_trait::async_trait]
 impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
     async fn join(&self, seeds: Vec<String>) -> Result<()> {
-        // Parse seed addresses and add to active view
-        for seed in seeds {
-            // In a real implementation, we would:
-            // 1. Parse the seed address (SocketAddr)
-            // 2. Connect via transport
-            // 3. Send JOIN message
-            // 4. Receive FORWARDJOIN response with peer list
-            // 5. Add peers to active/passive views
+        use std::net::SocketAddr;
 
-            debug!(seed = %seed, "JOIN: Attempting to join via seed (TODO: transport)");
+        if seeds.is_empty() {
+            debug!("JOIN: No seeds provided, operating as bootstrap node");
+            return Ok(());
         }
-        Ok(())
+
+        // Exponential backoff parameters
+        const INITIAL_DELAY_MS: u64 = 100;
+        const MAX_DELAY_MS: u64 = 30_000;
+        const MAX_RETRIES: usize = 10;
+
+        for seed in seeds {
+            // Parse the seed address
+            let addr: SocketAddr = match seed.parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(seed = %seed, error = %e, "JOIN: Invalid seed address");
+                    continue;
+                }
+            };
+
+            let mut delay_ms = INITIAL_DELAY_MS;
+            let mut connected = false;
+
+            for attempt in 0..MAX_RETRIES {
+                debug!(
+                    seed = %seed,
+                    attempt = attempt + 1,
+                    "JOIN: Connecting to bootstrap node"
+                );
+
+                // Connect via transport and get peer ID
+                match self.transport.dial_bootstrap(addr).await {
+                    Ok(seed_peer_id) => {
+                        debug!(
+                            seed = %seed,
+                            peer_id = %seed_peer_id,
+                            "JOIN: Connected to bootstrap"
+                        );
+
+                        // Store peer address
+                        self.store_peer_addr(seed_peer_id, addr).await;
+
+                        // Send JOIN message
+                        let join_msg = HyParViewMessage::Join {
+                            sender: self.local_peer_id,
+                            ttl: ACTIVE_RANDOM_WALK_LENGTH,
+                        };
+
+                        if let Err(e) = self.send_hyparview_message(seed_peer_id, &join_msg).await {
+                            warn!(error = %e, "JOIN: Failed to send JOIN message");
+                            continue;
+                        }
+
+                        // Add seed to active view immediately (optimistic)
+                        self.add_active(seed_peer_id).await?;
+                        connected = true;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            seed = %seed,
+                            attempt = attempt + 1,
+                            error = %e,
+                            delay_ms = delay_ms,
+                            "JOIN: Connection failed, will retry"
+                        );
+
+                        // Exponential backoff with jitter
+                        let jitter =
+                            (rand::random::<u64>() % (delay_ms / 4)).saturating_sub(delay_ms / 8);
+                        tokio::time::sleep(Duration::from_millis(delay_ms + jitter)).await;
+                        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                    }
+                }
+            }
+
+            if connected {
+                // Successfully joined via this seed
+                debug!(seed = %seed, "JOIN: Successfully joined network");
+                return Ok(());
+            }
+        }
+
+        Err(anyhow!("JOIN: Failed to connect to any seed nodes"))
     }
 
     fn active_view(&self) -> Vec<PeerId> {
@@ -580,8 +963,13 @@ mod tests {
         Arc::new(QuicTransport::new(TransportConfig::default()))
     }
 
+    fn test_peer_id() -> PeerId {
+        PeerId::new([0u8; 32])
+    }
+
     fn test_membership() -> HyParViewMembership<QuicTransport> {
         HyParViewMembership::new(
+            test_peer_id(),
             DEFAULT_ACTIVE_DEGREE,
             DEFAULT_PASSIVE_DEGREE,
             test_transport(),
@@ -621,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn test_active_view_capacity() {
         let transport = test_transport();
-        let membership = HyParViewMembership::new(3, 10, transport);
+        let membership = HyParViewMembership::new(test_peer_id(), 3, 10, transport);
 
         // Add 5 peers (more than capacity)
         for i in 0..5 {
@@ -694,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn test_degree_maintenance() {
         let transport = test_transport();
-        let membership = HyParViewMembership::new(5, 20, transport);
+        let membership = HyParViewMembership::new(test_peer_id(), 5, 20, transport);
 
         // Add many peers to passive
         for i in 0..15 {

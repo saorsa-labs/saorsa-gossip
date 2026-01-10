@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Coordinator advertisements for seedless bootstrap
 //!
 //! Implements SPEC2 §8 Coordinator Adverts for NAT traversal and seedless discovery.

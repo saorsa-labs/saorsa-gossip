@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Plumtree-based pub/sub dissemination
 //!
 //! Implements:
@@ -44,10 +46,6 @@ const IHAVE_FLUSH_INTERVAL_MS: u64 = 100;
 /// Target eager peer degree (6-8)
 const MIN_EAGER_DEGREE: usize = 6;
 const MAX_EAGER_DEGREE: usize = 12;
-
-/// IWANT timeout (2 seconds) - TODO: implement timeout tracking
-#[allow(dead_code)]
-const IWANT_TIMEOUT_SECS: u64 = 2;
 
 /// Message ID type alias
 type MessageIdType = [u8; 32];

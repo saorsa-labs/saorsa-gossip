@@ -7,14 +7,14 @@
 //! - Post-quantum cryptography (PQC) support via ML-KEM-768
 //! - Connection pooling and management
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use saorsa_gossip_types::PeerId as GossipPeerId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::{BootstrapCache, GossipTransport, StreamType};
@@ -318,16 +318,13 @@ impl AntQuicTransport {
     /// - If we only dial out (never receive incoming), we still need to receive messages
     /// - Waiting for accept() would block receiving on outbound-only connections
     fn spawn_receiver(&self) {
-        let node = Arc::clone(&self.node);
-        let recv_tx = self.recv_tx.clone();
-        let connected_peers = Arc::clone(&self.connected_peers);
         let max_peers = self.config.max_peers;
 
         // Task 1: Receive messages from ALL connected peers (inbound and outbound)
         // This must start immediately, not wait for accept()
-        let node_recv = Arc::clone(&node);
-        let tx = recv_tx;
-        let peers_recv = Arc::clone(&connected_peers);
+        let node_recv = Arc::clone(&self.node);
+        let recv_tx = self.recv_tx.clone();
+        let peers_recv = Arc::clone(&self.connected_peers);
 
         tokio::spawn(async move {
             info!("Ant-QUIC receiver task started (global message receiver)");
@@ -342,15 +339,15 @@ impl AntQuicTransport {
                         let from_gossip_id = ant_peer_id_to_gossip(&from_peer_id);
 
                         // Parse stream type from first byte
-                        let stream_type = match data.first() {
-                            Some(&0) => StreamType::Membership,
-                            Some(&1) => StreamType::PubSub,
-                            Some(&2) => StreamType::Bulk,
-                            Some(&other) => {
-                                warn!("Unknown stream type byte: {}", other);
+                        let stream_type = match data.first().and_then(|&b| StreamType::from_byte(b))
+                        {
+                            Some(st) => st,
+                            None => {
+                                if let Some(&b) = data.first() {
+                                    warn!("Unknown stream type byte: {}", b);
+                                }
                                 continue;
                             }
-                            None => continue,
                         };
 
                         // Extract payload (skip first byte)
@@ -364,7 +361,7 @@ impl AntQuicTransport {
                         update_peer_last_seen(&peers_recv, from_gossip_id).await;
 
                         // Forward to recv channel
-                        if let Err(e) = tx.send((from_gossip_id, stream_type, payload)).await {
+                        if let Err(e) = recv_tx.send((from_gossip_id, stream_type, payload)).await {
                             error!("Failed to forward message: {}", e);
                             break;
                         }
@@ -386,13 +383,14 @@ impl AntQuicTransport {
 
         // Task 2: Accept incoming connections and track them
         // This runs separately from receiving - it only tracks peer addresses
-        let peers_accept = connected_peers;
+        let node_accept = Arc::clone(&self.node);
+        let peers_accept = Arc::clone(&self.connected_peers);
 
         tokio::spawn(async move {
             info!("Ant-QUIC acceptor task started (incoming connection handler)");
 
             loop {
-                if let Some(peer_conn) = node.accept().await {
+                if let Some(peer_conn) = node_accept.accept().await {
                     let peer_id = peer_conn.peer_id;
                     let peer_addr = peer_conn.remote_addr;
                     let gossip_peer_id = ant_peer_id_to_gossip(&peer_id);
@@ -582,16 +580,9 @@ impl GossipTransport for AntQuicTransport {
         // Convert gossip PeerId to ant-quic PeerId
         let ant_peer_id = gossip_peer_id_to_ant(&peer);
 
-        // Encode stream type as first byte
-        let stream_type_byte = match stream_type {
-            StreamType::Membership => 0u8,
-            StreamType::PubSub => 1u8,
-            StreamType::Bulk => 2u8,
-        };
-
         // Prepare message: [stream_type_byte | data]
         let mut buf = Vec::with_capacity(1 + data.len());
-        buf.push(stream_type_byte);
+        buf.push(stream_type.to_byte());
         buf.extend_from_slice(&data);
 
         // Send via the node
@@ -622,6 +613,10 @@ impl GossipTransport for AntQuicTransport {
 mod tests {
     use super::*;
 
+    // ==========================================================================
+    // AntQuicTransport Creation Tests
+    // ==========================================================================
+
     #[tokio::test]
     async fn test_ant_quic_transport_creation() {
         let bind_addr = "127.0.0.1:0".parse().expect("Invalid address");
@@ -631,6 +626,123 @@ mod tests {
 
         assert_ne!(transport.peer_id(), GossipPeerId::new([0u8; 32]));
     }
+
+    #[tokio::test]
+    async fn test_ant_quic_transport_with_config() {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
+        let config = AntQuicTransportConfig {
+            bind_addr,
+            known_peers: vec![],
+            channel_capacity: 10_000,
+            stream_read_limit: 100 * 1024 * 1024,
+            max_peers: 1_000,
+            keypair: None,
+        };
+        let transport = AntQuicTransport::with_config(config, None)
+            .await
+            .expect("Failed to create transport with config");
+
+        assert_ne!(transport.peer_id(), GossipPeerId::new([0u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn test_ant_quic_transport_unique_peer_ids() {
+        // Create two transports and ensure they have unique peer IDs
+        let addr1: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
+        let addr2: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
+
+        let transport1 = AntQuicTransport::new(addr1, vec![])
+            .await
+            .expect("Failed to create transport1");
+        let transport2 = AntQuicTransport::new(addr2, vec![])
+            .await
+            .expect("Failed to create transport2");
+
+        assert_ne!(
+            transport1.peer_id(),
+            transport2.peer_id(),
+            "Each transport should have a unique peer ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ant_quic_transport_peer_id_consistency() {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
+        let transport = AntQuicTransport::new(bind_addr, vec![])
+            .await
+            .expect("Failed to create transport");
+
+        // Peer ID should be consistent across multiple calls
+        let id1 = transport.peer_id();
+        let id2 = transport.peer_id();
+        assert_eq!(id1, id2, "Peer ID should be consistent");
+    }
+
+    // ==========================================================================
+    // AntQuicTransportConfig Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_ant_quic_transport_config_defaults() {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
+        let config = AntQuicTransportConfig {
+            bind_addr,
+            known_peers: vec![],
+            channel_capacity: 10_000,
+            stream_read_limit: 100 * 1024 * 1024,
+            max_peers: 1_000,
+            keypair: None,
+        };
+        assert_eq!(config.channel_capacity, 10_000);
+        assert_eq!(config.max_peers, 1_000);
+        assert!(config.keypair.is_none());
+    }
+
+    #[test]
+    fn test_ant_quic_transport_config_with_known_peers() {
+        let bind_addr: SocketAddr = "127.0.0.1:9000".parse().expect("valid address");
+        let peer1: SocketAddr = "192.168.1.1:9000".parse().expect("valid address");
+        let peer2: SocketAddr = "192.168.1.2:9000".parse().expect("valid address");
+
+        let config = AntQuicTransportConfig {
+            bind_addr,
+            known_peers: vec![peer1, peer2],
+            channel_capacity: 5_000,
+            stream_read_limit: 50 * 1024 * 1024,
+            max_peers: 500,
+            keypair: None,
+        };
+
+        assert_eq!(config.known_peers.len(), 2);
+        assert_eq!(config.channel_capacity, 5_000);
+        assert_eq!(config.max_peers, 500);
+    }
+
+    #[test]
+    fn test_ant_quic_transport_config_with_keypair_bytes() {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
+        // Test that config can hold keypair bytes (actual key generation tested separately)
+        let mock_public_key = vec![1u8; 2592]; // ML-DSA-65 public key size
+        let mock_secret_key = vec![2u8; 4032]; // ML-DSA-65 secret key size
+
+        let config = AntQuicTransportConfig {
+            bind_addr,
+            known_peers: vec![],
+            channel_capacity: 10_000,
+            stream_read_limit: 100 * 1024 * 1024,
+            max_peers: 1_000,
+            keypair: Some((mock_public_key.clone(), mock_secret_key.clone())),
+        };
+
+        assert!(config.keypair.is_some());
+        let (pk, sk) = config.keypair.unwrap();
+        assert_eq!(pk.len(), 2592);
+        assert_eq!(sk.len(), 4032);
+    }
+
+    // ==========================================================================
+    // Peer ID Conversion Tests
+    // ==========================================================================
 
     #[tokio::test]
     async fn test_peer_id_conversion() {
@@ -647,10 +759,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_peer_id_conversion_deterministic() {
+        let (public_key, _secret_key) =
+            generate_ml_dsa_keypair().expect("Failed to generate keypair");
+        let ant_id = derive_peer_id_from_public_key(&public_key);
+
+        // Multiple conversions should produce same result
+        let gossip_id1 = ant_peer_id_to_gossip(&ant_id);
+        let gossip_id2 = ant_peer_id_to_gossip(&ant_id);
+        assert_eq!(gossip_id1, gossip_id2);
+    }
+
+    #[test]
+    fn test_gossip_peer_id_to_ant_deterministic() {
+        let gossip_id = GossipPeerId::new([42u8; 32]);
+
+        let ant_id1 = gossip_peer_id_to_ant(&gossip_id);
+        let ant_id2 = gossip_peer_id_to_ant(&gossip_id);
+        assert_eq!(ant_id1, ant_id2);
+    }
+
+    #[test]
+    fn test_peer_id_conversion_preserves_bytes() {
+        let original_bytes = [123u8; 32];
+        let gossip_id = GossipPeerId::new(original_bytes);
+        let ant_id = gossip_peer_id_to_ant(&gossip_id);
+        let recovered = ant_peer_id_to_gossip(&ant_id);
+
+        assert_eq!(gossip_id, recovered);
+    }
+
+    // ==========================================================================
+    // StreamType Encoding Tests
+    // ==========================================================================
+
+    #[tokio::test]
+    async fn test_stream_type_encoding() {
+        // Test to_byte()
+        assert_eq!(StreamType::Membership.to_byte(), 0u8);
+        assert_eq!(StreamType::PubSub.to_byte(), 1u8);
+        assert_eq!(StreamType::Bulk.to_byte(), 2u8);
+
+        // Test from_byte()
+        assert_eq!(StreamType::from_byte(0), Some(StreamType::Membership));
+        assert_eq!(StreamType::from_byte(1), Some(StreamType::PubSub));
+        assert_eq!(StreamType::from_byte(2), Some(StreamType::Bulk));
+        assert_eq!(StreamType::from_byte(3), None);
+        assert_eq!(StreamType::from_byte(255), None);
+
+        // Test round-trip
+        for st in [StreamType::Membership, StreamType::PubSub, StreamType::Bulk] {
+            assert_eq!(StreamType::from_byte(st.to_byte()), Some(st));
+        }
+    }
+
+    #[test]
+    fn test_stream_type_all_variants_have_unique_bytes() {
+        let membership = StreamType::Membership.to_byte();
+        let pubsub = StreamType::PubSub.to_byte();
+        let bulk = StreamType::Bulk.to_byte();
+
+        assert_ne!(membership, pubsub);
+        assert_ne!(membership, bulk);
+        assert_ne!(pubsub, bulk);
+    }
+
+    // ==========================================================================
+    // ML-DSA Key Generation Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_ml_dsa_keypair_generation_succeeds() {
+        let result = generate_ml_dsa_keypair();
+        assert!(result.is_ok(), "Key generation should succeed");
+    }
+
+    #[test]
+    fn test_derive_peer_id_deterministic() {
+        // Generate keypair and derive peer ID twice - should be same
+        let (public_key, _secret_key) =
+            generate_ml_dsa_keypair().expect("Failed to generate keypair");
+
+        let id1 = derive_peer_id_from_public_key(&public_key);
+        let id2 = derive_peer_id_from_public_key(&public_key);
+
+        assert_eq!(id1, id2, "Same public key should produce same peer ID");
+    }
+
+    #[test]
+    fn test_derive_peer_id_different_keys_produce_different_ids() {
+        let (pk1, _) = generate_ml_dsa_keypair().expect("keypair 1");
+        let (pk2, _) = generate_ml_dsa_keypair().expect("keypair 2");
+
+        let id1 = derive_peer_id_from_public_key(&pk1);
+        let id2 = derive_peer_id_from_public_key(&pk2);
+
+        assert_ne!(id1, id2, "Different keys should produce different peer IDs");
+    }
+
+    // ==========================================================================
+    // Transport Close Tests
+    // ==========================================================================
+
+    #[tokio::test]
+    async fn test_ant_quic_transport_close() {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
+        let transport = AntQuicTransport::new(bind_addr, vec![])
+            .await
+            .expect("Failed to create transport");
+
+        let result = transport.close().await;
+        assert!(result.is_ok(), "Close should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_ant_quic_transport_close_idempotent() {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
+        let transport = AntQuicTransport::new(bind_addr, vec![])
+            .await
+            .expect("Failed to create transport");
+
+        // Close twice - should be safe
+        let result1 = transport.close().await;
+        let result2 = transport.close().await;
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+    }
+
+    // ==========================================================================
+    // Integration Tests (Ignored by default)
+    // ==========================================================================
+
+    #[tokio::test]
     #[ignore] // Integration test - requires running ant-quic nodes
     async fn test_two_node_communication() {
         use std::net::{IpAddr, Ipv4Addr};
-        use tokio::time::{Duration, sleep, timeout};
+        use tokio::time::{sleep, timeout, Duration};
 
         // Dynamic port allocation to avoid conflicts
         let base_port = 20000
@@ -709,33 +953,5 @@ mod tests {
             Ok(Err(e)) => panic!("Receive error: {}", e),
             Err(_) => panic!("Receive timeout"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_stream_type_encoding() {
-        assert_eq!(
-            match StreamType::Membership {
-                StreamType::Membership => 0u8,
-                StreamType::PubSub => 1u8,
-                StreamType::Bulk => 2u8,
-            },
-            0u8
-        );
-        assert_eq!(
-            match StreamType::PubSub {
-                StreamType::Membership => 0u8,
-                StreamType::PubSub => 1u8,
-                StreamType::Bulk => 2u8,
-            },
-            1u8
-        );
-        assert_eq!(
-            match StreamType::Bulk {
-                StreamType::Membership => 0u8,
-                StreamType::PubSub => 1u8,
-                StreamType::Bulk => 2u8,
-            },
-            2u8
-        );
     }
 }

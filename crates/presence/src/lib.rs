@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Presence beacons and user discovery
 //!
 //! Implements:
@@ -7,12 +9,14 @@
 
 use anyhow::{Context, Result};
 use saorsa_gossip_groups::GroupContext;
-use saorsa_gossip_transport::GossipTransport;
+use saorsa_gossip_transport::{GossipTransport, StreamType};
 use saorsa_gossip_types::{PeerId, PresenceRecord, TopicId};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tracing::{debug, warn};
 
 /// Presence status for a peer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +27,36 @@ pub enum PresenceStatus {
     Offline,
     /// Unknown (never seen)
     Unknown,
+}
+
+/// Presence message for wire protocol
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PresenceMessage {
+    /// Beacon announcement
+    Beacon {
+        /// Topic/group this beacon is for
+        topic_id: TopicId,
+        /// Sender's peer ID
+        sender: PeerId,
+        /// The presence record
+        record: PresenceRecord,
+        /// MLS epoch for decryption (placeholder for future MLS encryption)
+        epoch: u64,
+    },
+    /// Request for presence information
+    Query {
+        /// Topic/group to query
+        topic_id: TopicId,
+        /// TTL for FOAF random walk
+        ttl: u8,
+    },
+    /// Response to presence query
+    QueryResponse {
+        /// Topic/group
+        topic_id: TopicId,
+        /// Known presence records
+        records: Vec<(PeerId, PresenceRecord)>,
+    },
 }
 
 /// Presence management trait
@@ -49,6 +83,10 @@ pub struct PresenceManager {
     shutdown_tx: Arc<RwLock<Option<tokio::sync::mpsc::Sender<()>>>>,
     /// Received beacons: TopicId -> (PeerId -> PresenceRecord)
     received_beacons: Arc<RwLock<HashMap<TopicId, HashMap<PeerId, PresenceRecord>>>>,
+    /// Peers to broadcast beacons to (from membership layer)
+    broadcast_peers: Arc<RwLock<HashSet<PeerId>>>,
+    /// Our address hints for connectivity (local, reflexive, relay addresses)
+    addr_hints: Arc<RwLock<Vec<String>>>,
 }
 
 impl PresenceManager {
@@ -65,7 +103,56 @@ impl PresenceManager {
             beacon_task: Arc::new(RwLock::new(None)),
             shutdown_tx: Arc::new(RwLock::new(None)),
             received_beacons: Arc::new(RwLock::new(HashMap::new())),
+            broadcast_peers: Arc::new(RwLock::new(HashSet::new())),
+            addr_hints: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Add a peer to broadcast beacons to
+    ///
+    /// Call this when a peer joins the mesh (from membership layer).
+    pub async fn add_broadcast_peer(&self, peer: PeerId) {
+        let mut peers = self.broadcast_peers.write().await;
+        peers.insert(peer);
+        debug!(?peer, "Added broadcast peer");
+    }
+
+    /// Remove a peer from beacon broadcasts
+    ///
+    /// Call this when a peer leaves the mesh or disconnects.
+    pub async fn remove_broadcast_peer(&self, peer: PeerId) {
+        let mut peers = self.broadcast_peers.write().await;
+        peers.remove(&peer);
+        debug!(?peer, "Removed broadcast peer");
+    }
+
+    /// Get current broadcast peer count
+    pub async fn broadcast_peer_count(&self) -> usize {
+        self.broadcast_peers.read().await.len()
+    }
+
+    /// Set address hints for our presence beacons
+    ///
+    /// Address hints help other peers find us. Include:
+    /// - Local bound addresses
+    /// - NAT-reflexive addresses (from STUN or observed by peers)
+    /// - Relay addresses (for symmetric NAT)
+    pub async fn set_addr_hints(&self, hints: Vec<String>) {
+        let mut addr = self.addr_hints.write().await;
+        *addr = hints;
+    }
+
+    /// Add a single address hint
+    pub async fn add_addr_hint(&self, hint: String) {
+        let mut addr = self.addr_hints.write().await;
+        if !addr.contains(&hint) {
+            addr.push(hint);
+        }
+    }
+
+    /// Get current address hints
+    pub async fn get_addr_hints(&self) -> Vec<String> {
+        self.addr_hints.read().await.clone()
     }
 
     /// Start periodic beacon broadcasting
@@ -93,8 +180,10 @@ impl PresenceManager {
         // Clone everything needed for the background task
         let peer_id = self.peer_id;
         let groups = self.groups.clone();
-        let _transport = self.transport.clone(); // TODO: Use for actual beacon broadcasting
+        let transport = self.transport.clone();
         let received_beacons = self.received_beacons.clone();
+        let broadcast_peers = self.broadcast_peers.clone();
+        let addr_hints = self.addr_hints.clone();
 
         // Spawn background task for beacon broadcasting
         let task_handle = tokio::spawn(async move {
@@ -108,7 +197,7 @@ impl PresenceManager {
                         // Broadcast beacons to all joined groups
                         let groups_lock = groups.read().await;
 
-                        for (topic_id, _group_ctx) in groups_lock.iter() {
+                        for (topic_id, group_ctx) in groups_lock.iter() {
                             // Derive presence tag for current time slice
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -124,16 +213,60 @@ impl PresenceManager {
 
                             let presence_tag = derive_presence_tag(&exporter_secret, &peer_id, time_slice);
 
-                            // Create presence record
-                            let addr_hints = vec!["127.0.0.1:8080".to_string()]; // TODO: Real addresses
-                            let ttl_seconds = interval_secs * 3; // Beacons valid for 3x interval
-                            let record = PresenceRecord::new(presence_tag, addr_hints, ttl_seconds);
+                            // Get address hints (real addresses when available)
+                            let hints = addr_hints.read().await.clone();
+                            let record_addr_hints = if hints.is_empty() {
+                                // Fallback for testing/development
+                                vec!["127.0.0.1:8080".to_string()]
+                            } else {
+                                hints
+                            };
 
-                            // Broadcast via transport (placeholder - in production, encrypt to group)
-                            // For now, just store our own beacon locally for testing
-                            let mut beacons = received_beacons.write().await;
-                            let topic_beacons = beacons.entry(*topic_id).or_insert_with(HashMap::new);
-                            topic_beacons.insert(peer_id, record);
+                            // Create presence record with 3x interval TTL
+                            let ttl_seconds = interval_secs * 3;
+                            let record = PresenceRecord::new(presence_tag, record_addr_hints, ttl_seconds);
+
+                            // Store our own beacon locally
+                            {
+                                let mut beacons = received_beacons.write().await;
+                                let topic_beacons = beacons.entry(*topic_id).or_insert_with(HashMap::new);
+                                topic_beacons.insert(peer_id, record.clone());
+                            }
+
+                            // Create wire message
+                            let message = PresenceMessage::Beacon {
+                                topic_id: *topic_id,
+                                sender: peer_id,
+                                record,
+                                epoch: group_ctx.epoch,
+                            };
+
+                            // Serialize message
+                            let data = match bincode::serialize(&message) {
+                                Ok(d) => bytes::Bytes::from(d),
+                                Err(e) => {
+                                    warn!(?e, "Failed to serialize presence beacon");
+                                    continue;
+                                }
+                            };
+
+                            // Broadcast to all known peers
+                            let peers = broadcast_peers.read().await;
+                            for target_peer in peers.iter() {
+                                if let Err(e) = transport
+                                    .send_to_peer(*target_peer, StreamType::Bulk, data.clone())
+                                    .await
+                                {
+                                    debug!(?target_peer, ?e, "Failed to send beacon to peer");
+                                    // Continue to next peer - don't fail entire broadcast
+                                }
+                            }
+
+                            debug!(
+                                ?topic_id,
+                                peer_count = peers.len(),
+                                "Broadcast presence beacon"
+                            );
                         }
                     }
                     _ = shutdown_rx.recv() => {
@@ -302,6 +435,50 @@ impl PresenceManager {
         topic_beacons.insert(peer, record);
 
         Ok(())
+    }
+
+    /// Handle received presence message from wire
+    ///
+    /// Deserializes and processes a PresenceMessage received via transport.
+    /// Returns the sender's PeerId if a beacon was processed.
+    pub async fn handle_presence_message(&self, data: &[u8]) -> Result<Option<PeerId>> {
+        let message: PresenceMessage =
+            bincode::deserialize(data).context("Failed to deserialize presence message")?;
+
+        match message {
+            PresenceMessage::Beacon {
+                topic_id,
+                sender,
+                record,
+                epoch: _,
+            } => {
+                // Verify we're in this group
+                let groups = self.groups.read().await;
+                if !groups.contains_key(&topic_id) {
+                    debug!(?topic_id, "Received beacon for unknown topic");
+                    return Ok(None);
+                }
+
+                // Store the beacon
+                self.handle_beacon(topic_id, sender, record).await?;
+                debug!(?sender, ?topic_id, "Processed presence beacon");
+                Ok(Some(sender))
+            }
+            PresenceMessage::Query { topic_id, ttl } => {
+                // Handle FOAF query - forward or respond
+                debug!(?topic_id, ttl, "Received presence query");
+                // TODO: Implement FOAF query handling
+                Ok(None)
+            }
+            PresenceMessage::QueryResponse { topic_id, records } => {
+                // Process query response
+                debug!(?topic_id, count = records.len(), "Received query response");
+                for (peer, record) in records {
+                    self.handle_beacon(topic_id, peer, record).await?;
+                }
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -618,5 +795,139 @@ mod tests {
         let tag2 = derive_presence_tag(&secret, &peer2, time_slice);
 
         assert_ne!(tag1, tag2, "Different peers should produce different tags");
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_peer_management() {
+        let manager = create_test_manager();
+
+        let peer1 = PeerId::new([10u8; 32]);
+        let peer2 = PeerId::new([20u8; 32]);
+
+        // Initially no broadcast peers
+        assert_eq!(manager.broadcast_peer_count().await, 0);
+
+        // Add peers
+        manager.add_broadcast_peer(peer1).await;
+        assert_eq!(manager.broadcast_peer_count().await, 1);
+
+        manager.add_broadcast_peer(peer2).await;
+        assert_eq!(manager.broadcast_peer_count().await, 2);
+
+        // Adding same peer twice doesn't duplicate
+        manager.add_broadcast_peer(peer1).await;
+        assert_eq!(manager.broadcast_peer_count().await, 2);
+
+        // Remove peer
+        manager.remove_broadcast_peer(peer1).await;
+        assert_eq!(manager.broadcast_peer_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_addr_hints_management() {
+        let manager = create_test_manager();
+
+        // Initially empty
+        assert!(manager.get_addr_hints().await.is_empty());
+
+        // Set hints
+        manager
+            .set_addr_hints(vec!["192.168.1.1:8080".to_string()])
+            .await;
+        assert_eq!(manager.get_addr_hints().await.len(), 1);
+
+        // Add single hint
+        manager.add_addr_hint("10.0.0.1:9000".to_string()).await;
+        assert_eq!(manager.get_addr_hints().await.len(), 2);
+
+        // Adding same hint doesn't duplicate
+        manager.add_addr_hint("10.0.0.1:9000".to_string()).await;
+        assert_eq!(manager.get_addr_hints().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_presence_message_serialization() {
+        let topic = TopicId::new([1u8; 32]);
+        let sender = PeerId::new([2u8; 32]);
+        let record = PresenceRecord::new([3u8; 32], vec!["127.0.0.1:8080".to_string()], 900);
+
+        let message = PresenceMessage::Beacon {
+            topic_id: topic,
+            sender,
+            record: record.clone(),
+            epoch: 5,
+        };
+
+        // Serialize and deserialize
+        let data = bincode::serialize(&message).expect("serialize failed");
+        let decoded: PresenceMessage = bincode::deserialize(&data).expect("deserialize failed");
+
+        match decoded {
+            PresenceMessage::Beacon {
+                topic_id,
+                sender: decoded_sender,
+                record: decoded_record,
+                epoch,
+            } => {
+                assert_eq!(topic_id, topic);
+                assert_eq!(decoded_sender, sender);
+                assert_eq!(decoded_record.presence_tag, record.presence_tag);
+                assert_eq!(epoch, 5);
+            }
+            _ => panic!("Expected Beacon message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_presence_message_beacon() {
+        let manager = create_test_manager();
+        let topic = TopicId::new([1u8; 32]);
+        let sender = PeerId::new([2u8; 32]);
+        let record = PresenceRecord::new([3u8; 32], vec!["127.0.0.1:8080".to_string()], 900);
+
+        // Add the topic to groups so the beacon is accepted
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, saorsa_gossip_groups::GroupContext::new(topic));
+        }
+
+        let message = PresenceMessage::Beacon {
+            topic_id: topic,
+            sender,
+            record,
+            epoch: 0,
+        };
+
+        let data = bincode::serialize(&message).expect("serialize failed");
+        let result = manager.handle_presence_message(&data).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(sender));
+
+        // Verify beacon was stored
+        let status = manager.get_status(sender, topic).await;
+        assert_eq!(status, PresenceStatus::Online);
+    }
+
+    #[tokio::test]
+    async fn test_handle_presence_message_unknown_topic() {
+        let manager = create_test_manager();
+        let topic = TopicId::new([99u8; 32]); // Not in groups
+        let sender = PeerId::new([2u8; 32]);
+        let record = PresenceRecord::new([3u8; 32], vec![], 900);
+
+        let message = PresenceMessage::Beacon {
+            topic_id: topic,
+            sender,
+            record,
+            epoch: 0,
+        };
+
+        let data = bincode::serialize(&message).expect("serialize failed");
+        let result = manager.handle_presence_message(&data).await;
+
+        // Should return Ok(None) for unknown topic
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
     }
 }

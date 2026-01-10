@@ -236,6 +236,7 @@ mod tests {
         let cache = AdvertCache::new(10);
 
         // Insert some adverts with different expiry times
+        // Use 50ms for the first one to avoid race condition during insert
         for i in 0..3 {
             let peer = PeerId::new([i; 32]);
             let advert = CoordinatorAdvert::new(
@@ -243,15 +244,15 @@ mod tests {
                 CoordinatorRoles::default(),
                 vec![],
                 NatClass::Eim,
-                if i == 0 { 1 } else { 10_000 }, // First one expires quickly
+                if i == 0 { 50 } else { 10_000 }, // First one expires after 50ms
             );
             cache.insert(advert);
         }
 
         assert_eq!(cache.len(), 3);
 
-        // Sleep to let first one expire
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Sleep to let first one expire (50ms TTL + margin)
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         let pruned = cache.prune_expired();
         assert_eq!(pruned, 1, "Should prune one expired advert");

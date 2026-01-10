@@ -30,9 +30,6 @@ pub struct SimulatedGossipTransport {
     simulator: Arc<RwLock<NetworkSimulator>>,
     /// Map of peer IDs to node IDs
     peer_to_node: Arc<RwLock<PeerMap>>,
-    /// Map of node IDs to peer IDs (for future reverse lookup support)
-    #[allow(dead_code)]
-    node_to_peer: Arc<RwLock<NodePeerMap>>,
     /// Channel for receiving messages
     receiver: Arc<Mutex<mpsc::UnboundedReceiver<(PeerId, StreamType, Bytes)>>>,
     /// Channel for sending to receiver
@@ -48,7 +45,6 @@ impl SimulatedGossipTransport {
         node_id: NodeId,
         simulator: Arc<RwLock<NetworkSimulator>>,
         peer_to_node: Arc<RwLock<PeerMap>>,
-        node_to_peer: Arc<RwLock<NodePeerMap>>,
     ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
 
@@ -57,7 +53,6 @@ impl SimulatedGossipTransport {
             node_id,
             simulator,
             peer_to_node,
-            node_to_peer,
             receiver: Arc::new(Mutex::new(receiver)),
             sender,
             listening: Arc::new(RwLock::new(false)),
@@ -187,7 +182,6 @@ impl SimulatedGossipNetwork {
             node_id,
             Arc::clone(&self.simulator),
             Arc::clone(&self.peer_to_node),
-            Arc::clone(&self.node_to_peer),
         )
     }
 

@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Production-Ready Delta-CRDT synchronization with anti-entropy
 //!
 //! Implements:

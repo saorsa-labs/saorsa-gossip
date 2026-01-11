@@ -975,7 +975,10 @@ mod tests {
 
         let num1 = runner1.rng.lock().expect("lock").gen::<u64>();
         let num2 = runner2.rng.lock().expect("lock").gen::<u64>();
-        assert_ne!(num1, num2, "Different seeds should produce different numbers");
+        assert_ne!(
+            num1, num2,
+            "Different seeds should produce different numbers"
+        );
     }
 
     // ==========================================================================

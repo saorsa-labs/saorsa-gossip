@@ -180,7 +180,7 @@ fn bench_topic_id_from_entity(c: &mut Criterion) {
     c.bench_function("topic_id_from_entity", |b| {
         b.iter(|| {
             let entity_id = entity_ids[rand::random::<usize>() % entity_ids.len()];
-            let topic_id = TopicId::from_entity(black_box(entity_id)).unwrap();
+            let topic_id = TopicId::from_entity(black_box(entity_id));
             black_box(topic_id)
         })
     });

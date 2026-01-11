@@ -41,10 +41,9 @@
 //! # }
 //! ```
 
-use saorsa_gossip_types::PeerId;
+use saorsa_gossip_types::{unix_millis, PeerId};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime};
 
 mod bootstrap;
 mod cache;
@@ -65,36 +64,10 @@ pub use peer_cache::{PeerCache, PeerCacheEntry, PeerRoles};
 pub use publisher::{CoordinatorPublisher, PeriodicPublisher};
 pub use topic::coordinator_topic;
 
-fn current_unix_time_millis() -> u64 {
-    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => duration.as_millis() as u64,
-        Err(_) => Duration::ZERO.as_millis() as u64,
-    }
-}
-
 /// Coordinator roles per SPEC2 §8
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CoordinatorRoles {
-    /// Acts as bootstrap coordinator
-    pub coordinator: bool,
-    /// Provides address reflection
-    pub reflector: bool,
-    /// Facilitates rendezvous for hole punching
-    pub rendezvous: bool,
-    /// Provides message relay service
-    pub relay: bool,
-}
-
-impl Default for CoordinatorRoles {
-    fn default() -> Self {
-        Self {
-            coordinator: true,
-            reflector: true,
-            rendezvous: false,
-            relay: false,
-        }
-    }
-}
+///
+/// Type alias for backward compatibility - use `PeerRoles` for new code.
+pub type CoordinatorRoles = PeerRoles;
 
 /// NAT class detection per SPEC2 §8
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,7 +96,7 @@ pub struct AddrHint {
 impl AddrHint {
     /// Create a new address hint with current timestamp
     pub fn new(addr: SocketAddr) -> Self {
-        let now = current_unix_time_millis();
+        let now = unix_millis();
 
         Self {
             addr,
@@ -171,48 +144,6 @@ pub struct CoordinatorAdvert {
     pub sig: Vec<u8>,
 }
 
-mod serde_bytes {
-    use serde::{de::Visitor, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(bytes)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct BytesVisitor;
-
-        impl<'de> Visitor<'de> for BytesVisitor {
-            type Value = Vec<u8>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a byte array")
-            }
-
-            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(v.to_vec())
-            }
-
-            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(v)
-            }
-        }
-
-        deserializer.deserialize_bytes(BytesVisitor)
-    }
-}
-
 impl CoordinatorAdvert {
     /// Create a new coordinator advert (unsigned)
     ///
@@ -229,7 +160,7 @@ impl CoordinatorAdvert {
         nat_class: NatClass,
         validity_duration_ms: u64,
     ) -> Self {
-        let now = current_unix_time_millis();
+        let now = unix_millis();
 
         Self {
             v: 1,
@@ -307,7 +238,7 @@ impl CoordinatorAdvert {
 
     /// Check if advert is currently valid (not expired)
     pub fn is_valid(&self) -> bool {
-        let now = current_unix_time_millis();
+        let now = unix_millis();
 
         now >= self.not_before && now <= self.not_after
     }

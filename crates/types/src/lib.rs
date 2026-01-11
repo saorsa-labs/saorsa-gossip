@@ -33,12 +33,10 @@ impl TopicId {
     /// * `entity_id` - String identifier for the entity (channel, project, org, etc.)
     ///
     /// # Returns
-    /// * `Result<Self>` - TopicId derived from the entity_id
-    pub fn from_entity(entity_id: &str) -> Result<Self, anyhow::Error> {
+    /// * `Self` - TopicId derived from the entity_id
+    pub fn from_entity(entity_id: &str) -> Self {
         let hash = blake3::hash(entity_id.as_bytes());
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&hash.as_bytes()[..32]);
-        Ok(Self(bytes))
+        Self(*hash.as_bytes())
     }
 
     /// Get the underlying bytes
@@ -255,7 +253,7 @@ pub struct PresenceRecord {
 impl PresenceRecord {
     /// Create a new presence record
     pub fn new(presence_tag: [u8; 32], addr_hints: Vec<String>, ttl_seconds: u64) -> Self {
-        let now = current_unix_secs();
+        let now = unix_secs();
         Self {
             presence_tag,
             addr_hints,
@@ -273,7 +271,7 @@ impl PresenceRecord {
         ttl_seconds: u64,
         four_words: String,
     ) -> Self {
-        let now = current_unix_secs();
+        let now = unix_secs();
         Self {
             presence_tag,
             addr_hints,
@@ -286,7 +284,7 @@ impl PresenceRecord {
 
     /// Check if the presence record is expired
     pub fn is_expired(&self) -> bool {
-        current_unix_secs() >= self.expires
+        unix_secs() >= self.expires
     }
 }
 
@@ -328,18 +326,21 @@ pub struct FoafResponse {
 /// Get current time as Unix timestamp in seconds
 ///
 /// Returns 0 if system time is before Unix epoch (shouldn't happen in practice).
-fn current_unix_secs() -> u64 {
+pub fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-// Helper module for hex encoding (simplified)
-mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{:02x}", b)).collect()
-    }
+/// Get current time as Unix timestamp in milliseconds
+///
+/// Returns 0 if system time is before Unix epoch (shouldn't happen in practice).
+pub fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -495,13 +496,10 @@ mod tests {
         assert_eq!(header.msg_id.len(), 32, "Message ID should be 32 bytes");
     }
 
-    // TDD: New failing tests for TopicId::from_entity
-
     #[test]
     fn test_topic_id_from_entity() {
-        // RED: This should fail because from_entity doesn't exist yet
         let entity_id = "channel-123";
-        let topic = TopicId::from_entity(entity_id).expect("should create topic from entity");
+        let topic = TopicId::from_entity(entity_id);
 
         // Should produce a valid 32-byte topic ID
         assert_eq!(topic.as_bytes().len(), 32);
@@ -511,8 +509,8 @@ mod tests {
     fn test_topic_id_from_entity_deterministic() {
         // Same entity ID should always produce the same topic
         let entity_id = "project-xyz";
-        let topic1 = TopicId::from_entity(entity_id).expect("should create topic");
-        let topic2 = TopicId::from_entity(entity_id).expect("should create topic");
+        let topic1 = TopicId::from_entity(entity_id);
+        let topic2 = TopicId::from_entity(entity_id);
 
         assert_eq!(topic1, topic2, "Same entity should produce same topic");
     }
@@ -520,8 +518,8 @@ mod tests {
     #[test]
     fn test_topic_id_from_entity_unique() {
         // Different entity IDs should produce different topics
-        let topic1 = TopicId::from_entity("channel-A").expect("should create topic");
-        let topic2 = TopicId::from_entity("channel-B").expect("should create topic");
+        let topic1 = TopicId::from_entity("channel-A");
+        let topic2 = TopicId::from_entity("channel-B");
 
         assert_ne!(
             topic1, topic2,
@@ -533,7 +531,7 @@ mod tests {
     fn test_topic_id_from_entity_hex() {
         // Should accept hex-encoded entity IDs
         let hex_entity = "deadbeef12345678";
-        let topic = TopicId::from_entity(hex_entity).expect("should create topic from hex");
+        let topic = TopicId::from_entity(hex_entity);
 
         assert_eq!(topic.as_bytes().len(), 32);
     }

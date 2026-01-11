@@ -3,19 +3,11 @@
 //! Implements SPEC2 §7.2 peer cache for storing coordinator connection info.
 
 use crate::NatClass;
-use saorsa_gossip_types::PeerId;
+use saorsa_gossip_types::{unix_millis, PeerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
-
-fn unix_time_millis() -> u64 {
-    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => duration.as_millis() as u64,
-        Err(_) => Duration::ZERO.as_millis() as u64,
-    }
-}
 
 /// Peer cache entry per SPEC2 §7.2
 ///
@@ -41,8 +33,8 @@ pub struct PeerCacheEntry {
     pub roles: PeerRoles,
 }
 
-/// Roles a peer can provide
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Roles a peer can provide (per SPEC2 §8)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRoles {
     /// Acts as bootstrap coordinator
     pub coordinator: bool,
@@ -52,6 +44,17 @@ pub struct PeerRoles {
     pub rendezvous: bool,
     /// Provides relay services
     pub relay: bool,
+}
+
+impl Default for PeerRoles {
+    fn default() -> Self {
+        Self {
+            coordinator: true,
+            reflector: true,
+            rendezvous: false,
+            relay: false,
+        }
+    }
 }
 
 impl PeerCacheEntry {
@@ -65,7 +68,7 @@ impl PeerCacheEntry {
         nat_class: NatClass,
         roles: PeerRoles,
     ) -> Self {
-        let now = unix_time_millis();
+        let now = unix_millis();
 
         Self {
             peer_id,
@@ -92,12 +95,12 @@ impl PeerCacheEntry {
 
     /// Update last success timestamp
     pub fn mark_success(&mut self) {
-        self.last_success = unix_time_millis();
+        self.last_success = unix_millis();
     }
 
     /// Check if entry is recent (within last 24 hours)
     pub fn is_recent(&self) -> bool {
-        let now = unix_time_millis();
+        let now = unix_millis();
 
         now - self.last_success < 24 * 3600 * 1000 // 24 hours in ms
     }
@@ -173,7 +176,7 @@ impl PeerCache {
             Some(guard) => guard,
             None => return 0,
         };
-        let now = unix_time_millis();
+        let now = unix_millis();
 
         let cutoff = now - (7 * 24 * 3600 * 1000); // 7 days in ms
 

@@ -190,7 +190,9 @@ impl QuicTransport {
     }
 
     /// Get a receiver for messages (for testing)
-    pub fn message_receiver(&mut self) -> &mut mpsc::UnboundedReceiver<(PeerId, StreamType, bytes::Bytes)> {
+    pub fn message_receiver(
+        &mut self,
+    ) -> &mut mpsc::UnboundedReceiver<(PeerId, StreamType, bytes::Bytes)> {
         &mut self.recv_rx
     }
 }
@@ -450,7 +452,9 @@ mod tests {
 
         for i in 0..5 {
             let peer_id = PeerId::new([i as u8; 32]);
-            let addr: SocketAddr = format!("127.0.0.1:{}", 8080 + i).parse().expect("valid address");
+            let addr: SocketAddr = format!("127.0.0.1:{}", 8080 + i)
+                .parse()
+                .expect("valid address");
             let result = transport.dial(peer_id, addr).await;
             assert!(result.is_ok(), "Failed to dial peer {}", i);
         }
@@ -558,7 +562,10 @@ mod tests {
         mux.send(StreamType::Bulk, bulk_data.clone()).ok();
 
         // Verify each stream received only its message
-        assert_eq!(receivers.membership_rx.recv().await.unwrap(), membership_data);
+        assert_eq!(
+            receivers.membership_rx.recv().await.unwrap(),
+            membership_data
+        );
         assert_eq!(receivers.pubsub_rx.recv().await.unwrap(), pubsub_data);
         assert_eq!(receivers.bulk_rx.recv().await.unwrap(), bulk_data);
     }

@@ -3,16 +3,9 @@
 //! Implements SPEC2 §7.3 FOAF queries for finding coordinators when the cache is cold.
 
 use crate::CoordinatorAdvert;
-use saorsa_gossip_types::PeerId;
+use rand::RngCore;
+use saorsa_gossip_types::{unix_millis, PeerId};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime};
-
-fn current_millis() -> u64 {
-    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => duration.as_millis() as u64,
-        Err(_) => Duration::ZERO.as_millis() as u64,
-    }
-}
 
 /// Maximum TTL for FIND_COORDINATOR queries (SPEC2 §7.3)
 pub const MAX_FIND_COORDINATOR_TTL: u8 = 3;
@@ -38,7 +31,7 @@ impl FindCoordinatorQuery {
     pub fn new(origin: PeerId) -> Self {
         let query_id = blake3::hash(&[&origin.to_bytes()[..], &rand_bytes()].concat());
 
-        let now = current_millis();
+        let now = unix_millis();
 
         Self {
             query_id: *query_id.as_bytes(),
@@ -60,7 +53,7 @@ impl FindCoordinatorQuery {
 
     /// Check if query has expired (older than 30 seconds)
     pub fn is_expired(&self) -> bool {
-        let now = current_millis();
+        let now = unix_millis();
 
         now > self.created_at + 30_000
     }
@@ -88,12 +81,11 @@ impl FindCoordinatorResponse {
     }
 }
 
-// Helper to generate random bytes for query IDs
-fn rand_bytes() -> Vec<u8> {
-    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos().to_le_bytes().to_vec(),
-        Err(_) => Duration::ZERO.as_nanos().to_le_bytes().to_vec(),
-    }
+/// Generate cryptographically random bytes for query IDs
+fn rand_bytes() -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes
 }
 
 #[cfg(test)]
@@ -141,7 +133,7 @@ mod tests {
         assert!(!query.is_expired(), "Fresh query should not be expired");
 
         // Simulate old query
-        query.created_at = current_millis() - 40_000; // 40 seconds ago
+        query.created_at = unix_millis() - 40_000; // 40 seconds ago
 
         assert!(query.is_expired(), "Old query should be expired");
     }

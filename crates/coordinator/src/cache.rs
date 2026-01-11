@@ -8,11 +8,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 const DEFAULT_CAPACITY: usize = 100;
 
+/// Compile-time validated non-zero default capacity
+const DEFAULT_CAPACITY_NONZERO: NonZeroUsize = match NonZeroUsize::new(DEFAULT_CAPACITY) {
+    Some(v) => v,
+    None => panic!("DEFAULT_CAPACITY must be non-zero"),
+};
+
 fn non_zero_capacity(capacity: usize) -> NonZeroUsize {
-    match NonZeroUsize::new(capacity) {
-        Some(value) => value,
-        None => unsafe { NonZeroUsize::new_unchecked(DEFAULT_CAPACITY) },
-    }
+    NonZeroUsize::new(capacity).unwrap_or(DEFAULT_CAPACITY_NONZERO)
 }
 
 /// LRU cache for coordinator advertisements

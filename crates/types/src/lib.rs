@@ -24,18 +24,37 @@ impl TopicId {
         Self(bytes)
     }
 
-    /// Create a TopicId from an entity identifier string
+    /// Create a TopicId from an entity identifier.
     ///
-    /// Uses BLAKE3 to hash the entity_id string into a 32-byte topic identifier.
+    /// Uses BLAKE3 to hash the entity identifier into a 32-byte topic identifier.
     /// This ensures deterministic topic IDs for the same entity across different nodes.
     ///
+    /// Accepts any type that can be converted to a byte slice, including:
+    /// - `&str` and `String` for string identifiers
+    /// - `&[u8]` and `Vec<u8>` for binary identifiers
+    /// - Any type implementing `AsRef<[u8]>`
+    ///
     /// # Arguments
-    /// * `entity_id` - String identifier for the entity (channel, project, org, etc.)
+    /// * `entity_id` - Identifier for the entity (channel, project, org, binary ID, etc.)
     ///
     /// # Returns
     /// * `Self` - TopicId derived from the entity_id
-    pub fn from_entity(entity_id: &str) -> Self {
-        let hash = blake3::hash(entity_id.as_bytes());
+    ///
+    /// # Examples
+    /// ```
+    /// use saorsa_gossip_types::TopicId;
+    ///
+    /// // From string
+    /// let topic1 = TopicId::from_entity("channel-123");
+    ///
+    /// // From bytes
+    /// let topic2 = TopicId::from_entity(&[1u8, 2, 3, 4]);
+    ///
+    /// // From Vec<u8>
+    /// let topic3 = TopicId::from_entity(vec![5u8, 6, 7, 8]);
+    /// ```
+    pub fn from_entity(entity_id: impl AsRef<[u8]>) -> Self {
+        let hash = blake3::hash(entity_id.as_ref());
         Self(*hash.as_bytes())
     }
 

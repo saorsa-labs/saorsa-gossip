@@ -63,26 +63,6 @@ impl SimulatedGossipTransport {
     pub fn get_sender(&self) -> mpsc::UnboundedSender<(PeerId, StreamType, Bytes)> {
         self.sender.clone()
     }
-
-    /// Convert StreamType to simulator MessageType
-    fn stream_to_message_type(stream: StreamType) -> MessageType {
-        match stream {
-            StreamType::Membership => MessageType::Membership,
-            StreamType::PubSub => MessageType::PubSub,
-            StreamType::Bulk => MessageType::CrdtSync, // Bulk used for CRDT and other data
-        }
-    }
-
-    /// Convert simulator MessageType to StreamType
-    fn message_type_to_stream(msg_type: MessageType) -> StreamType {
-        match msg_type {
-            MessageType::Membership => StreamType::Membership,
-            MessageType::PubSub => StreamType::PubSub,
-            MessageType::CrdtSync => StreamType::Bulk,
-            MessageType::Presence => StreamType::Bulk, // Map to Bulk stream
-            MessageType::Control => StreamType::Membership, // Map to Membership stream
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -132,8 +112,8 @@ impl GossipTransport for SimulatedGossipTransport {
             .get(&peer)
             .ok_or_else(|| anyhow!("Unknown peer: {:?}", peer))?;
 
-        // Send through the simulator
-        let message_type = Self::stream_to_message_type(stream_type);
+        // Send through the simulator using From trait conversion
+        let message_type: MessageType = stream_type.into();
         let sim = self.simulator.read().await;
         sim.send_message(self.node_id, *target_node, data.to_vec(), message_type)
             .await?;
@@ -230,8 +210,8 @@ impl SimulatedGossipNetwork {
         // Find the transport and deliver
         for transport in &self.transports {
             if transport.peer_id == *to_peer {
-                let stream_type =
-                    SimulatedGossipTransport::message_type_to_stream(message.message_type);
+                // Use From trait conversion for message type to stream type
+                let stream_type: StreamType = message.message_type.into();
                 let bytes = Bytes::from(message.payload);
                 transport.sender.send((*from_peer, stream_type, bytes))?;
                 return Ok(());

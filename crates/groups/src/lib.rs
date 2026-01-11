@@ -35,17 +35,19 @@ impl GroupContext {
         }
     }
 
-    /// Create a new group context from an entity identifier string
+    /// Create a new group context from an entity identifier.
     ///
     /// This is a convenience constructor that derives the TopicId from the entity_id.
     /// Equivalent to `GroupContext::new(TopicId::from_entity(entity_id))`
     ///
+    /// Accepts any type that can be converted to a byte slice (see `TopicId::from_entity`).
+    ///
     /// # Arguments
-    /// * `entity_id` - String identifier for the entity (channel, project, org, etc.)
+    /// * `entity_id` - Identifier for the entity (channel, project, org, binary ID, etc.)
     ///
     /// # Returns
     /// * `Self` - GroupContext with topic_id derived from entity_id
-    pub fn from_entity(entity_id: &str) -> Self {
+    pub fn from_entity(entity_id: impl AsRef<[u8]>) -> Self {
         let topic_id = TopicId::from_entity(entity_id);
         Self::new(topic_id)
     }

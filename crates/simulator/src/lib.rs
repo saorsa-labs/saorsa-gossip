@@ -91,6 +91,48 @@ pub enum MessageType {
     Control,
 }
 
+impl MessageType {
+    /// Convert to the corresponding stream type for transport.
+    ///
+    /// Maps simulator message types to transport stream types:
+    /// - `Membership` and `Control` → `StreamType::Membership`
+    /// - `PubSub` → `StreamType::PubSub`
+    /// - `CrdtSync` and `Presence` → `StreamType::Bulk`
+    pub fn to_stream_type(self) -> saorsa_gossip_transport::StreamType {
+        match self {
+            Self::Membership | Self::Control => saorsa_gossip_transport::StreamType::Membership,
+            Self::PubSub => saorsa_gossip_transport::StreamType::PubSub,
+            Self::CrdtSync | Self::Presence => saorsa_gossip_transport::StreamType::Bulk,
+        }
+    }
+
+    /// Create from a transport stream type.
+    ///
+    /// Maps transport stream types to simulator message types:
+    /// - `StreamType::Membership` → `MessageType::Membership`
+    /// - `StreamType::PubSub` → `MessageType::PubSub`
+    /// - `StreamType::Bulk` → `MessageType::CrdtSync`
+    pub fn from_stream_type(stream: saorsa_gossip_transport::StreamType) -> Self {
+        match stream {
+            saorsa_gossip_transport::StreamType::Membership => Self::Membership,
+            saorsa_gossip_transport::StreamType::PubSub => Self::PubSub,
+            saorsa_gossip_transport::StreamType::Bulk => Self::CrdtSync,
+        }
+    }
+}
+
+impl From<saorsa_gossip_transport::StreamType> for MessageType {
+    fn from(stream: saorsa_gossip_transport::StreamType) -> Self {
+        Self::from_stream_type(stream)
+    }
+}
+
+impl From<MessageType> for saorsa_gossip_transport::StreamType {
+    fn from(msg_type: MessageType) -> Self {
+        msg_type.to_stream_type()
+    }
+}
+
 /// Network link configuration between nodes
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LinkConfig {
@@ -191,13 +233,23 @@ pub struct NetworkSimulator {
     running: Arc<RwLock<bool>>,
 }
 
-impl Clone for NetworkSimulator {
-    fn clone(&self) -> Self {
-        // Note: Cloning creates a fresh simulator without nodes/channels
-        // This is used for passing to chaos injectors and load tests
+impl NetworkSimulator {
+    /// Clone the simulator's configuration, discarding runtime state.
+    ///
+    /// This method creates a new `NetworkSimulator` with the same configuration
+    /// (topology, link configs, time dilation, RNG seed) but WITHOUT:
+    /// - Nodes and their message channels
+    /// - The message queue
+    /// - Running state
+    ///
+    /// Use this when you need to pass simulator configuration to chaos injectors
+    /// or create parallel test scenarios with the same network parameters.
+    ///
+    /// For a full clone including all state, use individual field access methods.
+    pub fn clone_config(&self) -> Self {
         Self {
             rng: Arc::clone(&self.rng),
-            nodes: HashMap::new(), // Don't clone nodes - they have channels
+            nodes: HashMap::new(),
             topology: self.topology.clone(),
             link_configs: self.link_configs.clone(),
             default_link_config: self.default_link_config.clone(),
@@ -206,6 +258,17 @@ impl Clone for NetworkSimulator {
             next_message_id: Arc::clone(&self.next_message_id),
             running: Arc::new(RwLock::new(false)),
         }
+    }
+}
+
+impl Clone for NetworkSimulator {
+    /// Creates a configuration-only clone of the simulator.
+    ///
+    /// **Warning**: This does NOT clone runtime state (nodes, message queue, running flag).
+    /// Use `clone_config()` for explicit behavior, or access individual configuration
+    /// through getter methods if you need specific values.
+    fn clone(&self) -> Self {
+        self.clone_config()
     }
 }
 

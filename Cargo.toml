@@ -43,7 +43,7 @@ saorsa-mls = "0.3.1"
 ant-quic = "0.16.0"
 
 # Shared transport layer
-saorsa-transport = { path = "../saorsa-transport" }
+saorsa-transport = "0.1"
 
 # Hashing
 blake3 = "1.5"

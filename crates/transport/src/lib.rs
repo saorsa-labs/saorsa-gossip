@@ -8,18 +8,34 @@
 //! - Path migration by default
 //! - PQC handshake with ant-quic
 //!
+//! # SharedTransport Integration
+//!
+//! This crate provides [`GossipProtocolHandler`] for use with `saorsa-transport`'s
+//! [`SharedTransport`]. The handler processes all gossip stream types (Membership,
+//! PubSub, GossipBulk) and routes them to the appropriate internal handlers.
+//!
 //! # Peer Caching
 //!
 //! This crate uses ant-quic's `BootstrapCache` for persistent peer storage
 //! with epsilon-greedy selection for balanced exploration and exploitation.
 
 mod ant_quic_transport;
+mod protocol_handler;
 
 pub use ant_quic_transport::{AntQuicTransport, AntQuicTransportConfig};
+pub use protocol_handler::{
+    BulkHandler, GossipMessage, GossipProtocolHandler, MembershipHandler, PubSubHandler,
+};
 
 // Re-export ant-quic's bootstrap cache as our peer cache
 pub use ant_quic::{
     BootstrapCache, BootstrapCacheConfig, BootstrapCacheConfigBuilder, CacheEvent, CacheStats,
+};
+
+// Re-export saorsa-transport types for convenience
+pub use saorsa_transport::{
+    ProtocolHandler, ProtocolHandlerExt, SharedTransport, StreamType as SharedStreamType,
+    TransportError, TransportResult,
 };
 
 use anyhow::Result;
@@ -27,7 +43,7 @@ use saorsa_gossip_types::PeerId;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
 
-/// Stream type identifiers for QUIC streams
+/// Stream type identifiers for QUIC streams (legacy, prefer SharedStreamType)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamType {
     /// Membership stream for HyParView+SWIM
@@ -57,6 +73,27 @@ impl StreamType {
             Self::Membership => 0,
             Self::PubSub => 1,
             Self::Bulk => 2,
+        }
+    }
+
+    /// Convert to the shared transport stream type.
+    pub fn to_shared(self) -> SharedStreamType {
+        match self {
+            Self::Membership => SharedStreamType::Membership,
+            Self::PubSub => SharedStreamType::PubSub,
+            Self::Bulk => SharedStreamType::GossipBulk,
+        }
+    }
+
+    /// Convert from the shared transport stream type.
+    ///
+    /// Returns `None` for non-gossip stream types.
+    pub fn from_shared(st: SharedStreamType) -> Option<Self> {
+        match st {
+            SharedStreamType::Membership => Some(Self::Membership),
+            SharedStreamType::PubSub => Some(Self::PubSub),
+            SharedStreamType::GossipBulk => Some(Self::Bulk),
+            _ => None,
         }
     }
 }
@@ -410,6 +447,34 @@ mod tests {
         let original = StreamType::Membership;
         let copied = original;
         assert_eq!(original, copied);
+    }
+
+    #[test]
+    fn test_stream_type_to_shared() {
+        assert_eq!(
+            StreamType::Membership.to_shared(),
+            SharedStreamType::Membership
+        );
+        assert_eq!(StreamType::PubSub.to_shared(), SharedStreamType::PubSub);
+        assert_eq!(StreamType::Bulk.to_shared(), SharedStreamType::GossipBulk);
+    }
+
+    #[test]
+    fn test_stream_type_from_shared() {
+        assert_eq!(
+            StreamType::from_shared(SharedStreamType::Membership),
+            Some(StreamType::Membership)
+        );
+        assert_eq!(
+            StreamType::from_shared(SharedStreamType::PubSub),
+            Some(StreamType::PubSub)
+        );
+        assert_eq!(
+            StreamType::from_shared(SharedStreamType::GossipBulk),
+            Some(StreamType::Bulk)
+        );
+        // DHT types should return None
+        assert_eq!(StreamType::from_shared(SharedStreamType::DhtQuery), None);
     }
 
     // ==========================================================================

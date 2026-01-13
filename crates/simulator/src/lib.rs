@@ -98,11 +98,13 @@ impl MessageType {
     /// - `Membership` and `Control` → `StreamType::Membership`
     /// - `PubSub` → `StreamType::PubSub`
     /// - `CrdtSync` and `Presence` → `StreamType::Bulk`
-    pub fn to_stream_type(self) -> saorsa_gossip_transport::StreamType {
+    pub fn to_stream_type(self) -> saorsa_gossip_transport::GossipStreamType {
         match self {
-            Self::Membership | Self::Control => saorsa_gossip_transport::StreamType::Membership,
-            Self::PubSub => saorsa_gossip_transport::StreamType::PubSub,
-            Self::CrdtSync | Self::Presence => saorsa_gossip_transport::StreamType::Bulk,
+            Self::Membership | Self::Control => {
+                saorsa_gossip_transport::GossipStreamType::Membership
+            }
+            Self::PubSub => saorsa_gossip_transport::GossipStreamType::PubSub,
+            Self::CrdtSync | Self::Presence => saorsa_gossip_transport::GossipStreamType::Bulk,
         }
     }
 
@@ -112,22 +114,22 @@ impl MessageType {
     /// - `StreamType::Membership` → `MessageType::Membership`
     /// - `StreamType::PubSub` → `MessageType::PubSub`
     /// - `StreamType::Bulk` → `MessageType::CrdtSync`
-    pub fn from_stream_type(stream: saorsa_gossip_transport::StreamType) -> Self {
+    pub fn from_stream_type(stream: saorsa_gossip_transport::GossipStreamType) -> Self {
         match stream {
-            saorsa_gossip_transport::StreamType::Membership => Self::Membership,
-            saorsa_gossip_transport::StreamType::PubSub => Self::PubSub,
-            saorsa_gossip_transport::StreamType::Bulk => Self::CrdtSync,
+            saorsa_gossip_transport::GossipStreamType::Membership => Self::Membership,
+            saorsa_gossip_transport::GossipStreamType::PubSub => Self::PubSub,
+            saorsa_gossip_transport::GossipStreamType::Bulk => Self::CrdtSync,
         }
     }
 }
 
-impl From<saorsa_gossip_transport::StreamType> for MessageType {
-    fn from(stream: saorsa_gossip_transport::StreamType) -> Self {
+impl From<saorsa_gossip_transport::GossipStreamType> for MessageType {
+    fn from(stream: saorsa_gossip_transport::GossipStreamType) -> Self {
         Self::from_stream_type(stream)
     }
 }
 
-impl From<MessageType> for saorsa_gossip_transport::StreamType {
+impl From<MessageType> for saorsa_gossip_transport::GossipStreamType {
     fn from(msg_type: MessageType) -> Self {
         msg_type.to_stream_type()
     }

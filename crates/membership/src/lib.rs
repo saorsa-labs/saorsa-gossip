@@ -8,7 +8,7 @@
 //! - Periodic shuffling and anti-entropy
 
 use anyhow::{anyhow, Result};
-use saorsa_gossip_transport::{GossipTransport, StreamType};
+use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -274,7 +274,7 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                     let ping_msg = SwimMessage::Ping;
                     if let Ok(bytes) = bincode::serialize(&ping_msg) {
                         let _ = transport
-                            .send_to_peer(peer, StreamType::Membership, bytes.into())
+                            .send_to_peer(peer, GossipStreamType::Membership, bytes.into())
                             .await;
                     }
                     // Note: Response handling would mark peer alive/suspect
@@ -434,7 +434,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         let bytes = bincode::serialize(msg)
             .map_err(|e| anyhow!("Failed to serialize HyParView message: {}", e))?;
         self.transport
-            .send_to_peer(peer, StreamType::Membership, bytes.into())
+            .send_to_peer(peer, GossipStreamType::Membership, bytes.into())
             .await
     }
 

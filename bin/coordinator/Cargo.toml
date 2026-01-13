@@ -34,9 +34,9 @@ ant-quic = { workspace = true }
 bytes = { workspace = true }
 
 # Workspace crates
-saorsa-gossip-types = { version = "0.1.6", path = "../../crates/types" }
-saorsa-gossip-identity = { version = "0.1.6", path = "../../crates/identity" }
-saorsa-gossip-transport = { version = "0.1.6", path = "../../crates/transport" }
-saorsa-gossip-coordinator = { version = "0.1.6", path = "../../crates/coordinator" }
-saorsa-gossip-membership = { version = "0.1.6", path = "../../crates/membership" }
-saorsa-gossip-pubsub = { version = "0.1.6", path = "../../crates/pubsub" }
+saorsa-gossip-types = { version = "0.2.0", path = "../../crates/types" }
+saorsa-gossip-identity = { version = "0.2.0", path = "../../crates/identity" }
+saorsa-gossip-transport = { version = "0.2.0", path = "../../crates/transport" }
+saorsa-gossip-coordinator = { version = "0.2.0", path = "../../crates/coordinator" }
+saorsa-gossip-membership = { version = "0.2.0", path = "../../crates/membership" }
+saorsa-gossip-pubsub = { version = "0.2.0", path = "../../crates/pubsub" }

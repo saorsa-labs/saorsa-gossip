@@ -10,8 +10,7 @@ keywords = ["p2p", "gossip", "quic", "nat-traversal", "networking"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
-saorsa-gossip-types = { version = "0.1.3", path = "../types" }
-saorsa-transport.workspace = true
+saorsa-gossip-types = { version = "0.2.0", path = "../types" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

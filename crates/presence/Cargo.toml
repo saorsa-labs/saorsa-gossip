@@ -10,9 +10,9 @@ keywords = ["p2p", "gossip", "presence", "discovery", "foaf"]
 categories = ["network-programming"]
 
 [dependencies]
-saorsa-gossip-types = { version = "0.1.3", path = "../types" }
-saorsa-gossip-transport = { version = "0.1.3", path = "../transport" }
-saorsa-gossip-groups = { version = "0.1.3", path = "../groups" }
+saorsa-gossip-types = { version = "0.2.0", path = "../types" }
+saorsa-gossip-transport = { version = "0.2.0", path = "../transport" }
+saorsa-gossip-groups = { version = "0.2.0", path = "../groups" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }

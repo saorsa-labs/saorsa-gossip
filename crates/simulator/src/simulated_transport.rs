@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use saorsa_gossip_transport::{GossipTransport, StreamType};
+use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::PeerId;
 
 use crate::{MessageType, NetworkSimulator, NodeId, SimulatedMessage};
@@ -31,9 +31,9 @@ pub struct SimulatedGossipTransport {
     /// Map of peer IDs to node IDs
     peer_to_node: Arc<RwLock<PeerMap>>,
     /// Channel for receiving messages
-    receiver: Arc<Mutex<mpsc::UnboundedReceiver<(PeerId, StreamType, Bytes)>>>,
+    receiver: Arc<Mutex<mpsc::UnboundedReceiver<(PeerId, GossipStreamType, Bytes)>>>,
     /// Channel for sending to receiver
-    sender: mpsc::UnboundedSender<(PeerId, StreamType, Bytes)>,
+    sender: mpsc::UnboundedSender<(PeerId, GossipStreamType, Bytes)>,
     /// Listening state
     listening: Arc<RwLock<bool>>,
 }
@@ -60,7 +60,7 @@ impl SimulatedGossipTransport {
     }
 
     /// Get the channel sender for message delivery
-    pub fn get_sender(&self) -> mpsc::UnboundedSender<(PeerId, StreamType, Bytes)> {
+    pub fn get_sender(&self) -> mpsc::UnboundedSender<(PeerId, GossipStreamType, Bytes)> {
         self.sender.clone()
     }
 }
@@ -105,7 +105,12 @@ impl GossipTransport for SimulatedGossipTransport {
         Ok(())
     }
 
-    async fn send_to_peer(&self, peer: PeerId, stream_type: StreamType, data: Bytes) -> Result<()> {
+    async fn send_to_peer(
+        &self,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        data: Bytes,
+    ) -> Result<()> {
         // Look up the target node ID
         let node_map = self.peer_to_node.read().await;
         let target_node = node_map
@@ -121,7 +126,7 @@ impl GossipTransport for SimulatedGossipTransport {
         Ok(())
     }
 
-    async fn receive_message(&self) -> Result<(PeerId, StreamType, Bytes)> {
+    async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
         // Wait for a message from the channel
         let mut receiver = self.receiver.lock().await;
         receiver
@@ -211,7 +216,7 @@ impl SimulatedGossipNetwork {
         for transport in &self.transports {
             if transport.peer_id == *to_peer {
                 // Use From trait conversion for message type to stream type
-                let stream_type: StreamType = message.message_type.into();
+                let stream_type: GossipStreamType = message.message_type.into();
                 let bytes = Bytes::from(message.payload);
                 transport.sender.send((*from_peer, stream_type, bytes))?;
                 return Ok(());
@@ -263,7 +268,7 @@ mod tests {
         // Send a message from peer1 to peer2
         let message = Bytes::from("Hello, peer2!");
         transport1
-            .send_to_peer(peer2, StreamType::PubSub, message.clone())
+            .send_to_peer(peer2, GossipStreamType::PubSub, message.clone())
             .await
             .unwrap();
 

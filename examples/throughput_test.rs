@@ -13,7 +13,7 @@
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use saorsa_gossip_transport::{AntQuicTransport, GossipTransport, StreamType};
+use saorsa_gossip_transport::{AntQuicTransport, GossipStreamType, GossipTransport};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -168,7 +168,7 @@ async fn run_sender(args: &[String]) -> Result<()> {
         let send_start = Instant::now();
 
         match transport
-            .send_to_peer(coordinator_peer_id, StreamType::Bulk, data_bytes)
+            .send_to_peer(coordinator_peer_id, GossipStreamType::Bulk, data_bytes)
             .await
         {
             Ok(()) => {

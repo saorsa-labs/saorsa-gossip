@@ -5,12 +5,12 @@
 //! Protocol handler for gossip streams over SharedTransport.
 //!
 //! This module provides [`GossipProtocolHandler`] which implements the
-//! [`saorsa_transport::ProtocolHandler`] trait to handle gossip protocol
+//! [`ant_quic::ProtocolHandler`] trait to handle gossip protocol
 //! streams (Membership, PubSub, GossipBulk) over the shared transport layer.
 
+use ant_quic::{LinkResult, PeerId, ProtocolHandler, StreamType};
 use async_trait::async_trait;
 use bytes::Bytes;
-use saorsa_transport::{PeerId, ProtocolHandler, StreamType, TransportResult};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
@@ -35,7 +35,7 @@ pub struct GossipMessage {
 ///
 /// ```rust,ignore
 /// use saorsa_gossip_transport::GossipProtocolHandler;
-/// use saorsa_transport::{SharedTransport, ProtocolHandlerExt};
+/// use ant_quic::{SharedTransport, ProtocolHandlerExt};
 ///
 /// let (handler, rx) = GossipProtocolHandler::new();
 /// transport.register_handler(handler.boxed()).await;
@@ -65,21 +65,21 @@ pub struct GossipProtocolHandler {
 #[async_trait]
 pub trait MembershipHandler: Send + Sync {
     /// Handle a membership message from a peer.
-    async fn handle_membership(&self, peer: PeerId, data: Bytes) -> TransportResult<Option<Bytes>>;
+    async fn handle_membership(&self, peer: PeerId, data: Bytes) -> LinkResult<Option<Bytes>>;
 }
 
 /// Trait for handling pubsub protocol messages.
 #[async_trait]
 pub trait PubSubHandler: Send + Sync {
     /// Handle a pubsub message from a peer.
-    async fn handle_pubsub(&self, peer: PeerId, data: Bytes) -> TransportResult<Option<Bytes>>;
+    async fn handle_pubsub(&self, peer: PeerId, data: Bytes) -> LinkResult<Option<Bytes>>;
 }
 
 /// Trait for handling bulk data transfers.
 #[async_trait]
 pub trait BulkHandler: Send + Sync {
     /// Handle bulk data from a peer.
-    async fn handle_bulk(&self, peer: PeerId, data: Bytes) -> TransportResult<Option<Bytes>>;
+    async fn handle_bulk(&self, peer: PeerId, data: Bytes) -> LinkResult<Option<Bytes>>;
 }
 
 impl GossipProtocolHandler {
@@ -136,7 +136,7 @@ impl GossipProtocolHandler {
         &self,
         peer: PeerId,
         data: Bytes,
-    ) -> TransportResult<Option<Bytes>> {
+    ) -> LinkResult<Option<Bytes>> {
         trace!(peer = ?peer, len = data.len(), "handling membership message");
 
         // If we have a direct handler, use it
@@ -150,11 +150,7 @@ impl GossipProtocolHandler {
     }
 
     /// Handle a pubsub stream message.
-    async fn handle_pubsub_internal(
-        &self,
-        peer: PeerId,
-        data: Bytes,
-    ) -> TransportResult<Option<Bytes>> {
+    async fn handle_pubsub_internal(&self, peer: PeerId, data: Bytes) -> LinkResult<Option<Bytes>> {
         trace!(peer = ?peer, len = data.len(), "handling pubsub message");
 
         // If we have a direct handler, use it
@@ -168,11 +164,7 @@ impl GossipProtocolHandler {
     }
 
     /// Handle a bulk stream message.
-    async fn handle_bulk_internal(
-        &self,
-        peer: PeerId,
-        data: Bytes,
-    ) -> TransportResult<Option<Bytes>> {
+    async fn handle_bulk_internal(&self, peer: PeerId, data: Bytes) -> LinkResult<Option<Bytes>> {
         trace!(peer = ?peer, len = data.len(), "handling bulk message");
 
         // If we have a direct handler, use it
@@ -216,7 +208,7 @@ impl ProtocolHandler for GossipProtocolHandler {
         peer: PeerId,
         stream_type: StreamType,
         data: Bytes,
-    ) -> TransportResult<Option<Bytes>> {
+    ) -> LinkResult<Option<Bytes>> {
         debug!(
             peer = ?peer,
             stream_type = %stream_type,
@@ -243,7 +235,7 @@ impl ProtocolHandler for GossipProtocolHandler {
         peer: PeerId,
         stream_type: StreamType,
         data: Bytes,
-    ) -> TransportResult<()> {
+    ) -> LinkResult<()> {
         // For datagrams, we just send to the channel without expecting a response
         trace!(
             peer = ?peer,
@@ -256,7 +248,7 @@ impl ProtocolHandler for GossipProtocolHandler {
         Ok(())
     }
 
-    async fn shutdown(&self) -> TransportResult<()> {
+    async fn shutdown(&self) -> LinkResult<()> {
         debug!("shutting down gossip protocol handler");
         Ok(())
     }

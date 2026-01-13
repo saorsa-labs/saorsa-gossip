@@ -38,9 +38,9 @@ crossbeam = "0.8"
 hdrhistogram = "7.5"
 
 # Local crates
-saorsa-gossip-types = { version = "0.1", path = "../types" }
-saorsa-gossip-transport = { version = "0.1", path = "../transport" }
-saorsa-gossip-simulator = { version = "0.1", path = "../simulator" }
+saorsa-gossip-types = { version = "0.2.0", path = "../types" }
+saorsa-gossip-transport = { version = "0.2.0", path = "../transport" }
+saorsa-gossip-simulator = { version = "0.2.0", path = "../simulator" }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

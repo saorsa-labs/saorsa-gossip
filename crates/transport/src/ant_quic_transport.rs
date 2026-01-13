@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
-use crate::{BootstrapCache, GossipTransport, StreamType};
+use crate::{BootstrapCache, GossipStreamType, GossipTransport};
 
 // Import ant-quic types (v0.14+ API)
 use ant_quic::{MlDsaPublicKey, MlDsaSecretKey, Node, NodeConfig, PeerId as AntPeerId};
@@ -92,8 +92,8 @@ pub struct AntQuicTransport {
     /// The underlying ant-quic P2P node
     node: Arc<Node>,
     /// Incoming message channel (bounded for backpressure)
-    recv_tx: mpsc::Sender<(GossipPeerId, StreamType, Bytes)>,
-    recv_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(GossipPeerId, StreamType, Bytes)>>>,
+    recv_tx: mpsc::Sender<(GossipPeerId, GossipStreamType, Bytes)>,
+    recv_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(GossipPeerId, GossipStreamType, Bytes)>>>,
     /// Local peer ID (ant-quic format)
     ant_peer_id: AntPeerId,
     /// Local peer ID (gossip format)
@@ -339,16 +339,16 @@ impl AntQuicTransport {
                         let from_gossip_id = ant_peer_id_to_gossip(&from_peer_id);
 
                         // Parse stream type from first byte
-                        let stream_type = match data.first().and_then(|&b| StreamType::from_byte(b))
-                        {
-                            Some(st) => st,
-                            None => {
-                                if let Some(&b) = data.first() {
-                                    warn!("Unknown stream type byte: {}", b);
+                        let stream_type =
+                            match data.first().and_then(|&b| GossipStreamType::from_byte(b)) {
+                                Some(st) => st,
+                                None => {
+                                    if let Some(&b) = data.first() {
+                                        warn!("Unknown stream type byte: {}", b);
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
-                        };
+                            };
 
                         // Extract payload (skip first byte)
                         let payload = if data.len() > 1 {
@@ -567,7 +567,7 @@ impl GossipTransport for AntQuicTransport {
     async fn send_to_peer(
         &self,
         peer: GossipPeerId,
-        stream_type: StreamType,
+        stream_type: GossipStreamType,
         data: Bytes,
     ) -> Result<()> {
         debug!(
@@ -599,7 +599,7 @@ impl GossipTransport for AntQuicTransport {
         }
     }
 
-    async fn receive_message(&self) -> Result<(GossipPeerId, StreamType, Bytes)> {
+    async fn receive_message(&self) -> Result<(GossipPeerId, GossipStreamType, Bytes)> {
         let mut recv_rx = self.recv_rx.lock().await;
 
         recv_rx
@@ -796,28 +796,38 @@ mod tests {
     #[tokio::test]
     async fn test_stream_type_encoding() {
         // Test to_byte()
-        assert_eq!(StreamType::Membership.to_byte(), 0u8);
-        assert_eq!(StreamType::PubSub.to_byte(), 1u8);
-        assert_eq!(StreamType::Bulk.to_byte(), 2u8);
+        assert_eq!(GossipStreamType::Membership.to_byte(), 0u8);
+        assert_eq!(GossipStreamType::PubSub.to_byte(), 1u8);
+        assert_eq!(GossipStreamType::Bulk.to_byte(), 2u8);
 
         // Test from_byte()
-        assert_eq!(StreamType::from_byte(0), Some(StreamType::Membership));
-        assert_eq!(StreamType::from_byte(1), Some(StreamType::PubSub));
-        assert_eq!(StreamType::from_byte(2), Some(StreamType::Bulk));
-        assert_eq!(StreamType::from_byte(3), None);
-        assert_eq!(StreamType::from_byte(255), None);
+        assert_eq!(
+            GossipStreamType::from_byte(0),
+            Some(GossipStreamType::Membership)
+        );
+        assert_eq!(
+            GossipStreamType::from_byte(1),
+            Some(GossipStreamType::PubSub)
+        );
+        assert_eq!(GossipStreamType::from_byte(2), Some(GossipStreamType::Bulk));
+        assert_eq!(GossipStreamType::from_byte(3), None);
+        assert_eq!(GossipStreamType::from_byte(255), None);
 
         // Test round-trip
-        for st in [StreamType::Membership, StreamType::PubSub, StreamType::Bulk] {
-            assert_eq!(StreamType::from_byte(st.to_byte()), Some(st));
+        for st in [
+            GossipStreamType::Membership,
+            GossipStreamType::PubSub,
+            GossipStreamType::Bulk,
+        ] {
+            assert_eq!(GossipStreamType::from_byte(st.to_byte()), Some(st));
         }
     }
 
     #[test]
     fn test_stream_type_all_variants_have_unique_bytes() {
-        let membership = StreamType::Membership.to_byte();
-        let pubsub = StreamType::PubSub.to_byte();
-        let bulk = StreamType::Bulk.to_byte();
+        let membership = GossipStreamType::Membership.to_byte();
+        let pubsub = GossipStreamType::PubSub.to_byte();
+        let bulk = GossipStreamType::Bulk.to_byte();
 
         assert_ne!(membership, pubsub);
         assert_ne!(membership, bulk);
@@ -937,7 +947,7 @@ mod tests {
 
         // Send message
         node2
-            .send_to_peer(node1_peer_id, StreamType::PubSub, test_data.clone())
+            .send_to_peer(node1_peer_id, GossipStreamType::PubSub, test_data.clone())
             .await
             .expect("Failed to send message");
 
@@ -947,7 +957,7 @@ mod tests {
         match result {
             Ok(Ok((peer_id, stream_type, data))) => {
                 assert_eq!(peer_id, node2.peer_id());
-                assert_eq!(stream_type, StreamType::PubSub);
+                assert_eq!(stream_type, GossipStreamType::PubSub);
                 assert_eq!(data, test_data);
             }
             Ok(Err(e)) => panic!("Receive error: {}", e),

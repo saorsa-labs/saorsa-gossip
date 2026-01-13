@@ -20,7 +20,7 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use lru::LruCache;
-use saorsa_gossip_transport::{GossipTransport, StreamType};
+use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -361,7 +361,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let bytes = bincode::serialize(&_message)
                 .map_err(|e| anyhow!("Serialization failed: {}", e))?;
             self.transport
-                .send_to_peer(peer, StreamType::PubSub, bytes.into())
+                .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
                 .await?;
         }
 
@@ -441,7 +441,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let bytes =
                 bincode::serialize(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
             self.transport
-                .send_to_peer(peer, StreamType::PubSub, bytes.into())
+                .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
                 .await?;
         }
 
@@ -505,7 +505,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let bytes = bincode::serialize(&iwant_msg)
                 .map_err(|e| anyhow!("Serialization failed: {}", e))?;
             self.transport
-                .send_to_peer(from, StreamType::PubSub, bytes.into())
+                .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
                 .await?;
         }
 
@@ -550,7 +550,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let bytes = bincode::serialize(&_message)
                 .map_err(|e| anyhow!("Serialization failed: {}", e))?;
             self.transport
-                .send_to_peer(from, StreamType::PubSub, bytes.into())
+                .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
                 .await?;
         }
 
@@ -612,7 +612,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         };
                         if let Ok(bytes) = bincode::serialize(&ihave_msg) {
                             let _ = transport
-                                .send_to_peer(peer, StreamType::PubSub, bytes.into())
+                                .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
                                 .await;
                         }
                     }

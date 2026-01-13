@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use saorsa_gossip_groups::GroupContext;
-use saorsa_gossip_transport::{GossipTransport, StreamType};
+use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::{PeerId, PresenceRecord, TopicId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -254,7 +254,7 @@ impl PresenceManager {
                             let peers = broadcast_peers.read().await;
                             for target_peer in peers.iter() {
                                 if let Err(e) = transport
-                                    .send_to_peer(*target_peer, StreamType::Bulk, data.clone())
+                                    .send_to_peer(*target_peer, GossipStreamType::Bulk, data.clone())
                                     .await
                                 {
                                     debug!(?target_peer, ?e, "Failed to send beacon to peer");

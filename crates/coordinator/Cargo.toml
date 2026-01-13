@@ -10,7 +10,7 @@ keywords = ["p2p", "gossip", "coordinator", "nat-traversal", "bootstrap"]
 categories = ["network-programming"]
 
 [dependencies]
-saorsa-gossip-types = { version = "0.1.3", path = "../types" }
+saorsa-gossip-types = { version = "0.2.0", path = "../types" }
 saorsa-pqc = { workspace = true }
 serde = { workspace = true }
 serde_bytes = "0.11"

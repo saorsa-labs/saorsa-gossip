@@ -32,8 +32,8 @@ chrono = "0.4"
 tracing = { workspace = true }
 
 # Local crates
-saorsa-gossip-types = { version = "0.1", path = "../types" }
-saorsa-gossip-transport = { version = "0.1", path = "../transport" }
+saorsa-gossip-types = { version = "0.2.0", path = "../types" }
+saorsa-gossip-transport = { version = "0.2.0", path = "../transport" }
 
 # Async utilities
 bytes = { workspace = true }

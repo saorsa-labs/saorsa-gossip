@@ -21,7 +21,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use saorsa_gossip_transport::{
-    AntQuicTransport, BootstrapCache, BootstrapCacheConfig, GossipTransport, StreamType,
+    AntQuicTransport, BootstrapCache, BootstrapCacheConfig, GossipStreamType, GossipTransport,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -275,7 +275,7 @@ async fn run_benchmark(args: &[String]) -> Result<()> {
 
             let send_start = Instant::now();
             let result = transport
-                .send_to_peer(coordinator_peer_id, StreamType::Bulk, data_bytes)
+                .send_to_peer(coordinator_peer_id, GossipStreamType::Bulk, data_bytes)
                 .await;
 
             let send_duration = send_start.elapsed();

@@ -1,6 +1,14 @@
 //! Peer cache for bootstrap coordination
 //!
 //! Implements SPEC2 §7.2 peer cache for storing coordinator connection info.
+//!
+//! ## Deprecation Notice
+//!
+//! `PeerCache` and `PeerCacheEntry` are deprecated in favor of [`GossipCacheAdapter`](crate::GossipCacheAdapter)
+//! which wraps `ant-quic`'s `BootstrapCache` with gossip-specific functionality.
+//!
+//! **Migration**: Use [`GossipCacheAdapter`](crate::GossipCacheAdapter) with
+//! [`crate::bootstrap_cache::BootstrapCache`] for new code.
 
 use crate::NatClass;
 use saorsa_gossip_types::{unix_millis, PeerId};
@@ -15,6 +23,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// - Direct: Public addresses (best)
 /// - Reflexive: Hole-punched addresses (moderate)
 /// - Relay: Relay peer reference (last resort)
+///
+/// # Deprecated
+///
+/// Use [`GossipCacheAdapter`](crate::GossipCacheAdapter) with [`crate::bootstrap_cache::CachedPeer`]
+/// and [`CoordinatorAdvert`](crate::CoordinatorAdvert) instead.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use GossipCacheAdapter with bootstrap_cache::CachedPeer and CoordinatorAdvert instead"
+)]
+#[allow(deprecated)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerCacheEntry {
     /// Peer identifier
@@ -57,6 +75,7 @@ impl Default for PeerRoles {
     }
 }
 
+#[allow(deprecated)]
 impl PeerCacheEntry {
     /// Create a new cache entry with public addresses
     ///
@@ -107,10 +126,37 @@ impl PeerCacheEntry {
 }
 
 /// Persistent peer cache for bootstrap coordination
+///
+/// # Deprecated
+///
+/// Use [`GossipCacheAdapter`](crate::GossipCacheAdapter) with [`crate::bootstrap_cache::BootstrapCache`]
+/// instead. The new adapter provides epsilon-greedy peer selection, quality tracking, and
+/// persistent storage through `ant-quic`'s bootstrap cache.
+///
+/// ## Migration Example
+///
+/// ```ignore
+/// // Old code:
+/// let peer_cache = PeerCache::new();
+/// peer_cache.insert(entry);
+///
+/// // New code:
+/// use saorsa_gossip_coordinator::{GossipCacheAdapter, bootstrap_cache::*};
+/// let config = BootstrapCacheConfig::builder().cache_dir(path).build();
+/// let cache = Arc::new(BootstrapCache::open(config).await?);
+/// let adapter = GossipCacheAdapter::new(cache);
+/// adapter.insert_advert(advert).await;
+/// ```
+#[deprecated(
+    since = "0.2.0",
+    note = "Use GossipCacheAdapter with bootstrap_cache::BootstrapCache instead"
+)]
+#[allow(deprecated)]
 pub struct PeerCache {
     entries: Arc<Mutex<HashMap<PeerId, PeerCacheEntry>>>,
 }
 
+#[allow(deprecated)]
 impl PeerCache {
     /// Create a new empty peer cache
     pub fn new() -> Self {
@@ -120,7 +166,13 @@ impl PeerCache {
     }
 
     fn lock_entries(&self) -> Option<MutexGuard<'_, HashMap<PeerId, PeerCacheEntry>>> {
-        self.entries.lock().ok()
+        match self.entries.lock() {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                tracing::warn!("PeerCache Mutex poisoned: {e}");
+                None
+            }
+        }
     }
 
     /// Insert or update a peer cache entry
@@ -298,12 +350,14 @@ impl PeerCache {
     }
 }
 
+#[allow(deprecated)]
 impl Default for PeerCache {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[allow(deprecated)]
 impl Clone for PeerCache {
     fn clone(&self) -> Self {
         Self {
@@ -313,7 +367,7 @@ impl Clone for PeerCache {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used, deprecated)]
 mod tests {
     use super::*;
 

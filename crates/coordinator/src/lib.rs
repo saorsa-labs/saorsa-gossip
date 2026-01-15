@@ -12,7 +12,81 @@
 //! - **Rendezvous**: Connection coordination for hole punching
 //! - **Relay**: Last-resort message forwarding
 //!
-//! ## Example
+//! ## Cache Architecture
+//!
+//! This crate uses a two-layer cache architecture:
+//!
+//! 1. **ant-quic's `BootstrapCache`**: Handles peer quality scoring, epsilon-greedy selection,
+//!    persistent storage, and connection statistics.
+//!
+//! 2. **`GossipCacheAdapter`**: Extends the bootstrap cache with gossip-specific data
+//!    (coordinator adverts with ML-DSA signatures, expiry times, role information).
+//!
+//! ### Ownership Pattern
+//!
+//! The application owns the `Arc<BootstrapCache>` and shares it with the gossip layer:
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────┐
+//! │  Application (saorsa-node / communitas)             │
+//! │  ┌───────────────────────────────────┐              │
+//! │  │ Arc<BootstrapCache>               │ ← App owns   │
+//! │  └───────────────────────────────────┘              │
+//! │              │                                       │
+//! │              ▼                                       │
+//! │  ┌───────────────────────────────────┐              │
+//! │  │ GossipCacheAdapter                │ ← Wraps      │
+//! │  │ - cache: Arc<BootstrapCache>      │              │
+//! │  │ - adverts: HashMap<PeerId, Advert>│              │
+//! │  └───────────────────────────────────┘              │
+//! └─────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Quick Start
+//!
+//! ### Creating a Cache
+//!
+//! ```rust,ignore
+//! use saorsa_gossip_coordinator::{GossipCacheAdapter, bootstrap_cache::*};
+//! use std::sync::Arc;
+//!
+//! // Application creates and owns the bootstrap cache
+//! let config = BootstrapCacheConfig::builder()
+//!     .cache_dir("/path/to/cache".into())
+//!     .build();
+//! let cache = Arc::new(BootstrapCache::open(config).await?);
+//!
+//! // Gossip layer wraps it with adapter
+//! let adapter = GossipCacheAdapter::new(cache);
+//!
+//! // Use for coordinator discovery
+//! let coordinators = adapter.select_coordinators(3).await;
+//! ```
+//!
+//! ### Bootstrap Flow
+//!
+//! ```rust,ignore
+//! use saorsa_gossip_coordinator::{Bootstrap, GossipCacheAdapter, CoordinatorHandler, BootstrapAction};
+//!
+//! // Create handler and bootstrap with shared cache
+//! let handler = CoordinatorHandler::with_cache(peer_id, adapter.clone());
+//! let bootstrap = Bootstrap::new(peer_id, adapter, handler);
+//!
+//! // Find a coordinator
+//! match bootstrap.find_coordinator().await {
+//!     BootstrapAction::Connect(result) => {
+//!         // Connect to result.selected_peer at result.addrs
+//!     }
+//!     BootstrapAction::Query(query) => {
+//!         // Send FOAF query to discover coordinators
+//!     }
+//!     BootstrapAction::Wait => {
+//!         // Wait and retry later
+//!     }
+//! }
+//! ```
+//!
+//! ### Creating Adverts
 //!
 //! ```rust
 //! use saorsa_gossip_coordinator::{CoordinatorAdvert, CoordinatorRoles, NatClass};
@@ -40,6 +114,18 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Migration from Deprecated Types
+//!
+//! The following types are deprecated and will be removed in a future version:
+//!
+//! | Deprecated | Replacement |
+//! |------------|-------------|
+//! | `PeerCache` | [`GossipCacheAdapter`] with [`bootstrap_cache::BootstrapCache`] |
+//! | `PeerCacheEntry` | [`bootstrap_cache::CachedPeer`] + [`CoordinatorAdvert`] |
+//! | `AdvertCache` | [`GossipCacheAdapter`] |
+//!
+//! See the documentation on each deprecated type for migration examples.
 
 use saorsa_gossip_types::{unix_millis, PeerId};
 use serde::{Deserialize, Serialize};
@@ -48,21 +134,39 @@ use std::net::SocketAddr;
 mod bootstrap;
 mod cache;
 mod foaf;
+mod gossip_cache;
 mod handler;
 mod peer_cache;
 mod publisher;
 mod topic;
 
 pub use bootstrap::{Bootstrap, BootstrapAction, BootstrapResult, TraversalMethod};
+#[allow(deprecated)]
 pub use cache::AdvertCache;
 pub use foaf::{
     FindCoordinatorQuery, FindCoordinatorResponse, DEFAULT_FIND_COORDINATOR_FANOUT,
     MAX_FIND_COORDINATOR_TTL,
 };
+pub use gossip_cache::{capabilities_to_roles, nat_type_to_nat_class, GossipCacheAdapter};
 pub use handler::CoordinatorHandler;
-pub use peer_cache::{PeerCache, PeerCacheEntry, PeerRoles};
+pub use peer_cache::PeerRoles;
+#[allow(deprecated)]
+pub use peer_cache::{PeerCache, PeerCacheEntry};
 pub use publisher::{CoordinatorPublisher, PeriodicPublisher};
 pub use topic::coordinator_topic;
+
+// Re-export ant-quic bootstrap cache types for consumer convenience
+pub mod bootstrap_cache {
+    //! Re-exports from ant-quic bootstrap cache.
+    //!
+    //! These types are provided for consumers who need direct access to
+    //! ant-quic's bootstrap cache functionality.
+    pub use ant_quic::bootstrap_cache::{
+        BootstrapCache, BootstrapCacheConfig, BootstrapCacheConfigBuilder, CacheEvent, CacheStats,
+        CachedPeer, ConnectionOutcome, ConnectionStats, NatType, PeerCapabilities, PeerSource,
+        QualityWeights, SelectionStrategy,
+    };
+}
 
 /// Coordinator roles per SPEC2 §8
 ///

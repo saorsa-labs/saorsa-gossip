@@ -1,4 +1,11 @@
 //! LRU cache for coordinator advertisements
+//!
+//! ## Deprecation Notice
+//!
+//! `AdvertCache` is deprecated in favor of [`GossipCacheAdapter`](crate::GossipCacheAdapter)
+//! which wraps `ant-quic`'s `BootstrapCache` with gossip-specific advert storage.
+//!
+//! **Migration**: Use [`GossipCacheAdapter`](crate::GossipCacheAdapter) for new code.
 
 use crate::CoordinatorAdvert;
 use lru::LruCache;
@@ -22,10 +29,35 @@ fn non_zero_capacity(capacity: usize) -> NonZeroUsize {
 ///
 /// Stores recently seen coordinator adverts with automatic expiry.
 /// Thread-safe and supports concurrent access.
+///
+/// # Deprecated
+///
+/// Use [`GossipCacheAdapter`](crate::GossipCacheAdapter) instead. The new adapter integrates
+/// with `ant-quic`'s `BootstrapCache` for quality-based peer selection and persistent storage.
+///
+/// ## Migration Example
+///
+/// ```ignore
+/// // Old code:
+/// let cache = AdvertCache::new(100);
+/// cache.insert(advert);
+/// let adverts = cache.get_by_role(|a| a.roles.coordinator);
+///
+/// // New code:
+/// use saorsa_gossip_coordinator::{GossipCacheAdapter, bootstrap_cache::*};
+/// let config = BootstrapCacheConfig::builder().cache_dir(path).build();
+/// let cache = Arc::new(BootstrapCache::open(config).await?);
+/// let adapter = GossipCacheAdapter::new(cache);
+/// adapter.insert_advert(advert).await;
+/// let adverts = adapter.get_adverts_by_role(|a| a.roles.coordinator);
+/// ```
+#[deprecated(since = "0.2.0", note = "Use GossipCacheAdapter instead")]
+#[allow(deprecated)]
 pub struct AdvertCache {
     cache: Arc<Mutex<LruCache<PeerId, CoordinatorAdvert>>>,
 }
 
+#[allow(deprecated)]
 impl AdvertCache {
     /// Create a new advert cache with given capacity
     ///
@@ -44,7 +76,13 @@ impl AdvertCache {
     }
 
     fn lock_cache(&self) -> Option<MutexGuard<'_, LruCache<PeerId, CoordinatorAdvert>>> {
-        self.cache.lock().ok()
+        match self.cache.lock() {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                tracing::warn!("AdvertCache Mutex poisoned: {e}");
+                None
+            }
+        }
     }
 
     /// Insert an advert (if valid and not expired)
@@ -148,6 +186,7 @@ impl AdvertCache {
     }
 }
 
+#[allow(deprecated)]
 impl Clone for AdvertCache {
     fn clone(&self) -> Self {
         Self {
@@ -156,6 +195,7 @@ impl Clone for AdvertCache {
     }
 }
 
+#[allow(deprecated)]
 impl Default for AdvertCache {
     fn default() -> Self {
         Self::new(100)
@@ -163,7 +203,7 @@ impl Default for AdvertCache {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used, deprecated)]
 mod tests {
     use super::*;
     use crate::{CoordinatorRoles, NatClass};

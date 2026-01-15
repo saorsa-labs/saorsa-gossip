@@ -12,6 +12,7 @@ categories = ["network-programming"]
 [dependencies]
 saorsa-gossip-types = { version = "0.2.0", path = "../types" }
 saorsa-pqc = { workspace = true }
+ant-quic = { workspace = true }
 serde = { workspace = true }
 serde_bytes = "0.11"
 bincode = { workspace = true }
@@ -23,6 +24,7 @@ lru = { workspace = true }
 tokio = { workspace = true }
 fs2 = "0.4"
 rand = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

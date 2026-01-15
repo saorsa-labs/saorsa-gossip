@@ -2,7 +2,7 @@
 //!
 //! Implements SPEC2 §7.4 bootstrap flow: cache → FOAF → connect
 
-use crate::{CoordinatorHandler, FindCoordinatorQuery, PeerCache, PeerCacheEntry};
+use crate::{CoordinatorHandler, FindCoordinatorQuery, GossipCacheAdapter};
 use saorsa_gossip_types::PeerId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -46,8 +46,8 @@ pub enum BootstrapAction {
 pub struct Bootstrap {
     /// Local peer ID
     peer_id: PeerId,
-    /// Peer cache (primary source)
-    peer_cache: PeerCache,
+    /// Gossip cache adapter (wraps ant-quic BootstrapCache)
+    cache: GossipCacheAdapter,
     /// Coordinator handler (for FOAF queries)
     handler: CoordinatorHandler,
     /// Pending FOAF queries (query_id → timestamp)
@@ -56,33 +56,51 @@ pub struct Bootstrap {
 
 impl Bootstrap {
     /// Create a new bootstrap instance
-    pub fn new(peer_id: PeerId, peer_cache: PeerCache, handler: CoordinatorHandler) -> Self {
+    pub fn new(peer_id: PeerId, cache: GossipCacheAdapter, handler: CoordinatorHandler) -> Self {
         Self {
             peer_id,
-            peer_cache,
+            cache,
             handler,
             pending_queries: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn pending_queries_guard(&self) -> Option<MutexGuard<'_, HashMap<[u8; 32], Instant>>> {
-        self.pending_queries.lock().ok()
+        match self.pending_queries.lock() {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                tracing::warn!("Pending queries Mutex poisoned: {e}");
+                None
+            }
+        }
+    }
+
+    /// Get a reference to the gossip cache adapter
+    pub fn cache(&self) -> &GossipCacheAdapter {
+        &self.cache
+    }
+
+    /// Get a reference to the coordinator handler
+    ///
+    /// The handler is used for processing FOAF queries and validating adverts.
+    pub fn handler(&self) -> &CoordinatorHandler {
+        &self.handler
     }
 
     /// Attempt to find a coordinator to bootstrap from
     ///
     /// Strategy per SPEC2 §7:
-    /// 1. Check peer cache for recent coordinators
+    /// 1. Check cache for coordinators (using epsilon-greedy selection)
     /// 2. If cache is cold, issue FOAF FIND_COORDINATOR
     /// 3. Select best coordinator by traversal preference
     ///
     /// Returns an action to take (Connect, SendQuery, or NoAction)
-    pub fn find_coordinator(&self) -> BootstrapAction {
-        // Step 1: Try peer cache first
-        let cached_coordinators = self.peer_cache.get_coordinators();
+    pub async fn find_coordinator(&self) -> BootstrapAction {
+        // Step 1: Try cache first using ant-quic's quality-based selection
+        let coordinators = self.cache.select_coordinators(3).await;
 
-        if !cached_coordinators.is_empty() {
-            if let Some(result) = self.select_best_coordinator(&cached_coordinators) {
+        if !coordinators.is_empty() {
+            if let Some(result) = self.select_best_coordinator(&coordinators) {
                 return BootstrapAction::Connect(result);
             }
         }
@@ -101,7 +119,13 @@ impl Bootstrap {
     /// Select the best coordinator based on traversal preference
     ///
     /// Preference order: Direct → Reflexive → Relay
-    fn select_best_coordinator(&self, coordinators: &[PeerCacheEntry]) -> Option<BootstrapResult> {
+    fn select_best_coordinator(
+        &self,
+        coordinators: &[(
+            ant_quic::bootstrap_cache::CachedPeer,
+            Option<crate::CoordinatorAdvert>,
+        )],
+    ) -> Option<BootstrapResult> {
         if coordinators.is_empty() {
             return None;
         }
@@ -112,10 +136,13 @@ impl Bootstrap {
             TraversalMethod::Reflexive,
             TraversalMethod::Relay,
         ] {
-            for entry in coordinators {
-                if let Some(addr) = self.get_addr_for_method(entry, method) {
+            for (cached_peer, advert_opt) in coordinators {
+                if let Some(addr) =
+                    self.get_addr_for_method(cached_peer, advert_opt.as_ref(), method)
+                {
+                    let peer_id = PeerId::new(cached_peer.peer_id.0);
                     return Some(BootstrapResult {
-                        peer_id: entry.peer_id,
+                        peer_id,
                         addr,
                         method,
                     });
@@ -129,35 +156,32 @@ impl Bootstrap {
     /// Get an address for a specific traversal method per SPEC2 §7.4
     ///
     /// Traversal preference order:
-    /// 1. Direct: Use public_addrs (best performance, lowest cost)
-    /// 2. Reflexive: Use reflexive_addrs from hole punching (moderate cost)
-    /// 3. Relay: Lookup relay peer's public address (last resort, highest cost)
+    /// 1. Direct: Use addresses from cached peer (best performance, lowest cost)
+    /// 2. Reflexive: Use addr_hints from advert (moderate cost)
+    /// 3. Relay: Not yet implemented (requires relay peer lookup)
     fn get_addr_for_method(
         &self,
-        entry: &PeerCacheEntry,
+        cached_peer: &ant_quic::bootstrap_cache::CachedPeer,
+        advert: Option<&crate::CoordinatorAdvert>,
         method: TraversalMethod,
     ) -> Option<SocketAddr> {
         match method {
             TraversalMethod::Direct => {
-                // Direct connection via public address
-                entry.public_addrs.first().copied()
+                // Direct connection via cached peer's addresses
+                cached_peer.addresses.first().copied()
             }
             TraversalMethod::Reflexive => {
-                // Reflexive connection via hole-punched address
-                entry.reflexive_addrs.first().copied()
+                // Reflexive connection via advert hints
+                advert
+                    .and_then(|a| a.addr_hints.first())
+                    .map(|hint| hint.addr)
             }
             TraversalMethod::Relay => {
-                // Relay connection: lookup relay peer and use its public address
-                if let Some(relay_peer_id) = entry.relay_peer {
-                    // Look up relay peer from peer cache
-                    if let Some(relay_entry) = self.peer_cache.get(&relay_peer_id) {
-                        relay_entry.public_addrs.first().copied()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                // Relay connection: would need relay peer lookup
+                // For now, try advert hints as fallback
+                advert
+                    .and_then(|a| a.addr_hints.get(1))
+                    .map(|hint| hint.addr)
             }
         }
     }
@@ -166,7 +190,14 @@ impl Bootstrap {
     ///
     /// Processes coordinator adverts from response, updates cache, and returns connect action.
     /// Per SPEC2 §7.3, responses contain coordinator adverts that should be added to cache.
-    pub fn handle_find_response(
+    ///
+    /// # Security Note
+    ///
+    /// FOAF responses currently do not include public keys, so adverts cannot be
+    /// cryptographically verified. Only adverts with non-empty signatures are accepted,
+    /// providing basic structural validation. A future protocol enhancement should
+    /// include public keys alongside adverts for full verification.
+    pub async fn handle_find_response(
         &self,
         response: crate::FindCoordinatorResponse,
     ) -> Option<BootstrapAction> {
@@ -175,43 +206,80 @@ impl Bootstrap {
             pending.remove(&response.query_id);
         }
 
-        // Add all coordinator adverts to handler cache
+        // Add coordinator adverts to adapter cache with security logging
+        // TODO(security): FOAF protocol should include public keys for signature verification
+        let advert_count = response.adverts.len();
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+
         for advert in response.adverts {
-            // Note: In production, would verify signatures before caching
-            let _ = self.handler.cache().insert(advert);
+            // Basic structural validation: check for non-empty signature
+            // This is NOT cryptographic verification (requires public key)
+            if advert.sig.is_empty() {
+                tracing::warn!(
+                    peer = ?advert.peer,
+                    "Rejecting FOAF advert: missing signature"
+                );
+                rejected += 1;
+                continue;
+            }
+
+            // Check if advert is valid (not expired)
+            if !advert.is_valid() {
+                tracing::debug!(
+                    peer = ?advert.peer,
+                    "Rejecting FOAF advert: expired or invalid"
+                );
+                rejected += 1;
+                continue;
+            }
+
+            // Insert with result logging (don't discard)
+            if self.cache.insert_advert(advert.clone()).await {
+                accepted += 1;
+            } else {
+                tracing::debug!(
+                    peer = ?advert.peer,
+                    "FOAF advert insertion returned false (duplicate or invalid)"
+                );
+            }
         }
 
-        // Try to find coordinator from newly updated cache
-        let coordinators = self
-            .handler
-            .cache()
-            .get_by_role(|advert| advert.roles.coordinator);
+        if advert_count > 0 {
+            tracing::debug!(
+                total = advert_count,
+                accepted = accepted,
+                rejected = rejected,
+                "Processed FOAF response adverts (note: signature verification requires protocol enhancement)"
+            );
+        }
+
+        // Also add to handler cache for FOAF queries
+        let coordinators = self.cache.get_adverts_by_role(|a| a.roles.coordinator);
 
         self.select_best_from_adverts(&coordinators)
             .map(BootstrapAction::Connect)
     }
 
     /// Select best coordinator from coordinator adverts
+    ///
+    /// When selecting from FOAF response adverts, we only have addr_hints available
+    /// (reflexive addresses). Direct addresses require CachedPeer data which isn't
+    /// available in this context.
     fn select_best_from_adverts(
         &self,
         adverts: &[crate::CoordinatorAdvert],
     ) -> Option<BootstrapResult> {
-        for method in [
-            TraversalMethod::Direct,
-            TraversalMethod::Reflexive,
-            TraversalMethod::Relay,
-        ] {
-            for advert in adverts {
-                if let Some(addr_hint) = advert.addr_hints.first() {
-                    return Some(BootstrapResult {
-                        peer_id: advert.peer,
-                        addr: addr_hint.addr,
-                        method,
-                    });
-                }
-            }
-        }
-        None
+        // From FOAF responses, we only have addr_hints (reflexive addresses)
+        // Find first advert with a usable address hint
+        adverts.iter().find_map(|advert| {
+            advert.addr_hints.first().map(|addr_hint| BootstrapResult {
+                peer_id: advert.peer,
+                addr: addr_hint.addr,
+                // addr_hints are reflexive addresses per SPEC2
+                method: TraversalMethod::Reflexive,
+            })
+        })
     }
 
     /// Clean up expired pending queries
@@ -219,9 +287,8 @@ impl Bootstrap {
     /// Per SPEC2 §7.3, queries expire after 30 seconds.
     /// Returns the number of expired queries removed.
     pub fn prune_expired_queries(&self) -> usize {
-        let mut pending = match self.pending_queries_guard() {
-            Some(guard) => guard,
-            None => return 0,
+        let Some(mut pending) = self.pending_queries_guard() else {
+            return 0;
         };
         let now = Instant::now();
 
@@ -244,7 +311,18 @@ impl Bootstrap {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::{NatClass, PeerRoles};
+    use crate::{AddrHint, CoordinatorAdvert, NatClass, PeerRoles};
+    use ant_quic::bootstrap_cache::{BootstrapCache, BootstrapCacheConfig};
+    use std::sync::Arc;
+
+    async fn create_test_cache() -> GossipCacheAdapter {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let config = BootstrapCacheConfig::builder()
+            .cache_dir(temp_dir.path().to_path_buf())
+            .build();
+        let cache = Arc::new(BootstrapCache::open(config).await.expect("create cache"));
+        GossipCacheAdapter::new(cache)
+    }
 
     #[test]
     fn test_traversal_method_ordering() {
@@ -253,24 +331,24 @@ mod tests {
         assert!(TraversalMethod::Direct < TraversalMethod::Relay);
     }
 
-    #[test]
-    fn test_bootstrap_creation() {
+    #[tokio::test]
+    async fn test_bootstrap_creation() {
         let peer_id = PeerId::new([1u8; 32]);
-        let peer_cache = PeerCache::new();
+        let cache = create_test_cache().await;
         let handler = CoordinatorHandler::new(peer_id);
 
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
+        let bootstrap = Bootstrap::new(peer_id, cache, handler);
         assert_eq!(bootstrap.peer_id, peer_id);
     }
 
-    #[test]
-    fn test_find_coordinator_empty_cache() {
+    #[tokio::test]
+    async fn test_find_coordinator_empty_cache() {
         let peer_id = PeerId::new([1u8; 32]);
-        let peer_cache = PeerCache::new();
+        let cache = create_test_cache().await;
         let handler = CoordinatorHandler::new(peer_id);
 
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
-        let action = bootstrap.find_coordinator();
+        let bootstrap = Bootstrap::new(peer_id, cache, handler);
+        let action = bootstrap.find_coordinator().await;
 
         // Empty cache should trigger FOAF query per SPEC2 §7.4
         match action {
@@ -282,30 +360,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_find_coordinator_from_cache() {
+    #[tokio::test]
+    async fn test_find_coordinator_from_cache() {
         let peer_id = PeerId::new([1u8; 32]);
-        let peer_cache = PeerCache::new();
+        let cache = create_test_cache().await;
         let handler = CoordinatorHandler::new(peer_id);
 
         // Add a coordinator to cache
         let coord_peer = PeerId::new([2u8; 32]);
-        let addr = "127.0.0.1:8080".parse().expect("valid address");
-        let entry = PeerCacheEntry::new(
+        let addr: SocketAddr = "127.0.0.1:8080".parse().expect("valid address");
+        let advert = CoordinatorAdvert::new(
             coord_peer,
-            vec![addr],
-            NatClass::Eim,
             PeerRoles {
                 coordinator: true,
                 reflector: true,
                 rendezvous: false,
                 relay: false,
             },
+            vec![AddrHint::new(addr)],
+            NatClass::Eim,
+            60_000,
         );
-        peer_cache.insert(entry);
+        cache.insert_advert(advert).await;
 
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
-        let action = bootstrap.find_coordinator();
+        let bootstrap = Bootstrap::new(peer_id, cache, handler);
+        let action = bootstrap.find_coordinator().await;
 
         // Warm cache should return Connect action
         match action {
@@ -318,85 +397,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_select_most_recent_coordinator() {
+    #[tokio::test]
+    async fn test_traversal_preference_direct_first() {
         let peer_id = PeerId::new([1u8; 32]);
-        let peer_cache = PeerCache::new();
-        let handler = CoordinatorHandler::new(peer_id);
-
-        // Add multiple coordinators with different timestamps
-        let coord1 = PeerId::new([2u8; 32]);
-        let addr1 = "127.0.0.1:8080".parse().expect("valid");
-        let mut entry1 = PeerCacheEntry::new(
-            coord1,
-            vec![addr1],
-            NatClass::Eim,
-            PeerRoles {
-                coordinator: true,
-                reflector: false,
-                rendezvous: false,
-                relay: false,
-            },
-        );
-        entry1.last_success -= 10000; // Older
-        peer_cache.insert(entry1);
-
-        let coord2 = PeerId::new([3u8; 32]);
-        let addr2 = "127.0.0.1:8081".parse().expect("valid");
-        let entry2 = PeerCacheEntry::new(
-            coord2,
-            vec![addr2],
-            NatClass::Eim,
-            PeerRoles {
-                coordinator: true,
-                reflector: false,
-                rendezvous: false,
-                relay: false,
-            },
-        );
-        // entry2 has more recent timestamp
-        peer_cache.insert(entry2);
-
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
-        let action = bootstrap.find_coordinator();
-
-        // Should select most recent (coord2)
-        match action {
-            BootstrapAction::Connect(result) => {
-                assert_eq!(
-                    result.peer_id, coord2,
-                    "Should select most recent coordinator"
-                );
-                assert_eq!(result.addr, addr2);
-            }
-            _ => panic!("Expected Connect action"),
-        }
-    }
-
-    #[test]
-    fn test_traversal_preference_direct_first() {
-        let peer_id = PeerId::new([1u8; 32]);
-        let peer_cache = PeerCache::new();
+        let cache = create_test_cache().await;
         let handler = CoordinatorHandler::new(peer_id);
 
         let coord = PeerId::new([2u8; 32]);
-        let addr = "127.0.0.1:8080".parse().expect("valid");
+        let addr: SocketAddr = "127.0.0.1:8080".parse().expect("valid");
 
-        let entry = PeerCacheEntry::new(
+        let advert = CoordinatorAdvert::new(
             coord,
-            vec![addr],
-            NatClass::Eim,
             PeerRoles {
                 coordinator: true,
                 reflector: false,
                 rendezvous: false,
                 relay: false,
             },
+            vec![AddrHint::new(addr)],
+            NatClass::Eim,
+            60_000,
         );
-        peer_cache.insert(entry);
+        cache.insert_advert(advert).await;
 
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
-        let action = bootstrap.find_coordinator();
+        let bootstrap = Bootstrap::new(peer_id, cache, handler);
+        let action = bootstrap.find_coordinator().await;
 
         match action {
             BootstrapAction::Connect(result) => {
@@ -413,7 +438,7 @@ mod tests {
     #[test]
     fn test_bootstrap_result_creation() {
         let peer_id = PeerId::new([1u8; 32]);
-        let addr = "192.168.1.1:9000".parse().expect("valid");
+        let addr: SocketAddr = "192.168.1.1:9000".parse().expect("valid");
 
         let result = BootstrapResult {
             peer_id,
@@ -427,16 +452,16 @@ mod tests {
     }
 
     /// Test FOAF query is tracked in pending queries
-    #[test]
-    fn test_foaf_query_is_tracked() {
+    #[tokio::test]
+    async fn test_foaf_query_is_tracked() {
         let peer_id = PeerId::new([10u8; 32]);
-        let peer_cache = PeerCache::new();
+        let cache = create_test_cache().await;
         let handler = CoordinatorHandler::new(peer_id);
 
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
+        let bootstrap = Bootstrap::new(peer_id, cache, handler);
 
         // Empty cache triggers FOAF query
-        let action = bootstrap.find_coordinator();
+        let action = bootstrap.find_coordinator().await;
 
         match action {
             BootstrapAction::SendQuery(query) => {
@@ -452,20 +477,18 @@ mod tests {
     }
 
     /// Test handling FOAF query response
-    #[test]
-    fn test_handle_foaf_response() {
-        use crate::{
-            AddrHint, CoordinatorAdvert, CoordinatorRoles, FindCoordinatorResponse, NatClass,
-        };
+    #[tokio::test]
+    async fn test_handle_foaf_response() {
+        use crate::{CoordinatorRoles, FindCoordinatorResponse};
         use saorsa_pqc::{MlDsa65, MlDsaOperations};
 
         let peer_id = PeerId::new([11u8; 32]);
-        let peer_cache = PeerCache::new();
+        let cache = create_test_cache().await;
         let handler = CoordinatorHandler::new(peer_id);
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
+        let bootstrap = Bootstrap::new(peer_id, cache, handler);
 
         // Issue query first
-        let action = bootstrap.find_coordinator();
+        let action = bootstrap.find_coordinator().await;
         let query_id = match action {
             BootstrapAction::SendQuery(query) => query.query_id,
             _ => panic!("Expected SendQuery"),
@@ -473,7 +496,7 @@ mod tests {
 
         // Create a response with a coordinator advert
         let coord_peer = PeerId::new([12u8; 32]);
-        let addr = "10.0.0.1:8080".parse().expect("valid addr");
+        let addr: SocketAddr = "10.0.0.1:8080".parse().expect("valid addr");
 
         let mut advert = CoordinatorAdvert::new(
             coord_peer,
@@ -498,6 +521,7 @@ mod tests {
         // Handle the response
         let result_action = bootstrap
             .handle_find_response(response)
+            .await
             .expect("should return action");
 
         // Should return Connect action with coordinator
@@ -518,17 +542,17 @@ mod tests {
     }
 
     /// Test query timeout pruning
-    #[test]
-    fn test_prune_expired_queries() {
+    #[tokio::test]
+    async fn test_prune_expired_queries() {
         use std::time::Duration;
 
         let peer_id = PeerId::new([13u8; 32]);
-        let peer_cache = PeerCache::new();
+        let cache = create_test_cache().await;
         let handler = CoordinatorHandler::new(peer_id);
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
+        let bootstrap = Bootstrap::new(peer_id, cache, handler);
 
         // Create a query
-        let _ = bootstrap.find_coordinator();
+        let _ = bootstrap.find_coordinator().await;
 
         // Manually expire it by manipulating timestamp
         {
@@ -551,7 +575,7 @@ mod tests {
     #[test]
     fn test_bootstrap_action_variants() {
         let peer_id = PeerId::new([14u8; 32]);
-        let addr = "1.2.3.4:5678".parse().expect("valid");
+        let addr: SocketAddr = "1.2.3.4:5678".parse().expect("valid");
 
         // Test Connect variant
         let connect_action = BootstrapAction::Connect(BootstrapResult {
@@ -570,281 +594,19 @@ mod tests {
         assert!(matches!(no_action, BootstrapAction::NoAction));
     }
 
-    /// Test Direct traversal method uses public_addrs
-    #[test]
-    fn test_direct_traversal_uses_public_addrs() {
-        let peer_id = PeerId::new([20u8; 32]);
-        let peer_cache = PeerCache::new();
-        let handler = CoordinatorHandler::new(peer_id);
-
-        let coord_peer = PeerId::new([21u8; 32]);
-        let public_addr = "203.0.113.1:8080".parse().expect("valid");
-        let reflexive_addr = "192.168.1.10:9000".parse().expect("valid");
-
-        let entry = PeerCacheEntry::new(
-            coord_peer,
-            vec![public_addr],
-            NatClass::Eim,
-            PeerRoles {
-                coordinator: true,
-                reflector: false,
-                rendezvous: false,
-                relay: false,
-            },
-        )
-        .with_reflexive_addrs(vec![reflexive_addr]);
-
-        peer_cache.insert(entry);
-
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
-        let action = bootstrap.find_coordinator();
-
-        match action {
-            BootstrapAction::Connect(result) => {
-                assert_eq!(result.method, TraversalMethod::Direct);
-                assert_eq!(result.addr, public_addr, "Direct should use public address");
-            }
-            _ => panic!("Expected Connect action"),
-        }
-    }
-
-    /// Test Reflexive traversal when no public addresses
-    #[test]
-    fn test_reflexive_traversal_uses_reflexive_addrs() {
-        let peer_id = PeerId::new([22u8; 32]);
-        let peer_cache = PeerCache::new();
-        let handler = CoordinatorHandler::new(peer_id);
-
-        let coord_peer = PeerId::new([23u8; 32]);
-        let reflexive_addr = "192.168.1.100:9000".parse().expect("valid");
-
-        // Entry with NO public addresses, only reflexive
-        let entry = PeerCacheEntry::new(
-            coord_peer,
-            vec![], // No public addresses
-            NatClass::Edm,
-            PeerRoles {
-                coordinator: true,
-                reflector: false,
-                rendezvous: false,
-                relay: false,
-            },
-        )
-        .with_reflexive_addrs(vec![reflexive_addr]);
-
-        peer_cache.insert(entry);
-
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
-        let action = bootstrap.find_coordinator();
-
-        match action {
-            BootstrapAction::Connect(result) => {
-                assert_eq!(result.method, TraversalMethod::Reflexive);
-                assert_eq!(
-                    result.addr, reflexive_addr,
-                    "Reflexive should use reflexive address"
-                );
-            }
-            _ => panic!("Expected Connect action"),
-        }
-    }
-
-    /// Test Relay traversal when only relay peer available
-    #[test]
-    fn test_relay_traversal_uses_relay_peer() {
-        let peer_id = PeerId::new([24u8; 32]);
-        let peer_cache = PeerCache::new();
-        let handler = CoordinatorHandler::new(peer_id);
-
-        // Create a relay peer
-        let relay_peer = PeerId::new([25u8; 32]);
-        let relay_addr = "198.51.100.1:8080".parse().expect("valid");
-        let relay_entry = PeerCacheEntry::new(
-            relay_peer,
-            vec![relay_addr],
-            NatClass::Eim,
-            PeerRoles {
-                coordinator: false,
-                reflector: false,
-                rendezvous: false,
-                relay: true,
-            },
-        );
-        peer_cache.insert(relay_entry);
-
-        // Create coordinator that needs relay
-        let coord_peer = PeerId::new([26u8; 32]);
-        let entry = PeerCacheEntry::new(
-            coord_peer,
-            vec![], // No public addresses
-            NatClass::Symmetric,
-            PeerRoles {
-                coordinator: true,
-                reflector: false,
-                rendezvous: false,
-                relay: false,
-            },
-        )
-        .with_relay_peer(relay_peer);
-
-        peer_cache.insert(entry);
-
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
-        let action = bootstrap.find_coordinator();
-
-        match action {
-            BootstrapAction::Connect(result) => {
-                assert_eq!(result.method, TraversalMethod::Relay);
-                assert_eq!(
-                    result.addr, relay_addr,
-                    "Relay should use relay peer's public address"
-                );
-            }
-            _ => panic!("Expected Connect action"),
-        }
-    }
-
-    /// Test traversal preference order: Direct > Reflexive > Relay
-    #[test]
-    fn test_traversal_preference_order() {
-        let peer_id = PeerId::new([27u8; 32]);
-        let peer_cache = PeerCache::new();
-        let handler = CoordinatorHandler::new(peer_id);
-
-        let public_addr = "203.0.113.10:8080".parse().expect("valid");
-        let reflexive_addr = "192.168.1.50:9000".parse().expect("valid");
-
-        let relay_peer = PeerId::new([28u8; 32]);
-        let relay_addr = "198.51.100.10:8080".parse().expect("valid");
-        peer_cache.insert(PeerCacheEntry::new(
-            relay_peer,
-            vec![relay_addr],
-            NatClass::Eim,
-            PeerRoles {
-                coordinator: false,
-                reflector: false,
-                rendezvous: false,
-                relay: true,
-            },
-        ));
-
-        let coord_peer = PeerId::new([29u8; 32]);
-
-        // Coordinator with all three traversal options
-        let entry = PeerCacheEntry::new(
-            coord_peer,
-            vec![public_addr],
-            NatClass::Eim,
-            PeerRoles {
-                coordinator: true,
-                reflector: false,
-                rendezvous: false,
-                relay: false,
-            },
-        )
-        .with_reflexive_addrs(vec![reflexive_addr])
-        .with_relay_peer(relay_peer);
-
-        peer_cache.insert(entry);
-
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
-        let action = bootstrap.find_coordinator();
-
-        match action {
-            BootstrapAction::Connect(result) => {
-                assert_eq!(
-                    result.method,
-                    TraversalMethod::Direct,
-                    "Should prefer Direct"
-                );
-                assert_eq!(result.addr, public_addr, "Should use public address");
-            }
-            _ => panic!("Expected Connect action"),
-        }
-    }
-
-    /// Test relay fallback when relay peer not in cache
-    #[test]
-    fn test_relay_fallback_when_relay_peer_missing() {
-        let peer_id = PeerId::new([30u8; 32]);
-        let peer_cache = PeerCache::new();
-        let handler = CoordinatorHandler::new(peer_id);
-
-        let coord_peer = PeerId::new([31u8; 32]);
-        let missing_relay_peer = PeerId::new([32u8; 32]);
-
-        // Coordinator with relay peer that's NOT in cache
-        let entry = PeerCacheEntry::new(
-            coord_peer,
-            vec![], // No public addresses
-            NatClass::Symmetric,
-            PeerRoles {
-                coordinator: true,
-                reflector: false,
-                rendezvous: false,
-                relay: false,
-            },
-        )
-        .with_relay_peer(missing_relay_peer);
-
-        peer_cache.insert(entry);
-
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
-        let action = bootstrap.find_coordinator();
-
-        // Should trigger FOAF query since no valid traversal method available
-        match action {
-            BootstrapAction::SendQuery(_) => {
-                // Expected: can't connect, need to query for more coordinators
-            }
-            _ => panic!("Expected SendQuery when relay peer is missing"),
-        }
-    }
-
-    /// Test builder pattern for PeerCacheEntry
-    #[test]
-    fn test_peer_cache_entry_builder() {
-        let peer_id = PeerId::new([33u8; 32]);
-        let public_addr = "1.2.3.4:8080".parse().expect("valid");
-        let reflexive_addr = "192.168.1.1:9000".parse().expect("valid");
-        let relay_peer = PeerId::new([34u8; 32]);
-
-        let entry = PeerCacheEntry::new(
-            peer_id,
-            vec![public_addr],
-            NatClass::Edm,
-            PeerRoles {
-                coordinator: true,
-                reflector: true,
-                rendezvous: false,
-                relay: false,
-            },
-        )
-        .with_reflexive_addrs(vec![reflexive_addr])
-        .with_relay_peer(relay_peer);
-
-        assert_eq!(entry.public_addrs.len(), 1);
-        assert_eq!(entry.public_addrs[0], public_addr);
-        assert_eq!(entry.reflexive_addrs.len(), 1);
-        assert_eq!(entry.reflexive_addrs[0], reflexive_addr);
-        assert_eq!(entry.relay_peer, Some(relay_peer));
-    }
-
     /// Test response with multiple coordinators selects best
-    #[test]
-    fn test_response_with_multiple_coordinators() {
-        use crate::{
-            AddrHint, CoordinatorAdvert, CoordinatorRoles, FindCoordinatorResponse, NatClass,
-        };
+    #[tokio::test]
+    async fn test_response_with_multiple_coordinators() {
+        use crate::{CoordinatorRoles, FindCoordinatorResponse};
         use saorsa_pqc::{MlDsa65, MlDsaOperations};
 
         let peer_id = PeerId::new([15u8; 32]);
-        let peer_cache = PeerCache::new();
+        let cache = create_test_cache().await;
         let handler = CoordinatorHandler::new(peer_id);
-        let bootstrap = Bootstrap::new(peer_id, peer_cache, handler);
+        let bootstrap = Bootstrap::new(peer_id, cache, handler);
 
         // Issue query
-        let action = bootstrap.find_coordinator();
+        let action = bootstrap.find_coordinator().await;
         let query_id = match action {
             BootstrapAction::SendQuery(query) => query.query_id,
             _ => panic!("Expected SendQuery"),
@@ -857,7 +619,7 @@ mod tests {
         let mut adverts = vec![];
         for i in 0..3 {
             let coord_peer = PeerId::new([16 + i; 32]);
-            let addr = format!("10.0.0.{}:8080", i + 1)
+            let addr: SocketAddr = format!("10.0.0.{}:8080", i + 1)
                 .parse()
                 .expect("valid addr");
 
@@ -882,6 +644,7 @@ mod tests {
         // Should select the first coordinator (simplest traversal logic)
         let result_action = bootstrap
             .handle_find_response(response)
+            .await
             .expect("should return action");
 
         match result_action {

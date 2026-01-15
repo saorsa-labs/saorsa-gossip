@@ -301,6 +301,26 @@ impl PresenceRecord {
         }
     }
 
+    /// Create a new presence record with explicit sequence number
+    ///
+    /// Useful for testing sequence-based deduplication.
+    pub fn new_with_seq(
+        presence_tag: [u8; 32],
+        addr_hints: Vec<String>,
+        ttl_seconds: u64,
+        seq: u64,
+    ) -> Self {
+        let now = unix_secs();
+        Self {
+            presence_tag,
+            addr_hints,
+            since: now,
+            expires: now + ttl_seconds,
+            seq,
+            four_words: None,
+        }
+    }
+
     /// Check if the presence record is expired
     pub fn is_expired(&self) -> bool {
         unix_secs() >= self.expires

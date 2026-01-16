@@ -160,8 +160,7 @@ jobs:
             "crates/presence"
             "crates/coordinator"
             "crates/rendezvous"
-            "crates/simulator"
-            "crates/load-test"
+            "crates/runtime"
           )
 
           for crate in "${CRATES[@]}"; do

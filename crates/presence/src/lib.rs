@@ -3,7 +3,8 @@
 //! Presence beacons and user discovery
 //!
 //! Implements:
-//! - MLS exporter-derived presence tags
+//! - MLS exporter-derived presence tags (alpha note: current implementation uses deterministic
+//!   topic-derived secrets until the MLS exporter is wired in across the stack)
 //! - FOAF random-walk queries
 //! - IBLT summaries for efficient reconciliation
 
@@ -267,12 +268,16 @@ impl PresenceManager {
                             let time_slice = now / 3600; // Hourly rotation
 
                             // Derive presence tag using MLS group's exporter secret
-                            // In production, get actual MLS exporter secret from group_ctx
-                            // For now, use a deterministic placeholder based on topic_id
-                            let mut exporter_secret = [0u8; 32];
-                            exporter_secret.copy_from_slice(&topic_id.as_bytes()[..32]);
+                            let Some(exporter_secret) = group_ctx.presence_exporter() else {
+                                warn!(
+                                    ?topic_id,
+                                    "Skipping beacon broadcast: missing MLS exporter secret"
+                                );
+                                continue;
+                            };
 
-                            let presence_tag = derive_presence_tag(&exporter_secret, &peer_id, time_slice);
+                            let presence_tag =
+                                derive_presence_tag(&exporter_secret, &peer_id, time_slice);
 
                             // Get address hints (real addresses when available)
                             let hints = addr_hints.read().await.clone();
@@ -849,18 +854,6 @@ impl PresenceManager {
     }
 }
 
-impl Default for PresenceManager {
-    fn default() -> Self {
-        Self::new(
-            PeerId::new([0u8; 32]),
-            Arc::new(saorsa_gossip_transport::QuicTransport::new(
-                saorsa_gossip_transport::TransportConfig::default(),
-            )),
-            Arc::new(RwLock::new(HashMap::new())),
-        )
-    }
-}
-
 #[async_trait::async_trait]
 impl Presence for PresenceManager {
     async fn beacon(&self, _topic: TopicId) -> Result<()> {
@@ -925,32 +918,43 @@ pub fn derive_presence_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saorsa_gossip_transport::{QuicTransport, TransportConfig};
+    use saorsa_gossip_transport::AntQuicTransport;
+    use std::net::SocketAddr;
 
     // Helper: Create test presence manager
-    fn create_test_manager() -> PresenceManager {
+    async fn create_test_manager() -> PresenceManager {
         let peer_id = PeerId::new([1u8; 32]);
-        let transport = Arc::new(QuicTransport::new(TransportConfig::default()));
+        let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+        let transport = Arc::new(
+            AntQuicTransport::new(bind, vec![])
+                .await
+                .expect("transport"),
+        );
         let groups = Arc::new(RwLock::new(HashMap::new()));
         PresenceManager::new(peer_id, transport, groups)
+    }
+
+    fn group_ctx_with_secret(topic: TopicId) -> saorsa_gossip_groups::GroupContext {
+        let secret = topic.to_bytes();
+        saorsa_gossip_groups::GroupContext::with_presence_exporter(topic, secret)
     }
 
     #[tokio::test]
     async fn test_presence_manager_creation() {
         // RED: Test basic creation with dependencies
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         assert_eq!(manager.peer_id, PeerId::new([1u8; 32]));
     }
 
     #[tokio::test]
     async fn test_start_beacons_broadcasts_periodically() {
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([10u8; 32]);
 
         // Join a group so beacons are broadcast for it
         {
             let mut groups = manager.groups.write().await;
-            groups.insert(topic, saorsa_gossip_groups::GroupContext::new(topic));
+            groups.insert(topic, group_ctx_with_secret(topic));
         }
 
         // Start beacons with short interval for testing
@@ -974,13 +978,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_stop_beacons_halts_broadcasting() {
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([11u8; 32]);
 
         // Join a group
         {
             let mut groups = manager.groups.write().await;
-            groups.insert(topic, saorsa_gossip_groups::GroupContext::new(topic));
+            groups.insert(topic, group_ctx_with_secret(topic));
         }
 
         // Start beacons
@@ -1007,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn test_beacon_storage_and_retrieval() {
         // RED: This should fail because handle_beacon doesn't store yet
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         let topic = TopicId::new([1u8; 32]);
         let peer = PeerId::new([2u8; 32]);
@@ -1030,7 +1034,7 @@ mod tests {
     #[tokio::test]
     async fn test_beacon_ttl_expiration() {
         // Test that expired beacons are cleaned up
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         let topic = TopicId::new([1u8; 32]);
         let peer = PeerId::new([2u8; 32]);
@@ -1061,7 +1065,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_status_online_within_ttl() {
         // RED: This should fail because get_status always returns Unknown
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         let topic = TopicId::new([1u8; 32]);
         let peer = PeerId::new([2u8; 32]);
@@ -1083,7 +1087,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_status_offline_after_ttl() {
         // RED: This should fail because get_status doesn't check TTL
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         let topic = TopicId::new([1u8; 32]);
         let peer = PeerId::new([2u8; 32]);
@@ -1109,7 +1113,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_online_peers_filters_by_topic() {
         // RED: This should fail because get_online_peers returns empty vec
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         let topic1 = TopicId::new([1u8; 32]);
         let topic2 = TopicId::new([2u8; 32]);
@@ -1140,14 +1144,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_foaf_random_walk() {
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([12u8; 32]);
         let target = PeerId::new([42u8; 32]);
 
         // Join a group so FOAF queries are initiated
         {
             let mut groups = manager.groups.write().await;
-            groups.insert(topic, saorsa_gossip_groups::GroupContext::new(topic));
+            groups.insert(topic, group_ctx_with_secret(topic));
         }
 
         // Add broadcast peers so queries have targets
@@ -1174,7 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_topics_isolation() {
         // RED: This should fail because topics aren't isolated yet
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         let topic1 = TopicId::new([1u8; 32]);
         let topic2 = TopicId::new([2u8; 32]);
@@ -1244,7 +1248,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broadcast_peer_management() {
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         let peer1 = PeerId::new([10u8; 32]);
         let peer2 = PeerId::new([20u8; 32]);
@@ -1270,7 +1274,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_addr_hints_management() {
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         // Initially empty
         assert!(manager.get_addr_hints().await.is_empty());
@@ -1325,7 +1329,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_presence_message_beacon() {
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
         let sender = PeerId::new([2u8; 32]);
         let record = PresenceRecord::new([3u8; 32], vec!["127.0.0.1:8080".to_string()], 900);
@@ -1333,7 +1337,7 @@ mod tests {
         // Add the topic to groups so the beacon is accepted
         {
             let mut groups = manager.groups.write().await;
-            groups.insert(topic, saorsa_gossip_groups::GroupContext::new(topic));
+            groups.insert(topic, group_ctx_with_secret(topic));
         }
 
         let message = PresenceMessage::Beacon {
@@ -1356,7 +1360,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_presence_message_unknown_topic() {
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([99u8; 32]); // Not in groups
         let sender = PeerId::new([2u8; 32]);
         let record = PresenceRecord::new([3u8; 32], vec![], 900);
@@ -1383,7 +1387,7 @@ mod tests {
     #[tokio::test]
     async fn test_foaf_query_deduplication() {
         // Test that duplicate queries are dropped
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
         let origin = PeerId::new([2u8; 32]);
 
@@ -1418,14 +1422,14 @@ mod tests {
     #[tokio::test]
     async fn test_foaf_query_ttl_zero_not_forwarded() {
         // Test that queries with TTL=0 are not forwarded
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
         let origin = PeerId::new([2u8; 32]);
 
         // Add the topic to groups
         {
             let mut groups = manager.groups.write().await;
-            groups.insert(topic, saorsa_gossip_groups::GroupContext::new(topic));
+            groups.insert(topic, group_ctx_with_secret(topic));
         }
 
         // Query with TTL=0 should not be forwarded
@@ -1446,13 +1450,13 @@ mod tests {
     #[tokio::test]
     async fn test_foaf_query_response_aggregation() {
         // Test that responses are aggregated properly
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
 
         // Add topic to groups
         {
             let mut groups = manager.groups.write().await;
-            groups.insert(topic, saorsa_gossip_groups::GroupContext::new(topic));
+            groups.insert(topic, group_ctx_with_secret(topic));
         }
 
         // Create two QueryResponse messages with different records
@@ -1497,13 +1501,13 @@ mod tests {
     #[tokio::test]
     async fn test_foaf_query_response_deduplication() {
         // Test that duplicate records from multiple responses are deduplicated
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
 
         // Add topic to groups
         {
             let mut groups = manager.groups.write().await;
-            groups.insert(topic, saorsa_gossip_groups::GroupContext::new(topic));
+            groups.insert(topic, group_ctx_with_secret(topic));
         }
 
         let peer = PeerId::new([10u8; 32]);
@@ -1534,13 +1538,13 @@ mod tests {
     #[tokio::test]
     async fn test_foaf_query_expired_records_filtered() {
         // Test that expired records in responses are not stored
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
 
         // Add topic to groups
         {
             let mut groups = manager.groups.write().await;
-            groups.insert(topic, saorsa_gossip_groups::GroupContext::new(topic));
+            groups.insert(topic, group_ctx_with_secret(topic));
         }
 
         let peer = PeerId::new([10u8; 32]);
@@ -1574,7 +1578,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_query_cleanup() {
         // Test that expired pending queries are cleaned up
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         // Manually insert a pending query
         {
@@ -1662,7 +1666,7 @@ mod tests {
     #[tokio::test]
     async fn test_initiate_foaf_query_no_peers() {
         // Test that initiating a query with no broadcast peers returns empty
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
 
         // No broadcast peers added
@@ -1682,7 +1686,7 @@ mod tests {
     async fn test_cleanup_seen_queries_removes_old_entries() {
         // Test that old query IDs are cleaned up
         // Per SPEC2 §7.3, query IDs older than 30 seconds should be removed
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         // Insert a query ID with an old timestamp (simulate 35 seconds ago)
         let old_query_id = [1u8; 32];
@@ -1732,7 +1736,7 @@ mod tests {
     #[tokio::test]
     async fn test_seen_queries_tracks_timestamp() {
         // Test that seen_queries now tracks insertion timestamps
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
         let origin = PeerId::new([2u8; 32]);
 
@@ -1765,7 +1769,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_seen_queries_no_old_entries() {
         // Test cleanup when no old entries exist
-        let manager = create_test_manager();
+        let manager = create_test_manager().await;
 
         // Insert only recent query IDs
         {

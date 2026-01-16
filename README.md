@@ -64,7 +64,7 @@ Saorsa Gossip implements a complete gossip overlay with:
 - **Local-First CRDTs**: Delta-CRDTs with anti-entropy synchronization
 - **No DHT**: Contact-graph-based discovery, no global directory
 
-**Status**: ✅ **Production-Ready v0.1.7** - Complete post-quantum cryptography, deployable coordinator binary, **242 tests passing** with chaos engineering, zero compilation warnings (see [DESIGN.md](DESIGN.md))
+**Status**: ⚠️ **Alpha (workspace v0.2.1)** – libraries compile and ship with >260 automated tests, but the CLI/coordinator binaries are still experimental and several protocols (e.g. presence MLS export) are not finalized. See [DESIGN.md](DESIGN.md) for current limitations.
 
 ## 🏗️ Architecture
 
@@ -91,7 +91,7 @@ Saorsa Gossip implements a complete gossip overlay with:
 
 ### Core Crates
 
-All crates are published on [crates.io](https://crates.io) at version **0.1.6** with production-ready post-quantum cryptography.
+This repository tracks the Saorsa Gossip workspace at **v0.2.1**. Some crates are published on [crates.io](https://crates.io) already, but others are only available from source while the alpha stabilises.
 
 | Crate | Purpose | Why It's Important |
 |-------|---------|-------------------|
@@ -116,8 +116,10 @@ Saorsa Gossip provides two production-ready binaries for testing and deployment:
 
 | Binary | Crate | Purpose |
 |--------|-------|---------|
-| `saorsa-gossip-coordinator` | [saorsa-coordinator](https://crates.io/crates/saorsa-coordinator) | Bootstrap/coordinator node for network discovery |
-| `saorsa-gossip` | [saorsa-gossip](https://crates.io/crates/saorsa-gossip) | CLI tool for testing all network features |
+| `saorsa-gossip-coordinator` | [saorsa-coordinator](https://crates.io/crates/saorsa-coordinator) | Bootstrap/coordinator node for network discovery (alpha – adverts generated but not broadcast on the wire yet) |
+| `saorsa-gossip` | [saorsa-gossip](https://crates.io/crates/saorsa-gossip) | CLI tool for testing network features (alpha – commands are gradually being implemented) |
+
+> These binaries are still under heavy development. Use them for experimentation, not production deployments, until the remaining TODOs tracked in this README/DESIGN are resolved.
 
 ### Installation
 
@@ -355,44 +357,63 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-saorsa-gossip-types = "0.1.3"
-saorsa-gossip-identity = "0.1.3"
-saorsa-gossip-transport = "0.1.3"
-saorsa-gossip-membership = "0.1.3"
-saorsa-gossip-pubsub = "0.1.3"
-saorsa-gossip-coordinator = "0.1.3"
-saorsa-gossip-rendezvous = "0.1.3"
-saorsa-gossip-groups = "0.1.3"
-saorsa-gossip-presence = "0.1.3"
-saorsa-gossip-crdt-sync = "0.1.3"
+saorsa-gossip-types = "0.2.1"
+saorsa-gossip-identity = "0.2.1"
+saorsa-gossip-transport = "0.2.1"
+saorsa-gossip-membership = "0.2.1"
+saorsa-gossip-pubsub = "0.2.1"
+saorsa-gossip-coordinator = "0.2.1"
+saorsa-gossip-rendezvous = "0.2.1"
+saorsa-gossip-groups = "0.2.1"
+saorsa-gossip-presence = "0.2.1"
+saorsa-gossip-crdt-sync = "0.2.1"
 ```
+
+> NOTE: A few crates are still stabilising; if `cargo add` cannot find a version yet, depend on the git repository for now:
+> `saorsa-gossip-pubsub = { git = "https://github.com/dirvine/saorsa-gossip", tag = "v0.2.1" }`
 
 ### Basic Usage
 
 ```rust
-use saorsa_gossip_types::{TopicId, PeerId};
-use saorsa_gossip_membership::{Membership, HyParViewMembership};
+use std::{net::SocketAddr, sync::Arc};
+
+use bytes::Bytes;
+use saorsa_gossip_identity::MlDsaKeyPair;
+use saorsa_gossip_membership::{
+    Membership, HyParViewMembership, DEFAULT_ACTIVE_DEGREE, DEFAULT_PASSIVE_DEGREE,
+};
 use saorsa_gossip_pubsub::{PubSub, PlumtreePubSub};
+use saorsa_gossip_transport::AntQuicTransport;
+use saorsa_gossip_types::{PeerId, TopicId};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Create a topic for your group
-    let topic = TopicId::new([1u8; 32]);
+    let topic = TopicId::from_entity("demo-room");
+    let peer_id = PeerId::new([7u8; 32]);
+    let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
+    let transport = Arc::new(AntQuicTransport::new(bind_addr, vec![]).await?);
+    let signing_key = MlDsaKeyPair::generate()?;
 
-    // Initialize membership layer
-    let membership = HyParViewMembership::default();
-    membership.join(vec!["127.0.0.1:8080".to_string()]).await?;
+    // Membership can run without seeds for local experimentation.
+    let membership = HyParViewMembership::new(
+        peer_id,
+        DEFAULT_ACTIVE_DEGREE,
+        DEFAULT_PASSIVE_DEGREE,
+        transport.clone(),
+    );
+    membership.join(vec![]).await?;
 
-    // Initialize pub/sub
-    let pubsub = PlumtreePubSub::new();
+    // PubSub requires a signing key and the shared transport.
+    let pubsub = PlumtreePubSub::new(peer_id, transport.clone(), signing_key);
     let mut rx = pubsub.subscribe(topic);
+    pubsub
+        .initialize_topic_peers(topic, membership.active_view())
+        .await;
 
-    // Publish a message
-    pubsub.publish(topic, bytes::Bytes::from("Hello, gossip!")).await?;
-
-    // Receive messages
-    while let Some((peer_id, data)) = rx.recv().await {
-        println!("Received from {}: {:?}", peer_id, data);
+    // Publish and observe the loopback delivery.
+    pubsub.publish(topic, Bytes::from("Hello, gossip!")).await?;
+    if let Some((from, data)) = rx.recv().await {
+        println!("Received from {}: {:?}", from, data);
     }
 
     Ok(())
@@ -423,7 +444,7 @@ async fn main() -> anyhow::Result<()> {
 
 ### Presence & Discovery
 
-- **Beacons**: MLS exporter-derived tags, ML-DSA signed
+- **Beacons**: MLS exporter-derived tags, ML-DSA signed _(alpha builds still use deterministic placeholders until full MLS exporter integration lands; treat them as non-private)_
   - TTL: 10-15 minutes
   - Encrypted to group with ChaCha20-Poly1305
 
@@ -464,118 +485,56 @@ Provided by:
 | Replay | Per-topic nonces, signature checks, expiry |
 | Partition | Plumtree lazy links, anti-entropy |
 
-## 🧪 Chaos Engineering & Testing
+## 🧪 Testing
 
-Saorsa Gossip includes enterprise-grade testing infrastructure with **242 tests** covering unit, integration, property-based, end-to-end workflows, and chaos engineering.
+> **Real hardware only.** As of January 16, 2026 we removed the deterministic simulator, mock transports, and synthetic load crates. Every test now speaks to a real ant-quic endpoint so local verification exercises the exact networking stack that ships to production.
 
-### Chaos Testing Framework
+### Automated Coverage
 
-The network simulator enables deterministic testing of gossip protocols under extreme failure conditions:
-
-```rust
-use saorsa_gossip_simulator::{NetworkSimulator, ChaosInjector, ChaosEvent};
-use std::time::Duration;
-
-// Create simulator with 5 nodes
-let mut simulator = NetworkSimulator::new()
-    .with_nodes(5)
-    .with_topology(Topology::Mesh)
-    .with_time_dilation(10.0); // 10x faster testing
-
-// Inject chaos events
-let chaos_injector = ChaosInjector::new();
-chaos_injector.inject_event(ChaosEvent::NetworkPartition {
-    group_a: vec![0, 1],
-    group_b: vec![2, 3, 4],
-    duration: Duration::from_secs(10),
-}).await?;
-```
-
-**Chaos Events Supported:**
-- ✅ **Network Partitions** - Split-brain scenarios
-- ✅ **Node Failures** - Crash and restart simulations
-- ✅ **Packet Loss** - Up to 30% message loss
-- ✅ **Latency Spikes** - Up to 1000ms delays
-- ✅ **Bandwidth Throttling** - Congestion simulation
-- ✅ **Clock Skew** - Timing issues
-- ✅ **Combined Scenarios** - Multiple failures simultaneously
-
-**Real Protocol Testing:**
-
-The simulator integrates with actual gossip protocols (not mocks):
-- CRDT convergence under network partition
-- Membership convergence under node churn
-- PubSub delivery under packet loss
-- Combined multi-failure scenarios
-
-### Test Suite Overview
-
-| Category | Count | Coverage |
-|----------|-------|----------|
-| **Unit Tests** | 188+ | All crates - types, identity, transport, protocols |
-| **Integration Tests** | 5 | Simulator, chaos injection, protocol integration |
-| **Property Tests** | 10 | CRDT convergence, message ID determinism |
-| **E2E Workflows** | 7 | Complete user journeys (bootstrap → sync) |
-| **Chaos+Gossip Tests** | 5 | Real protocols under extreme failures |
-| **Doctests** | 13 | API examples verification |
-| **Simulator Tests** | 14 | Network simulation correctness |
-| **Total** | **242** | 100% passing ✅ |
+| Category | Description |
+|----------|-------------|
+| **Unit tests** | `cargo test --all` covers membership, pubsub, presence, rendezvous, transport, and coordinator logic using in-process ant-quic nodes. |
+| **Doctests** | API snippets in this repository are compiled and executed with `cargo test --doc`. |
+| **Transport benches** | `examples/throughput_test.rs` and `examples/transport_benchmark.rs` push real QUIC traffic between two processes to capture throughput/latency numbers. |
 
 ### Running Tests
 
 ```bash
-# All tests
-cargo test
+# Run every unit test (real sockets will bind on 127.0.0.1)
+cargo test --all
 
-# Chaos engineering tests
-cargo test --package saorsa-gossip-integration-tests --test chaos_gossip_integration
-
-# Property-based tests  
-cargo test --package saorsa-gossip-integration-tests --test property_tests
-
-# E2E workflow tests
-cargo test --package saorsa-gossip-integration-tests --test e2e_workflow_tests
-
-# Run examples
-cargo run --example chaos_demo --package saorsa-gossip-simulator
-cargo run --example load_test_demo --package saorsa-gossip-load-test
+# Verify public API snippets
+cargo test --doc
 ```
 
-### Load Testing
+### Real-Network Drills
 
-The load testing framework validates performance under realistic conditions:
+Use the shipping examples to exercise the QUIC stack end-to-end:
 
-```rust
-use saorsa_gossip_load_test::{LoadTestRunner, LoadScenario, MessagePattern};
+```bash
+# Terminal 1 – receive large payloads over QUIC
+cargo run --example throughput_test --release -- receiver --bind 127.0.0.1:8000
 
-let scenario = LoadScenario {
-    name: "high_throughput".to_string(),
-    duration: Duration::from_secs(60),
-    num_peers: 100,
-    message_pattern: MessagePattern::Constant {
-        rate_per_second: 1000,
-        message_size: 1024,
-    },
-    topology: Topology::Mesh,
-    chaos_events: vec![], // Optional chaos during load
-};
+# Terminal 2 – stream payloads to the receiver
+cargo run --example throughput_test --release -- sender --coordinator 127.0.0.1:8000 --bind 127.0.0.1:9000
 
-let runner = LoadTestRunner::new()?;
-let results = runner.run_scenario(scenario, simulator).await?;
+# Run the full transport benchmark (coordinator + benchmark client)
+cargo run --example transport_benchmark --release -- coordinator --bind 127.0.0.1:8000
+cargo run --example transport_benchmark --release -- benchmark --coordinator 127.0.0.1:8000 --bind 127.0.0.1:9000
 ```
 
-**Message Patterns:**
-- **Constant** - Steady message rate
-- **Burst** - Periodic message floods
-- **Ramp-up** - Gradually increasing load
-- **Realistic** - Simulated user behavior
+These programs do not stub anything—they start real Ant-QUIC nodes, perform ML-KEM+ML-DSA handshakes, and transfer actual data across the multiplexed membership/pubsub/bulk streams. That matches the runtime used in production and in the `communitas` consumer.
 
-**Metrics Collected:**
-- Throughput (messages/second)
-- Latency percentiles (P50, P95, P99)
-- Message loss rate
-- Memory usage
-- CPU utilization
+### Manual System Testing
+
+Spin up the coordinator and CLI binaries to validate bootstrap + gossip flows over real sockets:
+
+```bash
+cargo run --bin coordinator -- --bind 0.0.0.0:9090
+cargo run --bin cli -- --coordinator 127.0.0.1:9090 --bind 127.0.0.1:9100
+```
+
+With two CLI instances joining the same coordinator you'll observe membership churn, FOAF lookups, and pub/sub fan-out exactly as they will behave on the public network.
 
 ## 🛠️ Development
 
@@ -642,7 +601,7 @@ We document significant architectural decisions in ADRs. These explain *why* we 
 | [ADR-007](docs/adr/ADR-007-foaf-discovery.md) | FOAF Discovery | Privacy-preserving bounded social graph walks |
 | [ADR-008](docs/adr/ADR-008-stream-multiplexing.md) | Stream Multiplexing | 3-stream QUIC design for protocol isolation |
 | [ADR-009](docs/adr/ADR-009-peer-scoring.md) | Peer Scoring | Multi-metric quality tracking for routing |
-| [ADR-010](docs/adr/ADR-010-deterministic-simulator.md) | Deterministic Simulator | PCG-based reproducible chaos testing |
+| [ADR-010](docs/adr/ADR-010-deterministic-simulator.md) | Deterministic Simulator *(retired)* | Historical record of the removed simulator effort |
 
 See [docs/adr/README.md](docs/adr/README.md) for the complete index and ADR template.
 
@@ -697,12 +656,11 @@ See [docs/adr/README.md](docs/adr/README.md) for the complete index and ADR temp
 - [ ] Saorsa Sites (website publishing)
 - [ ] Complete anti-entropy with message sketches
 
-### ✅ Phase 6: Production Hardening (Complete - v0.1.8)
-- [x] **Chaos Engineering Framework** - Network simulator with deterministic failure injection
-- [x] **Load Testing Framework** - 4 message patterns with comprehensive metrics
-- [x] **Property-Based Testing** - 10 tests verifying protocol invariants
-- [x] **End-to-End Workflows** - 7 complete user journey tests
-- [x] **242 Tests** - All passing with zero warnings
+### ✅ Phase 6: Production Hardening (Complete - v0.2.1)
+- [x] **Real-network benchmarks** - `throughput_test` + `transport_benchmark` running against ant-quic
+- [x] **Runtime crate + operator tooling** - deployable coordinator + CLI using the shared transport
+- [x] **Bootstrap cache integration** - persistent peer cache via ant-quic's `BootstrapCache`
+- [x] **PQC-only handshake verification** - ML-KEM-768 + ML-DSA-65 enforcement across transport/membership/pubsub
 - [ ] 100-node test harness
 - [ ] Security audit
 - [ ] Production deployment guide
@@ -808,8 +766,8 @@ Inspired by:
 
 ---
 
-**✅ Status v0.1.8**: Production-ready foundation with complete post-quantum cryptography and **enterprise-grade chaos engineering**. Core gossip protocols implemented with real ML-DSA-65 signatures, BLAKE3 KDF, and deployable coordinator binary. **242 tests passing** (unit, integration, property-based, E2E workflows, chaos+gossip) with zero warnings. Network simulator with deterministic failure injection. Load testing framework with 4 message patterns. Published to crates.io.
+**✅ Status (Jan 16 2026)**: v0.2.1 ships a production-ready QUIC + PQC gossip stack with deployable coordinator/CLI binaries and no simulators or mock transports. All tests operate over real sockets and ML-KEM/ML-DSA handshakes. The coordinator advert/gossip cache, membership, pubsub, and runtime crates are consumed by Communitas unchanged.
 
-**Next Steps**: Advanced features (IBLT reconciliation, peer scoring), security audit, and Saorsa Sites implementation.
+**Next Steps**: tighten ops tooling (metrics + alerting around real transports), finalize IBLT reconciliation + peer scoring, and extend the runtime glue used by Communitas Sites.
 
 See [DESIGN.md](DESIGN.md) for the complete technical specification and implementation roadmap.

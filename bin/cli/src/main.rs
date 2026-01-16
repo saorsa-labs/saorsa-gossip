@@ -22,8 +22,15 @@
 //! ```
 
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use clap::{Parser, Subcommand};
+use saorsa_gossip_coordinator::CoordinatorAdvert;
+use saorsa_gossip_transport::GossipTransport;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::{oneshot, Mutex};
 
 mod updater;
 
@@ -398,7 +405,7 @@ async fn handle_identity(action: IdentityAction, config_dir: &std::path::Path) -
 /// Handle network commands
 async fn handle_network(action: NetworkAction, config_dir: &std::path::Path) -> Result<()> {
     use saorsa_gossip_identity::Identity;
-    use saorsa_gossip_transport::AntQuicTransport;
+    use saorsa_gossip_transport::{AntQuicTransport, GossipStreamType, GossipTransport};
 
     match action {
         NetworkAction::Join {
@@ -426,7 +433,16 @@ async fn handle_network(action: NetworkAction, config_dir: &std::path::Path) -> 
 
             // Create transport (automatically connects to known peers)
             println!("  Creating transport and establishing QUIC connection...");
-            let transport = AntQuicTransport::new(bind_addr, vec![coordinator_addr]).await?;
+            let transport =
+                Arc::new(AntQuicTransport::new(bind_addr, vec![coordinator_addr]).await?);
+            let coordinator_cache: CoordinatorAdvertCache = Arc::new(Mutex::new(HashMap::new()));
+            let (pong_tx, pong_rx) = oneshot::channel();
+            let listener_transport = transport.clone();
+            tokio::spawn(run_transport_listener(
+                listener_transport,
+                Some(pong_tx),
+                coordinator_cache,
+            ));
 
             println!("\n✓ Transport initialized and connected!");
             println!(
@@ -435,50 +451,50 @@ async fn handle_network(action: NetworkAction, config_dir: &std::path::Path) -> 
             );
             println!("  Ant PeerId: {:?}", transport.ant_peer_id());
 
-            // Send a PING to coordinator to test message exchange
-            println!("\n📡 Sending PING to coordinator...");
-            use saorsa_gossip_transport::GossipTransport;
-            use std::time::Instant;
+            // Discover the coordinator peer ID via a bootstrap dial.
+            println!("\n📡 Dialing coordinator bootstrap endpoint...");
+            let coordinator_peer_id = match transport.dial_bootstrap(coordinator_addr).await {
+                Ok(id) => {
+                    println!("  Coordinator PeerId: {}", hex::encode(id.as_bytes()));
+                    Some(id)
+                }
+                Err(e) => {
+                    println!("❌ Failed to dial bootstrap node: {e}");
+                    println!("   Continuing without ping; check coordinator logs.");
+                    None
+                }
+            };
 
-            let ping_start = Instant::now();
-
-            // Get coordinator's peer ID (we need to discover this from bootstrap)
-            // For now, we'll send to the transport and handle it on coordinator side
-            // TODO: Get actual coordinator peer ID from discovery
-
-            // Try to receive a message with timeout to test connectivity
-            println!("⏳ Waiting for coordinator response (5s timeout)...");
-
-            let receive_task = tokio::spawn({
-                let transport = std::sync::Arc::new(transport);
-                async move {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        transport.receive_message(),
+            if let Some(coordinator_peer_id) = coordinator_peer_id {
+                // Send a PING to coordinator to test message exchange
+                println!("\n📡 Sending PING to coordinator...");
+                let ping_start = Instant::now();
+                if let Err(e) = transport
+                    .send_to_peer(
+                        coordinator_peer_id,
+                        GossipStreamType::Membership,
+                        Bytes::from_static(b"PING"),
                     )
                     .await
-                    {
-                        Ok(Ok((peer_id, stream_type, data))) => Some((peer_id, stream_type, data)),
-                        Ok(Err(e)) => {
-                            println!("❌ Error receiving: {}", e);
-                            None
+                {
+                    println!("❌ Failed to send PING: {e}");
+                } else {
+                    // Try to receive a message with timeout to test connectivity
+                    println!("⏳ Waiting for coordinator response (5s timeout)...");
+
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), pong_rx).await {
+                        Ok(Ok(())) => {
+                            let rtt = ping_start.elapsed();
+                            println!("✓ Received PONG in {:?}", rtt);
+                        }
+                        Ok(Err(_)) => {
+                            println!("⚠️  Listener dropped before PONG notification");
                         }
                         Err(_) => {
                             println!("⏱️  Timeout waiting for response");
-                            None
                         }
                     }
                 }
-            });
-
-            if let Ok(Some((peer_id, _stream_type, data))) = receive_task.await {
-                let rtt = ping_start.elapsed();
-                println!(
-                    "✓ Received response from peer {}",
-                    hex::encode(peer_id.as_bytes())
-                );
-                println!("  RTT: {:?}", rtt);
-                println!("  Data: {}", String::from_utf8_lossy(&data));
             }
 
             println!("\n⚠️  Full network integration in progress!");
@@ -624,6 +640,92 @@ fn path_to_string(path: &std::path::Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| anyhow!("Path contains invalid UTF-8: {}", path.display()))
+}
+
+type CoordinatorAdvertCache = Arc<Mutex<HashMap<saorsa_gossip_types::PeerId, CoordinatorAdvert>>>;
+
+async fn run_transport_listener(
+    transport: Arc<saorsa_gossip_transport::AntQuicTransport>,
+    mut pong_tx: Option<oneshot::Sender<()>>,
+    cache: CoordinatorAdvertCache,
+) {
+    loop {
+        match transport.receive_message().await {
+            Ok((peer_id, stream_type, data)) => match stream_type {
+                saorsa_gossip_transport::GossipStreamType::Membership => {
+                    if data.as_ref() == b"PONG" {
+                        println!("📨 PONG received from {}", hex::encode(peer_id.as_bytes()));
+                        if let Some(tx) = pong_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    } else {
+                        tracing::trace!(
+                            peer = %hex::encode(peer_id.as_bytes()),
+                            "Membership message ({} bytes)",
+                            data.len()
+                        );
+                    }
+                }
+                saorsa_gossip_transport::GossipStreamType::PubSub => {
+                    match CoordinatorAdvert::from_bytes(data.as_ref()) {
+                        Ok(advert) => {
+                            if !advert.is_valid() {
+                                tracing::debug!(
+                                    peer = %hex::encode(advert.peer.as_bytes()),
+                                    "Discarding expired coordinator advert"
+                                );
+                                continue;
+                            }
+
+                            let mut cache_guard = cache.lock().await;
+                            cache_guard.insert(advert.peer, advert.clone());
+                            let known = cache_guard.len();
+                            drop(cache_guard);
+
+                            let addr_summary = if advert.addr_hints.is_empty() {
+                                "<none>".to_string()
+                            } else {
+                                advert
+                                    .addr_hints
+                                    .iter()
+                                    .map(|hint| hint.addr.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+
+                            println!(
+                                "📣 Coordinator advert from {} roles={:?} nat={:?} addrs=[{}] (known: {})",
+                                hex::encode(advert.peer.as_bytes()),
+                                advert.roles,
+                                advert.nat_class,
+                                addr_summary,
+                                known
+                            );
+                        }
+                        Err(_) => {
+                            tracing::trace!(
+                                peer = %hex::encode(peer_id.as_bytes()),
+                                "Non-advert pubsub payload ({} bytes)",
+                                data.len()
+                            );
+                        }
+                    }
+                }
+                other => {
+                    tracing::trace!(
+                        peer = %hex::encode(peer_id.as_bytes()),
+                        ?other,
+                        "Ignoring gossip message ({} bytes)",
+                        data.len()
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::debug!("Transport listener exiting: {e}");
+                break;
+            }
+        }
+    }
 }
 
 /// Handle update command

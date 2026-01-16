@@ -9,8 +9,11 @@ description = "QUIC transport for Saorsa Gossip with ant-quic, NAT traversal, an
 keywords = ["p2p", "gossip", "quic", "nat-traversal", "networking"]
 categories = ["network-programming", "asynchronous"]
 
+[features]
+test-helpers = []
+
 [dependencies]
-saorsa-gossip-types = { version = "0.2.0", path = "../types" }
+saorsa-gossip-types = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

@@ -10,7 +10,7 @@ keywords = ["p2p", "gossip", "rendezvous", "discovery", "sharding"]
 categories = ["network-programming"]
 
 [dependencies]
-saorsa-gossip-types = { version = "0.2.0", path = "../types" }
+saorsa-gossip-types = { workspace = true }
 saorsa-pqc = { workspace = true }
 serde = { workspace = true }
 ciborium = "0.2"

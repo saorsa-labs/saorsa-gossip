@@ -146,7 +146,7 @@ Result: High-priority traffic not blocked by bulk data loss
 
 ```rust
 // When network path changes (WiFi → cellular)
-impl QuicTransport {
+impl AntQuicTransport {
     fn on_path_change(&mut self, new_addr: SocketAddr) {
         // QUIC connection IDs allow migration without reconnection
         self.connection.migrate_to(new_addr);
@@ -159,7 +159,7 @@ impl QuicTransport {
 
 ```rust
 // Reconnecting to known peer
-impl QuicTransport {
+impl AntQuicTransport {
     async fn reconnect(&mut self, peer: PeerId) -> Result<()> {
         if let Some(session_ticket) = self.session_cache.get(&peer) {
             // 0-RTT: Send data immediately with resumption
@@ -217,7 +217,7 @@ impl WireMessage {
 QUIC's congestion control applies per-connection, with stream priorities:
 
 ```rust
-impl QuicTransport {
+impl AntQuicTransport {
     fn configure_priorities(&self) {
         // Membership stream: never throttled
         self.connection.set_stream_priority(0, StreamPriority::Highest);
@@ -234,7 +234,7 @@ impl QuicTransport {
 ### Connection Lifecycle
 
 ```rust
-impl QuicTransport {
+impl AntQuicTransport {
     /// Full connection establishment flow
     async fn establish_connection(&mut self, peer: PeerId, addr: SocketAddr) -> Result<()> {
         // 1. QUIC handshake (ML-KEM-768 key exchange, ML-DSA-65 cert)

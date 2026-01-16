@@ -1002,35 +1002,41 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saorsa_gossip_transport::{QuicTransport, TransportConfig};
+    use saorsa_gossip_transport::AntQuicTransport;
+    use std::net::SocketAddr;
 
-    fn test_transport() -> Arc<QuicTransport> {
-        Arc::new(QuicTransport::new(TransportConfig::default()))
+    async fn test_transport() -> Arc<AntQuicTransport> {
+        let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+        Arc::new(
+            AntQuicTransport::new(bind, vec![])
+                .await
+                .expect("transport"),
+        )
     }
 
     fn test_peer_id() -> PeerId {
         PeerId::new([0u8; 32])
     }
 
-    fn test_membership() -> HyParViewMembership<QuicTransport> {
+    async fn test_membership() -> HyParViewMembership<AntQuicTransport> {
         HyParViewMembership::new(
             test_peer_id(),
             DEFAULT_ACTIVE_DEGREE,
             DEFAULT_PASSIVE_DEGREE,
-            test_transport(),
+            test_transport().await,
         )
     }
 
     #[tokio::test]
     async fn test_hyparview_creation() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         assert_eq!(membership.active_view().len(), 0);
         assert_eq!(membership.passive_view().len(), 0);
     }
 
     #[tokio::test]
     async fn test_add_active_peer() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let peer = PeerId::new([1u8; 32]);
 
         membership.add_active(peer).await.ok();
@@ -1041,7 +1047,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_active_peer() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let peer = PeerId::new([1u8; 32]);
 
         membership.add_active(peer).await.ok();
@@ -1053,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_active_view_capacity() {
-        let transport = test_transport();
+        let transport = test_transport().await;
         let membership = HyParViewMembership::new(test_peer_id(), 3, 10, transport);
 
         // Add 5 peers (more than capacity)
@@ -1073,7 +1079,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_swim_states() {
-        let transport = test_transport();
+        let transport = test_transport().await;
         let swim = SwimDetector::new(1, 3, transport);
         let peer = PeerId::new([1u8; 32]);
 
@@ -1089,7 +1095,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_swim_suspect_timeout() {
-        let transport = test_transport();
+        let transport = test_transport().await;
         let swim = SwimDetector::new(1, 1, transport); // 1s timeout
         let peer = PeerId::new([1u8; 32]);
 
@@ -1105,7 +1111,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_promote_from_passive() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let peer = PeerId::new([1u8; 32]);
 
         // Add to passive
@@ -1126,7 +1132,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_degree_maintenance() {
-        let transport = test_transport();
+        let transport = test_transport().await;
         let membership = HyParViewMembership::new(test_peer_id(), 5, 20, transport);
 
         // Add many peers to passive
@@ -1147,7 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_peers_in_state() {
-        let transport = test_transport();
+        let transport = test_transport().await;
         let swim = SwimDetector::new(1, 100, transport); // Long timeout so background task doesn't interfere
 
         let peer1 = PeerId::new([1u8; 32]);
@@ -1176,7 +1182,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shuffle_returns_ok_with_empty_active_view() {
-        let membership = test_membership();
+        let membership = test_membership().await;
 
         // With empty active view, shuffle should return Ok but do nothing
         let result = membership.shuffle().await;
@@ -1185,7 +1191,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shuffle_builds_peer_list() {
-        let membership = test_membership();
+        let membership = test_membership().await;
 
         // Add peers to active and passive views
         let active_peer = PeerId::new([1u8; 32]);
@@ -1203,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sample_active_returns_correct_count() {
-        let membership = test_membership();
+        let membership = test_membership().await;
 
         // Add 5 peers to active
         for i in 1..=5 {
@@ -1218,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sample_passive_returns_correct_count() {
-        let membership = test_membership();
+        let membership = test_membership().await;
 
         // Add 5 peers to passive
         for i in 1..=5 {
@@ -1232,7 +1238,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_shuffle_reply_adds_to_passive() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let peer1 = PeerId::new([1u8; 32]);
         let peer2 = PeerId::new([2u8; 32]);
 
@@ -1251,7 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_shuffle_reply_excludes_self() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let local_peer = test_peer_id(); // Same as membership's local peer
         let other_peer = PeerId::new([1u8; 32]);
 
@@ -1269,7 +1275,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_shuffle_terminal_node_attempts_reply() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let sender = PeerId::new([1u8; 32]);
         let shuffle_peer = PeerId::new([2u8; 32]);
 
@@ -1289,7 +1295,7 @@ mod tests {
     async fn test_handle_shuffle_reply_integrates_peers_correctly() {
         // This tests the actual peer integration logic that handle_shuffle uses
         // (handle_shuffle_reply is the same code path for integrating received peers)
-        let membership = test_membership();
+        let membership = test_membership().await;
         let shuffle_peer = PeerId::new([2u8; 32]);
 
         // Directly verify the add_to_passive logic that handle_shuffle uses
@@ -1301,7 +1307,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_to_passive_excludes_active_peers() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let peer = PeerId::new([1u8; 32]);
 
         // Add peer to active view first
@@ -1317,7 +1323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_to_passive_excludes_self() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let local_peer = test_peer_id();
 
         // Try to add self to passive
@@ -1329,7 +1335,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_random_active_peer_except() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let peer1 = PeerId::new([1u8; 32]);
         let peer2 = PeerId::new([2u8; 32]);
 
@@ -1344,7 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_random_active_peer_except_returns_none_when_only_excluded() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let peer1 = PeerId::new([1u8; 32]);
 
         membership.add_active(peer1).await.ok();
@@ -1356,7 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_shuffle_forwards_when_ttl_positive_and_active_peers_exist() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let sender = PeerId::new([1u8; 32]);
         let forwarder = PeerId::new([2u8; 32]);
         let shuffle_peer = PeerId::new([3u8; 32]);
@@ -1370,7 +1376,7 @@ mod tests {
             .handle_shuffle(sender, vec![shuffle_peer], 2)
             .await;
 
-        // Should fail because mock transport can't actually send
+        // Should fail because no forwarding link is established yet
         assert!(result.is_err());
 
         // Peers should NOT be integrated when forwarding (only terminal nodes integrate)
@@ -1383,7 +1389,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_shuffle_becomes_terminal_when_sender_is_only_active_peer() {
-        let membership = test_membership();
+        let membership = test_membership().await;
         let sender = PeerId::new([1u8; 32]);
         let shuffle_peer = PeerId::new([2u8; 32]);
 

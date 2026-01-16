@@ -10,7 +10,7 @@ keywords = ["post-quantum", "ml-dsa", "identity", "cryptography", "pqc"]
 categories = ["cryptography"]
 
 [dependencies]
-saorsa-gossip-types = { version = "0.2.0", path = "../types" }
+saorsa-gossip-types = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 blake3 = { workspace = true }

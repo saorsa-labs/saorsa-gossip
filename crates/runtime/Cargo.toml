@@ -1,0 +1,31 @@
+[package]
+name = "saorsa-gossip-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "High-level runtime for assembling Saorsa gossip components"
+keywords = ["p2p", "gossip", "runtime", "saorsa"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+tracing = { workspace = true }
+ciborium = "0.2"
+blake3 = { workspace = true }
+rand = { workspace = true }
+
+saorsa-gossip-coordinator = { workspace = true }
+saorsa-gossip-groups = { workspace = true }
+saorsa-gossip-identity = { workspace = true }
+saorsa-gossip-membership = { workspace = true }
+saorsa-gossip-presence = { workspace = true }
+saorsa-gossip-pubsub = { workspace = true }
+saorsa-gossip-rendezvous = { workspace = true }
+saorsa-gossip-transport = { workspace = true }
+saorsa-gossip-types = { workspace = true }

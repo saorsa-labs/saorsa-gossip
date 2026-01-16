@@ -488,6 +488,19 @@ impl GossipTransport for AntQuicTransport {
                     gossip_id, addr, rtt_ms
                 );
 
+                if gossip_id != peer {
+                    warn!(
+                        "Connected to peer {} at {} but expected {}",
+                        gossip_id, addr, peer
+                    );
+                    self.remove_peer(&peer).await;
+                    return Err(anyhow!(
+                        "Connected to unexpected peer {} when dialing {}",
+                        gossip_id,
+                        peer
+                    ));
+                }
+
                 // Track the connection
                 self.add_peer(gossip_id, addr).await;
 
@@ -722,8 +735,8 @@ mod tests {
     fn test_ant_quic_transport_config_with_keypair_bytes() {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
         // Test that config can hold keypair bytes (actual key generation tested separately)
-        let mock_public_key = vec![1u8; 2592]; // ML-DSA-65 public key size
-        let mock_secret_key = vec![2u8; 4032]; // ML-DSA-65 secret key size
+        let test_public_key = vec![1u8; 2592]; // ML-DSA-65 public key size
+        let test_secret_key = vec![2u8; 4032]; // ML-DSA-65 secret key size
 
         let config = AntQuicTransportConfig {
             bind_addr,
@@ -731,7 +744,7 @@ mod tests {
             channel_capacity: 10_000,
             stream_read_limit: 100 * 1024 * 1024,
             max_peers: 1_000,
-            keypair: Some((mock_public_key.clone(), mock_secret_key.clone())),
+            keypair: Some((test_public_key.clone(), test_secret_key.clone())),
         };
 
         assert!(config.keypair.is_some());

@@ -16,7 +16,7 @@ Saorsa Gossip is a **post-quantum secure, fully decentralized gossip overlay net
 2. **Quantum-Safe from Day 1** - FIPS-approved post-quantum cryptography only
 3. **Partition Tolerance** - Local-first CRDTs enable offline operation
 4. **Privacy Preservation** - FOAF discovery limits social graph exposure
-5. **Production Ready** - Chaos-tested with deterministic simulator
+5. **Production Ready** - Real-network testing only; no simulators or mocks
 
 ## Index
 
@@ -31,7 +31,7 @@ Saorsa Gossip is a **post-quantum secure, fully decentralized gossip overlay net
 | [ADR-007](ADR-007-foaf-discovery.md) | FOAF Privacy-Preserving Discovery | Accepted | 2025-12-24 |
 | [ADR-008](ADR-008-stream-multiplexing.md) | QUIC Stream Multiplexing Design | Accepted | 2025-12-24 |
 | [ADR-009](ADR-009-peer-scoring.md) | Peer Scoring Architecture | Accepted | 2025-12-24 |
-| [ADR-010](ADR-010-deterministic-simulator.md) | Deterministic Network Simulator | Accepted | 2025-12-24 |
+| [ADR-010](ADR-010-deterministic-simulator.md) | Deterministic Network Simulator | **Retired** | 2026-01-16 |
 
 ## Architecture Layers
 
@@ -85,8 +85,9 @@ Saorsa Gossip is a **post-quantum secure, fully decentralized gossip overlay net
 | `groups` | MLS group key derivation | ADR-006 |
 | `presence` | Encrypted presence beacons, FOAF | ADR-007 |
 | `crdt-sync` | Delta-CRDTs + anti-entropy | ADR-003 |
-| `simulator` | Deterministic chaos testing | ADR-010 |
-| `load-test` | Performance benchmarking | - |
+| `runtime` | Glue orchestration for coordinators/sites | ADR-001, ADR-004 |
+| *(retired)* `simulator` | Deterministic chaos testing (removed Jan 2026) | ADR-010 |
+| *(retired)* `load-test` | Synthetic load harness (removed Jan 2026) | - |
 
 ## ADR Template
 

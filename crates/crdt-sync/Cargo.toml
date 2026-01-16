@@ -10,8 +10,8 @@ keywords = ["crdt", "distributed", "synchronization", "delta-crdt", "or-set"]
 categories = ["data-structures", "algorithms"]
 
 [dependencies]
-saorsa-gossip-types = { version = "0.2.0", path = "../types" }
-saorsa-gossip-transport = { version = "0.2.0", path = "../transport" }
+saorsa-gossip-types = { workspace = true }
+saorsa-gossip-transport = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

@@ -757,7 +757,8 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use saorsa_gossip_transport::{QuicTransport, TransportConfig};
+    use saorsa_gossip_transport::AntQuicTransport;
+    use std::net::SocketAddr;
 
     fn test_peer_id(id: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -765,8 +766,13 @@ mod tests {
         PeerId::new(bytes)
     }
 
-    fn test_transport() -> Arc<QuicTransport> {
-        Arc::new(QuicTransport::new(TransportConfig::default()))
+    async fn test_transport() -> Arc<AntQuicTransport> {
+        let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+        Arc::new(
+            AntQuicTransport::new(bind, vec![])
+                .await
+                .expect("transport"),
+        )
     }
 
     fn test_signing_key() -> saorsa_gossip_identity::MlDsaKeyPair {
@@ -776,7 +782,7 @@ mod tests {
     #[tokio::test]
     async fn test_pubsub_creation() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport();
+        let transport = test_transport().await;
         let signing_key = test_signing_key();
         let _pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
     }
@@ -784,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn test_publish_and_subscribe() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport();
+        let transport = test_transport().await;
         let signing_key = test_signing_key();
         let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
         let topic = TopicId::new([1u8; 32]);
@@ -806,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_caching() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport();
+        let transport = test_transport().await;
         let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
         let topic = TopicId::new([1u8; 32]);
 
@@ -824,7 +830,7 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_detection_prune() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport();
+        let transport = test_transport().await;
         let signing_key = test_signing_key();
         let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
         let topic = TopicId::new([1u8; 32]);
@@ -875,7 +881,7 @@ mod tests {
     #[tokio::test]
     async fn test_ihave_handling() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport();
+        let transport = test_transport().await;
         let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
         let topic = TopicId::new([1u8; 32]);
         let from_peer = test_peer_id(2);
@@ -896,7 +902,7 @@ mod tests {
     #[tokio::test]
     async fn test_iwant_graft() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport();
+        let transport = test_transport().await;
         let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
         let topic = TopicId::new([1u8; 32]);
         let from_peer = test_peer_id(2);
@@ -930,7 +936,7 @@ mod tests {
     #[tokio::test]
     async fn test_degree_maintenance() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport();
+        let transport = test_transport().await;
         let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
         let topic = TopicId::new([1u8; 32]);
 
@@ -957,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_expiration() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport();
+        let transport = test_transport().await;
         let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
         let topic = TopicId::new([1u8; 32]);
 
@@ -989,7 +995,7 @@ mod tests {
 
         let keypair = MlDsaKeyPair::generate().expect("keypair");
         let peer_id = PeerId::new([1u8; 32]);
-        let transport = test_transport();
+        let transport = test_transport().await;
 
         // Create PlumtreePubSub with signing key
         let _pubsub = PlumtreePubSub::new(peer_id, transport, keypair.clone());
@@ -1064,7 +1070,7 @@ mod tests {
 
         let keypair = MlDsaKeyPair::generate().expect("keypair");
         let peer_id = PeerId::new([1u8; 32]);
-        let transport = test_transport();
+        let transport = test_transport().await;
 
         // Create pubsub with signing key
         let pubsub = PlumtreePubSub::new(peer_id, transport, keypair.clone());

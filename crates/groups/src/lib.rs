@@ -23,6 +23,8 @@ pub struct GroupContext {
     pub cipher_suite: CipherSuite,
     /// Current epoch
     pub epoch: u64,
+    /// Optional MLS exporter secret used for presence beacons
+    presence_exporter: Option<[u8; 32]>,
 }
 
 impl GroupContext {
@@ -32,6 +34,15 @@ impl GroupContext {
             topic_id,
             cipher_suite: CipherSuite::MlKem768MlDsa65,
             epoch: 0,
+            presence_exporter: None,
+        }
+    }
+
+    /// Create a group context with a known MLS exporter secret
+    pub fn with_presence_exporter(topic_id: TopicId, exporter_secret: [u8; 32]) -> Self {
+        Self {
+            presence_exporter: Some(exporter_secret),
+            ..Self::new(topic_id)
         }
     }
 
@@ -50,6 +61,16 @@ impl GroupContext {
     pub fn from_entity(entity_id: impl AsRef<[u8]>) -> Self {
         let topic_id = TopicId::from_entity(entity_id);
         Self::new(topic_id)
+    }
+
+    /// Set the MLS exporter secret used for presence beacons.
+    pub fn set_presence_exporter(&mut self, exporter_secret: [u8; 32]) {
+        self.presence_exporter = Some(exporter_secret);
+    }
+
+    /// Get the configured MLS exporter secret, if any.
+    pub fn presence_exporter(&self) -> Option<[u8; 32]> {
+        self.presence_exporter
     }
 
     /// Advance to next epoch
@@ -95,8 +116,17 @@ mod tests {
         let mut ctx = GroupContext::new(topic);
 
         assert_eq!(ctx.epoch, 0);
+        assert!(ctx.presence_exporter().is_none());
         ctx.next_epoch();
         assert_eq!(ctx.epoch, 1);
+    }
+
+    #[test]
+    fn test_group_context_with_presence_exporter() {
+        let topic = TopicId::new([9u8; 32]);
+        let secret = [7u8; 32];
+        let ctx = GroupContext::with_presence_exporter(topic, secret);
+        assert_eq!(ctx.presence_exporter(), Some(secret));
     }
 
     #[test]
@@ -131,6 +161,17 @@ mod tests {
 
         assert_eq!(ctx_from_entity.topic_id, ctx_from_new.topic_id);
         assert_eq!(ctx_from_entity.epoch, ctx_from_new.epoch);
+        assert_eq!(ctx_from_entity.presence_exporter(), None);
+    }
+
+    #[test]
+    fn test_set_presence_exporter() {
+        let topic = TopicId::new([5u8; 32]);
+        let mut ctx = GroupContext::new(topic);
+        assert!(ctx.presence_exporter().is_none());
+        let secret = [11u8; 32];
+        ctx.set_presence_exporter(secret);
+        assert_eq!(ctx.presence_exporter(), Some(secret));
     }
 
     #[test]

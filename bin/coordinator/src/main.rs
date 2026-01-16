@@ -14,7 +14,9 @@
 //! ```
 
 use anyhow::Result;
+use bytes::Bytes;
 use clap::Parser;
+use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -69,16 +71,20 @@ async fn main() -> Result<()> {
     );
 
     // 2. Start coordinator services based on roles
-    if coordinator_roles.coordinator {
+    let mut advert_rx = if coordinator_roles.coordinator {
         tracing::info!("Starting coordinator advertisement service...");
-        start_coordinator_service(
-            &identity,
-            &coordinator_roles,
-            args.bind,
-            args.publish_interval,
+        Some(
+            start_coordinator_service(
+                &identity,
+                &coordinator_roles,
+                args.bind,
+                args.publish_interval,
+            )
+            .await?,
         )
-        .await?;
-    }
+    } else {
+        None
+    };
 
     // 3. Start transport and message handling
     tracing::info!("Initializing transport on {}...", args.bind);
@@ -116,6 +122,38 @@ async fn main() -> Result<()> {
 
     // 5. Start message handling loop
     let transport = std::sync::Arc::new(transport);
+    let publish_interval = args.publish_interval;
+    if let Some(mut advert_stream) = advert_rx.take() {
+        let transport_for_adverts = transport.clone();
+        tokio::spawn(async move {
+            tracing::info!(
+                "Coordinator advert publisher started (interval: {}s)",
+                publish_interval
+            );
+
+            while let Some(advert) = advert_stream.recv().await {
+                let peers = transport_for_adverts.connected_peers().await;
+                if peers.is_empty() {
+                    tracing::debug!("No connected peers to send coordinator adverts");
+                    continue;
+                }
+
+                for (peer_id, _) in peers {
+                    if let Err(e) = transport_for_adverts
+                        .send_to_peer(peer_id, GossipStreamType::PubSub, advert.clone())
+                        .await
+                    {
+                        tracing::warn!(?peer_id, ?e, "Failed to send coordinator advert");
+                    } else {
+                        tracing::trace!(?peer_id, "Sent coordinator advert");
+                    }
+                }
+            }
+
+            tracing::info!("Coordinator advert publisher stopped");
+        });
+    }
+
     let transport_clone = transport.clone();
 
     tokio::spawn(async move {
@@ -168,7 +206,7 @@ async fn start_coordinator_service(
     roles: &CoordinatorRoles,
     bind_addr: SocketAddr,
     publish_interval_secs: u64,
-) -> Result<()> {
+) -> Result<tokio::sync::mpsc::Receiver<Bytes>> {
     use saorsa_gossip_coordinator::{CoordinatorPublisher, NatClass, PeriodicPublisher};
 
     // Create publisher
@@ -185,29 +223,7 @@ async fn start_coordinator_service(
 
     // Start periodic publishing
     let periodic = PeriodicPublisher::new(publisher, publish_interval_secs);
-    let mut advert_rx = periodic.start().await;
-
-    // Spawn task to handle published adverts
-    tokio::spawn(async move {
-        tracing::info!(
-            "Coordinator advert publisher started (interval: {}s)",
-            publish_interval_secs
-        );
-
-        while let Some(advert_bytes) = advert_rx.recv().await {
-            tracing::debug!(
-                "Published coordinator advert ({} bytes)",
-                advert_bytes.len()
-            );
-            // In a full implementation, this would be sent via pubsub transport
-            // For now, we just log that it was published
-            // TODO: Wire to actual transport pubsub.publish(coordinator_topic(), advert_bytes)
-        }
-
-        tracing::info!("Coordinator advert publisher stopped");
-    });
-
-    Ok(())
+    Ok(periodic.start().await)
 }
 
 /// Coordinator identity wrapper
@@ -258,8 +274,6 @@ impl From<CoordinatorRoles> for saorsa_gossip_coordinator::CoordinatorRoles {
 
 /// Handle incoming messages from peers
 async fn handle_messages(transport: std::sync::Arc<saorsa_gossip_transport::AntQuicTransport>) {
-    use saorsa_gossip_transport::GossipTransport;
-
     tracing::info!("Message handler started - listening for PING messages...");
 
     loop {

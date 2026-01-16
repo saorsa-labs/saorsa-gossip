@@ -1,7 +1,7 @@
 # Saorsa Gossip: Design and Architecture
 
-**Version:** 0.1.6
-**Status:** Active Development
+**Version:** 0.2.1 (workspace)
+**Status:** Alpha / Feature Incomplete
 **Purpose:** Post-quantum secure, peer-to-peer gossip overlay for friend-of-a-friend networks, decentralized website hosting, and privacy-preserving social applications
 
 ---

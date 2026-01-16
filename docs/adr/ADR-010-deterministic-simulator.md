@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted (2025-12-24)
+Retired (2026-01-16)
+
+> **Why retired?** We now mandate end-to-end testing over real ant-quic transports, even in CI. The deterministic simulator and mock transports were removed from the repository, but this ADR is preserved to capture the historical design.
 
 ## Context
 

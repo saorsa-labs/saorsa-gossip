@@ -10,10 +10,10 @@ keywords = ["p2p", "gossip", "pubsub", "plumtree", "broadcast"]
 categories = ["network-programming"]
 
 [dependencies]
-saorsa-gossip-types = { version = "0.2.0", path = "../types" }
-saorsa-gossip-transport = { version = "0.2.0", path = "../transport" }
-saorsa-gossip-membership = { version = "0.2.0", path = "../membership" }
-saorsa-gossip-identity = { version = "0.2.0", path = "../identity" }
+saorsa-gossip-types = { workspace = true }
+saorsa-gossip-transport = { workspace = true }
+saorsa-gossip-membership = { workspace = true }
+saorsa-gossip-identity = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
@@ -28,3 +28,4 @@ blake3 = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 tokio-test = { workspace = true }
+saorsa-gossip-transport = { workspace = true, features = ["test-helpers"] }

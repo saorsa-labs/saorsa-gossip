@@ -754,6 +754,59 @@ impl TransportRequest {
         self.exclude_descriptors.insert(descriptor);
         self
     }
+
+    /// Creates a request for low-latency control messages.
+    ///
+    /// Used by the membership protocol for probes, joins, heartbeats,
+    /// and other latency-sensitive control plane messages.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use saorsa_gossip_transport::TransportRequest;
+    ///
+    /// let request = TransportRequest::low_latency_control();
+    /// ```
+    #[must_use]
+    pub fn low_latency_control() -> Self {
+        Self::new().require(TransportCapability::LowLatencyControl)
+    }
+
+    /// Creates a request for bulk data transfer.
+    ///
+    /// Used by pubsub for CRDT deltas, large messages, and other
+    /// bandwidth-intensive operations where throughput is prioritized
+    /// over latency.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use saorsa_gossip_transport::TransportRequest;
+    ///
+    /// let request = TransportRequest::bulk_transfer();
+    /// ```
+    #[must_use]
+    pub fn bulk_transfer() -> Self {
+        Self::new().require(TransportCapability::BulkTransfer)
+    }
+
+    /// Creates a request for offline-ready message delivery.
+    ///
+    /// Used for delay-tolerant networking scenarios where messages
+    /// may need to be stored and forwarded later, such as LoRa mesh
+    /// with intermittent connectivity.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use saorsa_gossip_transport::TransportRequest;
+    ///
+    /// let request = TransportRequest::offline_ready();
+    /// ```
+    #[must_use]
+    pub fn offline_ready() -> Self {
+        Self::new().require(TransportCapability::OfflineReady)
+    }
 }
 
 // ============================================================================
@@ -1263,5 +1316,61 @@ mod tests {
 
         let transport = mux.select_transport(&request).await.unwrap();
         assert_eq!(transport.capabilities().name, "MockBLE");
+    }
+
+    // ========================================================================
+    // TransportRequest Convenience Constructor Tests
+    // ========================================================================
+
+    #[test]
+    fn test_low_latency_control_constructor() {
+        let request = TransportRequest::low_latency_control();
+
+        assert_eq!(request.required_capabilities.len(), 1);
+        assert!(request
+            .required_capabilities
+            .contains(&TransportCapability::LowLatencyControl));
+        assert!(request.preferred_descriptor.is_none());
+        assert!(request.exclude_descriptors.is_empty());
+    }
+
+    #[test]
+    fn test_bulk_transfer_constructor() {
+        let request = TransportRequest::bulk_transfer();
+
+        assert_eq!(request.required_capabilities.len(), 1);
+        assert!(request
+            .required_capabilities
+            .contains(&TransportCapability::BulkTransfer));
+        assert!(request.preferred_descriptor.is_none());
+        assert!(request.exclude_descriptors.is_empty());
+    }
+
+    #[test]
+    fn test_offline_ready_constructor() {
+        let request = TransportRequest::offline_ready();
+
+        assert_eq!(request.required_capabilities.len(), 1);
+        assert!(request
+            .required_capabilities
+            .contains(&TransportCapability::OfflineReady));
+        assert!(request.preferred_descriptor.is_none());
+        assert!(request.exclude_descriptors.is_empty());
+    }
+
+    #[test]
+    fn test_convenience_constructors_are_chainable() {
+        // Test that convenience constructors return a request that can be further configured
+        let request = TransportRequest::low_latency_control()
+            .prefer(TransportDescriptor::Udp)
+            .exclude(TransportDescriptor::Lora);
+
+        assert!(request
+            .required_capabilities
+            .contains(&TransportCapability::LowLatencyControl));
+        assert_eq!(request.preferred_descriptor, Some(TransportDescriptor::Udp));
+        assert!(request
+            .exclude_descriptors
+            .contains(&TransportDescriptor::Lora));
     }
 }

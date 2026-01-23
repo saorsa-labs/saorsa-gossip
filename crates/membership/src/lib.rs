@@ -8,7 +8,7 @@
 //! - Periodic shuffling and anti-entropy
 
 use anyhow::{anyhow, Result};
-use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
+use saorsa_gossip_transport::{GossipStreamType, GossipTransport, TransportRequest};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -274,8 +274,15 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                     let ping_msg = SwimMessage::Ping;
                     match bincode::serialize(&ping_msg) {
                         Ok(bytes) => {
+                            // SWIM probes are latency-sensitive control plane messages
+                            let request = TransportRequest::low_latency_control();
                             if let Err(e) = transport
-                                .send_to_peer(peer, GossipStreamType::Membership, bytes.into())
+                                .send_with_request(
+                                    peer,
+                                    GossipStreamType::Membership,
+                                    bytes.into(),
+                                    &request,
+                                )
                                 .await
                             {
                                 debug!(?e, peer_id = %peer, "SWIM: Probe send failed");
@@ -438,11 +445,15 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     }
 
     /// Send a HyParView message to a peer
+    ///
+    /// Uses low-latency transport routing for control plane messages.
     async fn send_hyparview_message(&self, peer: PeerId, msg: &HyParViewMessage) -> Result<()> {
         let bytes = bincode::serialize(msg)
             .map_err(|e| anyhow!("Failed to serialize HyParView message: {}", e))?;
+        // HyParView messages are latency-sensitive control plane messages
+        let request = TransportRequest::low_latency_control();
         self.transport
-            .send_to_peer(peer, GossipStreamType::Membership, bytes.into())
+            .send_with_request(peer, GossipStreamType::Membership, bytes.into(), &request)
             .await
     }
 

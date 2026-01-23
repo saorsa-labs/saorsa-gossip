@@ -24,4 +24,3 @@
 [2026-01-23T15:31:35Z] PHASE_COMPLETE: 2.6 Transport Hints in Peer Adverts | 7/7 tasks | 330+ tests passing | 0 warnings
 [2026-01-23T15:33:48Z] PHASE_START: 2.7 Benchmarking & BLE Stub | 6 tasks planned
 [2026-01-23T15:42:22Z] PHASE_COMPLETE: 2.7 Benchmarking & BLE Stub | 6/6 tasks | 365+ tests passing | 0 warnings
-[2026-01-23T17:20:07Z] MILESTONE_COMPLETE: 2 Transport Multi-Plexing Refactor | 7/7 phases | 365+ tests | 24 commits

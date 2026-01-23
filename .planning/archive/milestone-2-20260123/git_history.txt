@@ -1,0 +1,30 @@
+7f29272 chore(planning): complete Phase 2.7 and Milestone 2
+e10cf1e docs: add transport benchmarking guide
+0ca518c test(transport): add property-based tests for capability routing
+2056f59 feat(benchmark): add --ble flag for BLE transport simulation
+1a64890 feat(transport): add BleTransportAdapter stub for benchmarking
+169bbbe feat(coordinator): add TransportHint for multi-transport peer discovery
+28540fe docs(transport): update module docs with capability routing examples
+7fbbca4 test(transport): add comprehensive capability routing tests
+077d640 feat(pubsub): use capability-based transport routing
+cf872aa feat(membership): use capability-based transport routing
+188af01 feat(transport): add convenience constructors to TransportRequest
+2d7f935 feat(transport): add capability-aware send_with_request to GossipTransport
+ae5ca7b fix(runtime): address review findings in GossipContext
+b8f4926 test(runtime): add integration tests for GossipContext::build()
+6610c3f feat(runtime): add GossipContext for simplified runtime configuration
+e569730 feat(runtime): integrate MultiplexedGossipTransport into GossipRuntime
+ba31936 feat(transport): implement GossipTransport for MultiplexedGossipTransport
+390fa04 feat(transport): add MultiplexedGossipTransport struct
+bc22873 feat(transport): implement TransportAdapter for UdpTransportAdapter
+7674129 refactor(transport): rename AntQuicTransport to UdpTransportAdapter
+c56b29b refactor(transport): rename ant_quic_transport.rs to udp_transport_adapter.rs
+fc42d07 feat(transport): add TransportAdapter trait for multi-transport support
+359a8bc feat(transport): add TransportError enum with thiserror
+19afafa chore(deps): update ant-quic to 0.19.0
+c067746 fix(ci): handle already-published crates correctly
+bf132f5 fix(ci): remove non-existent crates from publish workflow
+ff1a2ef chore(release): v0.2.2
+69bc7d9 feat: complete milestone 1 - production bug fixes & improvements
+dd04af1 chore: update to ant-quic 0.18, bump to v0.2.0
+403f096 fix: use crates.io version for saorsa-transport

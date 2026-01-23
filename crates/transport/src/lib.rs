@@ -22,13 +22,13 @@
 //! This crate uses ant-quic's `BootstrapCache` for persistent peer storage
 //! with epsilon-greedy selection for balanced exploration and exploitation.
 
-mod ant_quic_transport;
 mod error;
 mod protocol_handler;
+mod udp_transport_adapter;
 
 pub use error::{TransportError as GossipTransportError, TransportResult as GossipTransportResult};
 
-pub use ant_quic_transport::{AntQuicTransport, AntQuicTransportConfig};
+pub use udp_transport_adapter::{AntQuicTransport, AntQuicTransportConfig};
 pub use protocol_handler::{
     BulkHandler, GossipMessage, GossipProtocolHandler, MembershipHandler, PubSubHandler,
 };

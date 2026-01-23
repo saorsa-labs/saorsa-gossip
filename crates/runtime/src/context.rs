@@ -26,7 +26,7 @@
 //!     .await?;
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use saorsa_gossip_identity::MlDsaKeyPair;
 use saorsa_gossip_transport::{
     TransportDescriptor, TransportMultiplexer, UdpTransportAdapter, UdpTransportAdapterConfig,
@@ -84,8 +84,9 @@ pub struct GossipContext {
 impl Default for GossipContext {
     /// Creates a default GossipContext bound to 0.0.0.0:0.
     fn default() -> Self {
+        use std::net::{IpAddr, Ipv4Addr};
         Self {
-            bind_addr: "0.0.0.0:0".parse().expect("valid default addr"),
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             known_peers: Vec::new(),
             identity: None,
             channel_capacity: 10_000,
@@ -225,6 +226,12 @@ impl GossipContext {
         self.max_peers
     }
 
+    /// Returns the stream read limit in bytes.
+    #[must_use]
+    pub fn stream_read_limit(&self) -> usize {
+        self.stream_read_limit
+    }
+
     /// Builds the GossipRuntime from this context.
     ///
     /// This method creates a UDP transport with the configured settings,
@@ -257,21 +264,27 @@ impl GossipContext {
         // Get identity (generate if not provided)
         let identity = match self.identity {
             Some(id) => id,
-            None => MlDsaKeyPair::generate()?,
+            None => MlDsaKeyPair::generate().context("failed to generate identity keypair")?,
         };
         let peer_id = identity.peer_id();
 
         // Create UDP transport adapter
-        let udp_adapter = Arc::new(UdpTransportAdapter::with_config(udp_config, None).await?);
+        let udp_adapter = Arc::new(
+            UdpTransportAdapter::with_config(udp_config, None)
+                .await
+                .context("failed to create UDP transport adapter")?,
+        );
 
         // Create and configure multiplexer
         let multiplexer = TransportMultiplexer::new(peer_id);
         multiplexer
             .register_transport(TransportDescriptor::Udp, udp_adapter)
-            .await?;
+            .await
+            .context("failed to register UDP transport with multiplexer")?;
         multiplexer
             .set_default_transport(TransportDescriptor::Udp)
-            .await?;
+            .await
+            .context("failed to set default transport")?;
 
         // Use the standard builder with our configured multiplexer
         GossipRuntimeBuilder::new()
@@ -281,6 +294,7 @@ impl GossipContext {
             .with_multiplexer(Arc::new(multiplexer))
             .build()
             .await
+            .context("failed to build GossipRuntime")
     }
 }
 

@@ -5,9 +5,7 @@
 //! - Throughput (MB/s and Mbps)
 //! - Latency (round-trip time)
 //! - Message success rate
-//! - Concurrent connection handling
-//! - Memory usage
-//! - CPU utilization trends
+//! - Per-transport metrics when using multiplexed mode
 //!
 //! Usage:
 //! ```bash
@@ -19,13 +17,17 @@
 //!
 //! # Terminal 2 - Run benchmark client (multiplexed transport mode)
 //! cargo run --example transport_benchmark --release -- benchmark --coordinator 127.0.0.1:8000 --bind 127.0.0.1:9000 --multiplexed
+//!
+//! # Terminal 2 - Run with BLE stub transport (tests constrained link simulation)
+//! cargo run --example transport_benchmark --release -- benchmark --coordinator 127.0.0.1:8000 --bind 127.0.0.1:9000 --multiplexed --ble
 //! ```
 
 use anyhow::Result;
 use bytes::Bytes;
 use saorsa_gossip_transport::{
-    BootstrapCache, BootstrapCacheConfig, GossipStreamType, GossipTransport,
-    MultiplexedGossipTransport, TransportDescriptor, TransportMultiplexer, UdpTransportAdapter,
+    BleTransportAdapter, BleTransportAdapterConfig, BootstrapCache, BootstrapCacheConfig,
+    GossipStreamType, GossipTransport, MultiplexedGossipTransport, TransportAdapter,
+    TransportDescriptor, TransportMultiplexer, UdpTransportAdapter,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -194,7 +196,11 @@ async fn run_benchmark(args: &[String]) -> Result<()> {
     println!("Coordinator: {}", coordinator_addr);
     println!("Local bind: {}", bind_addr);
     if benchmark_args.multiplexed {
-        println!("Mode: MULTIPLEXED TRANSPORT");
+        if benchmark_args.ble_enabled {
+            println!("Mode: MULTIPLEXED TRANSPORT (UDP + BLE stub)");
+        } else {
+            println!("Mode: MULTIPLEXED TRANSPORT");
+        }
     } else {
         println!("Mode: DIRECT UDP TRANSPORT");
     }
@@ -217,10 +223,11 @@ async fn run_benchmark(args: &[String]) -> Result<()> {
     let connect_start = Instant::now();
 
     // Create transport - either direct UDP or multiplexed
-    let (transport, peer_id, coordinator_peer_id): (
+    let (transport, peer_id, coordinator_peer_id, ble_adapter_opt): (
         Arc<dyn GossipTransport>,
         saorsa_gossip_types::PeerId,
         saorsa_gossip_types::PeerId,
+        Option<Arc<BleTransportAdapter>>,
     ) = if benchmark_args.multiplexed {
         // Create multiplexed transport wrapping UDP adapter
         let udp_adapter = Arc::new(
@@ -251,10 +258,33 @@ async fn run_benchmark(args: &[String]) -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to set default transport: {}", e))?;
 
+        // Optionally add BLE stub transport
+        let ble_adapter = if benchmark_args.ble_enabled {
+            let ble_config = BleTransportAdapterConfig::new()
+                .with_latency(50, 150) // 50-150ms simulated latency
+                .with_mtu(512); // BLE typical MTU
+            let ble = Arc::new(BleTransportAdapter::with_config(local_peer_id, ble_config));
+
+            multiplexer
+                .register_transport(TransportDescriptor::Ble, Arc::clone(&ble) as Arc<_>)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to register BLE transport: {}", e))?;
+
+            println!("  BLE stub registered (MTU: 512, latency: 50-150ms)");
+            Some(ble)
+        } else {
+            None
+        };
+
         // Wrap in MultiplexedGossipTransport
         let multiplexed = MultiplexedGossipTransport::new(Arc::new(multiplexer), local_peer_id);
 
-        (Arc::new(multiplexed), local_peer_id, coord_peer_id)
+        (
+            Arc::new(multiplexed),
+            local_peer_id,
+            coord_peer_id,
+            ble_adapter,
+        )
     } else {
         // Direct UDP transport (original mode)
         let transport = UdpTransportAdapter::new_with_cache(
@@ -270,7 +300,7 @@ async fn run_benchmark(args: &[String]) -> Result<()> {
             .await
             .ok_or_else(|| anyhow::anyhow!("Failed to retrieve coordinator peer ID"))?;
 
-        (Arc::new(transport), local_peer_id, coord_peer_id)
+        (Arc::new(transport), local_peer_id, coord_peer_id, None)
     };
 
     let connect_duration = connect_start.elapsed();
@@ -421,6 +451,20 @@ async fn run_benchmark(args: &[String]) -> Result<()> {
     // Display final summary
     display_summary(&summary);
 
+    // Display BLE transport statistics if enabled
+    if let Some(ref ble) = ble_adapter_opt {
+        println!("📡 BLE Transport Statistics");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("  Messages sent: {}", ble.messages_sent().await);
+        println!("  Bytes sent: {} bytes", ble.bytes_sent().await);
+        println!("  MTU: {} bytes", ble.capabilities().max_message_size);
+        println!(
+            "  Typical latency: {}ms",
+            ble.capabilities().typical_latency_ms
+        );
+        println!();
+    }
+
     // Display cache stats after benchmark
     let final_stats = cache.stats().await;
     println!("📦 Final Cache Stats");
@@ -537,12 +581,15 @@ struct BenchmarkArgs {
     coordinator_addr: SocketAddr,
     bind_addr: SocketAddr,
     multiplexed: bool,
+    /// Enable BLE transport stub (requires --multiplexed)
+    ble_enabled: bool,
 }
 
 fn parse_benchmark_args(args: &[String]) -> Result<BenchmarkArgs> {
     let mut coordinator_addr = None;
     let mut bind_addr = None;
     let mut multiplexed = false;
+    let mut ble_enabled = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -567,6 +614,10 @@ fn parse_benchmark_args(args: &[String]) -> Result<BenchmarkArgs> {
                 multiplexed = true;
                 i += 1;
             }
+            "--ble" => {
+                ble_enabled = true;
+                i += 1;
+            }
             _ => {
                 anyhow::bail!("Unknown argument: {}", args[i]);
             }
@@ -577,9 +628,15 @@ fn parse_benchmark_args(args: &[String]) -> Result<BenchmarkArgs> {
         coordinator_addr.ok_or_else(|| anyhow::anyhow!("Missing --coordinator argument"))?;
     let bind = bind_addr.ok_or_else(|| anyhow::anyhow!("Missing --bind argument"))?;
 
+    // --ble requires --multiplexed
+    if ble_enabled && !multiplexed {
+        anyhow::bail!("--ble requires --multiplexed mode");
+    }
+
     Ok(BenchmarkArgs {
         coordinator_addr: coordinator,
         bind_addr: bind,
         multiplexed,
+        ble_enabled,
     })
 }

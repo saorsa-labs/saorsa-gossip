@@ -1373,4 +1373,129 @@ mod tests {
             .exclude_descriptors
             .contains(&TransportDescriptor::Lora));
     }
+
+    // ========================================================================
+    // Property-Based Tests
+    // ========================================================================
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy to generate random transport capabilities
+        fn arb_capability() -> impl Strategy<Value = TransportCapability> {
+            prop_oneof![
+                Just(TransportCapability::LowLatencyControl),
+                Just(TransportCapability::BulkTransfer),
+                Just(TransportCapability::Broadcast),
+                Just(TransportCapability::OfflineReady),
+            ]
+        }
+
+        /// Strategy to generate random transport descriptors
+        fn arb_descriptor() -> impl Strategy<Value = TransportDescriptor> {
+            prop_oneof![
+                Just(TransportDescriptor::Udp),
+                Just(TransportDescriptor::Ble),
+                Just(TransportDescriptor::Lora),
+            ]
+        }
+
+        /// Strategy to generate a random transport request
+        fn arb_request() -> impl Strategy<Value = TransportRequest> {
+            (
+                proptest::collection::vec(arb_capability(), 0..3),
+                proptest::option::of(arb_descriptor()),
+                proptest::collection::vec(arb_descriptor(), 0..2),
+            )
+                .prop_map(|(caps, preferred, excludes)| {
+                    let mut request = TransportRequest::new();
+                    for cap in caps {
+                        request = request.require(cap);
+                    }
+                    if let Some(pref) = preferred {
+                        request = request.prefer(pref);
+                    }
+                    for excl in excludes {
+                        request = request.exclude(excl);
+                    }
+                    request
+                })
+        }
+
+        proptest! {
+            /// Property: Adding a requirement twice doesn't change the set
+            #[test]
+            fn require_is_idempotent(cap in arb_capability()) {
+                let request1 = TransportRequest::new().require(cap.clone());
+                let request2 = TransportRequest::new().require(cap.clone()).require(cap);
+
+                prop_assert_eq!(request1.required_capabilities.len(), request2.required_capabilities.len());
+            }
+
+            /// Property: Excluding a transport twice doesn't change the set
+            #[test]
+            fn exclude_is_idempotent(desc in arb_descriptor()) {
+                let request1 = TransportRequest::new().exclude(desc.clone());
+                let request2 = TransportRequest::new().exclude(desc.clone()).exclude(desc);
+
+                prop_assert_eq!(request1.exclude_descriptors.len(), request2.exclude_descriptors.len());
+            }
+
+            /// Property: Preferred descriptor can be overwritten
+            #[test]
+            fn prefer_overwrites_previous(desc1 in arb_descriptor(), desc2 in arb_descriptor()) {
+                let request = TransportRequest::new().prefer(desc1).prefer(desc2.clone());
+                prop_assert_eq!(request.preferred_descriptor, Some(desc2));
+            }
+
+            /// Property: UDP descriptor has both low-latency and bulk capabilities
+            #[test]
+            fn udp_has_expected_capabilities(_seed in 0u32..1000) {
+                let caps = TransportDescriptor::Udp.capabilities();
+                prop_assert!(caps.contains(&TransportCapability::LowLatencyControl));
+                prop_assert!(caps.contains(&TransportCapability::BulkTransfer));
+                prop_assert!(!caps.contains(&TransportCapability::Broadcast));
+            }
+
+            /// Property: BLE descriptor has low-latency but no bulk transfer
+            #[test]
+            fn ble_has_expected_capabilities(_seed in 0u32..1000) {
+                let caps = TransportDescriptor::Ble.capabilities();
+                prop_assert!(caps.contains(&TransportCapability::LowLatencyControl));
+                prop_assert!(!caps.contains(&TransportCapability::BulkTransfer));
+            }
+
+            /// Property: LoRa descriptor has offline-ready but no low-latency
+            #[test]
+            fn lora_has_expected_capabilities(_seed in 0u32..1000) {
+                let caps = TransportDescriptor::Lora.capabilities();
+                prop_assert!(!caps.contains(&TransportCapability::LowLatencyControl));
+                prop_assert!(caps.contains(&TransportCapability::OfflineReady));
+            }
+
+            /// Property: TransportRequest can be constructed from any combination of inputs
+            #[test]
+            fn request_construction_never_panics(request in arb_request()) {
+                // Just accessing fields should not panic
+                let _caps = &request.required_capabilities;
+                let _pref = &request.preferred_descriptor;
+                let _excl = &request.exclude_descriptors;
+            }
+
+            /// Property: Capability display is non-empty
+            #[test]
+            fn capability_display_non_empty(cap in arb_capability()) {
+                let display = cap.to_string();
+                prop_assert!(!display.is_empty());
+            }
+
+            /// Property: Descriptor display is non-empty
+            #[test]
+            fn descriptor_display_non_empty(desc in arb_descriptor()) {
+                let display = desc.to_string();
+                prop_assert!(!display.is_empty());
+            }
+        }
+    }
 }

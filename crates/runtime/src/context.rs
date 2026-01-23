@@ -344,4 +344,65 @@ mod tests {
         let ctx = GossipContext::new().with_stream_read_limit(50 * 1024 * 1024);
         assert_eq!(ctx.stream_read_limit, 50 * 1024 * 1024);
     }
+
+    // Integration tests for build() - require async runtime
+    #[tokio::test]
+    async fn test_build_creates_runtime_with_defaults() {
+        // Use port 0 to let the OS assign an available port
+        let runtime = GossipContext::with_defaults().build().await;
+        assert!(runtime.is_ok(), "build() should succeed with defaults");
+
+        let runtime = runtime.unwrap();
+        // Verify we have a valid peer ID (non-empty)
+        assert_ne!(runtime.peer_id().as_bytes(), &[0u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn test_build_with_custom_bind_addr() {
+        // Use port 0 to get a random available port
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+
+        let runtime = GossipContext::new().with_bind_addr(addr).build().await;
+
+        assert!(
+            runtime.is_ok(),
+            "build() should succeed with custom bind addr"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_with_identity() {
+        let identity = MlDsaKeyPair::generate().expect("identity generation should succeed");
+        let expected_peer_id = identity.peer_id();
+
+        let runtime = GossipContext::new().with_identity(identity).build().await;
+
+        assert!(
+            runtime.is_ok(),
+            "build() should succeed with custom identity"
+        );
+        let runtime = runtime.unwrap();
+        assert_eq!(runtime.peer_id(), expected_peer_id);
+    }
+
+    #[tokio::test]
+    async fn test_build_with_custom_config() {
+        let runtime = GossipContext::new()
+            .with_channel_capacity(5_000)
+            .with_max_peers(500)
+            .with_stream_read_limit(50 * 1024 * 1024)
+            .build()
+            .await;
+
+        assert!(runtime.is_ok(), "build() should succeed with custom config");
+    }
+
+    #[tokio::test]
+    async fn test_build_runtime_has_transport() {
+        let runtime = GossipContext::with_defaults().build().await.unwrap();
+
+        // Verify the transport is accessible and has the expected type
+        // The transport should have a local peer ID that matches the runtime
+        assert_eq!(runtime.transport.local_peer_id(), runtime.peer_id());
+    }
 }

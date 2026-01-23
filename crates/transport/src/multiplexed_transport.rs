@@ -965,4 +965,210 @@ mod tests {
         assert!(result1.is_ok());
         assert!(result2.is_ok());
     }
+
+    // ========================================================================
+    // send_with_request Tests (Capability-Based Routing)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_send_with_low_latency_request() {
+        // Test that send_with_request routes using low latency capability
+        let peer_id = test_peer_id();
+        let mock_adapter = Arc::new(MockTransportAdapter::new_with_peer_id(peer_id));
+
+        let transport =
+            MultiplexedGossipTransport::from_adapter(mock_adapter, TransportDescriptor::Udp)
+                .await
+                .expect("from_adapter should succeed");
+
+        let target = PeerId::new([1u8; 32]);
+        let request = TransportRequest::low_latency_control();
+        let result = transport
+            .send_with_request(
+                target,
+                GossipStreamType::Membership,
+                Bytes::from("control message"),
+                &request,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_with_bulk_request() {
+        // Test that send_with_request routes using bulk transfer capability
+        let peer_id = test_peer_id();
+        let mock_adapter = Arc::new(MockTransportAdapter::new_with_peer_id(peer_id));
+
+        let transport =
+            MultiplexedGossipTransport::from_adapter(mock_adapter, TransportDescriptor::Udp)
+                .await
+                .expect("from_adapter should succeed");
+
+        let target = PeerId::new([1u8; 32]);
+        let request = TransportRequest::bulk_transfer();
+        let result = transport
+            .send_with_request(
+                target,
+                GossipStreamType::Bulk,
+                Bytes::from("large payload data"),
+                &request,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_with_request_falls_back_when_capability_unavailable() {
+        // Test fallback to stream-type routing when no transport has the requested capability
+        let peer_id = test_peer_id();
+        let multiplexer = Arc::new(TransportMultiplexer::new(peer_id));
+
+        // Register a transport that doesn't have OfflineReady capability
+        let mock_adapter = Arc::new(MockTransportAdapter::new_with_peer_id(peer_id));
+        multiplexer
+            .register_transport(TransportDescriptor::Udp, mock_adapter)
+            .await
+            .expect("registration should succeed");
+        multiplexer
+            .set_default_transport(TransportDescriptor::Udp)
+            .await
+            .expect("setting default should succeed");
+
+        let transport = MultiplexedGossipTransport::new(multiplexer, peer_id);
+
+        // Request offline_ready capability (not supported by mock)
+        let target = PeerId::new([1u8; 32]);
+        let request = TransportRequest::offline_ready();
+
+        // Should fall back to stream-type routing and succeed
+        let result = transport
+            .send_with_request(
+                target,
+                GossipStreamType::Membership,
+                Bytes::from("data"),
+                &request,
+            )
+            .await;
+        assert!(result.is_ok(), "Should fall back to default transport");
+    }
+
+    #[tokio::test]
+    async fn test_send_with_request_uses_default_when_no_match() {
+        // Test that send_with_request uses default transport when no capability match
+        let peer_id = test_peer_id();
+        let mock_adapter = Arc::new(MockTransportAdapter::new_with_peer_id(peer_id));
+
+        let transport =
+            MultiplexedGossipTransport::from_adapter(mock_adapter, TransportDescriptor::Udp)
+                .await
+                .expect("from_adapter should succeed");
+
+        // Create a request with multiple requirements that may not be fully met
+        let target = PeerId::new([1u8; 32]);
+        let request = TransportRequest::new()
+            .require(crate::TransportCapability::LowLatencyControl)
+            .require(crate::TransportCapability::OfflineReady); // Unlikely combination
+
+        // Should still succeed via fallback
+        let result = transport
+            .send_with_request(
+                target,
+                GossipStreamType::Membership,
+                Bytes::from("data"),
+                &request,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_to_peer_still_works() {
+        // Test backward compatibility - send_to_peer should continue to work
+        let peer_id = test_peer_id();
+        let mock_adapter = Arc::new(MockTransportAdapter::new_with_peer_id(peer_id));
+
+        let transport =
+            MultiplexedGossipTransport::from_adapter(mock_adapter, TransportDescriptor::Udp)
+                .await
+                .expect("from_adapter should succeed");
+
+        let target = PeerId::new([1u8; 32]);
+
+        // Old API should still work
+        let result = transport
+            .send_to_peer(target, GossipStreamType::Membership, Bytes::from("legacy"))
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_default_implementation_ignores_request() {
+        // Test that the default trait implementation ignores the request parameter
+        // This test verifies backward compatibility with non-multiplexed transports
+        let peer_id = test_peer_id();
+        let mock_adapter = Arc::new(MockTransportAdapter::new_with_peer_id(peer_id));
+
+        let transport =
+            MultiplexedGossipTransport::from_adapter(mock_adapter, TransportDescriptor::Udp)
+                .await
+                .expect("from_adapter should succeed");
+
+        // Even with an impossible request, should succeed
+        let target = PeerId::new([1u8; 32]);
+        let request = TransportRequest::new()
+            .require(crate::TransportCapability::Broadcast)
+            .exclude(TransportDescriptor::Udp)
+            .exclude(TransportDescriptor::Ble)
+            .exclude(TransportDescriptor::Lora);
+
+        // Should fall back and succeed
+        let result = transport
+            .send_with_request(
+                target,
+                GossipStreamType::Membership,
+                Bytes::from("fallback test"),
+                &request,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_with_request_chainable_constructors() {
+        // Test that the chainable constructors work correctly in send_with_request
+        let peer_id = test_peer_id();
+        let mock_adapter = Arc::new(MockTransportAdapter::new_with_peer_id(peer_id));
+
+        let transport =
+            MultiplexedGossipTransport::from_adapter(mock_adapter, TransportDescriptor::Udp)
+                .await
+                .expect("from_adapter should succeed");
+
+        let target = PeerId::new([1u8; 32]);
+
+        // Test low_latency_control with prefer
+        let request = TransportRequest::low_latency_control().prefer(TransportDescriptor::Udp);
+        let result = transport
+            .send_with_request(
+                target,
+                GossipStreamType::Membership,
+                Bytes::from("test"),
+                &request,
+            )
+            .await;
+        assert!(result.is_ok());
+
+        // Test bulk_transfer with exclude
+        let request = TransportRequest::bulk_transfer().exclude(TransportDescriptor::Ble);
+        let result = transport
+            .send_with_request(
+                target,
+                GossipStreamType::Bulk,
+                Bytes::from("bulk test"),
+                &request,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
 }

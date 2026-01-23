@@ -209,6 +209,70 @@ impl AddrHint {
     }
 }
 
+/// Transport capability hint for multi-transport peer discovery.
+///
+/// This struct advertises which transports a peer supports, enabling
+/// other peers to discover BLE bridges, LoRa gateways, etc.
+///
+/// # Example
+///
+/// ```
+/// use saorsa_gossip_coordinator::TransportHint;
+///
+/// // Advertise UDP/QUIC transport
+/// let udp_hint = TransportHint::new("udp");
+///
+/// // Advertise BLE bridge with endpoint
+/// let ble_hint = TransportHint::with_endpoint("ble", "AA:BB:CC:DD:EE:FF");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportHint {
+    /// Transport type identifier (e.g., "udp", "ble", "lora")
+    pub transport_type: String,
+    /// Optional endpoint or connection info for this transport
+    pub endpoint: Option<String>,
+    /// Whether this transport is currently available
+    pub available: bool,
+}
+
+impl TransportHint {
+    /// Create a new transport hint with the given type, marked as available.
+    ///
+    /// # Arguments
+    ///
+    /// * `transport_type` - Transport type identifier (e.g., "udp", "ble", "lora")
+    #[must_use]
+    pub fn new(transport_type: impl Into<String>) -> Self {
+        Self {
+            transport_type: transport_type.into(),
+            endpoint: None,
+            available: true,
+        }
+    }
+
+    /// Create a new transport hint with an endpoint.
+    ///
+    /// # Arguments
+    ///
+    /// * `transport_type` - Transport type identifier
+    /// * `endpoint` - Connection info (e.g., BLE MAC address, LoRa device ID)
+    #[must_use]
+    pub fn with_endpoint(transport_type: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        Self {
+            transport_type: transport_type.into(),
+            endpoint: Some(endpoint.into()),
+            available: true,
+        }
+    }
+
+    /// Mark this transport as unavailable.
+    #[must_use]
+    pub fn unavailable(mut self) -> Self {
+        self.available = false;
+        self
+    }
+}
+
 /// Coordinator Advertisement per SPEC2 §8
 ///
 /// Wire format (CBOR):
@@ -243,6 +307,12 @@ pub struct CoordinatorAdvert {
     pub not_after: u64,
     /// Local-only advisory score (higher is better)
     pub score: i32,
+    /// Transport capability hints for multi-transport discovery.
+    ///
+    /// Advertises which transports this peer supports (UDP, BLE, LoRa, etc.)
+    /// to enable transport-aware routing and BLE bridge discovery.
+    #[serde(default)]
+    pub transport_hints: Vec<TransportHint>,
     /// ML-DSA signature over all fields except sig
     #[serde(with = "serde_bytes")]
     pub sig: Vec<u8>,
@@ -275,8 +345,73 @@ impl CoordinatorAdvert {
             not_before: now,
             not_after: now + validity_duration_ms,
             score: 0,
+            transport_hints: Vec::new(),
             sig: Vec::new(), // Will be filled by sign()
         }
+    }
+
+    /// Add transport hints to this advert (builder pattern).
+    ///
+    /// # Arguments
+    ///
+    /// * `hints` - Transport capability hints to include
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use saorsa_gossip_coordinator::{CoordinatorAdvert, CoordinatorRoles, NatClass, TransportHint};
+    /// use saorsa_gossip_types::PeerId;
+    ///
+    /// let advert = CoordinatorAdvert::new(
+    ///     PeerId::new([1u8; 32]),
+    ///     CoordinatorRoles::default(),
+    ///     vec![],
+    ///     NatClass::Unknown,
+    ///     3600_000,
+    /// )
+    /// .with_transport_hints(vec![
+    ///     TransportHint::new("udp"),
+    ///     TransportHint::with_endpoint("ble", "AA:BB:CC:DD:EE:FF"),
+    /// ]);
+    /// ```
+    #[must_use]
+    pub fn with_transport_hints(mut self, hints: Vec<TransportHint>) -> Self {
+        self.transport_hints = hints;
+        self
+    }
+
+    /// Add a single transport hint to this advert.
+    pub fn add_transport_hint(&mut self, hint: TransportHint) {
+        self.transport_hints.push(hint);
+    }
+
+    /// Check if this peer supports a given transport type.
+    ///
+    /// # Arguments
+    ///
+    /// * `transport_type` - The transport type to check (e.g., "udp", "ble", "lora")
+    ///
+    /// # Returns
+    ///
+    /// `true` if a matching, available transport hint exists.
+    #[must_use]
+    pub fn has_transport(&self, transport_type: &str) -> bool {
+        self.transport_hints
+            .iter()
+            .any(|h| h.transport_type == transport_type && h.available)
+    }
+
+    /// Get all available transports advertised by this peer.
+    ///
+    /// # Returns
+    ///
+    /// References to all transport hints marked as available.
+    #[must_use]
+    pub fn available_transports(&self) -> Vec<&TransportHint> {
+        self.transport_hints
+            .iter()
+            .filter(|h| h.available)
+            .collect()
     }
 
     /// Sign the advert with ML-DSA
@@ -298,6 +433,7 @@ impl CoordinatorAdvert {
                 not_before: self.not_before,
                 not_after: self.not_after,
                 score: self.score,
+                transport_hints: &self.transport_hints,
             },
             &mut to_sign,
         )?;
@@ -329,6 +465,7 @@ impl CoordinatorAdvert {
                 not_before: self.not_before,
                 not_after: self.not_after,
                 score: self.score,
+                transport_hints: &self.transport_hints,
             },
             &mut to_verify,
         )?;
@@ -382,6 +519,7 @@ struct SignableFields<'a> {
     not_before: u64,
     not_after: u64,
     score: i32,
+    transport_hints: &'a Vec<TransportHint>,
 }
 
 #[cfg(test)]
@@ -657,5 +795,203 @@ mod tests {
         // from_bytes should work with CBOR
         let decoded = CoordinatorAdvert::from_bytes(&bytes).expect("from_bytes");
         assert_eq!(decoded.peer, peer);
+    }
+
+    // ========================================================================
+    // TransportHint Tests
+    // ========================================================================
+
+    #[test]
+    fn test_transport_hint_new() {
+        let hint = TransportHint::new("udp");
+        assert_eq!(hint.transport_type, "udp");
+        assert!(hint.endpoint.is_none());
+        assert!(hint.available);
+    }
+
+    #[test]
+    fn test_transport_hint_with_endpoint() {
+        let hint = TransportHint::with_endpoint("ble", "AA:BB:CC:DD:EE:FF");
+        assert_eq!(hint.transport_type, "ble");
+        assert_eq!(hint.endpoint, Some("AA:BB:CC:DD:EE:FF".to_string()));
+        assert!(hint.available);
+    }
+
+    #[test]
+    fn test_transport_hint_unavailable() {
+        let hint = TransportHint::new("lora").unavailable();
+        assert_eq!(hint.transport_type, "lora");
+        assert!(!hint.available);
+    }
+
+    #[test]
+    fn test_advert_with_transport_hints() {
+        let peer = PeerId::new([10u8; 32]);
+        let hints = vec![
+            TransportHint::new("udp"),
+            TransportHint::with_endpoint("ble", "AA:BB:CC:DD:EE:FF"),
+        ];
+
+        let advert = CoordinatorAdvert::new(
+            peer,
+            CoordinatorRoles::default(),
+            vec![],
+            NatClass::Unknown,
+            5_000,
+        )
+        .with_transport_hints(hints);
+
+        assert_eq!(advert.transport_hints.len(), 2);
+        assert_eq!(advert.transport_hints[0].transport_type, "udp");
+        assert_eq!(advert.transport_hints[1].transport_type, "ble");
+    }
+
+    #[test]
+    fn test_advert_add_transport_hint() {
+        let peer = PeerId::new([11u8; 32]);
+        let mut advert = CoordinatorAdvert::new(
+            peer,
+            CoordinatorRoles::default(),
+            vec![],
+            NatClass::Unknown,
+            5_000,
+        );
+
+        assert!(advert.transport_hints.is_empty());
+
+        advert.add_transport_hint(TransportHint::new("udp"));
+        assert_eq!(advert.transport_hints.len(), 1);
+
+        advert.add_transport_hint(TransportHint::new("ble"));
+        assert_eq!(advert.transport_hints.len(), 2);
+    }
+
+    #[test]
+    fn test_advert_has_transport() {
+        let peer = PeerId::new([12u8; 32]);
+        let advert = CoordinatorAdvert::new(
+            peer,
+            CoordinatorRoles::default(),
+            vec![],
+            NatClass::Unknown,
+            5_000,
+        )
+        .with_transport_hints(vec![
+            TransportHint::new("udp"),
+            TransportHint::new("ble"),
+            TransportHint::new("lora").unavailable(),
+        ]);
+
+        assert!(advert.has_transport("udp"));
+        assert!(advert.has_transport("ble"));
+        assert!(!advert.has_transport("lora")); // unavailable
+        assert!(!advert.has_transport("unknown"));
+    }
+
+    #[test]
+    fn test_advert_available_transports() {
+        let peer = PeerId::new([13u8; 32]);
+        let advert = CoordinatorAdvert::new(
+            peer,
+            CoordinatorRoles::default(),
+            vec![],
+            NatClass::Unknown,
+            5_000,
+        )
+        .with_transport_hints(vec![
+            TransportHint::new("udp"),
+            TransportHint::new("ble"),
+            TransportHint::new("lora").unavailable(),
+        ]);
+
+        let available = advert.available_transports();
+        assert_eq!(available.len(), 2);
+        assert!(available.iter().any(|h| h.transport_type == "udp"));
+        assert!(available.iter().any(|h| h.transport_type == "ble"));
+        assert!(!available.iter().any(|h| h.transport_type == "lora"));
+    }
+
+    #[test]
+    fn test_transport_hints_cbor_roundtrip() {
+        let peer = PeerId::new([14u8; 32]);
+        let hints = vec![
+            TransportHint::new("udp"),
+            TransportHint::with_endpoint("ble", "AA:BB:CC:DD:EE:FF"),
+            TransportHint::new("lora").unavailable(),
+        ];
+
+        let advert = CoordinatorAdvert::new(
+            peer,
+            CoordinatorRoles::default(),
+            vec![],
+            NatClass::Edm,
+            5_000,
+        )
+        .with_transport_hints(hints);
+
+        // Serialize and deserialize
+        let cbor_bytes = advert.to_cbor().expect("CBOR serialization");
+        let decoded = CoordinatorAdvert::from_cbor(&cbor_bytes).expect("CBOR deserialization");
+
+        // Verify transport hints are preserved
+        assert_eq!(decoded.transport_hints.len(), 3);
+        assert_eq!(decoded.transport_hints[0], advert.transport_hints[0]);
+        assert_eq!(decoded.transport_hints[1], advert.transport_hints[1]);
+        assert_eq!(decoded.transport_hints[2], advert.transport_hints[2]);
+    }
+
+    #[test]
+    fn test_transport_hints_backward_compat_empty() {
+        // Test that adverts without transport_hints can still be deserialized
+        // This simulates receiving an advert from an older peer
+        let peer = PeerId::new([15u8; 32]);
+        let advert = CoordinatorAdvert::new(
+            peer,
+            CoordinatorRoles::default(),
+            vec![],
+            NatClass::Unknown,
+            5_000,
+        );
+
+        // Advert has no transport hints
+        assert!(advert.transport_hints.is_empty());
+
+        // Serialize and deserialize
+        let cbor_bytes = advert.to_cbor().expect("CBOR serialization");
+        let decoded = CoordinatorAdvert::from_cbor(&cbor_bytes).expect("CBOR deserialization");
+
+        // Empty transport hints should be preserved
+        assert!(decoded.transport_hints.is_empty());
+    }
+
+    #[test]
+    fn test_transport_hints_included_in_signature() {
+        use saorsa_pqc::{MlDsa65, MlDsaOperations};
+
+        let peer = PeerId::new([16u8; 32]);
+        let mut advert = CoordinatorAdvert::new(
+            peer,
+            CoordinatorRoles::default(),
+            vec![],
+            NatClass::Eim,
+            10_000,
+        )
+        .with_transport_hints(vec![TransportHint::new("udp")]);
+
+        // Sign the advert
+        let signer = MlDsa65::new();
+        let (pk, sk) = signer.generate_keypair().expect("keypair");
+        advert.sign(&sk).expect("signing");
+
+        // Verify original
+        let valid = advert.verify(&pk).expect("verification");
+        assert!(valid, "Original should be valid");
+
+        // Tamper with transport hints
+        advert.transport_hints.push(TransportHint::new("ble"));
+
+        // Verification should fail
+        let valid = advert.verify(&pk).expect("verification");
+        assert!(!valid, "Tampered advert should be invalid");
     }
 }

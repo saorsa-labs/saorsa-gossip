@@ -14,14 +14,18 @@
 //! # Terminal 1 - Run coordinator (receiver)
 //! cargo run --example transport_benchmark --release -- coordinator --bind 127.0.0.1:8000
 //!
-//! # Terminal 2 - Run benchmark client
+//! # Terminal 2 - Run benchmark client (direct UDP transport)
 //! cargo run --example transport_benchmark --release -- benchmark --coordinator 127.0.0.1:8000 --bind 127.0.0.1:9000
+//!
+//! # Terminal 2 - Run benchmark client (multiplexed transport mode)
+//! cargo run --example transport_benchmark --release -- benchmark --coordinator 127.0.0.1:8000 --bind 127.0.0.1:9000 --multiplexed
 //! ```
 
 use anyhow::Result;
 use bytes::Bytes;
 use saorsa_gossip_transport::{
-    BootstrapCache, BootstrapCacheConfig, GossipStreamType, GossipTransport, UdpTransportAdapter,
+    BootstrapCache, BootstrapCacheConfig, GossipStreamType, GossipTransport,
+    MultiplexedGossipTransport, TransportDescriptor, TransportMultiplexer, UdpTransportAdapter,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -181,12 +185,19 @@ async fn run_coordinator(args: &[String]) -> Result<()> {
 }
 
 async fn run_benchmark(args: &[String]) -> Result<()> {
-    let (coordinator_addr, bind_addr) = parse_benchmark_args(args)?;
+    let benchmark_args = parse_benchmark_args(args)?;
+    let coordinator_addr = benchmark_args.coordinator_addr;
+    let bind_addr = benchmark_args.bind_addr;
 
     println!("🚀 Transport Benchmark - CLIENT");
     println!("================================");
     println!("Coordinator: {}", coordinator_addr);
     println!("Local bind: {}", bind_addr);
+    if benchmark_args.multiplexed {
+        println!("Mode: MULTIPLEXED TRANSPORT");
+    } else {
+        println!("Mode: DIRECT UDP TRANSPORT");
+    }
     println!();
 
     // Create bootstrap cache for benchmark client using ant-quic's BootstrapCache
@@ -198,18 +209,71 @@ async fn run_benchmark(args: &[String]) -> Result<()> {
     let cache = Arc::new(BootstrapCache::open(cache_config).await?);
 
     // Measure connection time
-    println!("⏳ Connecting to coordinator with bootstrap cache...");
+    if benchmark_args.multiplexed {
+        println!("⏳ Connecting to coordinator via MULTIPLEXED transport...");
+    } else {
+        println!("⏳ Connecting to coordinator with bootstrap cache...");
+    }
     let connect_start = Instant::now();
 
-    let transport = UdpTransportAdapter::new_with_cache(
-        bind_addr,
-        vec![coordinator_addr],
-        Some(Arc::clone(&cache)),
-    )
-    .await?;
+    // Create transport - either direct UDP or multiplexed
+    let (transport, peer_id, coordinator_peer_id): (
+        Arc<dyn GossipTransport>,
+        saorsa_gossip_types::PeerId,
+        saorsa_gossip_types::PeerId,
+    ) = if benchmark_args.multiplexed {
+        // Create multiplexed transport wrapping UDP adapter
+        let udp_adapter = Arc::new(
+            UdpTransportAdapter::new_with_cache(
+                bind_addr,
+                vec![coordinator_addr],
+                Some(Arc::clone(&cache)),
+            )
+            .await?,
+        );
+
+        let local_peer_id = udp_adapter.peer_id();
+
+        // Get coordinator peer ID before wrapping
+        let coord_peer_id = udp_adapter
+            .get_bootstrap_peer_id(coordinator_addr)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Failed to retrieve coordinator peer ID"))?;
+
+        // Create multiplexer and register UDP transport
+        let multiplexer = TransportMultiplexer::new(local_peer_id);
+        multiplexer
+            .register_transport(TransportDescriptor::Udp, udp_adapter)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to register UDP transport: {}", e))?;
+        multiplexer
+            .set_default_transport(TransportDescriptor::Udp)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to set default transport: {}", e))?;
+
+        // Wrap in MultiplexedGossipTransport
+        let multiplexed = MultiplexedGossipTransport::new(Arc::new(multiplexer), local_peer_id);
+
+        (Arc::new(multiplexed), local_peer_id, coord_peer_id)
+    } else {
+        // Direct UDP transport (original mode)
+        let transport = UdpTransportAdapter::new_with_cache(
+            bind_addr,
+            vec![coordinator_addr],
+            Some(Arc::clone(&cache)),
+        )
+        .await?;
+
+        let local_peer_id = transport.peer_id();
+        let coord_peer_id = transport
+            .get_bootstrap_peer_id(coordinator_addr)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Failed to retrieve coordinator peer ID"))?;
+
+        (Arc::new(transport), local_peer_id, coord_peer_id)
+    };
 
     let connect_duration = connect_start.elapsed();
-    let peer_id = transport.peer_id();
 
     println!("✓ Connected in {:.3}s", connect_duration.as_secs_f64());
     println!("  Local PeerId: {}", peer_id);
@@ -220,13 +284,10 @@ async fn run_benchmark(args: &[String]) -> Result<()> {
         "  Cache: {} total peers ({} relay, {} coordinator)",
         stats.total_peers, stats.relay_peers, stats.coordinator_peers
     );
+    if benchmark_args.multiplexed {
+        println!("  Transport Mode: Multiplexed (UDP via TransportMultiplexer)");
+    }
     println!();
-
-    // Get coordinator peer ID
-    let coordinator_peer_id = transport
-        .get_bootstrap_peer_id(coordinator_addr)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Failed to retrieve coordinator peer ID"))?;
 
     println!("  Coordinator PeerId: {}", coordinator_peer_id);
     println!();
@@ -471,9 +532,17 @@ fn parse_bind_addr(args: &[String]) -> Result<SocketAddr> {
     bind_addr.ok_or_else(|| anyhow::anyhow!("Missing --bind argument"))
 }
 
-fn parse_benchmark_args(args: &[String]) -> Result<(SocketAddr, SocketAddr)> {
+/// Benchmark arguments including optional multiplexed mode
+struct BenchmarkArgs {
+    coordinator_addr: SocketAddr,
+    bind_addr: SocketAddr,
+    multiplexed: bool,
+}
+
+fn parse_benchmark_args(args: &[String]) -> Result<BenchmarkArgs> {
     let mut coordinator_addr = None;
     let mut bind_addr = None;
+    let mut multiplexed = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -494,6 +563,10 @@ fn parse_benchmark_args(args: &[String]) -> Result<(SocketAddr, SocketAddr)> {
                     anyhow::bail!("--bind requires an address");
                 }
             }
+            "--multiplexed" => {
+                multiplexed = true;
+                i += 1;
+            }
             _ => {
                 anyhow::bail!("Unknown argument: {}", args[i]);
             }
@@ -504,5 +577,9 @@ fn parse_benchmark_args(args: &[String]) -> Result<(SocketAddr, SocketAddr)> {
         coordinator_addr.ok_or_else(|| anyhow::anyhow!("Missing --coordinator argument"))?;
     let bind = bind_addr.ok_or_else(|| anyhow::anyhow!("Missing --bind argument"))?;
 
-    Ok((coordinator, bind))
+    Ok(BenchmarkArgs {
+        coordinator_addr: coordinator,
+        bind_addr: bind,
+        multiplexed,
+    })
 }

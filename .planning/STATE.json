@@ -7,16 +7,16 @@
     "name": "Transport Multi-Plexing Refactor"
   },
   "phase": {
-    "number": "2.3",
-    "name": "Plumb Multiplexer into GossipTransport",
-    "plan": "PLAN-203"
+    "number": "2.4",
+    "name": "Configuration & GossipContext",
+    "plan": "PLAN-204"
   },
   "progress": {
-    "total_tasks": 9,
+    "total_tasks": 7,
     "completed_tasks": 0,
-    "current_task": "PLAN-203.1: Create MultiplexedGossipTransport struct"
+    "current_task": "PLAN-204.1: Create GossipContext struct"
   },
-  "status": "planned",
+  "status": "executing",
   "interview_decisions": {
     "problem": "Missing functionality - Users can't use BLE/LoRa transports",
     "success_criteria": "Feature complete - All planned transports work correctly",
@@ -29,12 +29,12 @@
     "risks": []
   },
   "phase_decisions": {
-    "breakdown": "By layer - MultiplexedGossipTransport → Runtime wiring → Tests → Examples",
+    "breakdown": "By layer - GossipContext struct → Builder pattern → Public API → Documentation",
     "task_size": "Small - ~50 lines per task",
-    "technical": "Follow existing patterns from UdpTransportAdapter",
-    "testing": "Unit tests for types + logic + integration + property tests",
-    "dependencies": "Uses TransportMultiplexer from Phase 2.2",
+    "technical": "Follow existing GossipRuntimeBuilder and UdpTransportAdapterConfig patterns",
+    "testing": "Unit tests for builder + integration tests for build()",
+    "dependencies": "Uses TransportMultiplexer from Phase 2.2, MultiplexedGossipTransport from Phase 2.3",
     "order": "Foundation first"
   },
-  "last_updated": "2026-01-23T13:15:00Z"
+  "last_updated": "2026-01-23T14:55:00Z"
 }

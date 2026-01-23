@@ -1,4 +1,7 @@
 #![warn(missing_docs)]
+#![deny(clippy::panic)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 
 //! QUIC transport adapter for Saorsa Gossip
 //!
@@ -20,7 +23,10 @@
 //! with epsilon-greedy selection for balanced exploration and exploitation.
 
 mod ant_quic_transport;
+mod error;
 mod protocol_handler;
+
+pub use error::{TransportError as GossipTransportError, TransportResult as GossipTransportResult};
 
 pub use ant_quic_transport::{AntQuicTransport, AntQuicTransportConfig};
 pub use protocol_handler::{

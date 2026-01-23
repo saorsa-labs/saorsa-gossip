@@ -19,6 +19,7 @@ tokio-util = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }
+thiserror = "2.0"
 tracing = { workspace = true }
 ant-quic = { workspace = true }
 serde = { workspace = true }

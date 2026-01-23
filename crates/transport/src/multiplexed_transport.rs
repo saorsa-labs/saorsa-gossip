@@ -37,6 +37,7 @@ use tracing::{debug, info, warn};
 use crate::error::TransportResult;
 use crate::{
     GossipStreamType, GossipTransport, TransportAdapter, TransportDescriptor, TransportMultiplexer,
+    TransportRequest,
 };
 
 /// A multiplexed gossip transport that manages multiple transport adapters.
@@ -247,6 +248,46 @@ impl GossipTransport for MultiplexedGossipTransport {
         );
 
         Ok((peer_id, stream_type, data))
+    }
+
+    async fn send_with_request(
+        &self,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        data: Bytes,
+        request: &TransportRequest,
+    ) -> Result<()> {
+        debug!(
+            "MultiplexedGossipTransport: sending {} bytes to {} on {:?} with request {:?}",
+            data.len(),
+            peer,
+            stream_type,
+            request
+        );
+
+        // Try to select transport based on capability requirements
+        let transport = match self.multiplexer.select_transport(request).await {
+            Ok(t) => t,
+            Err(e) => {
+                // Fall back to stream-type based routing if no transport matches requirements
+                debug!(
+                    "No transport matches request {:?}, falling back to stream routing: {}",
+                    request, e
+                );
+                self.multiplexer
+                    .select_transport_for_stream(stream_type)
+                    .await
+                    .map_err(|e| anyhow!("{}", e))?
+            }
+        };
+
+        // Send using the selected transport
+        transport
+            .send(peer, stream_type, data)
+            .await
+            .map_err(|e| anyhow!("{}", e))?;
+
+        Ok(())
     }
 }
 

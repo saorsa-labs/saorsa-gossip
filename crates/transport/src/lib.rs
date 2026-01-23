@@ -308,6 +308,45 @@ pub trait GossipTransport: Send + Sync {
 
     /// Receive a message from any peer on any stream
     async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)>;
+
+    /// Send data to a peer with specific transport capability requirements.
+    ///
+    /// This method allows specifying capability requirements for transport
+    /// selection. If the requirements cannot be met, the implementation should
+    /// fall back to the default transport.
+    ///
+    /// The default implementation ignores the request and delegates to `send_to_peer`,
+    /// which routes based on stream type only. This maintains backward compatibility
+    /// with implementations that don't support capability-based routing.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer` - The target peer ID
+    /// * `stream_type` - The stream type for the message
+    /// * `data` - The message payload
+    /// * `request` - Transport capability requirements
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use saorsa_gossip_transport::{GossipTransport, TransportRequest, TransportCapability};
+    ///
+    /// // Request low-latency transport for control messages
+    /// let request = TransportRequest::new()
+    ///     .require(TransportCapability::LowLatencyControl);
+    ///
+    /// transport.send_with_request(peer, stream_type, data, &request).await?;
+    /// ```
+    async fn send_with_request(
+        &self,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        data: bytes::Bytes,
+        _request: &TransportRequest,
+    ) -> Result<()> {
+        // Default: ignore request, route by stream type only
+        self.send_to_peer(peer, stream_type, data).await
+    }
 }
 
 // Blanket implementation for Arc<T> to allow calling trait methods through Arc
@@ -340,6 +379,18 @@ impl<T: GossipTransport + ?Sized> GossipTransport for std::sync::Arc<T> {
 
     async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)> {
         (**self).receive_message().await
+    }
+
+    async fn send_with_request(
+        &self,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        data: bytes::Bytes,
+        request: &TransportRequest,
+    ) -> Result<()> {
+        (**self)
+            .send_with_request(peer, stream_type, data, request)
+            .await
     }
 }
 

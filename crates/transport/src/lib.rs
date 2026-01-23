@@ -51,8 +51,148 @@ pub use ant_quic::{
 };
 
 use anyhow::Result;
+use bytes::Bytes;
+use error::TransportResult;
 use saorsa_gossip_types::PeerId;
 use std::net::SocketAddr;
+
+// ============================================================================
+// TransportAdapter - Low-level transport abstraction
+// ============================================================================
+
+/// Capabilities of a transport implementation.
+///
+/// This struct describes the characteristics and limitations of a specific
+/// transport, allowing higher-level code to make routing decisions based on
+/// transport properties.
+#[derive(Debug, Clone, Default)]
+pub struct TransportCapabilities {
+    /// Whether this transport supports broadcast/multicast.
+    pub supports_broadcast: bool,
+    /// Maximum message size in bytes that can be sent atomically.
+    pub max_message_size: usize,
+    /// Typical one-way latency in milliseconds.
+    pub typical_latency_ms: u32,
+    /// Whether the transport provides reliable delivery.
+    pub is_reliable: bool,
+    /// Human-readable transport name (e.g., "UDP/QUIC", "BLE", "LoRa").
+    pub name: &'static str,
+}
+
+/// Low-level transport adapter trait.
+///
+/// This trait abstracts the underlying transport mechanism (QUIC, BLE, LoRa, etc.)
+/// and provides a common interface for sending and receiving gossip messages.
+/// Unlike [`GossipTransport`], this trait uses [`TransportResult`] for error handling
+/// and focuses on transport-level operations.
+///
+/// # Implementors
+///
+/// - [`UdpTransportAdapter`] - QUIC over UDP (default)
+/// - Future: `BleTransportAdapter` - Bluetooth Low Energy
+/// - Future: `LoraTransportAdapter` - LoRa radio
+///
+/// # Example
+///
+/// ```ignore
+/// use saorsa_gossip_transport::{TransportAdapter, TransportCapabilities};
+///
+/// async fn send_message<T: TransportAdapter>(transport: &T, peer: PeerId, data: Bytes) {
+///     let caps = transport.capabilities();
+///     if data.len() <= caps.max_message_size {
+///         transport.send(peer, GossipStreamType::Membership, data).await?;
+///     }
+/// }
+/// ```
+#[async_trait::async_trait]
+pub trait TransportAdapter: Send + Sync {
+    /// Returns the local peer ID for this transport.
+    fn local_peer_id(&self) -> PeerId;
+
+    /// Dials a remote address and returns the peer ID of the connected node.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GossipTransportError::DialFailed`] if the connection cannot be established.
+    async fn dial(&self, addr: SocketAddr) -> TransportResult<PeerId>;
+
+    /// Sends data to a peer with the given stream type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GossipTransportError::SendFailed`] if the message cannot be delivered.
+    async fn send(
+        &self,
+        peer_id: PeerId,
+        stream_type: GossipStreamType,
+        data: Bytes,
+    ) -> TransportResult<()>;
+
+    /// Receives the next message from any connected peer.
+    ///
+    /// This method blocks until a message is available or an error occurs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GossipTransportError::ReceiveFailed`] on receive errors.
+    /// Returns [`GossipTransportError::Closed`] if the transport is closed.
+    async fn recv(&self) -> TransportResult<(PeerId, GossipStreamType, Bytes)>;
+
+    /// Closes the transport and releases all resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if cleanup fails.
+    async fn close(&self) -> TransportResult<()>;
+
+    /// Returns a list of currently connected peers with their addresses.
+    async fn connected_peers(&self) -> Vec<(PeerId, SocketAddr)>;
+
+    /// Returns the capabilities of this transport.
+    fn capabilities(&self) -> TransportCapabilities;
+}
+
+// Blanket implementation for Arc<T> to allow calling trait methods through Arc
+#[async_trait::async_trait]
+impl<T: TransportAdapter + ?Sized> TransportAdapter for std::sync::Arc<T> {
+    fn local_peer_id(&self) -> PeerId {
+        (**self).local_peer_id()
+    }
+
+    async fn dial(&self, addr: SocketAddr) -> TransportResult<PeerId> {
+        (**self).dial(addr).await
+    }
+
+    async fn send(
+        &self,
+        peer_id: PeerId,
+        stream_type: GossipStreamType,
+        data: Bytes,
+    ) -> TransportResult<()> {
+        (**self).send(peer_id, stream_type, data).await
+    }
+
+    async fn recv(&self) -> TransportResult<(PeerId, GossipStreamType, Bytes)> {
+        (**self).recv().await
+    }
+
+    async fn close(&self) -> TransportResult<()> {
+        (**self).close().await
+    }
+
+    async fn connected_peers(&self) -> Vec<(PeerId, SocketAddr)> {
+        (**self).connected_peers().await
+    }
+
+    fn capabilities(&self) -> TransportCapabilities {
+        (**self).capabilities()
+    }
+}
+
+// ============================================================================
+// GossipStreamType
+// ============================================================================
+
 /// Stream type identifiers for QUIC streams (legacy wrapper)
 ///
 /// This type provides a simpler interface for gossip-specific stream types.

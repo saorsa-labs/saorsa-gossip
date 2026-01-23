@@ -38,7 +38,7 @@ saorsa-pqc = "0.3.14"
 saorsa-mls = "0.3.1"
 
 # QUIC transport
-ant-quic = "0.18"
+ant-quic = "0.19"
 
 # Shared transport layer
 

@@ -33,6 +33,7 @@ impl Default for GossipRuntimeConfig {
 }
 
 /// Builder for [`GossipRuntime`].
+#[derive(Default)]
 pub struct GossipRuntimeBuilder {
     config: GossipRuntimeConfig,
     identity: Option<MlDsaKeyPair>,
@@ -40,11 +41,9 @@ pub struct GossipRuntimeBuilder {
 
 impl GossipRuntimeBuilder {
     /// Create a new builder with default configuration.
+    #[must_use]
     pub fn new() -> Self {
-        Self {
-            config: GossipRuntimeConfig::default(),
-            identity: None,
-        }
+        Self::default()
     }
 
     /// Override the bind address for the transport.

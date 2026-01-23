@@ -49,12 +49,14 @@
 //! This crate uses ant-quic's `BootstrapCache` for persistent peer storage
 //! with epsilon-greedy selection for balanced exploration and exploitation.
 
+mod ble_transport_adapter;
 mod error;
 mod multiplexed_transport;
 mod multiplexer;
 mod protocol_handler;
 mod udp_transport_adapter;
 
+pub use ble_transport_adapter::{BleTransportAdapter, BleTransportAdapterConfig};
 pub use error::{TransportError as GossipTransportError, TransportResult as GossipTransportResult};
 
 pub use multiplexed_transport::MultiplexedGossipTransport;

@@ -68,6 +68,15 @@ pub enum TransportError {
         reason: String,
     },
 
+    /// Message exceeds transport MTU.
+    #[error("Message size {size} exceeds MTU {mtu}")]
+    MtuExceeded {
+        /// The actual message size.
+        size: usize,
+        /// The maximum allowed size.
+        mtu: usize,
+    },
+
     /// Transport is closed.
     #[error("Transport is closed")]
     Closed,

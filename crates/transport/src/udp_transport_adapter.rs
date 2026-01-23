@@ -1,6 +1,8 @@
-//! Ant-QUIC transport implementation for Saorsa Gossip
+//! UDP Transport Adapter for Saorsa Gossip
 //!
-//! This module provides a production-ready QUIC transport using ant-quic.
+//! This module provides a production-ready QUIC-over-UDP transport using ant-quic.
+//! It is the primary transport adapter for gossip communication.
+//!
 //! Features:
 //! - Full QUIC multiplexing for membership/pubsub/bulk streams
 //! - NAT traversal with hole punching
@@ -28,7 +30,7 @@ use ant_quic::{derive_peer_id_from_public_key, generate_ml_dsa_keypair};
 
 /// Configuration for Ant-QUIC transport
 #[derive(Debug, Clone)]
-pub struct AntQuicTransportConfig {
+pub struct UdpTransportAdapterConfig {
     /// Local address to bind to
     pub bind_addr: SocketAddr,
     /// List of known peer addresses for initial discovery
@@ -45,7 +47,7 @@ pub struct AntQuicTransportConfig {
     pub keypair: Option<(Vec<u8>, Vec<u8>)>,
 }
 
-impl AntQuicTransportConfig {
+impl UdpTransportAdapterConfig {
     /// Create a new configuration with required fields and sensible defaults
     pub fn new(bind_addr: SocketAddr, known_peers: Vec<SocketAddr>) -> Self {
         Self {
@@ -88,7 +90,7 @@ impl AntQuicTransportConfig {
 ///
 /// Uses the ant-quic Node API for symmetric P2P networking with NAT traversal.
 /// All nodes can both connect to peers and accept connections.
-pub struct AntQuicTransport {
+pub struct UdpTransportAdapter {
     /// The underlying ant-quic P2P node
     node: Arc<Node>,
     /// Incoming message channel (bounded for backpressure)
@@ -105,17 +107,17 @@ pub struct AntQuicTransport {
     /// Optional bootstrap cache for persistent peer storage (using ant-quic's cache)
     bootstrap_cache: Option<Arc<BootstrapCache>>,
     /// Configuration
-    config: AntQuicTransportConfig,
+    config: UdpTransportAdapterConfig,
 }
 
-impl AntQuicTransport {
+impl UdpTransportAdapter {
     /// Create a new Ant-QUIC transport
     ///
     /// # Arguments
     /// * `bind_addr` - Local address to bind to
     /// * `known_peers` - List of known peer addresses for initial discovery
     pub async fn new(bind_addr: SocketAddr, known_peers: Vec<SocketAddr>) -> Result<Self> {
-        let config = AntQuicTransportConfig::new(bind_addr, known_peers);
+        let config = UdpTransportAdapterConfig::new(bind_addr, known_peers);
         Self::with_config(config, None).await
     }
 
@@ -130,7 +132,7 @@ impl AntQuicTransport {
         known_peers: Vec<SocketAddr>,
         bootstrap_cache: Option<Arc<BootstrapCache>>,
     ) -> Result<Self> {
-        let config = AntQuicTransportConfig::new(bind_addr, known_peers);
+        let config = UdpTransportAdapterConfig::new(bind_addr, known_peers);
         Self::with_config(config, bootstrap_cache).await
     }
 
@@ -140,7 +142,7 @@ impl AntQuicTransport {
     /// * `config` - Transport configuration
     /// * `bootstrap_cache` - Optional bootstrap cache for persistent peer storage
     pub async fn with_config(
-        config: AntQuicTransportConfig,
+        config: UdpTransportAdapterConfig,
         bootstrap_cache: Option<Arc<BootstrapCache>>,
     ) -> Result<Self> {
         info!(
@@ -473,7 +475,7 @@ fn gossip_peer_id_to_ant(gossip_id: &GossipPeerId) -> AntPeerId {
 }
 
 #[async_trait::async_trait]
-impl GossipTransport for AntQuicTransport {
+impl GossipTransport for UdpTransportAdapter {
     async fn dial(&self, peer: GossipPeerId, addr: SocketAddr) -> Result<()> {
         info!("Dialing peer {} at {}", peer, addr);
 
@@ -627,13 +629,13 @@ mod tests {
     use super::*;
 
     // ==========================================================================
-    // AntQuicTransport Creation Tests
+    // UdpTransportAdapter Creation Tests
     // ==========================================================================
 
     #[tokio::test]
-    async fn test_ant_quic_transport_creation() {
+    async fn test_udp_transport_adapter_creation() {
         let bind_addr = "127.0.0.1:0".parse().expect("Invalid address");
-        let transport = AntQuicTransport::new(bind_addr, vec![])
+        let transport = UdpTransportAdapter::new(bind_addr, vec![])
             .await
             .expect("Failed to create transport");
 
@@ -641,9 +643,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ant_quic_transport_with_config() {
+    async fn test_udp_transport_adapter_with_config() {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
-        let config = AntQuicTransportConfig {
+        let config = UdpTransportAdapterConfig {
             bind_addr,
             known_peers: vec![],
             channel_capacity: 10_000,
@@ -651,7 +653,7 @@ mod tests {
             max_peers: 1_000,
             keypair: None,
         };
-        let transport = AntQuicTransport::with_config(config, None)
+        let transport = UdpTransportAdapter::with_config(config, None)
             .await
             .expect("Failed to create transport with config");
 
@@ -659,15 +661,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ant_quic_transport_unique_peer_ids() {
+    async fn test_udp_transport_adapter_unique_peer_ids() {
         // Create two transports and ensure they have unique peer IDs
         let addr1: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
         let addr2: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
 
-        let transport1 = AntQuicTransport::new(addr1, vec![])
+        let transport1 = UdpTransportAdapter::new(addr1, vec![])
             .await
             .expect("Failed to create transport1");
-        let transport2 = AntQuicTransport::new(addr2, vec![])
+        let transport2 = UdpTransportAdapter::new(addr2, vec![])
             .await
             .expect("Failed to create transport2");
 
@@ -679,9 +681,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ant_quic_transport_peer_id_consistency() {
+    async fn test_udp_transport_adapter_peer_id_consistency() {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
-        let transport = AntQuicTransport::new(bind_addr, vec![])
+        let transport = UdpTransportAdapter::new(bind_addr, vec![])
             .await
             .expect("Failed to create transport");
 
@@ -692,13 +694,13 @@ mod tests {
     }
 
     // ==========================================================================
-    // AntQuicTransportConfig Tests
+    // UdpTransportAdapterConfig Tests
     // ==========================================================================
 
     #[test]
-    fn test_ant_quic_transport_config_defaults() {
+    fn test_udp_transport_adapter_config_defaults() {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
-        let config = AntQuicTransportConfig {
+        let config = UdpTransportAdapterConfig {
             bind_addr,
             known_peers: vec![],
             channel_capacity: 10_000,
@@ -712,12 +714,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ant_quic_transport_config_with_known_peers() {
+    fn test_udp_transport_adapter_config_with_known_peers() {
         let bind_addr: SocketAddr = "127.0.0.1:9000".parse().expect("valid address");
         let peer1: SocketAddr = "192.168.1.1:9000".parse().expect("valid address");
         let peer2: SocketAddr = "192.168.1.2:9000".parse().expect("valid address");
 
-        let config = AntQuicTransportConfig {
+        let config = UdpTransportAdapterConfig {
             bind_addr,
             known_peers: vec![peer1, peer2],
             channel_capacity: 5_000,
@@ -732,13 +734,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ant_quic_transport_config_with_keypair_bytes() {
+    fn test_udp_transport_adapter_config_with_keypair_bytes() {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
         // Test that config can hold keypair bytes (actual key generation tested separately)
         let test_public_key = vec![1u8; 2592]; // ML-DSA-65 public key size
         let test_secret_key = vec![2u8; 4032]; // ML-DSA-65 secret key size
 
-        let config = AntQuicTransportConfig {
+        let config = UdpTransportAdapterConfig {
             bind_addr,
             known_peers: vec![],
             channel_capacity: 10_000,
@@ -885,9 +887,9 @@ mod tests {
     // ==========================================================================
 
     #[tokio::test]
-    async fn test_ant_quic_transport_close() {
+    async fn test_udp_transport_adapter_close() {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
-        let transport = AntQuicTransport::new(bind_addr, vec![])
+        let transport = UdpTransportAdapter::new(bind_addr, vec![])
             .await
             .expect("Failed to create transport");
 
@@ -896,9 +898,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ant_quic_transport_close_idempotent() {
+    async fn test_udp_transport_adapter_close_idempotent() {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("Invalid address");
-        let transport = AntQuicTransport::new(bind_addr, vec![])
+        let transport = UdpTransportAdapter::new(bind_addr, vec![])
             .await
             .expect("Failed to create transport");
 
@@ -929,7 +931,7 @@ mod tests {
 
         // Create first node
         let node1_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), base_port);
-        let node1 = AntQuicTransport::new(node1_addr, vec![])
+        let node1 = UdpTransportAdapter::new(node1_addr, vec![])
             .await
             .expect("Failed to create node1");
 
@@ -938,7 +940,7 @@ mod tests {
 
         // Create second node that knows about first
         let node2_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), base_port + 1);
-        let node2 = AntQuicTransport::new(node2_addr, vec![node1_addr])
+        let node2 = UdpTransportAdapter::new(node2_addr, vec![node1_addr])
             .await
             .expect("Failed to create node2");
 

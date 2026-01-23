@@ -28,7 +28,16 @@ mod udp_transport_adapter;
 
 pub use error::{TransportError as GossipTransportError, TransportResult as GossipTransportResult};
 
-pub use udp_transport_adapter::{AntQuicTransport, AntQuicTransportConfig};
+pub use udp_transport_adapter::{UdpTransportAdapter, UdpTransportAdapterConfig};
+
+// Deprecated aliases for backward compatibility
+#[deprecated(since = "0.3.0", note = "Use UdpTransportAdapter instead")]
+/// Deprecated alias for [`UdpTransportAdapter`].
+pub type AntQuicTransport = UdpTransportAdapter;
+
+#[deprecated(since = "0.3.0", note = "Use UdpTransportAdapterConfig instead")]
+/// Deprecated alias for [`UdpTransportAdapterConfig`].
+pub type AntQuicTransportConfig = UdpTransportAdapterConfig;
 pub use protocol_handler::{
     BulkHandler, GossipMessage, GossipProtocolHandler, MembershipHandler, PubSubHandler,
 };

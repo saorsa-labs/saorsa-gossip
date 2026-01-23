@@ -26,12 +26,18 @@
 //! );
 //! ```
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use saorsa_gossip_types::PeerId;
+use tracing::{debug, info, warn};
 
 use crate::error::TransportResult;
-use crate::{TransportAdapter, TransportDescriptor, TransportMultiplexer};
+use crate::{
+    GossipStreamType, GossipTransport, TransportAdapter, TransportDescriptor, TransportMultiplexer,
+};
 
 /// A multiplexed gossip transport that manages multiple transport adapters.
 ///
@@ -110,6 +116,137 @@ impl MultiplexedGossipTransport {
         multiplexer.set_default_transport(descriptor).await?;
 
         Ok(Self::new(Arc::new(multiplexer), local_peer_id))
+    }
+}
+
+#[async_trait::async_trait]
+impl GossipTransport for MultiplexedGossipTransport {
+    async fn dial(&self, peer: PeerId, addr: SocketAddr) -> Result<()> {
+        debug!(
+            "MultiplexedGossipTransport: dialing peer {} at {}",
+            peer, addr
+        );
+
+        // Get the default transport for dialing
+        let transport = self
+            .multiplexer
+            .get_default_transport()
+            .await
+            .ok_or_else(|| anyhow!("No default transport configured"))?;
+
+        // Dial using the adapter
+        let connected_peer = transport.dial(addr).await.map_err(|e| anyhow!("{}", e))?;
+
+        // Verify we connected to the expected peer
+        if connected_peer != peer {
+            warn!(
+                "Connected to peer {} at {} but expected {}",
+                connected_peer, addr, peer
+            );
+            return Err(anyhow!(
+                "Connected to unexpected peer {} when dialing {}",
+                connected_peer,
+                peer
+            ));
+        }
+
+        info!("Successfully dialed peer {} at {}", peer, addr);
+        Ok(())
+    }
+
+    async fn dial_bootstrap(&self, addr: SocketAddr) -> Result<PeerId> {
+        debug!("MultiplexedGossipTransport: dialing bootstrap at {}", addr);
+
+        // Get the default transport for bootstrap dialing
+        let transport = self
+            .multiplexer
+            .get_default_transport()
+            .await
+            .ok_or_else(|| anyhow!("No default transport configured"))?;
+
+        // Dial and return the peer ID
+        let peer_id = transport.dial(addr).await.map_err(|e| anyhow!("{}", e))?;
+
+        info!(
+            "Successfully connected to bootstrap at {} (peer: {})",
+            addr, peer_id
+        );
+        Ok(peer_id)
+    }
+
+    async fn listen(&self, bind: SocketAddr) -> Result<()> {
+        // For multiplexed transport, listening is handled by the individual transports
+        // during their initialization. This is a no-op for most transports.
+        debug!("MultiplexedGossipTransport: listen called for {} (no-op, handled by individual transports)", bind);
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<()> {
+        info!("MultiplexedGossipTransport: closing all transports");
+
+        // Get all registered transports and close them
+        let descriptors = self.multiplexer.available_transports().await;
+
+        for descriptor in descriptors {
+            if let Some(transport) = self.multiplexer.get_transport(&descriptor).await {
+                if let Err(e) = transport.close().await {
+                    warn!("Error closing {:?} transport: {}", descriptor, e);
+                }
+            }
+        }
+
+        info!("All transports closed");
+        Ok(())
+    }
+
+    async fn send_to_peer(
+        &self,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        data: Bytes,
+    ) -> Result<()> {
+        debug!(
+            "MultiplexedGossipTransport: sending {} bytes to {} on {:?}",
+            data.len(),
+            peer,
+            stream_type
+        );
+
+        // Select the appropriate transport based on stream type
+        let transport = self
+            .multiplexer
+            .select_transport_for_stream(stream_type)
+            .await
+            .map_err(|e| anyhow!("{}", e))?;
+
+        // Send using the selected transport
+        transport
+            .send(peer, stream_type, data)
+            .await
+            .map_err(|e| anyhow!("{}", e))?;
+
+        Ok(())
+    }
+
+    async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+        // Receive from the default transport
+        // Future enhancement: multiplex receive from all transports
+        let transport = self
+            .multiplexer
+            .get_default_transport()
+            .await
+            .ok_or_else(|| anyhow!("No default transport configured"))?;
+
+        let (peer_id, stream_type, data) = transport.recv().await.map_err(|e| anyhow!("{}", e))?;
+
+        debug!(
+            "MultiplexedGossipTransport: received {} bytes from {} on {:?}",
+            data.len(),
+            peer_id,
+            stream_type
+        );
+
+        Ok((peer_id, stream_type, data))
     }
 }
 

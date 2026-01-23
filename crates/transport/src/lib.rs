@@ -20,10 +20,23 @@
 //! on capability requirements. Use [`TransportRequest`] to specify routing needs:
 //!
 //! ```ignore
+//! // Request low-latency transport for control messages
+//! let request = TransportRequest::low_latency_control();
+//! transport.send_with_request(peer, stream_type, data, &request).await?;
+//!
+//! // Request bulk transfer for large CRDT payloads
+//! let request = TransportRequest::bulk_transfer();
+//! transport.send_with_request(peer, stream_type, data, &request).await?;
+//!
+//! // Custom request with preferences and exclusions
 //! let request = TransportRequest::new()
-//!     .require(TransportCapability::LowLatencyControl);
-//! let transport = multiplexer.select_transport(&request).await?;
+//!     .require(TransportCapability::LowLatencyControl)
+//!     .prefer(TransportDescriptor::Udp)
+//!     .exclude(TransportDescriptor::Lora);
 //! ```
+//!
+//! The membership module uses `low_latency_control()` for HyParView and SWIM
+//! messages, while the pubsub module uses `bulk_transfer()` for large payloads.
 //!
 //! # SharedTransport Integration
 //!

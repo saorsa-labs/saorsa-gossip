@@ -143,3 +143,107 @@ Bug fixes and improvements: Bootstrap cache integration, FOAF discovery, shuffle
 - Added `pending_query_count()` method for monitoring/testing
 - 331 tests passing (32 presence tests, up from 27)
 - Clippy clean with strict settings
+
+---
+
+## Milestone 2: Transport Multi-Plexing Refactor
+
+### Overview
+Refactor the transport layer to support multiple transports (UDP/QUIC, BLE, LoRa) through a unified multiplexer architecture. This enables gossip protocols to work across constrained and broadband links while maintaining the existing GossipTransport trait API.
+
+### Success Criteria
+- All planned transports work correctly (UDP, BLE stubs, LoRa stubs)
+- TransportMultiplexer routes messages based on capability requirements
+- Peer adverts include transport-type hints for BLE bridge discovery
+- Dual-transport benchmarks compare constrained vs broadband links
+- Zero compilation warnings, zero test failures
+
+### Technical Decisions
+| Topic | Decision |
+|-------|----------|
+| Error Handling | Dedicated error types with thiserror |
+| Async Model | Match existing pattern (async methods, tokio::spawn) |
+| Testing | Unit tests + Integration tests + Property-based tests |
+| Documentation | Full public API docs with examples |
+| Priority | Technical foundation first (registry/multiplexer) |
+
+### Phase 1: Rename and Create TransportAdapter Trait ← CURRENT
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 1.1 | Create `TransportAdapter` trait | Pending | Define common transport operations |
+| 1.2 | Create `TransportError` enum | Pending | Dedicated error types with thiserror |
+| 1.3 | Rename `AntQuicTransport` to `UdpTransportAdapter` | Pending | File and struct rename |
+| 1.4 | Implement `TransportAdapter` for `UdpTransportAdapter` | Pending | Wrap existing functionality |
+| 1.5 | Update all imports and references | Pending | crates/runtime, examples, tests |
+| 1.6 | Verify all tests pass | Pending | 331+ tests must pass |
+
+### Phase 2: Implement TransportMultiplexer
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 2.1 | Create `TransportMultiplexer` struct | Pending | Registry + routing logic |
+| 2.2 | Create `TransportCapability` enum | Pending | LowLatencyControl, BulkCrdt, etc. |
+| 2.3 | Create `TransportDescriptor` enum | Pending | UDP, BLE, LoRa variants |
+| 2.4 | Implement transport registration | Pending | `register_transport()` API |
+| 2.5 | Implement capability-based routing | Pending | Route based on request requirements |
+| 2.6 | Add ant-quic routing update subscription | Pending | If ant-quic provides registry |
+| 2.7 | Unit tests for multiplexer | Pending | Routing logic tests |
+
+### Phase 3: Plumb Multiplexer into GossipTransport
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 3.1 | Create `MultiplexedGossipTransport` | Pending | Implements GossipTransport |
+| 3.2 | Wire multiplexer to runtime | Pending | Update GossipRuntime |
+| 3.3 | Backward compatibility | Pending | Single-transport mode still works |
+| 3.4 | Integration tests | Pending | Multi-transport scenarios |
+| 3.5 | Update examples | Pending | Show multiplexed usage |
+
+### Phase 4: Configuration & GossipContext
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 4.1 | Create `GossipContext` struct | Pending | Central configuration object |
+| 4.2 | Add transport descriptor configuration | Pending | Builder pattern for descriptors |
+| 4.3 | Public API for communitas-core | Pending | Clean interface for consumers |
+| 4.4 | Documentation | Pending | API docs with examples |
+
+### Phase 5: Transport Capability Requests
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 5.1 | Create `TransportRequest` type | Pending | Capability requirements |
+| 5.2 | Update membership module | Pending | Request "low-latency control" |
+| 5.3 | Update pubsub module | Pending | Request "bulk CRDT" for large messages |
+| 5.4 | Fallback logic | Pending | When preferred transport unavailable |
+| 5.5 | Tests for capability requests | Pending | Verify routing behavior |
+
+### Phase 6: Transport Hints in Peer Adverts
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 6.1 | Extend `CoordinatorAdvert` | Pending | Add transport_hints field |
+| 6.2 | Update serialization | Pending | CBOR encoding for hints |
+| 6.3 | Bootstrap cache preserves hints | Pending | GossipCacheAdapter update |
+| 6.4 | BLE bridge discovery | Pending | Communitas integration |
+| 6.5 | Tests | Pending | Advert round-trip tests |
+
+### Phase 7: Benchmarking & BLE Stub
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 7.1 | Extend `transport_benchmark.rs` | Pending | Dual transport support |
+| 7.2 | Per-transport metrics | Pending | Throughput/latency per stream |
+| 7.3 | Create `BleTransportAdapter` stub | Pending | Simulated constrained link |
+| 7.4 | Benchmark documentation | Pending | Methodology and results |
+| 7.5 | Property-based tests | Pending | Routing edge cases |
+
+---
+
+## Files to be Modified (Milestone 2)
+
+| File | Changes |
+|------|---------|
+| `crates/transport/src/lib.rs` | Add TransportAdapter trait, TransportCapability, re-exports |
+| `crates/transport/src/ant_quic_transport.rs` | Rename to udp_transport_adapter.rs |
+| `crates/transport/src/multiplexer.rs` | NEW: TransportMultiplexer implementation |
+| `crates/transport/src/error.rs` | NEW: TransportError enum |
+| `crates/runtime/src/runtime.rs` | Add GossipContext, update runtime |
+| `crates/coordinator/src/lib.rs` | CoordinatorAdvert transport hints |
+| `crates/membership/src/lib.rs` | Transport capability requests |
+| `crates/pubsub/src/lib.rs` | Transport capability requests |
+| `examples/transport_benchmark.rs` | Dual-transport benchmarks |

@@ -21,7 +21,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use saorsa_gossip_transport::{
-    AntQuicTransport, BootstrapCache, BootstrapCacheConfig, GossipStreamType, GossipTransport,
+    BootstrapCache, BootstrapCacheConfig, GossipStreamType, GossipTransport, UdpTransportAdapter,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -119,7 +119,7 @@ async fn run_coordinator(args: &[String]) -> Result<()> {
     // Create transport (symmetric P2P node)
     println!("⏳ Initializing transport with bootstrap cache...");
     let transport =
-        AntQuicTransport::new_with_cache(bind_addr, vec![], Some(Arc::clone(&cache))).await?;
+        UdpTransportAdapter::new_with_cache(bind_addr, vec![], Some(Arc::clone(&cache))).await?;
 
     let peer_id = transport.peer_id();
     println!("✓ Transport initialized");
@@ -201,7 +201,7 @@ async fn run_benchmark(args: &[String]) -> Result<()> {
     println!("⏳ Connecting to coordinator with bootstrap cache...");
     let connect_start = Instant::now();
 
-    let transport = AntQuicTransport::new_with_cache(
+    let transport = UdpTransportAdapter::new_with_cache(
         bind_addr,
         vec![coordinator_addr],
         Some(Arc::clone(&cache)),

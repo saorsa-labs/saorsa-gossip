@@ -7,7 +7,7 @@ use saorsa_gossip_membership::{
 };
 use saorsa_gossip_presence::PresenceManager;
 use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
-use saorsa_gossip_transport::{AntQuicTransport, AntQuicTransportConfig, GossipTransport};
+use saorsa_gossip_transport::{GossipTransport, UdpTransportAdapter, UdpTransportAdapterConfig};
 use saorsa_gossip_types::{PeerId, TopicId};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -74,8 +74,8 @@ impl GossipRuntimeBuilder {
         let peer_id = identity.peer_id();
 
         let transport = Arc::new(
-            AntQuicTransport::with_config(
-                AntQuicTransportConfig::new(self.config.bind_addr, self.config.known_peers),
+            UdpTransportAdapter::with_config(
+                UdpTransportAdapterConfig::new(self.config.bind_addr, self.config.known_peers),
                 None,
             )
             .await?,
@@ -142,7 +142,7 @@ pub struct GossipRuntime {
     /// Local peer-id.
     pub peer_id: PeerId,
     /// Shared QUIC transport.
-    pub transport: Arc<AntQuicTransport>,
+    pub transport: Arc<UdpTransportAdapter>,
     /// Membership layer.
     pub membership: Arc<RwLock<Box<dyn Membership>>>,
     /// PubSub layer.

@@ -96,13 +96,12 @@ impl From<anyhow::Error> for TransportError {
 
 impl From<std::io::Error> for TransportError {
     fn from(err: std::io::Error) -> Self {
-        TransportError::Other {
-            source: err.into(),
-        }
+        TransportError::Other { source: err.into() }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};

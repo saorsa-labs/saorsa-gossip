@@ -1002,13 +1002,13 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saorsa_gossip_transport::AntQuicTransport;
+    use saorsa_gossip_transport::UdpTransportAdapter;
     use std::net::SocketAddr;
 
-    async fn test_transport() -> Arc<AntQuicTransport> {
+    async fn test_transport() -> Arc<UdpTransportAdapter> {
         let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
         Arc::new(
-            AntQuicTransport::new(bind, vec![])
+            UdpTransportAdapter::new(bind, vec![])
                 .await
                 .expect("transport"),
         )
@@ -1018,7 +1018,7 @@ mod tests {
         PeerId::new([0u8; 32])
     }
 
-    async fn test_membership() -> HyParViewMembership<AntQuicTransport> {
+    async fn test_membership() -> HyParViewMembership<UdpTransportAdapter> {
         HyParViewMembership::new(
             test_peer_id(),
             DEFAULT_ACTIVE_DEGREE,

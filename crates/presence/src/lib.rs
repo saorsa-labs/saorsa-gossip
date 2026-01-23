@@ -918,7 +918,7 @@ pub fn derive_presence_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saorsa_gossip_transport::AntQuicTransport;
+    use saorsa_gossip_transport::UdpTransportAdapter;
     use std::net::SocketAddr;
 
     // Helper: Create test presence manager
@@ -926,7 +926,7 @@ mod tests {
         let peer_id = PeerId::new([1u8; 32]);
         let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
         let transport = Arc::new(
-            AntQuicTransport::new(bind, vec![])
+            UdpTransportAdapter::new(bind, vec![])
                 .await
                 .expect("transport"),
         );

@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
 
     // 3. Start transport and message handling
     tracing::info!("Initializing transport on {}...", args.bind);
-    let transport = saorsa_gossip_transport::AntQuicTransport::new(
+    let transport = saorsa_gossip_transport::UdpTransportAdapter::new(
         args.bind,
         vec![], // Coordinator nodes don't need other known peers
     )
@@ -273,7 +273,7 @@ impl From<CoordinatorRoles> for saorsa_gossip_coordinator::CoordinatorRoles {
 }
 
 /// Handle incoming messages from peers
-async fn handle_messages(transport: std::sync::Arc<saorsa_gossip_transport::AntQuicTransport>) {
+async fn handle_messages(transport: std::sync::Arc<saorsa_gossip_transport::UdpTransportAdapter>) {
     tracing::info!("Message handler started - listening for PING messages...");
 
     loop {

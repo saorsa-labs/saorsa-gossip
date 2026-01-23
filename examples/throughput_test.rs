@@ -13,7 +13,7 @@
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use saorsa_gossip_transport::{AntQuicTransport, GossipStreamType, GossipTransport};
+use saorsa_gossip_transport::{GossipStreamType, GossipTransport, UdpTransportAdapter};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -62,7 +62,7 @@ async fn run_receiver(args: &[String]) -> Result<()> {
 
     // Create transport (symmetric P2P node)
     println!("⏳ Initializing transport...");
-    let transport = AntQuicTransport::new(bind_addr, vec![]).await?;
+    let transport = UdpTransportAdapter::new(bind_addr, vec![]).await?;
 
     let peer_id = transport.peer_id();
     println!("✓ Transport initialized");
@@ -127,7 +127,7 @@ async fn run_sender(args: &[String]) -> Result<()> {
     println!("⏳ Connecting to coordinator...");
     let connect_start = Instant::now();
 
-    let transport = AntQuicTransport::new(bind_addr, vec![coordinator_addr]).await?;
+    let transport = UdpTransportAdapter::new(bind_addr, vec![coordinator_addr]).await?;
 
     let connect_duration = connect_start.elapsed();
     let peer_id = transport.peer_id();

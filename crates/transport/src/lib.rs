@@ -3,13 +3,27 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 
-//! QUIC transport adapter for Saorsa Gossip
+//! Multi-transport adapter for Saorsa Gossip
 //!
-//! Provides QUIC transport with:
+//! Provides transport abstraction with:
+//! - [`TransportAdapter`] trait for pluggable transports
+//! - [`TransportMultiplexer`] for capability-based routing
+//! - UDP/QUIC as the default transport via [`UdpTransportAdapter`]
 //! - Three control streams: `mship`, `pubsub`, `bulk`
 //! - 0-RTT resumption where safe
 //! - Path migration by default
 //! - PQC handshake with ant-quic
+//!
+//! # Transport Multiplexing
+//!
+//! The [`TransportMultiplexer`] routes messages to appropriate transports based
+//! on capability requirements. Use [`TransportRequest`] to specify routing needs:
+//!
+//! ```ignore
+//! let request = TransportRequest::new()
+//!     .require(TransportCapability::LowLatencyControl);
+//! let transport = multiplexer.select_transport(&request).await?;
+//! ```
 //!
 //! # SharedTransport Integration
 //!
@@ -23,10 +37,18 @@
 //! with epsilon-greedy selection for balanced exploration and exploitation.
 
 mod error;
+mod multiplexed_transport;
+mod multiplexer;
 mod protocol_handler;
 mod udp_transport_adapter;
 
 pub use error::{TransportError as GossipTransportError, TransportResult as GossipTransportResult};
+
+pub use multiplexed_transport::MultiplexedGossipTransport;
+pub use multiplexer::{
+    TransportCapability, TransportDescriptor, TransportMultiplexer, TransportRegistry,
+    TransportRequest,
+};
 
 pub use udp_transport_adapter::{UdpTransportAdapter, UdpTransportAdapterConfig};
 

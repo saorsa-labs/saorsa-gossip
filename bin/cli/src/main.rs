@@ -405,7 +405,7 @@ async fn handle_identity(action: IdentityAction, config_dir: &std::path::Path) -
 /// Handle network commands
 async fn handle_network(action: NetworkAction, config_dir: &std::path::Path) -> Result<()> {
     use saorsa_gossip_identity::Identity;
-    use saorsa_gossip_transport::{AntQuicTransport, GossipStreamType, GossipTransport};
+    use saorsa_gossip_transport::{GossipStreamType, GossipTransport, UdpTransportAdapter};
 
     match action {
         NetworkAction::Join {
@@ -434,7 +434,7 @@ async fn handle_network(action: NetworkAction, config_dir: &std::path::Path) -> 
             // Create transport (automatically connects to known peers)
             println!("  Creating transport and establishing QUIC connection...");
             let transport =
-                Arc::new(AntQuicTransport::new(bind_addr, vec![coordinator_addr]).await?);
+                Arc::new(UdpTransportAdapter::new(bind_addr, vec![coordinator_addr]).await?);
             let coordinator_cache: CoordinatorAdvertCache = Arc::new(Mutex::new(HashMap::new()));
             let (pong_tx, pong_rx) = oneshot::channel();
             let listener_transport = transport.clone();
@@ -645,7 +645,7 @@ fn path_to_string(path: &std::path::Path) -> Result<String> {
 type CoordinatorAdvertCache = Arc<Mutex<HashMap<saorsa_gossip_types::PeerId, CoordinatorAdvert>>>;
 
 async fn run_transport_listener(
-    transport: Arc<saorsa_gossip_transport::AntQuicTransport>,
+    transport: Arc<saorsa_gossip_transport::UdpTransportAdapter>,
     mut pong_tx: Option<oneshot::Sender<()>>,
     cache: CoordinatorAdvertCache,
 ) {

@@ -757,7 +757,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use saorsa_gossip_transport::AntQuicTransport;
+    use saorsa_gossip_transport::UdpTransportAdapter;
     use std::net::SocketAddr;
 
     fn test_peer_id(id: u8) -> PeerId {
@@ -766,10 +766,10 @@ mod tests {
         PeerId::new(bytes)
     }
 
-    async fn test_transport() -> Arc<AntQuicTransport> {
+    async fn test_transport() -> Arc<UdpTransportAdapter> {
         let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
         Arc::new(
-            AntQuicTransport::new(bind, vec![])
+            UdpTransportAdapter::new(bind, vec![])
                 .await
                 .expect("transport"),
         )

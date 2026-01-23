@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "project": "saorsa-gossip",
+  "active": true,
+  "milestone": {
+    "number": 2,
+    "name": "Transport Multi-Plexing Refactor"
+  },
+  "phase": {
+    "number": "2.3",
+    "name": "Plumb Multiplexer into GossipTransport",
+    "plan": "PLAN-203"
+  },
+  "progress": {
+    "total_tasks": 9,
+    "completed_tasks": 0,
+    "current_task": "PLAN-203.1: Create MultiplexedGossipTransport struct"
+  },
+  "status": "planned",
+  "interview_decisions": {
+    "problem": "Missing functionality - Users can't use BLE/LoRa transports",
+    "success_criteria": "Feature complete - All planned transports work correctly",
+    "integration": "Modify existing crate - Refactor crates/transport in place",
+    "error_handling": "Dedicated error types - New TransportError enum with thiserror",
+    "async_model": "Match existing pattern - Async methods, tokio::spawn for background",
+    "testing": "Unit + Integration + Property-based tests",
+    "documentation": "Full public API docs with examples",
+    "priority": "Technical foundation first - Registry/multiplexer base",
+    "risks": []
+  },
+  "phase_decisions": {
+    "breakdown": "By layer - MultiplexedGossipTransport → Runtime wiring → Tests → Examples",
+    "task_size": "Small - ~50 lines per task",
+    "technical": "Follow existing patterns from UdpTransportAdapter",
+    "testing": "Unit tests for types + logic + integration + property tests",
+    "dependencies": "Uses TransportMultiplexer from Phase 2.2",
+    "order": "Foundation first"
+  },
+  "last_updated": "2026-01-23T13:15:00Z"
+}

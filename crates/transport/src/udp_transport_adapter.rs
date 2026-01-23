@@ -688,7 +688,12 @@ impl TransportAdapter for UdpTransportAdapter {
         // Use ant-quic's send() with peer ID and raw bytes
         match self.node.send(&ant_peer_id, &payload).await {
             Ok(()) => {
-                debug!("Sent {} bytes to peer {} on {:?}", data.len(), peer_id, stream_type);
+                debug!(
+                    "Sent {} bytes to peer {} on {:?}",
+                    data.len(),
+                    peer_id,
+                    stream_type
+                );
                 Ok(())
             }
             Err(e) => {
@@ -705,10 +710,7 @@ impl TransportAdapter for UdpTransportAdapter {
     async fn recv(&self) -> TransportResult<(GossipPeerId, GossipStreamType, Bytes)> {
         let mut recv_rx = self.recv_rx.lock().await;
 
-        recv_rx
-            .recv()
-            .await
-            .ok_or_else(|| TransportError::Closed)
+        recv_rx.recv().await.ok_or_else(|| TransportError::Closed)
     }
 
     async fn close(&self) -> TransportResult<()> {
@@ -740,6 +742,7 @@ impl TransportAdapter for UdpTransportAdapter {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

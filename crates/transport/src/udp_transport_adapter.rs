@@ -624,6 +624,121 @@ impl GossipTransport for UdpTransportAdapter {
     }
 }
 
+// =============================================================================
+// TransportAdapter Implementation
+// =============================================================================
+
+use crate::error::{TransportError, TransportResult};
+use crate::{TransportAdapter, TransportCapabilities};
+
+#[async_trait::async_trait]
+impl TransportAdapter for UdpTransportAdapter {
+    fn local_peer_id(&self) -> GossipPeerId {
+        self.gossip_peer_id
+    }
+
+    async fn dial(&self, addr: SocketAddr) -> TransportResult<GossipPeerId> {
+        debug!("TransportAdapter::dial to {}", addr);
+
+        let start = Instant::now();
+        match self.node.connect_addr(addr).await {
+            Ok(peer_conn) => {
+                let gossip_peer_id = ant_peer_id_to_gossip(&peer_conn.peer_id);
+                let rtt_ms = start.elapsed().as_millis() as u32;
+                info!(
+                    "Connected to peer {} at {} (rtt: {}ms)",
+                    gossip_peer_id, addr, rtt_ms
+                );
+
+                // Track the connection
+                self.add_peer(gossip_peer_id, addr).await;
+
+                // Update bootstrap cache if present
+                if let Some(cache) = &self.bootstrap_cache {
+                    let ant_peer_id = gossip_peer_id_to_ant(&gossip_peer_id);
+                    cache.record_success(&ant_peer_id, rtt_ms).await;
+                }
+
+                Ok(gossip_peer_id)
+            }
+            Err(e) => {
+                warn!("Failed to dial {}: {}", addr, e);
+
+                Err(TransportError::DialFailed {
+                    addr,
+                    source: anyhow!("{}", e),
+                })
+            }
+        }
+    }
+
+    async fn send(
+        &self,
+        peer_id: GossipPeerId,
+        stream_type: GossipStreamType,
+        data: Bytes,
+    ) -> TransportResult<()> {
+        let ant_peer_id = gossip_peer_id_to_ant(&peer_id);
+
+        // Prepend stream type byte to payload (same format as GossipTransport)
+        let mut payload = Vec::with_capacity(1 + data.len());
+        payload.push(stream_type.to_byte());
+        payload.extend_from_slice(&data);
+
+        // Use ant-quic's send() with peer ID and raw bytes
+        match self.node.send(&ant_peer_id, &payload).await {
+            Ok(()) => {
+                debug!("Sent {} bytes to peer {} on {:?}", data.len(), peer_id, stream_type);
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to send to peer {}: {}", peer_id, e);
+                self.remove_peer(&peer_id).await;
+                Err(TransportError::SendFailed {
+                    peer_id,
+                    source: anyhow!("{}", e),
+                })
+            }
+        }
+    }
+
+    async fn recv(&self) -> TransportResult<(GossipPeerId, GossipStreamType, Bytes)> {
+        let mut recv_rx = self.recv_rx.lock().await;
+
+        recv_rx
+            .recv()
+            .await
+            .ok_or_else(|| TransportError::Closed)
+    }
+
+    async fn close(&self) -> TransportResult<()> {
+        info!("Closing TransportAdapter");
+        // The underlying node will be closed when dropped
+        // For now, just clear tracked peers
+        let mut peers = self.connected_peers.write().await;
+        peers.clear();
+        Ok(())
+    }
+
+    async fn connected_peers(&self) -> Vec<(GossipPeerId, SocketAddr)> {
+        let peers = self.connected_peers.read().await;
+        peers
+            .iter()
+            .map(|(peer_id, (addr, _instant))| (*peer_id, *addr))
+            .collect()
+    }
+
+    fn capabilities(&self) -> TransportCapabilities {
+        TransportCapabilities {
+            supports_broadcast: false,
+            max_message_size: self.config.stream_read_limit,
+            typical_latency_ms: 50, // Typical UDP/QUIC latency
+            is_reliable: true,      // QUIC provides reliable delivery
+            name: "UDP/QUIC",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,7 +1008,7 @@ mod tests {
             .await
             .expect("Failed to create transport");
 
-        let result = transport.close().await;
+        let result = GossipTransport::close(&transport).await;
         assert!(result.is_ok(), "Close should succeed");
     }
 
@@ -904,9 +1019,9 @@ mod tests {
             .await
             .expect("Failed to create transport");
 
-        // Close twice - should be safe
-        let result1 = transport.close().await;
-        let result2 = transport.close().await;
+        // Close twice - should be safe (using GossipTransport trait)
+        let result1: Result<()> = GossipTransport::close(&transport).await;
+        let result2: Result<()> = GossipTransport::close(&transport).await;
         assert!(result1.is_ok());
         assert!(result2.is_ok());
     }
@@ -951,9 +1066,8 @@ mod tests {
         let test_data = Bytes::from("Hello, QUIC!");
         let node1_peer_id = node1.peer_id();
 
-        // Dial node1 from node2
-        node2
-            .dial(node1_peer_id, node1_addr)
+        // Dial node1 from node2 (using GossipTransport trait)
+        GossipTransport::dial(&node2, node1_peer_id, node1_addr)
             .await
             .expect("Failed to dial node1");
 

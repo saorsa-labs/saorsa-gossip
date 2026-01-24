@@ -3,38 +3,35 @@
   "project": "saorsa-gossip",
   "active": true,
   "milestone": {
-    "number": 2,
-    "name": "Transport Multi-Plexing Refactor"
+    "number": 3,
+    "name": "Transport Layer Simplification"
   },
   "phase": {
-    "number": "2.7",
-    "name": "Benchmarking & BLE Stub",
-    "plan": "PLAN-207"
+    "number": "3.1",
+    "name": "Upgrade ant-quic Dependency",
+    "plan": "PLAN-301"
   },
   "progress": {
     "total_tasks": 6,
     "completed_tasks": 6,
     "current_task": null
   },
-  "status": "complete",
+  "status": "phase_complete",
   "interview_decisions": {
-    "problem": "Missing functionality - Users can't use BLE/LoRa transports",
-    "success_criteria": "Feature complete - All planned transports work correctly",
-    "integration": "Modify existing crate - Refactor crates/transport in place",
-    "error_handling": "Dedicated error types - New TransportError enum with thiserror",
-    "async_model": "Match existing pattern - Async methods, tokio::spawn for background",
+    "problem": "Technical debt - Custom multiplexer duplicates ant-quic's native capabilities (~3000 lines redundant)",
+    "success_criteria": "Production ready - Full refactor, remove redundant code, update docs, all tests pass",
+    "integration": "Simplify existing crate - Flatten transport layer onto ant-quic",
+    "error_handling": "Keep existing TransportError, adapt as needed",
+    "async_model": "Match existing pattern",
     "testing": "Unit + Integration + Property-based tests",
-    "documentation": "Full public API docs with examples",
-    "priority": "Technical foundation first - Registry/multiplexer base",
-    "risks": []
+    "documentation": "Full public API docs, update README, DESIGN, ADRs",
+    "priority": "Foundation first - Upgrade dependency, then refactor layers",
+    "risks": [
+      "Breaking changes for consumers using TransportMultiplexer directly",
+      "ant-quic API may have changed significantly",
+      "Tests dependent on custom multiplexer need rewriting"
+    ]
   },
-  "phase_decisions": {
-    "breakdown": "By module - GossipTransport API -> Membership -> PubSub -> Fallback -> Tests",
-    "task_size": "Small - ~50 lines per task",
-    "technical": "Extend GossipTransport trait with capability-aware send methods",
-    "testing": "Unit tests for capability routing, integration tests for module behavior",
-    "dependencies": "TransportRequest from Phase 2.2, MultiplexedGossipTransport from Phase 2.3, GossipContext from Phase 2.4",
-    "order": "Foundation first"
-  },
-  "last_updated": "2026-01-23T15:25:00Z"
+  "phase_decisions": {},
+  "last_updated": "2026-01-24T11:00:00Z"
 }

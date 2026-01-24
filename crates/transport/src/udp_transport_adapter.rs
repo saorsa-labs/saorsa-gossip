@@ -394,7 +394,9 @@ impl UdpTransportAdapter {
             loop {
                 if let Some(peer_conn) = node_accept.accept().await {
                     let peer_id = peer_conn.peer_id;
-                    let peer_addr = peer_conn.remote_addr;
+                    let transport_addr = peer_conn.remote_addr;
+                    // Convert TransportAddr to SocketAddr for peer tracking
+                    let peer_addr = transport_addr.to_synthetic_socket_addr();
                     let gossip_peer_id = ant_peer_id_to_gossip(&peer_id);
 
                     info!("Accepted connection from {:?} at {}", peer_id, peer_addr);

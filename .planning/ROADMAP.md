@@ -23,7 +23,7 @@ Bug fixes and improvements: Bootstrap cache integration, FOAF discovery, shuffle
 
 ---
 
-## Milestone 1: Production Bug Fixes & Improvements
+## Milestone 1: Production Bug Fixes & Improvements ✅
 
 ### Phase 1: Bootstrap Cache Integration (HIGH PRIORITY) ✅
 | # | Task | Status | Details |
@@ -65,6 +65,111 @@ Bug fixes and improvements: Bootstrap cache integration, FOAF discovery, shuffle
 
 ---
 
+## Milestone 2: Transport Multi-Plexing Refactor ✅
+
+### Overview
+Refactor the transport layer to support multiple transports (UDP/QUIC, BLE, LoRa) through a unified multiplexer architecture. This enables gossip protocols to work across constrained and broadband links while maintaining the existing GossipTransport trait API.
+
+### Success Criteria
+- All planned transports work correctly (UDP, BLE stubs, LoRa stubs)
+- TransportMultiplexer routes messages based on capability requirements
+- Peer adverts include transport-type hints for BLE bridge discovery
+- Dual-transport benchmarks compare constrained vs broadband links
+- Zero compilation warnings, zero test failures
+
+### Technical Decisions
+| Topic | Decision |
+|-------|----------|
+| Error Handling | Dedicated error types with thiserror |
+| Async Model | Match existing pattern (async methods, tokio::spawn) |
+| Testing | Unit tests + Integration tests + Property-based tests |
+| Documentation | Full public API docs with examples |
+| Priority | Technical foundation first (registry/multiplexer) |
+
+### Phase 2.1: Error Handling & Adapter Trait ✅
+### Phase 2.2: Implement TransportMultiplexer ✅
+### Phase 2.3: Plumb Multiplexer into GossipTransport ✅
+### Phase 2.4: Configuration & GossipContext ✅
+### Phase 2.5: Transport Capability Requests ✅
+### Phase 2.6: Transport Hints in Peer Adverts ✅
+### Phase 2.7: Benchmarking & BLE Stub ✅
+
+---
+
+## Milestone 3: Transport Layer Simplification 🚧
+
+### Overview
+Simplify saorsa-gossip's transport layer by leveraging ant-quic's native TransportRegistry, ConnectionRouter, and shared-socket capabilities. The custom TransportMultiplexer built in Milestone 2 is now redundant - ant-quic 0.20+ handles multi-transport routing internally.
+
+### Problem Statement (from review)
+- `Cargo.toml:41` pins ant-quic = "0.19", missing new multi-transport release
+- `crates/transport/src/lib.rs` implements custom TransportMultiplexer that duplicates ant-quic
+- `crates/transport/src/udp_transport_adapter.rs` doesn't expose transport_registry plumbing
+- `crates/runtime/src/runtime.rs` wraps every transport in redundant MultiplexedGossipTransport
+- Tests exercise custom multiplexer instead of real ant-quic paths
+
+### Success Criteria
+- ant-quic upgraded to version with TransportRegistry/ConnectionRouter
+- Custom TransportMultiplexer retired (flatten onto ant-quic's P2pEndpoint)
+- Runtime no longer wraps transports in redundant multiplexer
+- Tests exercise real ant-quic flow, not custom multiplexer
+- Documentation reflects that multi-transport routing lives in ant-quic
+- Estimated code reduction: ~3000 lines (60% of transport crate)
+- Zero compilation errors, zero warnings, all tests pass
+
+### Technical Decisions
+| Topic | Decision |
+|-------|----------|
+| Error Handling | Keep existing TransportError, adapt as needed |
+| Async Model | Match existing pattern |
+| Testing | Unit + Integration + Property-based tests |
+| Documentation | Full public API docs, update README, DESIGN, ADRs |
+| Migration | Staged deprecation for backward compatibility |
+
+### Phase 3.1: Upgrade ant-quic Dependency
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 1.1 | Research latest ant-quic API | ⏳ | Identify TransportRegistry, ConnectionRouter APIs |
+| 1.2 | Bump ant-quic version | ⏳ | Update all Cargo.toml files |
+| 1.3 | Run cargo update -p ant-quic | ⏳ | Update lock file |
+| 1.4 | Fix compilation errors | ⏳ | Adapt to any API changes |
+| 1.5 | Verify CI builds | ⏳ | All targets compile |
+
+### Phase 3.2: Flatten Transport Layer onto ant-quic
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 2.1 | Deprecate TransportMultiplexer | ⏳ | Add deprecation warnings |
+| 2.2 | Deprecate TransportRequest | ⏳ | No longer needed with ant-quic routing |
+| 2.3 | Archive BLE stub | ⏳ | Move to examples/ for reference |
+| 2.4 | Simplify UdpTransportAdapter | ⏳ | Expose P2pEndpoint streams directly |
+| 2.5 | Update MultiplexedGossipTransport | ⏳ | Thin wrapper on ant-quic |
+
+### Phase 3.3: Wire Runtime Directly to ant-quic
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 3.1 | Remove multiplexer wrapping | ⏳ | GossipRuntime uses direct adapter |
+| 3.2 | Remove transport descriptors | ⏳ | Runtime doesn't need them |
+| 3.3 | Update GossipContext | ⏳ | Simplified transport config |
+| 3.4 | Backward compatibility shim | ⏳ | Optional deprecation path |
+
+### Phase 3.4: Clean Up Tests
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 4.1 | Rewrite multiplexer tests | ⏳ | Exercise real ant-quic flow |
+| 4.2 | Remove BLE stub tests | ⏳ | Archive with stub |
+| 4.3 | Update integration tests | ⏳ | Use new transport API |
+| 4.4 | Property tests for routing | ⏳ | Keep valuable logic |
+
+### Phase 3.5: Documentation Updates
+| # | Task | Status | Details |
+|---|------|--------|---------|
+| 5.1 | Update README.md | ⏳ | Multi-transport routing in ant-quic |
+| 5.2 | Update DESIGN.md | ⏳ | Reflect simplified architecture |
+| 5.3 | Create ADR | ⏳ | Document decision to flatten |
+| 5.4 | Update crate docs | ⏳ | transport/src/lib.rs module docs |
+
+---
+
 ## Architecture Notes
 
 ### Cache Ownership Pattern
@@ -89,6 +194,26 @@ Bug fixes and improvements: Bootstrap cache integration, FOAF discovery, shuffle
 └─────────────────────────────────────────────────────┘
 ```
 
+### Transport Layer (Post-Milestone 3)
+```
+┌─────────────────────────────────────────────────────┐
+│  GossipRuntime                                       │
+│  ┌───────────────────────────────────┐              │
+│  │ AntQuicTransportAdapter           │ ← Direct     │
+│  │ - endpoint: P2pEndpoint           │              │
+│  │ - registry: TransportRegistry     │ ← ant-quic   │
+│  └───────────────────────────────────┘              │
+│              │                                       │
+│              ▼                                       │
+│  ┌───────────────────────────────────┐              │
+│  │ ant-quic (native routing)         │              │
+│  │ - ConnectionRouter                │              │
+│  │ - TransportRegistry               │              │
+│  │ - SharedSocket                    │              │
+│  └───────────────────────────────────┘              │
+└─────────────────────────────────────────────────────┘
+```
+
 ### Type Mappings
 | ant-quic | saorsa-gossip | Notes |
 |----------|---------------|-------|
@@ -101,150 +226,23 @@ Bug fixes and improvements: Bootstrap cache integration, FOAF discovery, shuffle
 
 ## Completion Log
 
-### Phase 1: Bootstrap Cache Integration ✅
+### Milestone 1 ✅
 **Completed**: 2025-01-15
-- Created `GossipCacheAdapter` wrapping `Arc<BootstrapCache>` with gossip-specific advert storage
-- Added security fix: PeerId-to-public-key binding verification in `handle_advert()`
-- Added security fix: FOAF response structural validation
-- Fixed `select_best_from_adverts()` logic bug
-- Added proper lock poisoning logging throughout
-- Added age-based query ID pruning (30s expiry per SPEC2 §7.3)
-- 80 coordinator tests passing
+- Bootstrap cache integration
+- FOAF discovery completion
+- Shuffle protocol completion
+- Test coverage & polish
 
-### Phase 2: FOAF Discovery Completion ✅
-**Completed**: 2025-01-15
-- Implemented `handle_foaf_query()` with deduplication via `seen_queries`
-- Implemented query forwarding with TTL decrement and fanout of 3
-- Added `PendingQuery` struct for response aggregation
-- Implemented `initiate_foaf_query()` for initiating FOAF queries
-- Updated `find()` method to use FOAF queries across all groups
-- Added `cleanup_pending_queries()` for expired query cleanup
-- Added 9 integration tests for multi-hop discovery
-- 27 presence tests passing
+### Milestone 2 ✅
+**Completed**: 2026-01-23
+- Transport multi-plexing refactor
+- Custom TransportMultiplexer with capability-based routing
+- BLE stub for testing
+- Property-based tests for routing
+- 320+ tests passing
 
-### Phase 3: Shuffle Protocol Completion ✅
-**Completed**: 2025-01-15
-- Fixed `spawn_shuffle_task()` to actually send SHUFFLE messages (was TODO)
-- `handle_shuffle()` implements TTL forwarding and terminal node reply
-- `handle_shuffle_reply()` integrates received peers into passive view
-- Added 15 new shuffle tests (23 total membership tests)
-- Review fixes applied:
-  - Silent serialization failures now logged with `warn!`
-  - Double silent failure in probe task fixed
-  - Lock contention warnings added to view accessors
-  - TTL > 0 forwarding path tested
-- 331 tests passing, clippy clean
-
-### Phase 4: Test Coverage & Polish ✅
-**Completed**: 2025-01-15
-- Updated `test_start_beacons_broadcasts_periodically` to verify beacon self-storage
-- Updated `test_stop_beacons_halts_broadcasting` to verify restart capability
-- Updated `test_find_foaf_random_walk` with proper setup and verification
-- Added `pending_query_count()` method for monitoring/testing
-- 331 tests passing (32 presence tests, up from 27)
-- Clippy clean with strict settings
-
----
-
-## Milestone 2: Transport Multi-Plexing Refactor
-
-### Overview
-Refactor the transport layer to support multiple transports (UDP/QUIC, BLE, LoRa) through a unified multiplexer architecture. This enables gossip protocols to work across constrained and broadband links while maintaining the existing GossipTransport trait API.
-
-### Success Criteria
-- All planned transports work correctly (UDP, BLE stubs, LoRa stubs)
-- TransportMultiplexer routes messages based on capability requirements
-- Peer adverts include transport-type hints for BLE bridge discovery
-- Dual-transport benchmarks compare constrained vs broadband links
-- Zero compilation warnings, zero test failures
-
-### Technical Decisions
-| Topic | Decision |
-|-------|----------|
-| Error Handling | Dedicated error types with thiserror |
-| Async Model | Match existing pattern (async methods, tokio::spawn) |
-| Testing | Unit tests + Integration tests + Property-based tests |
-| Documentation | Full public API docs with examples |
-| Priority | Technical foundation first (registry/multiplexer) |
-
-### Phase 2.1: Error Handling & Adapter Trait ✅
-| # | Task | Status | Details |
-|---|------|--------|---------|
-| 1.1 | Create `TransportAdapter` trait | ✅ | Common transport operations |
-| 1.2 | Create `TransportError` enum | ✅ | Dedicated error types with thiserror |
-| 1.3 | Rename `AntQuicTransport` to `UdpTransportAdapter` | ✅ | File and struct rename |
-| 1.4 | Implement `TransportAdapter` for `UdpTransportAdapter` | ✅ | Wrap existing functionality |
-| 1.5 | Update all imports and references | ✅ | crates/runtime, examples, tests |
-
-### Phase 2.2: Implement TransportMultiplexer ✅
-| # | Task | Status | Details |
-|---|------|--------|---------|
-| 2.1 | Create `TransportMultiplexer` struct | ✅ | Registry + routing logic |
-| 2.2 | Create `TransportCapability` enum | ✅ | LowLatencyControl, BulkTransfer, Broadcast, OfflineReady |
-| 2.3 | Create `TransportDescriptor` enum | ✅ | Udp, Ble, Lora, Custom variants |
-| 2.4 | Implement transport registration | ✅ | `register_transport()` API |
-| 2.5 | Implement capability-based routing | ✅ | Route based on request requirements |
-| 2.6 | Unit tests for multiplexer | ✅ | Routing logic tests (268 tests) |
-
-### Phase 2.3: Plumb Multiplexer into GossipTransport ✅
-| # | Task | Status | Details |
-|---|------|--------|---------|
-| 3.1 | Create `MultiplexedGossipTransport` | ✅ | Implements GossipTransport |
-| 3.2 | Wire multiplexer to runtime | ✅ | GossipRuntimeBuilder integration |
-| 3.3 | Backward compatibility | ✅ | Single-transport mode works |
-| 3.4 | Integration tests | ✅ | 14 unit + 6 integration tests |
-| 3.5 | Update examples | ✅ | --multiplexed flag in benchmark |
-
-### Phase 2.4: Configuration & GossipContext ✅
-| # | Task | Status | Details |
-|---|------|--------|---------|
-| 4.1 | Create `GossipContext` struct | ✅ | Central configuration object |
-| 4.2 | Create `GossipContextBuilder` | ✅ | Builder pattern for config |
-| 4.3 | Public API for communitas-core | ✅ | Clean interface for consumers |
-| 4.4 | Integration tests | ✅ | GossipContext::build() tests |
-
-### Phase 2.5: Transport Capability Requests ✅
-| # | Task | Status | Details |
-|---|------|--------|---------|
-| 5.1 | Create `TransportRequest` type | ✅ | Builder with require/exclude/prefer |
-| 5.2 | Add `send_with_request()` to GossipTransport | ✅ | Capability-aware send |
-| 5.3 | Update membership module | ✅ | Request "LowLatencyControl" |
-| 5.4 | Update pubsub module | ✅ | Request "BulkTransfer" for large |
-| 5.5 | Tests for capability requests | ✅ | 320+ tests passing |
-| 5.6 | Documentation | ✅ | Module docs with examples |
-
-### Phase 2.6: Transport Hints in Peer Adverts ✅
-| # | Task | Status | Details |
-|---|------|--------|---------|
-| 6.1 | Create `TransportHint` struct | ✅ | transport_type, endpoint, available |
-| 6.2 | Extend `CoordinatorAdvert` | ✅ | Add transport_hints field |
-| 6.3 | Update serialization | ✅ | CBOR with #[serde(default)] |
-| 6.4 | Helper methods | ✅ | has_transport(), available_transports() |
-| 6.5 | SignableFields update | ✅ | Include hints in signature |
-| 6.6 | Tests | ✅ | 12 transport hint tests |
-
-### Phase 2.7: Benchmarking & BLE Stub ✅
-| # | Task | Status | Details |
-|---|------|--------|---------|
-| 7.1 | Create `BleTransportAdapter` | ✅ | Simulated BLE (512B MTU, 50-150ms latency) |
-| 7.2 | Add `MtuExceeded` error | ✅ | TransportError variant |
-| 7.3 | Add `--ble` flag to benchmark | ✅ | BLE transport simulation |
-| 7.4 | Property-based tests | ✅ | 9 proptest tests for routing |
-| 7.5 | Benchmark documentation | ✅ | docs/benchmarks.md |
-| 7.6 | Per-transport statistics | ✅ | BLE stats display in benchmark |
-
----
-
-## Files to be Modified (Milestone 2)
-
-| File | Changes |
-|------|---------|
-| `crates/transport/src/lib.rs` | Add TransportAdapter trait, TransportCapability, re-exports |
-| `crates/transport/src/ant_quic_transport.rs` | Rename to udp_transport_adapter.rs |
-| `crates/transport/src/multiplexer.rs` | NEW: TransportMultiplexer implementation |
-| `crates/transport/src/error.rs` | NEW: TransportError enum |
-| `crates/runtime/src/runtime.rs` | Add GossipContext, update runtime |
-| `crates/coordinator/src/lib.rs` | CoordinatorAdvert transport hints |
-| `crates/membership/src/lib.rs` | Transport capability requests |
-| `crates/pubsub/src/lib.rs` | Transport capability requests |
-| `examples/transport_benchmark.rs` | Dual-transport benchmarks |
+### Milestone 3 🚧
+**Started**: 2026-01-24
+- Transport layer simplification
+- Leverage ant-quic native capabilities
+- Estimated LOC reduction: ~3000 lines

@@ -96,6 +96,18 @@ pub use ant_quic::{
     SharedTransport, StreamType, TransportError,
 };
 
+// Re-export ant-quic transport infrastructure (v0.20+)
+// These types enable native multi-transport routing via ant-quic's native registry
+// and ConnectionRouter, reducing the need for saorsa-gossip's custom multiplexer.
+//
+// Note: We alias ant-quic's TransportRegistry as AntTransportRegistry to avoid
+// collision with saorsa-gossip's own TransportRegistry (which will be deprecated
+// in Phase 3.2 once we fully migrate to ant-quic's routing).
+pub use ant_quic::transport::{
+    LoRaParams as AntLoRaParams, TransportAddr, TransportCapabilities as AntTransportCapabilities,
+    TransportProvider, TransportRegistry as AntTransportRegistry, TransportType as AntTransportType,
+};
+
 use anyhow::Result;
 use bytes::Bytes;
 use error::TransportResult;

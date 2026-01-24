@@ -1427,8 +1427,8 @@ mod tests {
             /// Property: Adding a requirement twice doesn't change the set
             #[test]
             fn require_is_idempotent(cap in arb_capability()) {
-                let request1 = TransportRequest::new().require(cap.clone());
-                let request2 = TransportRequest::new().require(cap.clone()).require(cap);
+                let request1 = TransportRequest::new().require(cap);
+                let request2 = TransportRequest::new().require(cap).require(cap);
 
                 prop_assert_eq!(request1.required_capabilities.len(), request2.required_capabilities.len());
             }

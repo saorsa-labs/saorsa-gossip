@@ -1,3 +1,7 @@
+// Allow deprecated transport types - this example demonstrates the current API
+// which will be updated when Phase 3.3 migrates to ant-quic native transport.
+#![allow(deprecated)]
+
 //! Comprehensive Transport Benchmark
 //!
 //! Measures performance metrics for the Saorsa Gossip transport layer:

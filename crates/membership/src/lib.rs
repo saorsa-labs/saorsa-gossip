@@ -1,4 +1,6 @@
 #![warn(missing_docs)]
+// Allow deprecated TransportRequest during migration to ant-quic native routing
+#![allow(deprecated)]
 
 //! Membership management using HyParView + SWIM
 //!

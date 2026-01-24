@@ -11,6 +11,15 @@
 //! This is a **stub implementation** for benchmarking and testing. It does not
 //! perform actual BLE communication.
 //!
+//! # Deprecation Notice
+//!
+//! This stub is deprecated. For real BLE transport, use ant-quic 0.20+ with the
+//! `ble` feature enabled, which provides a production-ready BLE implementation:
+//!
+//! ```ignore
+//! use ant_quic::transport::ble::BleTransport;
+//! ```
+//!
 //! # Example
 //!
 //! ```ignore
@@ -20,6 +29,9 @@
 //! let caps = ble.capabilities();
 //! assert_eq!(caps.max_message_size, 512);
 //! ```
+
+// Allow deprecated usage of TransportAdapter within this module
+#![allow(deprecated)]
 
 use crate::error::{TransportError, TransportResult};
 use crate::{GossipStreamType, TransportAdapter, TransportCapabilities};
@@ -40,6 +52,10 @@ const BLE_MAX_LATENCY_MS: u64 = 150;
 const BLE_CHANNEL_CAPACITY: usize = 100;
 
 /// Configuration for BLE transport adapter stub.
+#[deprecated(
+    since = "0.4.0",
+    note = "Use ant_quic::transport::ble::BleConfig instead for production BLE support."
+)]
 #[derive(Debug, Clone)]
 pub struct BleTransportAdapterConfig {
     /// Simulated minimum latency in milliseconds.
@@ -96,7 +112,17 @@ impl BleTransportAdapterConfig {
 /// Use this adapter with [`TransportMultiplexer`] to test fallback behavior
 /// and capability-based routing.
 ///
+/// # Deprecation Notice
+///
+/// This stub is deprecated. For production BLE support, use ant-quic 0.20+
+/// with the `ble` feature enabled.
+///
 /// [`TransportMultiplexer`]: crate::TransportMultiplexer
+#[deprecated(
+    since = "0.4.0",
+    note = "Use ant_quic::transport::ble::BleTransport instead for production BLE support. \
+            This stub remains available for testing constrained link simulation."
+)]
 pub struct BleTransportAdapter {
     /// Local peer ID.
     peer_id: PeerId,

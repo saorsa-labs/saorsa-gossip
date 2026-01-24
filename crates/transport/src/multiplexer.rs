@@ -3,6 +3,12 @@
 //! This module provides the infrastructure for routing gossip messages across
 //! multiple transport types (UDP/QUIC, BLE, LoRa) based on capability requirements.
 //!
+//! **Deprecation Notice**: This module is deprecated in favor of ant-quic's native
+//! transport routing. See individual type deprecation notices for migration guidance.
+
+// Allow deprecated usage within this module during deprecation period
+#![allow(deprecated)]
+//!
 //! # Architecture
 //!
 //! ```text
@@ -217,6 +223,15 @@ impl fmt::Display for TransportDescriptor {
 /// descriptor type. It supports registration, deregistration, and capability-based
 /// queries.
 ///
+/// # Deprecation Notice
+///
+/// This type is deprecated in favor of ant-quic's native [`AntTransportRegistry`].
+/// ant-quic 0.20+ provides a more capable transport registry with:
+/// - Pluggable `TransportProvider` trait implementations
+/// - Automatic capability detection
+/// - Protocol engine selection (QUIC vs Constrained)
+/// - Socket sharing between transport and NAT traversal layers
+///
 /// # Example
 ///
 /// ```ignore
@@ -228,6 +243,11 @@ impl fmt::Display for TransportDescriptor {
 ///
 /// let transports = registry.find_by_capability(TransportCapability::BulkTransfer);
 /// ```
+#[deprecated(
+    since = "0.4.0",
+    note = "Use ant_quic::transport::TransportRegistry (re-exported as AntTransportRegistry) instead. \
+            It provides native multi-transport support with automatic capability detection."
+)]
 #[derive(Default)]
 pub struct TransportRegistry {
     /// Registered transports indexed by descriptor.
@@ -407,6 +427,19 @@ impl TransportRegistry {
 /// for registering, querying, and routing messages to the appropriate transport
 /// based on capability requirements.
 ///
+/// # Deprecation Notice
+///
+/// This type is deprecated in favor of ant-quic's native transport routing.
+/// Use [`AntTransportRegistry`] from ant-quic 0.20+ which provides:
+/// - Native multi-transport support (UDP, BLE, LoRa, Serial)
+/// - Automatic protocol engine selection (QUIC vs Constrained)
+/// - Unified `TransportAddr` addressing
+///
+/// Migration guide:
+/// 1. Import `ant_quic::transport::TransportRegistry` (re-exported as `AntTransportRegistry`)
+/// 2. Use ant-quic's `TransportProvider` trait for custom transports
+/// 3. Let ant-quic's `ConnectionRouter` handle engine selection
+///
 /// # Thread Safety
 ///
 /// The multiplexer uses [`tokio::sync::RwLock`] internally, making it safe to
@@ -423,6 +456,11 @@ impl TransportRegistry {
 ///
 /// let descriptors = mux.available_transports().await;
 /// ```
+#[deprecated(
+    since = "0.4.0",
+    note = "Use ant_quic::transport::TransportRegistry (re-exported as AntTransportRegistry) instead. \
+            ant-quic 0.20+ provides native multi-transport routing with automatic engine selection."
+)]
 pub struct TransportMultiplexer {
     /// The transport registry (async-safe access).
     registry: RwLock<TransportRegistry>,
@@ -692,6 +730,12 @@ impl TransportMultiplexer {
 /// Use the builder pattern to construct a request with capability requirements,
 /// preferences, and exclusions.
 ///
+/// # Deprecation Notice
+///
+/// This type is deprecated. ant-quic 0.20+ handles transport routing internally
+/// based on `TransportCapabilities`. The `ConnectionRouter` automatically selects
+/// between QUIC and Constrained engines based on transport characteristics.
+///
 /// # Example
 ///
 /// ```
@@ -702,6 +746,11 @@ impl TransportMultiplexer {
 ///     .prefer(TransportDescriptor::Udp)
 ///     .exclude(TransportDescriptor::Lora);
 /// ```
+#[deprecated(
+    since = "0.4.0",
+    note = "ant-quic 0.20+ handles transport routing internally via ConnectionRouter. \
+            Transport selection is automatic based on TransportCapabilities."
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TransportRequest {
     /// Required capabilities that the transport must support.

@@ -1,3 +1,6 @@
+// Allow deprecated transport types during migration to ant-quic native routing
+#![allow(deprecated)]
+
 //! GossipContext - Simplified configuration for the gossip runtime.
 //!
 //! This module provides [`GossipContext`], a high-level configuration builder that

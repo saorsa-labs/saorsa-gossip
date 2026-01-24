@@ -7,14 +7,41 @@
 //!
 //! Provides transport abstraction with:
 //! - [`TransportAdapter`] trait for pluggable transports
-//! - [`TransportMultiplexer`] for capability-based routing
+//! - [`TransportMultiplexer`] for capability-based routing (deprecated)
 //! - UDP/QUIC as the default transport via [`UdpTransportAdapter`]
 //! - Three control streams: `mship`, `pubsub`, `bulk`
 //! - 0-RTT resumption where safe
 //! - Path migration by default
 //! - PQC handshake with ant-quic
 //!
-//! # Transport Multiplexing
+//! # Migration to ant-quic 0.20+ Native Transport
+//!
+//! **Several types in this crate are deprecated** in favor of ant-quic 0.20's
+//! native multi-transport infrastructure:
+//!
+//! | Deprecated Type | Replacement | Notes |
+//! |-----------------|-------------|-------|
+//! | [`TransportMultiplexer`] | [`AntTransportRegistry`] | Native transport collection |
+//! | [`TransportRegistry`] | [`AntTransportRegistry`] | With automatic capability detection |
+//! | [`TransportRequest`] | (not needed) | ConnectionRouter handles routing |
+//! | [`MultiplexedGossipTransport`] | Direct ant-quic adapter | Phase 3.3 migration |
+//! | [`BleTransportAdapter`] | `ant_quic::transport::ble::BleTransport` | Production BLE |
+//!
+//! ## New ant-quic Types (re-exported)
+//!
+//! - [`TransportAddr`] - Unified addressing for all transport types
+//! - [`AntTransportRegistry`] - Native multi-transport collection
+//! - [`TransportProvider`] - Trait for pluggable transport implementations
+//! - [`AntTransportCapabilities`] - Transport capability detection
+//!
+//! ## Migration Steps
+//!
+//! 1. **Phase 3.2 (current)**: Deprecation warnings added, existing API works
+//! 2. **Phase 3.3**: Runtime wires directly to ant-quic transport layer
+//! 3. **Phase 3.4**: Tests updated to exercise native ant-quic routing
+//! 4. **Future**: Deprecated types removed in a major version bump
+//!
+//! # Transport Multiplexing (Deprecated)
 //!
 //! The [`TransportMultiplexer`] routes messages to appropriate transports based
 //! on capability requirements. Use [`TransportRequest`] to specify routing needs:
@@ -56,10 +83,15 @@ mod multiplexer;
 mod protocol_handler;
 mod udp_transport_adapter;
 
+#[allow(deprecated)]
 pub use ble_transport_adapter::{BleTransportAdapter, BleTransportAdapterConfig};
 pub use error::{TransportError as GossipTransportError, TransportResult as GossipTransportResult};
 
+// Re-export deprecated types with allow attribute to suppress internal warnings.
+// External consumers will still see deprecation warnings.
+#[allow(deprecated)]
 pub use multiplexed_transport::MultiplexedGossipTransport;
+#[allow(deprecated)]
 pub use multiplexer::{
     TransportCapability, TransportDescriptor, TransportMultiplexer, TransportRegistry,
     TransportRequest,
@@ -310,6 +342,7 @@ impl GossipStreamType {
 }
 
 /// QUIC transport trait for dial/listen operations
+#[allow(deprecated)] // Uses deprecated TransportRequest in send_with_request
 #[async_trait::async_trait]
 pub trait GossipTransport: Send + Sync {
     /// Dial a peer and establish QUIC connection
@@ -377,6 +410,7 @@ pub trait GossipTransport: Send + Sync {
 }
 
 // Blanket implementation for Arc<T> to allow calling trait methods through Arc
+#[allow(deprecated)] // Uses deprecated TransportRequest in send_with_request
 #[async_trait::async_trait]
 impl<T: GossipTransport + ?Sized> GossipTransport for std::sync::Arc<T> {
     async fn dial(&self, peer: PeerId, addr: SocketAddr) -> Result<()> {

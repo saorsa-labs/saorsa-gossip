@@ -1,3 +1,7 @@
+// Allow deprecated transport types during migration period.
+// Phase 3.3 will replace these with direct ant-quic transport integration.
+#![allow(deprecated)]
+
 use crate::{CoordinatorClient, RendezvousClient};
 use anyhow::Result;
 use saorsa_gossip_groups::GroupContext;

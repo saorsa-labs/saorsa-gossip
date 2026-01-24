@@ -5,6 +5,12 @@
 //! protocol to communicate over multiple transport layers (UDP, BLE, LoRa)
 //! simultaneously, routing messages based on capability requirements.
 //!
+//! **Note**: This module is deprecated. See the deprecation notice on
+//! [`MultiplexedGossipTransport`] for migration guidance.
+
+// Allow deprecated usage within this module during deprecation period
+#![allow(deprecated)]
+//!
 //! # Example
 //!
 //! ```ignore
@@ -48,6 +54,24 @@ use crate::{
 ///
 /// The multiplexer routes messages to the appropriate transport based on
 /// capability requirements (e.g., low-latency for membership, bulk for CRDTs).
+///
+/// # Deprecation Notice
+///
+/// This type is deprecated. In Phase 3.3, the runtime will wire directly to
+/// ant-quic's transport layer, eliminating the need for this wrapper.
+///
+/// ant-quic 0.20+ provides:
+/// - `LinkTransport` trait: Stable abstraction for overlay networks
+/// - `SharedTransport`: Protocol handler multiplexing
+/// - `ConnectionRouter`: Automatic engine selection
+///
+/// The `GossipProtocolHandler` can be registered directly with ant-quic's
+/// `SharedTransport` to handle gossip streams.
+#[deprecated(
+    since = "0.4.0",
+    note = "Will be replaced with direct ant-quic transport in Phase 3.3. \
+            Use ant-quic's LinkTransport and SharedTransport for protocol multiplexing."
+)]
 #[derive(Clone)]
 pub struct MultiplexedGossipTransport {
     /// The underlying transport multiplexer managing multiple adapters

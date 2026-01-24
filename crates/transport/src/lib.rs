@@ -70,7 +70,8 @@ pub use ant_quic::{
 // These types enable native multi-transport routing via ant-quic's native registry.
 pub use ant_quic::transport::{
     LoRaParams as AntLoRaParams, TransportAddr, TransportCapabilities as AntTransportCapabilities,
-    TransportProvider, TransportRegistry as AntTransportRegistry, TransportType as AntTransportType,
+    TransportProvider, TransportRegistry as AntTransportRegistry,
+    TransportType as AntTransportType,
 };
 
 use anyhow::Result;

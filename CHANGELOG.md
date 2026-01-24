@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-01-24
+
+### Changed
+
+- **Transport Layer Simplification** (Milestone 3)
+  - Upgraded ant-quic from 0.19 to 0.20 with native multi-transport capabilities
+  - Removed custom `TransportMultiplexer` in favor of ant-quic's `TransportRegistry`
+  - Removed custom `MultiplexedGossipTransport` in favor of direct `UdpTransportAdapter`
+  - Removed `BleTransportAdapter` stub - use ant-quic's native BLE transport
+  - Simplified `GossipTransport` trait: removed `send_with_request()` method
+  - Runtime now uses `UdpTransportAdapter` directly
+
+### Removed
+
+- `TransportMultiplexer`, `TransportRegistry`, `TransportRequest` (use ant-quic native)
+- `MultiplexedGossipTransport` wrapper
+- `BleTransportAdapter` stub
+- `transport_benchmark.rs` example
+- ~4,130 lines of redundant code
+
+### Documentation
+
+- Updated README.md transport section
+- Updated benchmarks.md to reflect simplified architecture
+- Added ADR-011: Transport Layer Simplification
+
 ## [0.3.0] - 2026-01-23
 
 ### Added

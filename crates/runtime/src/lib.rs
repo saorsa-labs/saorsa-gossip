@@ -32,6 +32,4 @@ pub use rendezvous::RendezvousClient;
 pub use runtime::{GossipRuntime, GossipRuntimeBuilder, GossipRuntimeConfig};
 
 // Re-export commonly used transport types for convenience
-pub use saorsa_gossip_transport::{
-    TransportCapability, TransportDescriptor, UdpTransportAdapterConfig,
-};
+pub use saorsa_gossip_transport::UdpTransportAdapterConfig;

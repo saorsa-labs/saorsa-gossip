@@ -3,67 +3,20 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 
-//! Multi-transport adapter for Saorsa Gossip
+//! Transport adapter for Saorsa Gossip
 //!
 //! Provides transport abstraction with:
 //! - [`TransportAdapter`] trait for pluggable transports
-//! - [`TransportMultiplexer`] for capability-based routing (deprecated)
 //! - UDP/QUIC as the default transport via [`UdpTransportAdapter`]
 //! - Three control streams: `mship`, `pubsub`, `bulk`
 //! - 0-RTT resumption where safe
 //! - Path migration by default
 //! - PQC handshake with ant-quic
 //!
-//! # Migration to ant-quic 0.20+ Native Transport
+//! # Architecture
 //!
-//! **Several types in this crate are deprecated** in favor of ant-quic 0.20's
-//! native multi-transport infrastructure:
-//!
-//! | Deprecated Type | Replacement | Notes |
-//! |-----------------|-------------|-------|
-//! | [`TransportMultiplexer`] | [`AntTransportRegistry`] | Native transport collection |
-//! | [`TransportRegistry`] | [`AntTransportRegistry`] | With automatic capability detection |
-//! | [`TransportRequest`] | (not needed) | ConnectionRouter handles routing |
-//! | [`MultiplexedGossipTransport`] | Direct ant-quic adapter | Phase 3.3 migration |
-//! | [`BleTransportAdapter`] | `ant_quic::transport::ble::BleTransport` | Production BLE |
-//!
-//! ## New ant-quic Types (re-exported)
-//!
-//! - [`TransportAddr`] - Unified addressing for all transport types
-//! - [`AntTransportRegistry`] - Native multi-transport collection
-//! - [`TransportProvider`] - Trait for pluggable transport implementations
-//! - [`AntTransportCapabilities`] - Transport capability detection
-//!
-//! ## Migration Steps
-//!
-//! 1. **Phase 3.2 (current)**: Deprecation warnings added, existing API works
-//! 2. **Phase 3.3**: Runtime wires directly to ant-quic transport layer
-//! 3. **Phase 3.4**: Tests updated to exercise native ant-quic routing
-//! 4. **Future**: Deprecated types removed in a major version bump
-//!
-//! # Transport Multiplexing (Deprecated)
-//!
-//! The [`TransportMultiplexer`] routes messages to appropriate transports based
-//! on capability requirements. Use [`TransportRequest`] to specify routing needs:
-//!
-//! ```ignore
-//! // Request low-latency transport for control messages
-//! let request = TransportRequest::low_latency_control();
-//! transport.send_with_request(peer, stream_type, data, &request).await?;
-//!
-//! // Request bulk transfer for large CRDT payloads
-//! let request = TransportRequest::bulk_transfer();
-//! transport.send_with_request(peer, stream_type, data, &request).await?;
-//!
-//! // Custom request with preferences and exclusions
-//! let request = TransportRequest::new()
-//!     .require(TransportCapability::LowLatencyControl)
-//!     .prefer(TransportDescriptor::Udp)
-//!     .exclude(TransportDescriptor::Lora);
-//! ```
-//!
-//! The membership module uses `low_latency_control()` for HyParView and SWIM
-//! messages, while the pubsub module uses `bulk_transfer()` for large payloads.
+//! This crate uses ant-quic's native transport infrastructure. For multi-transport
+//! routing (UDP, BLE, LoRa), use ant-quic's `TransportRegistry` directly.
 //!
 //! # SharedTransport Integration
 //!
@@ -76,27 +29,11 @@
 //! This crate uses ant-quic's `BootstrapCache` for persistent peer storage
 //! with epsilon-greedy selection for balanced exploration and exploitation.
 
-mod ble_transport_adapter;
 mod error;
-mod multiplexed_transport;
-mod multiplexer;
 mod protocol_handler;
 mod udp_transport_adapter;
 
-#[allow(deprecated)]
-pub use ble_transport_adapter::{BleTransportAdapter, BleTransportAdapterConfig};
 pub use error::{TransportError as GossipTransportError, TransportResult as GossipTransportResult};
-
-// Re-export deprecated types with allow attribute to suppress internal warnings.
-// External consumers will still see deprecation warnings.
-#[allow(deprecated)]
-pub use multiplexed_transport::MultiplexedGossipTransport;
-#[allow(deprecated)]
-pub use multiplexer::{
-    TransportCapability, TransportDescriptor, TransportMultiplexer, TransportRegistry,
-    TransportRequest,
-};
-
 pub use udp_transport_adapter::{UdpTransportAdapter, UdpTransportAdapterConfig};
 
 // Deprecated aliases for backward compatibility
@@ -107,6 +44,7 @@ pub type AntQuicTransport = UdpTransportAdapter;
 #[deprecated(since = "0.3.0", note = "Use UdpTransportAdapterConfig instead")]
 /// Deprecated alias for [`UdpTransportAdapterConfig`].
 pub type AntQuicTransportConfig = UdpTransportAdapterConfig;
+
 pub use protocol_handler::{
     BulkHandler, GossipMessage, GossipProtocolHandler, MembershipHandler, PubSubHandler,
 };
@@ -129,12 +67,7 @@ pub use ant_quic::{
 };
 
 // Re-export ant-quic transport infrastructure (v0.20+)
-// These types enable native multi-transport routing via ant-quic's native registry
-// and ConnectionRouter, reducing the need for saorsa-gossip's custom multiplexer.
-//
-// Note: We alias ant-quic's TransportRegistry as AntTransportRegistry to avoid
-// collision with saorsa-gossip's own TransportRegistry (which will be deprecated
-// in Phase 3.2 once we fully migrate to ant-quic's routing).
+// These types enable native multi-transport routing via ant-quic's native registry.
 pub use ant_quic::transport::{
     LoRaParams as AntLoRaParams, TransportAddr, TransportCapabilities as AntTransportCapabilities,
     TransportProvider, TransportRegistry as AntTransportRegistry, TransportType as AntTransportType,
@@ -179,8 +112,6 @@ pub struct TransportCapabilities {
 /// # Implementors
 ///
 /// - [`UdpTransportAdapter`] - QUIC over UDP (default)
-/// - Future: `BleTransportAdapter` - Bluetooth Low Energy
-/// - Future: `LoraTransportAdapter` - LoRa radio
 ///
 /// # Example
 ///
@@ -342,7 +273,6 @@ impl GossipStreamType {
 }
 
 /// QUIC transport trait for dial/listen operations
-#[allow(deprecated)] // Uses deprecated TransportRequest in send_with_request
 #[async_trait::async_trait]
 pub trait GossipTransport: Send + Sync {
     /// Dial a peer and establish QUIC connection
@@ -369,48 +299,11 @@ pub trait GossipTransport: Send + Sync {
     /// Receive a message from any peer on any stream
     async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)>;
 
-    /// Send data to a peer with specific transport capability requirements.
-    ///
-    /// This method allows specifying capability requirements for transport
-    /// selection. If the requirements cannot be met, the implementation should
-    /// fall back to the default transport.
-    ///
-    /// The default implementation ignores the request and delegates to `send_to_peer`,
-    /// which routes based on stream type only. This maintains backward compatibility
-    /// with implementations that don't support capability-based routing.
-    ///
-    /// # Arguments
-    ///
-    /// * `peer` - The target peer ID
-    /// * `stream_type` - The stream type for the message
-    /// * `data` - The message payload
-    /// * `request` - Transport capability requirements
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use saorsa_gossip_transport::{GossipTransport, TransportRequest, TransportCapability};
-    ///
-    /// // Request low-latency transport for control messages
-    /// let request = TransportRequest::new()
-    ///     .require(TransportCapability::LowLatencyControl);
-    ///
-    /// transport.send_with_request(peer, stream_type, data, &request).await?;
-    /// ```
-    async fn send_with_request(
-        &self,
-        peer: PeerId,
-        stream_type: GossipStreamType,
-        data: bytes::Bytes,
-        _request: &TransportRequest,
-    ) -> Result<()> {
-        // Default: ignore request, route by stream type only
-        self.send_to_peer(peer, stream_type, data).await
-    }
+    /// Returns the local peer ID for this transport.
+    fn local_peer_id(&self) -> PeerId;
 }
 
 // Blanket implementation for Arc<T> to allow calling trait methods through Arc
-#[allow(deprecated)] // Uses deprecated TransportRequest in send_with_request
 #[async_trait::async_trait]
 impl<T: GossipTransport + ?Sized> GossipTransport for std::sync::Arc<T> {
     async fn dial(&self, peer: PeerId, addr: SocketAddr) -> Result<()> {
@@ -442,16 +335,8 @@ impl<T: GossipTransport + ?Sized> GossipTransport for std::sync::Arc<T> {
         (**self).receive_message().await
     }
 
-    async fn send_with_request(
-        &self,
-        peer: PeerId,
-        stream_type: GossipStreamType,
-        data: bytes::Bytes,
-        request: &TransportRequest,
-    ) -> Result<()> {
-        (**self)
-            .send_with_request(peer, stream_type, data, request)
-            .await
+    fn local_peer_id(&self) -> PeerId {
+        (**self).local_peer_id()
     }
 }
 

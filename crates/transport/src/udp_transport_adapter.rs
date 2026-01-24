@@ -624,6 +624,10 @@ impl GossipTransport for UdpTransportAdapter {
             .await
             .ok_or_else(|| anyhow!("Receive channel closed"))
     }
+
+    fn local_peer_id(&self) -> GossipPeerId {
+        self.gossip_peer_id
+    }
 }
 
 // =============================================================================

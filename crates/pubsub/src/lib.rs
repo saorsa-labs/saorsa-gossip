@@ -1,6 +1,4 @@
 #![warn(missing_docs)]
-// Allow deprecated TransportRequest during migration to ant-quic native routing
-#![allow(deprecated)]
 
 //! Plumtree-based pub/sub dissemination
 //!
@@ -22,7 +20,7 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use lru::LruCache;
-use saorsa_gossip_transport::{GossipStreamType, GossipTransport, TransportRequest};
+use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -44,10 +42,6 @@ const MAX_IHAVE_BATCH_SIZE: usize = 1024;
 
 /// IHAVE flush interval (100ms)
 const IHAVE_FLUSH_INTERVAL_MS: u64 = 100;
-
-/// Message size threshold for bulk transfer routing (64 KB)
-/// Messages larger than this will request bulk transfer capability.
-const BULK_TRANSFER_THRESHOLD: usize = 64 * 1024;
 
 /// Target eager peer degree (6-8)
 const MIN_EAGER_DEGREE: usize = 6;
@@ -366,14 +360,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             trace!(peer_id = %peer, msg_id = ?msg_id, "Sending EAGER");
             let bytes = bincode::serialize(&_message)
                 .map_err(|e| anyhow!("Serialization failed: {}", e))?;
-            // Use bulk transfer for large messages, low latency for small ones
-            let request = if bytes.len() > BULK_TRANSFER_THRESHOLD {
-                TransportRequest::bulk_transfer()
-            } else {
-                TransportRequest::low_latency_control()
-            };
             self.transport
-                .send_with_request(peer, GossipStreamType::PubSub, bytes.into(), &request)
+                .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
                 .await?;
         }
 
@@ -452,14 +440,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             trace!(peer_id = %peer, msg_id = ?msg_id, "Forwarding EAGER");
             let bytes =
                 bincode::serialize(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
-            // Use bulk transfer for large messages, low latency for small ones
-            let request = if bytes.len() > BULK_TRANSFER_THRESHOLD {
-                TransportRequest::bulk_transfer()
-            } else {
-                TransportRequest::low_latency_control()
-            };
             self.transport
-                .send_with_request(peer, GossipStreamType::PubSub, bytes.into(), &request)
+                .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
                 .await?;
         }
 
@@ -522,10 +504,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             };
             let bytes = bincode::serialize(&iwant_msg)
                 .map_err(|e| anyhow!("Serialization failed: {}", e))?;
-            // IWANT requests are small control messages - use low latency
-            let request = TransportRequest::low_latency_control();
             self.transport
-                .send_with_request(from, GossipStreamType::PubSub, bytes.into(), &request)
+                .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
                 .await?;
         }
 
@@ -569,14 +549,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
             let bytes = bincode::serialize(&_message)
                 .map_err(|e| anyhow!("Serialization failed: {}", e))?;
-            // Use bulk transfer for large payloads, low latency for small ones
-            let request = if bytes.len() > BULK_TRANSFER_THRESHOLD {
-                TransportRequest::bulk_transfer()
-            } else {
-                TransportRequest::low_latency_control()
-            };
             self.transport
-                .send_with_request(from, GossipStreamType::PubSub, bytes.into(), &request)
+                .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
                 .await?;
         }
 
@@ -637,15 +611,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             public_key: signing_key.public_key().to_vec(),
                         };
                         if let Ok(bytes) = bincode::serialize(&ihave_msg) {
-                            // IHAVE batches are small control messages - use low latency
-                            let request = TransportRequest::low_latency_control();
                             let _ = transport
-                                .send_with_request(
-                                    peer,
-                                    GossipStreamType::PubSub,
-                                    bytes.into(),
-                                    &request,
-                                )
+                                .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
                                 .await;
                         }
                     }

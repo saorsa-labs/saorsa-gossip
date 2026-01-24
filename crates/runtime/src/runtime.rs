@@ -1,7 +1,3 @@
-// Allow deprecated transport types during migration period.
-// Phase 3.3 will replace these with direct ant-quic transport integration.
-#![allow(deprecated)]
-
 use crate::{CoordinatorClient, RendezvousClient};
 use anyhow::Result;
 use saorsa_gossip_groups::GroupContext;
@@ -11,10 +7,7 @@ use saorsa_gossip_membership::{
 };
 use saorsa_gossip_presence::PresenceManager;
 use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
-use saorsa_gossip_transport::{
-    GossipTransport, MultiplexedGossipTransport, TransportDescriptor, TransportMultiplexer,
-    UdpTransportAdapter, UdpTransportAdapterConfig,
-};
+use saorsa_gossip_transport::{GossipTransport, UdpTransportAdapter, UdpTransportAdapterConfig};
 use saorsa_gossip_types::{PeerId, TopicId};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -44,8 +37,8 @@ impl Default for GossipRuntimeConfig {
 pub struct GossipRuntimeBuilder {
     config: GossipRuntimeConfig,
     identity: Option<MlDsaKeyPair>,
-    /// Optional pre-configured multiplexer for multi-transport support.
-    multiplexer: Option<Arc<TransportMultiplexer>>,
+    /// Optional pre-configured transport.
+    transport: Option<Arc<UdpTransportAdapter>>,
 }
 
 impl GossipRuntimeBuilder {
@@ -73,28 +66,25 @@ impl GossipRuntimeBuilder {
         self
     }
 
-    /// Provide a pre-configured transport multiplexer.
+    /// Provide a pre-configured transport.
     ///
-    /// When set, the runtime will use the multiplexer for routing messages
-    /// to different transports based on capability requirements. If not set,
-    /// a default single-transport (UDP) configuration is used.
+    /// When set, the runtime will use the provided transport directly.
+    /// If not set, a default UDP transport is created.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// use saorsa_gossip_transport::{TransportMultiplexer, TransportDescriptor};
+    /// use saorsa_gossip_transport::UdpTransportAdapter;
     ///
-    /// let multiplexer = TransportMultiplexer::new(peer_id);
-    /// multiplexer.register_transport(TransportDescriptor::Udp, udp_transport).await?;
-    /// multiplexer.set_default_transport(TransportDescriptor::Udp).await?;
+    /// let transport = Arc::new(UdpTransportAdapter::new(bind_addr).await?);
     ///
     /// let runtime = GossipRuntimeBuilder::new()
-    ///     .with_multiplexer(Arc::new(multiplexer))
+    ///     .with_transport(transport)
     ///     .build()
     ///     .await?;
     /// ```
-    pub fn with_multiplexer(mut self, multiplexer: Arc<TransportMultiplexer>) -> Self {
-        self.multiplexer = Some(multiplexer);
+    pub fn with_transport(mut self, transport: Arc<UdpTransportAdapter>) -> Self {
+        self.transport = Some(transport);
         self
     }
 
@@ -107,15 +97,12 @@ impl GossipRuntimeBuilder {
 
         let peer_id = identity.peer_id();
 
-        // Create the transport - either from provided multiplexer or default single-transport
-        let transport: Arc<MultiplexedGossipTransport> = match self.multiplexer {
-            Some(multiplexer) => {
-                // Use the provided multiplexer wrapped in MultiplexedGossipTransport
-                Arc::new(MultiplexedGossipTransport::new(multiplexer, peer_id))
-            }
+        // Create the transport - either from provided transport or default UDP
+        let transport: Arc<UdpTransportAdapter> = match self.transport {
+            Some(transport) => transport,
             None => {
-                // Create default single UDP transport with multiplexer wrapper
-                let udp_adapter = Arc::new(
+                // Create default UDP transport
+                Arc::new(
                     UdpTransportAdapter::with_config(
                         UdpTransportAdapterConfig::new(
                             self.config.bind_addr,
@@ -124,21 +111,7 @@ impl GossipRuntimeBuilder {
                         None,
                     )
                     .await?,
-                );
-
-                // Wrap in multiplexer for consistency
-                let multiplexer = TransportMultiplexer::new(peer_id);
-                multiplexer
-                    .register_transport(TransportDescriptor::Udp, udp_adapter)
-                    .await?;
-                multiplexer
-                    .set_default_transport(TransportDescriptor::Udp)
-                    .await?;
-
-                Arc::new(MultiplexedGossipTransport::new(
-                    Arc::new(multiplexer),
-                    peer_id,
-                ))
+                )
             }
         };
 
@@ -202,8 +175,8 @@ pub struct GossipRuntime {
     pub identity: MlDsaKeyPair,
     /// Local peer-id.
     pub peer_id: PeerId,
-    /// Shared multiplexed transport for multi-transport support.
-    pub transport: Arc<MultiplexedGossipTransport>,
+    /// Shared transport layer.
+    pub transport: Arc<UdpTransportAdapter>,
     /// Membership layer.
     pub membership: Arc<RwLock<Box<dyn Membership>>>,
     /// PubSub layer.

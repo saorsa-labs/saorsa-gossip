@@ -7,16 +7,17 @@
     "name": "Transport Layer Simplification"
   },
   "phase": {
-    "number": "3.2",
-    "name": "Flatten Transport Layer onto ant-quic",
-    "plan": "PLAN-302"
+    "number": "3.3",
+    "name": "Wire Runtime Directly to ant-quic",
+    "plan": "PLAN-303"
   },
   "progress": {
-    "total_tasks": 7,
+    "total_tasks": 4,
     "completed_tasks": 0,
     "current_task": 1
   },
-  "status": "planned",
+  "status": "planning",
+  "completed_phases": ["3.1", "3.2"],
   "interview_decisions": {
     "problem": "Technical debt - Custom multiplexer duplicates ant-quic's native capabilities (~3000 lines redundant)",
     "success_criteria": "Production ready - Full refactor, remove redundant code, update docs, all tests pass",
@@ -33,5 +34,5 @@
     ]
   },
   "phase_decisions": {},
-  "last_updated": "2026-01-24T11:45:00Z"
+  "last_updated": "2026-01-24T12:15:00Z"
 }

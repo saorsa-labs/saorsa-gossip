@@ -126,23 +126,26 @@ Simplify saorsa-gossip's transport layer by leveraging ant-quic's native Transpo
 | Documentation | Full public API docs, update README, DESIGN, ADRs |
 | Migration | Staged deprecation for backward compatibility |
 
-### Phase 3.1: Upgrade ant-quic Dependency
+### Phase 3.1: Upgrade ant-quic Dependency ✅
 | # | Task | Status | Details |
 |---|------|--------|---------|
-| 1.1 | Research latest ant-quic API | ⏳ | Identify TransportRegistry, ConnectionRouter APIs |
-| 1.2 | Bump ant-quic version | ⏳ | Update all Cargo.toml files |
-| 1.3 | Run cargo update -p ant-quic | ⏳ | Update lock file |
-| 1.4 | Fix compilation errors | ⏳ | Adapt to any API changes |
-| 1.5 | Verify CI builds | ⏳ | All targets compile |
+| 1.1 | Research latest ant-quic API | ✅ | Confirmed TransportRegistry, ConnectionRouter in ant-quic 0.20 |
+| 1.2 | Bump ant-quic version | ✅ | Updated Cargo.toml to ant-quic = "0.20" |
+| 1.3 | Run cargo update -p ant-quic | ✅ | Lock file updated |
+| 1.4 | Fix compilation errors | ✅ | TransportAddr API change, clippy fix |
+| 1.5 | Verify CI builds | ✅ | 363 tests pass, zero warnings |
+| 1.6 | Re-export new types | ✅ | AntTransportRegistry, TransportAddr, TransportType, etc. |
 
-### Phase 3.2: Flatten Transport Layer onto ant-quic
+### Phase 3.2: Deprecate Custom Multiplexer ✅
 | # | Task | Status | Details |
 |---|------|--------|---------|
-| 2.1 | Deprecate TransportMultiplexer | ⏳ | Add deprecation warnings |
-| 2.2 | Deprecate TransportRequest | ⏳ | No longer needed with ant-quic routing |
-| 2.3 | Archive BLE stub | ⏳ | Move to examples/ for reference |
-| 2.4 | Simplify UdpTransportAdapter | ⏳ | Expose P2pEndpoint streams directly |
-| 2.5 | Update MultiplexedGossipTransport | ⏳ | Thin wrapper on ant-quic |
+| 2.1 | Deprecate TransportMultiplexer | ✅ | Added #[deprecated] with migration docs |
+| 2.2 | Deprecate TransportRegistry | ✅ | Points to AntTransportRegistry |
+| 2.3 | Deprecate TransportRequest | ✅ | Points to TransportType |
+| 2.4 | Deprecate MultiplexedGossipTransport | ✅ | Points to ant-quic SharedTransport |
+| 2.5 | Deprecate BLE stub | ✅ | Points to ant_quic::transport::ble |
+| 2.6 | Update lib.rs exports | ✅ | Added migration documentation |
+| 2.7 | Add #![allow(deprecated)] | ✅ | Internal consumers allowed during migration |
 
 ### Phase 3.3: Wire Runtime Directly to ant-quic
 | # | Task | Status | Details |

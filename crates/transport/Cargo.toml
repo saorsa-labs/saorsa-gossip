@@ -35,7 +35,3 @@ tracing-subscriber = "0.3"
 [[example]]
 name = "throughput_test"
 path = "../../examples/throughput_test.rs"
-
-[[example]]
-name = "transport_benchmark"
-path = "../../examples/transport_benchmark.rs"

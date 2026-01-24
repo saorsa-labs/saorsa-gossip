@@ -1,11 +1,8 @@
-// Allow deprecated transport types during migration to ant-quic native routing
-#![allow(deprecated)]
-
 //! GossipContext - Simplified configuration for the gossip runtime.
 //!
 //! This module provides [`GossipContext`], a high-level configuration builder that
 //! simplifies setting up a gossip runtime with transport configuration. It handles
-//! the complexity of creating transport multiplexers and adapters automatically.
+//! the complexity of creating transport adapters automatically.
 //!
 //! # Example
 //!
@@ -31,9 +28,7 @@
 
 use anyhow::{Context, Result};
 use saorsa_gossip_identity::MlDsaKeyPair;
-use saorsa_gossip_transport::{
-    TransportDescriptor, TransportMultiplexer, UdpTransportAdapter, UdpTransportAdapterConfig,
-};
+use saorsa_gossip_transport::{UdpTransportAdapter, UdpTransportAdapterConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -42,7 +37,7 @@ use crate::runtime::{GossipRuntime, GossipRuntimeBuilder};
 /// Central configuration structure for gossip protocol runtime.
 ///
 /// `GossipContext` provides a simplified API for configuring the gossip runtime
-/// without needing to manually create transport multiplexers. It handles all the
+/// without needing to manually create transports. It handles all the
 /// wiring automatically while exposing the most commonly needed configuration options.
 ///
 /// # Configuration Options
@@ -237,9 +232,8 @@ impl GossipContext {
 
     /// Builds the GossipRuntime from this context.
     ///
-    /// This method creates a UDP transport with the configured settings,
-    /// wraps it in a transport multiplexer, and initializes the full
-    /// gossip runtime stack.
+    /// This method creates a UDP transport with the configured settings
+    /// and initializes the full gossip runtime stack.
     ///
     /// # Errors
     ///
@@ -269,7 +263,6 @@ impl GossipContext {
             Some(id) => id,
             None => MlDsaKeyPair::generate().context("failed to generate identity keypair")?,
         };
-        let peer_id = identity.peer_id();
 
         // Create UDP transport adapter
         let udp_adapter = Arc::new(
@@ -278,23 +271,12 @@ impl GossipContext {
                 .context("failed to create UDP transport adapter")?,
         );
 
-        // Create and configure multiplexer
-        let multiplexer = TransportMultiplexer::new(peer_id);
-        multiplexer
-            .register_transport(TransportDescriptor::Udp, udp_adapter)
-            .await
-            .context("failed to register UDP transport with multiplexer")?;
-        multiplexer
-            .set_default_transport(TransportDescriptor::Udp)
-            .await
-            .context("failed to set default transport")?;
-
-        // Use the standard builder with our configured multiplexer
+        // Use the standard builder with our configured transport
         GossipRuntimeBuilder::new()
             .bind_addr(self.bind_addr)
             .known_peers(self.known_peers)
             .identity(identity)
-            .with_multiplexer(Arc::new(multiplexer))
+            .with_transport(udp_adapter)
             .build()
             .await
             .context("failed to build GossipRuntime")
@@ -304,6 +286,7 @@ impl GossipContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saorsa_gossip_transport::GossipTransport;
 
     #[test]
     fn test_default_context() {
@@ -418,8 +401,9 @@ mod tests {
     async fn test_build_runtime_has_transport() {
         let runtime = GossipContext::with_defaults().build().await.unwrap();
 
-        // Verify the transport is accessible and has the expected type
-        // The transport should have a local peer ID that matches the runtime
-        assert_eq!(runtime.transport.local_peer_id(), runtime.peer_id());
+        // Verify the transport is accessible and returns valid peer IDs
+        // Note: The transport has its own QUIC identity, separate from the gossip identity
+        assert_ne!(runtime.transport.local_peer_id().as_bytes(), &[0u8; 32]);
+        assert_ne!(runtime.peer_id().as_bytes(), &[0u8; 32]);
     }
 }

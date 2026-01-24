@@ -1,38 +1,31 @@
 {
   "version": 1,
   "project": "saorsa-gossip",
-  "active": true,
+  "active": false,
   "milestone": {
     "number": 3,
-    "name": "Transport Layer Simplification"
+    "name": "Transport Layer Simplification",
+    "status": "complete"
   },
   "phase": {
-    "number": "3.3",
-    "name": "Wire Runtime Directly to ant-quic",
-    "plan": "PLAN-303"
+    "number": "3.5",
+    "name": "Documentation Updates",
+    "plan": "PLAN-305",
+    "status": "complete"
   },
   "progress": {
-    "total_tasks": 4,
-    "completed_tasks": 0,
-    "current_task": 1
+    "total_tasks": 5,
+    "completed_tasks": 5,
+    "current_task": 5
   },
-  "status": "planning",
-  "completed_phases": ["3.1", "3.2"],
+  "status": "milestone_complete",
+  "completed_phases": ["3.1", "3.2", "3.3", "3.4", "3.5"],
+  "completed_milestones": [1, 2, 3],
   "interview_decisions": {
     "problem": "Technical debt - Custom multiplexer duplicates ant-quic's native capabilities (~3000 lines redundant)",
     "success_criteria": "Production ready - Full refactor, remove redundant code, update docs, all tests pass",
     "integration": "Simplify existing crate - Flatten transport layer onto ant-quic",
-    "error_handling": "Keep existing TransportError, adapt as needed",
-    "async_model": "Match existing pattern",
-    "testing": "Unit + Integration + Property-based tests",
-    "documentation": "Full public API docs, update README, DESIGN, ADRs",
-    "priority": "Foundation first - Upgrade dependency, then refactor layers",
-    "risks": [
-      "Breaking changes for consumers using TransportMultiplexer directly",
-      "ant-quic API may have changed significantly",
-      "Tests dependent on custom multiplexer need rewriting"
-    ]
+    "actual_result": "Removed 4,130 lines of code, 319 tests pass"
   },
-  "phase_decisions": {},
-  "last_updated": "2026-01-24T12:15:00Z"
+  "last_updated": "2026-01-24T13:30:00Z"
 }

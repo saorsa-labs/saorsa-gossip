@@ -383,7 +383,7 @@ use saorsa_gossip_membership::{
     Membership, HyParViewMembership, DEFAULT_ACTIVE_DEGREE, DEFAULT_PASSIVE_DEGREE,
 };
 use saorsa_gossip_pubsub::{PubSub, PlumtreePubSub};
-use saorsa_gossip_transport::AntQuicTransport;
+use saorsa_gossip_transport::UdpTransportAdapter;
 use saorsa_gossip_types::{PeerId, TopicId};
 
 #[tokio::main]
@@ -391,7 +391,7 @@ async fn main() -> anyhow::Result<()> {
     let topic = TopicId::from_entity("demo-room");
     let peer_id = PeerId::new([7u8; 32]);
     let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
-    let transport = Arc::new(AntQuicTransport::new(bind_addr, vec![]).await?);
+    let transport = Arc::new(UdpTransportAdapter::new(bind_addr, vec![]).await?);
     let signing_key = MlDsaKeyPair::generate()?;
 
     // Membership can run without seeds for local experimentation.
@@ -495,7 +495,7 @@ Provided by:
 |----------|-------------|
 | **Unit tests** | `cargo test --all` covers membership, pubsub, presence, rendezvous, transport, and coordinator logic using in-process ant-quic nodes. |
 | **Doctests** | API snippets in this repository are compiled and executed with `cargo test --doc`. |
-| **Transport benches** | `examples/throughput_test.rs` and `examples/transport_benchmark.rs` push real QUIC traffic between two processes to capture throughput/latency numbers. |
+| **Transport benches** | `examples/throughput_test.rs` pushes real QUIC traffic between two processes to capture throughput/latency numbers. |
 
 ### Running Tests
 
@@ -517,13 +517,9 @@ cargo run --example throughput_test --release -- receiver --bind 127.0.0.1:8000
 
 # Terminal 2 – stream payloads to the receiver
 cargo run --example throughput_test --release -- sender --coordinator 127.0.0.1:8000 --bind 127.0.0.1:9000
-
-# Run the full transport benchmark (coordinator + benchmark client)
-cargo run --example transport_benchmark --release -- coordinator --bind 127.0.0.1:8000
-cargo run --example transport_benchmark --release -- benchmark --coordinator 127.0.0.1:8000 --bind 127.0.0.1:9000
 ```
 
-These programs do not stub anything—they start real Ant-QUIC nodes, perform ML-KEM+ML-DSA handshakes, and transfer actual data across the multiplexed membership/pubsub/bulk streams. That matches the runtime used in production and in the `communitas` consumer.
+These programs do not stub anything—they start real ant-quic nodes, perform ML-KEM+ML-DSA handshakes, and transfer actual data across the membership/pubsub/bulk streams. That matches the runtime used in production and in the `communitas` consumer.
 
 ### Manual System Testing
 
@@ -657,7 +653,7 @@ See [docs/adr/README.md](docs/adr/README.md) for the complete index and ADR temp
 - [ ] Complete anti-entropy with message sketches
 
 ### ✅ Phase 6: Production Hardening (Complete - v0.2.1)
-- [x] **Real-network benchmarks** - `throughput_test` + `transport_benchmark` running against ant-quic
+- [x] **Real-network benchmarks** - `throughput_test` running against ant-quic
 - [x] **Runtime crate + operator tooling** - deployable coordinator + CLI using the shared transport
 - [x] **Bootstrap cache integration** - persistent peer cache via ant-quic's `BootstrapCache`
 - [x] **PQC-only handshake verification** - ML-KEM-768 + ML-DSA-65 enforcement across transport/membership/pubsub
@@ -766,7 +762,7 @@ Inspired by:
 
 ---
 
-**✅ Status (Jan 16 2026)**: v0.2.1 ships a production-ready QUIC + PQC gossip stack with deployable coordinator/CLI binaries and no simulators or mock transports. All tests operate over real sockets and ML-KEM/ML-DSA handshakes. The coordinator advert/gossip cache, membership, pubsub, and runtime crates are consumed by Communitas unchanged.
+**✅ Status (Jan 24 2026)**: v0.3.0 ships a production-ready QUIC + PQC gossip stack with deployable coordinator/CLI binaries and no simulators or mock transports. All tests operate over real sockets and ML-KEM/ML-DSA handshakes. The transport layer has been simplified to use ant-quic's native infrastructure directly, removing ~4,000 lines of redundant multiplexer code.
 
 **Next Steps**: tighten ops tooling (metrics + alerting around real transports), finalize IBLT reconciliation + peer scoring, and extend the runtime glue used by Communitas Sites.
 

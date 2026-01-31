@@ -43,6 +43,7 @@ Saorsa Gossip is a **post-quantum secure**, **DNS-free**, **DHT-free** peer-to-p
 4. **Local-First**: Data lives on your device, syncs via CRDTs when online
 5. **Privacy-Preserving**: Bounded queries, capability tokens, peer scoring
 6. **Partition-Tolerant**: Works in isolated networks, reconnects seamlessly
+7. **Measure, Don’t Trust**: Capability claims are hints; peers validate reachability and behavior before relying on them
 
 ---
 
@@ -74,6 +75,7 @@ Saorsa Gossip is a **post-quantum secure**, **DNS-free**, **DHT-free** peer-to-p
 - **Rendezvous Shards**: 65,536 content-addressed shards for global findability
 - **FOAF Queries**: Bounded random-walk over friend graph (TTL=3)
 - **Peer Cache**: Persistent storage of known peers with NAT hints
+  - Coordinator roles are treated as *hints*; peers test and score nodes before selecting them
 
 #### 5. **Decentralized Website Hosting (Saorsa Sites)**
 - Content-addressed sites with BLAKE3 merkle trees

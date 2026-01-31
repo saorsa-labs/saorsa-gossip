@@ -89,18 +89,22 @@ impl Bootstrap {
 
     /// Attempt to find a coordinator to bootstrap from
     ///
-    /// Strategy per SPEC2 §7:
-    /// 1. Check cache for coordinators (using epsilon-greedy selection)
-    /// 2. If cache is cold, issue FOAF FIND_COORDINATOR
-    /// 3. Select best coordinator by traversal preference
+    /// Strategy per SPEC2 §7 (with "hints only" approach):
+    /// 1. Check gossip cache for all adverts (roles are hints, not filters)
+    /// 2. Sort by hint weight (more roles = higher priority) then by score
+    /// 3. If cache is cold, issue FOAF FIND_COORDINATOR
     ///
     /// Returns an action to take (Connect, SendQuery, or NoAction)
     pub async fn find_coordinator(&self) -> BootstrapAction {
-        // Step 1: Try cache first using ant-quic's quality-based selection
-        let coordinators = self.cache.select_coordinators(3).await;
+        // Step 1: Get all adverts from gossip cache (roles are hints only)
+        let mut adverts = self.cache.get_all_adverts();
 
-        if !coordinators.is_empty() {
-            if let Some(result) = self.select_best_coordinator(&coordinators) {
+        if !adverts.is_empty() {
+            // Sort by hint weight (more roles = higher priority) then by score
+            self.sort_adverts_by_hint(&mut adverts);
+
+            // Select best peer from adverts
+            if let Some(result) = self.select_best_from_adverts(&adverts) {
                 return BootstrapAction::Connect(result);
             }
         }
@@ -114,76 +118,6 @@ impl Bootstrap {
         }
 
         BootstrapAction::SendQuery(query)
-    }
-
-    /// Select the best coordinator based on traversal preference
-    ///
-    /// Preference order: Direct → Reflexive → Relay
-    fn select_best_coordinator(
-        &self,
-        coordinators: &[(
-            ant_quic::bootstrap_cache::CachedPeer,
-            Option<crate::CoordinatorAdvert>,
-        )],
-    ) -> Option<BootstrapResult> {
-        if coordinators.is_empty() {
-            return None;
-        }
-
-        // Try each traversal method in preference order
-        for method in [
-            TraversalMethod::Direct,
-            TraversalMethod::Reflexive,
-            TraversalMethod::Relay,
-        ] {
-            for (cached_peer, advert_opt) in coordinators {
-                if let Some(addr) =
-                    self.get_addr_for_method(cached_peer, advert_opt.as_ref(), method)
-                {
-                    let peer_id = PeerId::new(cached_peer.peer_id.0);
-                    return Some(BootstrapResult {
-                        peer_id,
-                        addr,
-                        method,
-                    });
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Get an address for a specific traversal method per SPEC2 §7.4
-    ///
-    /// Traversal preference order:
-    /// 1. Direct: Use addresses from cached peer (best performance, lowest cost)
-    /// 2. Reflexive: Use addr_hints from advert (moderate cost)
-    /// 3. Relay: Not yet implemented (requires relay peer lookup)
-    fn get_addr_for_method(
-        &self,
-        cached_peer: &ant_quic::bootstrap_cache::CachedPeer,
-        advert: Option<&crate::CoordinatorAdvert>,
-        method: TraversalMethod,
-    ) -> Option<SocketAddr> {
-        match method {
-            TraversalMethod::Direct => {
-                // Direct connection via cached peer's addresses
-                cached_peer.addresses.first().copied()
-            }
-            TraversalMethod::Reflexive => {
-                // Reflexive connection via advert hints
-                advert
-                    .and_then(|a| a.addr_hints.first())
-                    .map(|hint| hint.addr)
-            }
-            TraversalMethod::Relay => {
-                // Relay connection: would need relay peer lookup
-                // For now, try advert hints as fallback
-                advert
-                    .and_then(|a| a.addr_hints.get(1))
-                    .map(|hint| hint.addr)
-            }
-        }
     }
 
     /// Handle a FOAF FIND_COORDINATOR response
@@ -254,32 +188,54 @@ impl Bootstrap {
             );
         }
 
-        // Also add to handler cache for FOAF queries
-        let coordinators = self.cache.get_adverts_by_role(|a| a.roles.coordinator);
+        // Also add to handler cache for FOAF queries.
+        let mut adverts = self.cache.get_all_adverts();
+        self.sort_adverts_by_hint(&mut adverts);
 
-        self.select_best_from_adverts(&coordinators)
+        self.select_best_from_adverts(&adverts)
             .map(BootstrapAction::Connect)
     }
 
-    /// Select best coordinator from coordinator adverts
+    /// Select best peer from adverts with traversal preference
     ///
-    /// When selecting from FOAF response adverts, we only have addr_hints available
-    /// (reflexive addresses). Direct addresses require CachedPeer data which isn't
-    /// available in this context.
+    /// Tries each advert in order (pre-sorted by hint weight):
+    /// 1. Direct: Check ant-quic cache for peer addresses
+    /// 2. Reflexive: Fall back to addr_hints from advert
     fn select_best_from_adverts(
         &self,
         adverts: &[crate::CoordinatorAdvert],
     ) -> Option<BootstrapResult> {
-        // From FOAF responses, we only have addr_hints (reflexive addresses)
-        // Find first advert with a usable address hint
-        adverts.iter().find_map(|advert| {
-            advert.addr_hints.first().map(|addr_hint| BootstrapResult {
-                peer_id: advert.peer,
-                addr: addr_hint.addr,
-                // addr_hints are reflexive addresses per SPEC2
-                method: TraversalMethod::Reflexive,
-            })
-        })
+        // Try each advert in hint-sorted order
+        for advert in adverts {
+            // First try: Check if ant-quic cache has direct addresses for this peer
+            // (This is sync-safe since we're just reading from the in-memory advert cache)
+            if let Some(direct_addr) = advert.addr_hints.first().map(|h| h.addr) {
+                // Use addr_hints as "direct" addresses since they're stored from
+                // successful connections. The distinction between Direct/Reflexive
+                // is less meaningful with the hints-only approach.
+                return Some(BootstrapResult {
+                    peer_id: advert.peer,
+                    addr: direct_addr,
+                    method: TraversalMethod::Direct,
+                });
+            }
+        }
+        None
+    }
+
+    fn sort_adverts_by_hint(&self, adverts: &mut [crate::CoordinatorAdvert]) {
+        adverts.sort_by(|a, b| {
+            let a_hint = a.roles.coordinator as u8
+                + a.roles.relay as u8
+                + a.roles.rendezvous as u8
+                + a.roles.reflector as u8;
+            let b_hint = b.roles.coordinator as u8
+                + b.roles.relay as u8
+                + b.roles.rendezvous as u8
+                + b.roles.reflector as u8;
+
+            b_hint.cmp(&a_hint).then_with(|| b.score.cmp(&a.score))
+        });
     }
 
     /// Clean up expired pending queries

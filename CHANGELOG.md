@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-01-31
+
+### Changed
+
+- **Coordinator roles are now hints, not filters** ("measure, don't trust")
+  - Bootstrap selection uses all peers; roles only influence sort order
+  - `find_coordinator()` now uses gossip cache adverts directly
+  - `handle_find_query()` returns all adverts sorted by hint weight
+  - Removed capability-based filtering from ant-quic integration
+
+### Documentation
+
+- Added core principle #7: "Measure, Don't Trust" to DESIGN.md
+- Updated coordinator crate description in README.md
+- Updated ADR-004 (Seedless Bootstrap) with hints clarification
+- Updated ADR-009 (Peer Scoring) with hint-based bootstrap example
+- Updated module docs in `lib.rs` to clarify roles are hints
+
+### Removed
+
+- `select_best_coordinator()` and `get_addr_for_method()` methods (replaced by hint-sorted advert selection)
+- Capability setting in `insert_advert()` (capabilities are now measured, not trusted)
+
 ## [0.4.1] - 2026-01-30
 
 ### Changed

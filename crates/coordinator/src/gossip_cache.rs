@@ -141,14 +141,12 @@ impl GossipCacheAdapter {
         // Also update ant-quic cache with peer info
         let addresses: Vec<SocketAddr> = advert.addr_hints.iter().map(|h| h.addr).collect();
 
-        let capabilities = roles_to_capabilities(&advert.roles, &advert.nat_class);
-
         let ant_peer_id = gossip_to_ant_peer_id(&peer_id);
         self.cache
-            .add_from_connection(ant_peer_id, addresses, Some(capabilities))
+            .add_from_connection(ant_peer_id, addresses, None)
             .await;
 
-        debug!(peer = ?peer_id, "Inserted coordinator advert");
+        debug!(peer = ?peer_id, "Inserted coordinator advert (hints only)");
         true
     }
 
@@ -351,6 +349,10 @@ fn ant_to_gossip_peer_id(peer_id: &ant_quic::PeerId) -> PeerId {
 }
 
 /// Convert gossip PeerRoles to ant-quic PeerCapabilities.
+///
+/// Note: With the "hints only" approach (v0.4.2+), capabilities are no longer
+/// set from adverts. This function is retained for tests and potential future use.
+#[cfg(test)]
 fn roles_to_capabilities(roles: &PeerRoles, nat_class: &NatClass) -> PeerCapabilities {
     PeerCapabilities {
         supports_relay: roles.relay,
@@ -362,6 +364,9 @@ fn roles_to_capabilities(roles: &PeerRoles, nat_class: &NatClass) -> PeerCapabil
 }
 
 /// Convert gossip NatClass to ant-quic NatType.
+///
+/// Note: With the "hints only" approach (v0.4.2+), this is primarily used for tests.
+#[cfg(test)]
 fn nat_class_to_nat_type(nat_class: &NatClass) -> NatType {
     match nat_class {
         NatClass::Eim => NatType::FullCone, // EIM maps to FullCone (easiest)

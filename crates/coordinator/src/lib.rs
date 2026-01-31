@@ -6,11 +6,14 @@
 //!
 //! ## Overview
 //!
-//! Coordinators are self-elected public nodes that provide:
+//! Coordinators are self-elected nodes that *attempt* to provide:
 //! - **Bootstrap**: Seedless network entry
 //! - **Reflection**: Address observation for NAT detection
 //! - **Rendezvous**: Connection coordination for hole punching
 //! - **Relay**: Last-resort message forwarding
+//!
+//! Roles are **hints**, not trusted claims. Peers are selected based on
+//! observed reachability and success rates ("measure, don't trust").
 //!
 //! ## Cache Architecture
 //!

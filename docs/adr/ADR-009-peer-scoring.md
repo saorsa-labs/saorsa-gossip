@@ -279,12 +279,14 @@ impl Plumtree {
 
 ```rust
 impl BootstrapManager {
-    /// Select coordinators for bootstrap
+    /// Select bootstrap peers (roles are hints only)
     fn select_bootstrap_peers(&self, count: usize) -> Vec<SocketAddr> {
         let mut candidates: Vec<_> = self.peer_cache
             .iter()
-            .filter(|p| p.roles.coordinator)
-            .map(|p| (p, self.scorer.get_score(&p.peer_id)))
+            .map(|p| {
+                let hint_bonus = if p.roles.coordinator { 50 } else { 0 };
+                (p, self.scorer.get_score(&p.peer_id) + hint_bonus)
+            })
             .collect();
 
         // Epsilon-greedy selection

@@ -138,12 +138,25 @@ impl CoordinatorHandler {
             return None; // TTL exhausted
         }
 
-        // Get coordinator adverts from cache
-        let coordinators = self
+        // Get coordinator adverts from cache (roles are hints only).
+        let mut coordinators = self
             .cache
             .as_ref()
-            .map(|c| c.get_adverts_by_role(|advert| advert.roles.coordinator))
+            .map(|c| c.get_all_adverts())
             .unwrap_or_default();
+
+        coordinators.sort_by(|a, b| {
+            let a_hint = a.roles.coordinator as u8
+                + a.roles.relay as u8
+                + a.roles.rendezvous as u8
+                + a.roles.reflector as u8;
+            let b_hint = b.roles.coordinator as u8
+                + b.roles.relay as u8
+                + b.roles.rendezvous as u8
+                + b.roles.reflector as u8;
+
+            b_hint.cmp(&a_hint).then_with(|| b.score.cmp(&a.score))
+        });
 
         // Return response with known coordinators
         Some(FindCoordinatorResponse::new(

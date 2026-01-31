@@ -25,6 +25,9 @@ We needed a bootstrap mechanism that:
 
 Implement **Coordinator Adverts**: self-elected, cryptographically signed, gossip-disseminated peer announcements.
 
+**Important:** Roles in adverts are *hints*, not trust anchors. Peers validate
+reachability and observed behavior before relying on a node for coordination or relay.
+
 ### Coordinator Advert Structure
 
 ```rust

@@ -332,7 +332,7 @@ impl UdpTransportAdapter {
             info!("Ant-QUIC receiver task started (global message receiver)");
 
             loop {
-                match node_recv.recv(Duration::from_secs(60)).await {
+                match node_recv.recv().await {
                     Ok((from_peer_id, data)) => {
                         if data.is_empty() {
                             continue;

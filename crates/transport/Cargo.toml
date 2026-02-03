@@ -23,7 +23,7 @@ thiserror = "2.0"
 tracing = { workspace = true }
 ant-quic = { workspace = true }
 serde = { workspace = true }
-bincode = { workspace = true }
+postcard = { workspace = true }
 dirs = "5.0"
 uuid = { version = "1.6", features = ["v4"] }
 futures = "0.3"

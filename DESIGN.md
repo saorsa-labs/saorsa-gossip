@@ -856,7 +856,7 @@ impl GroupManager {
         };
 
         // 3. Encrypt with ChaCha20-Poly1305
-        let plaintext = bincode::serialize(&crdt_op)?;
+        let plaintext = postcard::to_stdvec(&crdt_op)?;
         let ciphertext = chacha20poly1305::encrypt(&epoch_key, &plaintext)?;
 
         // 4. Sign with user's ML-DSA key

@@ -659,12 +659,12 @@ mod tests {
         );
 
         let cbor_bytes = advert.to_cbor().expect("CBOR serialization");
-        let bincode_bytes = bincode::serialize(&advert).expect("bincode serialization");
+        let postcard_bytes = postcard::to_stdvec(&advert).expect("postcard serialization");
 
-        // CBOR and bincode MUST produce different wire formats
+        // CBOR and postcard MUST produce different wire formats
         assert_ne!(
-            cbor_bytes, bincode_bytes,
-            "CBOR must not be bincode - wire formats differ"
+            cbor_bytes, postcard_bytes,
+            "CBOR must not be postcard - wire formats differ"
         );
     }
 

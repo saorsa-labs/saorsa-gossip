@@ -272,7 +272,7 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                     // Send PING to peer via transport
                     trace!(peer_id = %peer, "SWIM: Probing peer");
                     let ping_msg = SwimMessage::Ping;
-                    match bincode::serialize(&ping_msg) {
+                    match postcard::to_stdvec(&ping_msg) {
                         Ok(bytes) => {
                             if let Err(e) = transport
                                 .send_to_peer(peer, GossipStreamType::Membership, bytes.into())
@@ -441,7 +441,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     ///
     /// Uses low-latency transport routing for control plane messages.
     async fn send_hyparview_message(&self, peer: PeerId, msg: &HyParViewMessage) -> Result<()> {
-        let bytes = bincode::serialize(msg)
+        let bytes = postcard::to_stdvec(msg)
             .map_err(|e| anyhow!("Failed to serialize HyParView message: {}", e))?;
         self.transport
             .send_to_peer(peer, GossipStreamType::Membership, bytes.into())
@@ -759,7 +759,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                     ttl: PASSIVE_RANDOM_WALK_LENGTH,
                 };
 
-                match bincode::serialize(&shuffle_msg) {
+                match postcard::to_stdvec(&shuffle_msg) {
                     Ok(bytes) => {
                         if let Err(e) = transport
                             .send_to_peer(target, GossipStreamType::Membership, bytes.into())

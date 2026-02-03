@@ -272,7 +272,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// Per SPEC2 §2, all gossip messages MUST be signed for authenticity.
     fn sign_message(&self, header: &MessageHeader) -> Vec<u8> {
         // Serialize header for signing
-        let header_bytes = match bincode::serialize(header) {
+        let header_bytes = match postcard::to_stdvec(header) {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!("Failed to serialize header for signing: {}", e);
@@ -306,7 +306,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         public_key: &[u8],
     ) -> bool {
         // Serialize header
-        let header_bytes = match bincode::serialize(header) {
+        let header_bytes = match postcard::to_stdvec(header) {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!("Failed to serialize header for verification: {}", e);
@@ -358,7 +358,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         for peer in eager_peers {
             trace!(peer_id = %peer, msg_id = ?msg_id, "Sending EAGER");
-            let bytes = bincode::serialize(&_message)
+            let bytes = postcard::to_stdvec(&_message)
                 .map_err(|e| anyhow!("Serialization failed: {}", e))?;
             self.transport
                 .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
@@ -439,7 +439,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         for peer in eager_peers {
             trace!(peer_id = %peer, msg_id = ?msg_id, "Forwarding EAGER");
             let bytes =
-                bincode::serialize(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
+                postcard::to_stdvec(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
             self.transport
                 .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
                 .await?;
@@ -495,14 +495,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let iwant_msg = GossipMessage {
                 header: iwant_header,
                 payload: Some(
-                    bincode::serialize(&requested)
+                    postcard::to_stdvec(&requested)
                         .map_err(|e| anyhow!("Serialization failed: {}", e))?
                         .into(),
                 ),
                 signature: self.sign_message(&iwant_header_clone),
                 public_key: self.signing_key.public_key().to_vec(),
             };
-            let bytes = bincode::serialize(&iwant_msg)
+            let bytes = postcard::to_stdvec(&iwant_msg)
                 .map_err(|e| anyhow!("Serialization failed: {}", e))?;
             self.transport
                 .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
@@ -547,7 +547,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 public_key: self.signing_key.public_key().to_vec(),
             };
 
-            let bytes = bincode::serialize(&_message)
+            let bytes = postcard::to_stdvec(&_message)
                 .map_err(|e| anyhow!("Serialization failed: {}", e))?;
             self.transport
                 .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
@@ -599,18 +599,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         let ihave_header_clone = ihave_header.clone();
 
                         // Sign the header
-                        let signature = match bincode::serialize(&ihave_header_clone) {
+                        let signature = match postcard::to_stdvec(&ihave_header_clone) {
                             Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
                             Err(_) => Vec::new(),
                         };
 
                         let ihave_msg = GossipMessage {
                             header: ihave_header,
-                            payload: Some(bincode::serialize(&batch).unwrap_or_default().into()),
+                            payload: Some(postcard::to_stdvec(&batch).unwrap_or_default().into()),
                             signature,
                             public_key: signing_key.public_key().to_vec(),
                         };
-                        if let Ok(bytes) = bincode::serialize(&ihave_msg) {
+                        if let Ok(bytes) = postcard::to_stdvec(&ihave_msg) {
                             let _ = transport
                                 .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
                                 .await;
@@ -704,7 +704,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
 
     async fn handle_message(&self, from: PeerId, data: Bytes) -> Result<()> {
         // Deserialize the GossipMessage
-        let message: GossipMessage = bincode::deserialize(&data)
+        let message: GossipMessage = postcard::from_bytes(&data)
             .map_err(|e| anyhow!("Failed to deserialize PubSub message: {}", e))?;
 
         let topic_id = message.header.topic;
@@ -724,7 +724,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
             MessageKind::IHave => {
                 // IHAVE payload contains Vec<MessageIdType>
                 if let Some(payload) = &message.payload {
-                    let msg_ids: Vec<MessageIdType> = bincode::deserialize(payload)
+                    let msg_ids: Vec<MessageIdType> = postcard::from_bytes(payload)
                         .map_err(|e| anyhow!("Failed to deserialize IHAVE payload: {}", e))?;
                     self.handle_ihave(from, topic_id, msg_ids).await
                 } else {
@@ -734,7 +734,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
             MessageKind::IWant => {
                 // IWANT payload contains Vec<MessageIdType>
                 if let Some(payload) = &message.payload {
-                    let msg_ids: Vec<MessageIdType> = bincode::deserialize(payload)
+                    let msg_ids: Vec<MessageIdType> = postcard::from_bytes(payload)
                         .map_err(|e| anyhow!("Failed to deserialize IWANT payload: {}", e))?;
                     self.handle_iwant(from, topic_id, msg_ids).await
                 } else {
@@ -852,7 +852,7 @@ mod tests {
         };
 
         // Create properly signed message
-        let header_bytes = bincode::serialize(&header).expect("serialize");
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize");
         let signature = signing_key.sign(&header_bytes).expect("sign");
 
         let message = GossipMessage {
@@ -1012,7 +1012,7 @@ mod tests {
         };
 
         // Serialize header for signing
-        let header_bytes = bincode::serialize(&header).expect("serialize");
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize");
 
         // Sign with ML-DSA
         let signature = keypair.sign(&header_bytes).expect("sign");
@@ -1046,7 +1046,7 @@ mod tests {
             ttl: 10,
         };
 
-        let header_bytes = bincode::serialize(&header).expect("serialize");
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize");
         let signature = keypair.sign(&header_bytes).expect("sign");
 
         // Valid signature should verify
@@ -1099,7 +1099,7 @@ mod tests {
         );
 
         // Verify the signature is valid
-        let header_bytes = bincode::serialize(&header).expect("serialize");
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize");
         let valid =
             MlDsaKeyPair::verify(keypair.public_key(), &header_bytes, &signature).expect("verify");
         assert!(valid, "Signature should be valid");

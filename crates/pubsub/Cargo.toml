@@ -20,7 +20,7 @@ async-trait = { workspace = true }
 bytes = { version = "1.5", features = ["serde"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
-bincode = { workspace = true }
+postcard = { workspace = true }
 lru = { workspace = true }
 tracing = { workspace = true }
 blake3 = { workspace = true }

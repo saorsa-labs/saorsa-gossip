@@ -308,7 +308,7 @@ impl PresenceManager {
                             };
 
                             // Serialize message
-                            let data = match bincode::serialize(&message) {
+                            let data = match postcard::to_stdvec(&message) {
                                 Ok(d) => bytes::Bytes::from(d),
                                 Err(e) => {
                                     warn!(?e, "Failed to serialize presence beacon");
@@ -545,7 +545,7 @@ impl PresenceManager {
 
         // Now send to selected peers (rng is dropped)
         if !selected_peers.is_empty() {
-            match bincode::serialize(&query) {
+            match postcard::to_stdvec(&query) {
                 Ok(data) => {
                     let data = bytes::Bytes::from(data);
                     for peer in &selected_peers {
@@ -673,7 +673,7 @@ impl PresenceManager {
     /// Returns the sender's PeerId if a beacon was processed.
     pub async fn handle_presence_message(&self, data: &[u8]) -> Result<Option<PeerId>> {
         let message: PresenceMessage =
-            bincode::deserialize(data).context("Failed to deserialize presence message")?;
+            postcard::from_bytes(data).context("Failed to deserialize presence message")?;
 
         match message {
             PresenceMessage::Beacon {
@@ -735,7 +735,7 @@ impl PresenceManager {
                         records: records.clone(),
                     };
 
-                    match bincode::serialize(&response) {
+                    match postcard::to_stdvec(&response) {
                         Ok(data) => {
                             if let Err(e) = self
                                 .transport
@@ -781,7 +781,7 @@ impl PresenceManager {
                             origin,
                         };
 
-                        match bincode::serialize(&forward_msg) {
+                        match postcard::to_stdvec(&forward_msg) {
                             Ok(data) => {
                                 let data = bytes::Bytes::from(data);
                                 for &idx in indices.iter().take(fanout) {
@@ -1308,8 +1308,8 @@ mod tests {
         };
 
         // Serialize and deserialize
-        let data = bincode::serialize(&message).expect("serialize failed");
-        let decoded: PresenceMessage = bincode::deserialize(&data).expect("deserialize failed");
+        let data = postcard::to_stdvec(&message).expect("serialize failed");
+        let decoded: PresenceMessage = postcard::from_bytes(&data).expect("deserialize failed");
 
         match decoded {
             PresenceMessage::Beacon {
@@ -1347,7 +1347,7 @@ mod tests {
             epoch: 0,
         };
 
-        let data = bincode::serialize(&message).expect("serialize failed");
+        let data = postcard::to_stdvec(&message).expect("serialize failed");
         let result = manager.handle_presence_message(&data).await;
 
         assert!(result.is_ok());
@@ -1372,7 +1372,7 @@ mod tests {
             epoch: 0,
         };
 
-        let data = bincode::serialize(&message).expect("serialize failed");
+        let data = postcard::to_stdvec(&message).expect("serialize failed");
         let result = manager.handle_presence_message(&data).await;
 
         // Should return Ok(None) for unknown topic
@@ -1400,7 +1400,7 @@ mod tests {
             origin,
         };
 
-        let data = bincode::serialize(&query).expect("serialize");
+        let data = postcard::to_stdvec(&query).expect("serialize");
 
         // First query should process (returns None but adds to seen_queries)
         let result1 = manager.handle_presence_message(&data).await;
@@ -1440,7 +1440,7 @@ mod tests {
             origin,
         };
 
-        let data = bincode::serialize(&query).expect("serialize");
+        let data = postcard::to_stdvec(&query).expect("serialize");
         let result = manager.handle_presence_message(&data).await;
 
         // Should succeed but not forward (no peers to verify, but it should process)
@@ -1478,8 +1478,8 @@ mod tests {
         };
 
         // Process both responses
-        let data1 = bincode::serialize(&response1).expect("serialize");
-        let data2 = bincode::serialize(&response2).expect("serialize");
+        let data1 = postcard::to_stdvec(&response1).expect("serialize");
+        let data2 = postcard::to_stdvec(&response2).expect("serialize");
 
         manager
             .handle_presence_message(&data1)
@@ -1520,7 +1520,7 @@ mod tests {
             records: vec![(peer, record.clone())],
         };
 
-        let data = bincode::serialize(&response).expect("serialize");
+        let data = postcard::to_stdvec(&response).expect("serialize");
 
         // Process same response twice
         manager.handle_presence_message(&data).await.expect("first");
@@ -1560,7 +1560,7 @@ mod tests {
             records: vec![(peer, expired_record)],
         };
 
-        let data = bincode::serialize(&response).expect("serialize");
+        let data = postcard::to_stdvec(&response).expect("serialize");
         manager
             .handle_presence_message(&data)
             .await
@@ -1611,8 +1611,8 @@ mod tests {
             origin,
         };
 
-        let data = bincode::serialize(&query).expect("serialize");
-        let decoded: PresenceMessage = bincode::deserialize(&data).expect("deserialize");
+        let data = postcard::to_stdvec(&query).expect("serialize");
+        let decoded: PresenceMessage = postcard::from_bytes(&data).expect("deserialize");
 
         match decoded {
             PresenceMessage::Query {
@@ -1644,8 +1644,8 @@ mod tests {
             records: vec![(peer, record.clone())],
         };
 
-        let data = bincode::serialize(&response).expect("serialize");
-        let decoded: PresenceMessage = bincode::deserialize(&data).expect("deserialize");
+        let data = postcard::to_stdvec(&response).expect("serialize");
+        let decoded: PresenceMessage = postcard::from_bytes(&data).expect("deserialize");
 
         match decoded {
             PresenceMessage::QueryResponse {
@@ -1748,7 +1748,7 @@ mod tests {
             origin,
         };
 
-        let data = bincode::serialize(&query).expect("serialize");
+        let data = postcard::to_stdvec(&query).expect("serialize");
         manager
             .handle_presence_message(&data)
             .await

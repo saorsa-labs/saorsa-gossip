@@ -20,7 +20,7 @@ blake3 = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
-bincode = { workspace = true }
+postcard = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

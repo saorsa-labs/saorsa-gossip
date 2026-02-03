@@ -92,14 +92,14 @@ impl MlDsaKeyPair {
         Ok(verifier.verify(&pk, message, &sig)?)
     }
 
-    /// Serialize key pair to bytes using bincode
+    /// Serialize key pair to bytes using postcard
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).context("Failed to serialize keypair")
+        postcard::to_stdvec(self).context("Failed to serialize keypair")
     }
 
-    /// Deserialize key pair from bytes using bincode
+    /// Deserialize key pair from bytes using postcard
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        bincode::deserialize(bytes).context("Failed to deserialize keypair")
+        postcard::from_bytes(bytes).context("Failed to deserialize keypair")
     }
 }
 
@@ -167,7 +167,7 @@ impl Identity {
 
         // Deserialize (in production, this would be encrypted)
         let identity: Identity =
-            bincode::deserialize(&data).context("Failed to deserialize identity")?;
+            postcard::from_bytes(&data).context("Failed to deserialize identity")?;
 
         Ok(identity)
     }
@@ -188,7 +188,7 @@ impl Identity {
         }
 
         // Serialize (in production, this would be encrypted)
-        let data = bincode::serialize(&self).context("Failed to serialize identity")?;
+        let data = postcard::to_stdvec(&self).context("Failed to serialize identity")?;
 
         // Write file
         tokio::fs::write(&file_path, data).await.context(format!(

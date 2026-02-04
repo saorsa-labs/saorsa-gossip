@@ -918,7 +918,17 @@ mod tests {
         let payload = Bytes::from("test");
         pubsub.publish(topic, payload.clone()).await.ok();
 
-        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        // Get the actual cached msg_id (don't recalculate - epoch may have changed)
+        let msg_id = {
+            let topics = pubsub.topics.read().await;
+            let state = topics.get(&topic).unwrap();
+            // Get the first (and only) cached message ID
+            state
+                .message_cache
+                .peek_lru()
+                .map(|(id, _)| *id)
+                .expect("message should be cached")
+        };
 
         // Handle IWANT from lazy peer
         pubsub

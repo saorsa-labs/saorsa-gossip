@@ -438,8 +438,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Forward EAGER
         for peer in eager_peers {
             trace!(peer_id = %peer, msg_id = ?msg_id, "Forwarding EAGER");
-            let bytes =
-                postcard::to_stdvec(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
+            let bytes = postcard::to_stdvec(&message)
+                .map_err(|e| anyhow!("Serialization failed: {}", e))?;
             self.transport
                 .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
                 .await?;

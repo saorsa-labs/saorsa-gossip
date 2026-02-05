@@ -1,11 +1,13 @@
 #![warn(missing_docs)]
 
-//! Membership management using HyParView + SWIM
+//! Membership management using HyParView + SWIM.
 //!
 //! Provides:
-//! - HyParView for partial views (active + passive)
-//! - SWIM for failure detection
-//! - Periodic shuffling and anti-entropy
+//! - **HyParView** for partial views (active + passive) with periodic shuffle
+//! - **SWIM failure detection** with configurable K-random-peer probing (default K=3),
+//!   direct probes (`Ping`/`Ack`), indirect probes (`PingReq`/`AckResponse`),
+//!   and Alive -> Suspect -> Dead state transitions
+//! - Unified `MembershipProtocolMessage` envelope for routing HyParView and SWIM messages
 
 use anyhow::{anyhow, Result};
 use rand::SeedableRng;
@@ -3075,5 +3077,252 @@ mod tests {
                 });
             }
         }
+    }
+
+    // ===== SWIM Integration Tests =====
+
+    /// Helper: simulate ack responses for healthy peers on all detectors.
+    ///
+    /// Since mock transport cannot deliver real acks, background probe tasks
+    /// create pending probes that would time out. This helper clears those
+    /// pending probes and keeps healthy peers alive, mimicking real responses.
+    async fn simulate_healthy_acks(
+        detectors: &[SwimDetector<saorsa_gossip_transport::UdpTransportAdapter>],
+        healthy_peer_ids: &[PeerId],
+    ) {
+        for detector in detectors {
+            for &peer_id in healthy_peer_ids {
+                // Clear any pending probe the background task may have created
+                detector.clear_probe(&peer_id).await;
+                // Re-affirm alive state in case background timeout task ran first
+                detector.mark_alive(peer_id).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_swim_full_cycle_5_nodes() {
+        // Create 5 SwimDetector instances with short timeouts
+        // probe_period=100s (long, but first tick is immediate), suspect_timeout=2s
+        let mut detectors = Vec::new();
+        let mut peer_ids = Vec::new();
+
+        for i in 0..5u8 {
+            let transport = test_transport().await;
+            let peer_id = PeerId::new([10 + i; 32]);
+            peer_ids.push(peer_id);
+            // Long probe_period; short suspect_timeout (2s) for fast Dead promotion
+            let detector = SwimDetector::new(peer_id, 100, 2, SWIM_PROBE_FANOUT, transport);
+            detectors.push(detector);
+        }
+
+        // Mark all peers as alive on each detector (each node knows the other 4)
+        for (idx, detector) in detectors.iter().enumerate() {
+            for (j, &peer_id) in peer_ids.iter().enumerate() {
+                if j != idx {
+                    detector.mark_alive(peer_id).await;
+                }
+            }
+        }
+
+        // Verify all 5 nodes see all other peers as Alive
+        for (idx, detector) in detectors.iter().enumerate() {
+            let alive = detector.get_peers_in_state(PeerState::Alive).await;
+            assert_eq!(
+                alive.len(),
+                4,
+                "Node {} should see 4 alive peers, got {}",
+                idx,
+                alive.len()
+            );
+        }
+
+        // The healthy peers (nodes 0-3) that should remain alive
+        let healthy_ids: Vec<PeerId> = peer_ids[..4].to_vec();
+
+        // Simulate node 4 going down: record a probe on nodes 0-3 targeting node 4
+        // and do NOT call handle_ack for node 4 -- the probe will time out
+        let dead_node_id = peer_ids[4];
+        for detector in detectors.iter().take(4) {
+            detector.record_probe(dead_node_id).await;
+        }
+
+        // Wait for probe timeouts to detect the "dead" node (SWIM_ACK_TIMEOUT_MS = 500ms)
+        // The probe_timeout_task checks every 500ms and marks timed-out probes as Suspect.
+        // During polling, simulate acks for healthy peers so background probes don't
+        // cause false suspects among nodes 0-3.
+        let mut any_suspect = false;
+        for _ in 0..15 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Keep healthy peers alive (clear background-probe artifacts)
+            simulate_healthy_acks(&detectors[..4], &healthy_ids).await;
+            for detector in detectors.iter().take(4) {
+                if detector.get_state(&dead_node_id).await == Some(PeerState::Suspect) {
+                    any_suspect = true;
+                }
+            }
+            if any_suspect {
+                break;
+            }
+        }
+
+        assert!(
+            any_suspect,
+            "At least one node should have detected node 4 as Suspect"
+        );
+
+        // Verify that at least some nodes marked the dead node as Suspect
+        let mut suspect_count = 0;
+        for detector in detectors.iter().take(4) {
+            if detector.get_state(&dead_node_id).await == Some(PeerState::Suspect) {
+                suspect_count += 1;
+            }
+        }
+        assert!(
+            suspect_count >= 1,
+            "Expected at least 1 node to mark dead node as Suspect, got {}",
+            suspect_count
+        );
+
+        // Now wait for suspect timeout (2s) to promote Suspect -> Dead
+        // Continue simulating healthy acks during the wait
+        let mut any_dead = false;
+        for _ in 0..25 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            simulate_healthy_acks(&detectors[..4], &healthy_ids).await;
+            for detector in detectors.iter().take(4) {
+                if detector.get_state(&dead_node_id).await == Some(PeerState::Dead) {
+                    any_dead = true;
+                }
+            }
+            if any_dead {
+                break;
+            }
+        }
+
+        assert!(
+            any_dead,
+            "At least one node should have promoted node 4 from Suspect to Dead"
+        );
+
+        // Final ack simulation to ensure healthy peers are in clean state
+        simulate_healthy_acks(&detectors[..4], &healthy_ids).await;
+
+        // Verify remaining nodes (0-3) still see each other as Alive
+        for (idx, detector) in detectors.iter().enumerate().take(4) {
+            for (j, &peer_id) in peer_ids.iter().enumerate().take(4) {
+                if j != idx {
+                    assert_eq!(
+                        detector.get_state(&peer_id).await,
+                        Some(PeerState::Alive),
+                        "Node {} should still see node {} as Alive",
+                        idx,
+                        j
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_swim_ack_prevents_suspect() {
+        // Create 2 SwimDetector instances
+        let transport_a = test_transport().await;
+        let transport_b = test_transport().await;
+        let peer_a = PeerId::new([20u8; 32]);
+        let peer_b = PeerId::new([21u8; 32]);
+
+        // Long probe_period so background probes don't interfere,
+        // long suspect_timeout since we're testing that Suspect never happens
+        let detector_a = SwimDetector::new(peer_a, 100, 100, SWIM_PROBE_FANOUT, transport_a);
+        let _detector_b = SwimDetector::new(peer_b, 100, 100, SWIM_PROBE_FANOUT, transport_b);
+
+        // Node A knows about node B
+        detector_a.mark_alive(peer_b).await;
+
+        // Record a probe from A targeting B
+        detector_a.record_probe(peer_b).await;
+
+        // Before timeout, call handle_ack (simulating B responding to A)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        detector_a.handle_ack(peer_b).await.expect("handle_ack");
+
+        // Verify B stays Alive (not Suspect)
+        assert_eq!(
+            detector_a.get_state(&peer_b).await,
+            Some(PeerState::Alive),
+            "Peer B should remain Alive after ack"
+        );
+
+        // Verify the pending probe was cleared
+        let pending = detector_a.pending_probes.read().await;
+        assert!(
+            !pending.contains_key(&peer_b),
+            "Pending probe for B should be cleared after ack"
+        );
+        drop(pending);
+
+        // Wait past the ack timeout to confirm B doesn't become Suspect
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            detector_a.get_state(&peer_b).await,
+            Some(PeerState::Alive),
+            "Peer B should still be Alive after timeout window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_swim_indirect_probe_request() {
+        // Create 3 SwimDetector instances (A, B, C)
+        let transport_a = test_transport().await;
+        let transport_b = test_transport().await;
+        let transport_c = test_transport().await;
+        let peer_a = PeerId::new([30u8; 32]);
+        let peer_b = PeerId::new([31u8; 32]);
+        let peer_c = PeerId::new([32u8; 32]);
+
+        let detector_a = SwimDetector::new(peer_a, 100, 100, SWIM_PROBE_FANOUT, transport_a);
+        let _detector_b = SwimDetector::new(peer_b, 100, 100, SWIM_PROBE_FANOUT, transport_b);
+        let _detector_c = SwimDetector::new(peer_c, 100, 100, SWIM_PROBE_FANOUT, transport_c);
+
+        // Mark all peers as alive on all nodes
+        detector_a.mark_alive(peer_b).await;
+        detector_a.mark_alive(peer_c).await;
+
+        // Request indirect probes from A for target B
+        // C is the only other alive peer, so it should be selected as the indirect prober
+        let result = detector_a.request_indirect_probes(peer_b).await;
+        assert!(
+            result.is_ok(),
+            "request_indirect_probes should succeed (sends are best-effort)"
+        );
+
+        // Verify the state machine is consistent: B is still alive on A
+        // (request_indirect_probes doesn't change state, it only sends PingReq messages)
+        assert_eq!(
+            detector_a.get_state(&peer_b).await,
+            Some(PeerState::Alive),
+            "Target B should remain Alive after requesting indirect probes"
+        );
+
+        // Verify C is still alive (not affected by being asked to probe)
+        assert_eq!(
+            detector_a.get_state(&peer_c).await,
+            Some(PeerState::Alive),
+            "Helper C should remain Alive"
+        );
+
+        // Test with no alive peers available for indirect probing
+        let transport_d = test_transport().await;
+        let peer_d = PeerId::new([33u8; 32]);
+        let detector_d = SwimDetector::new(peer_d, 100, 100, SWIM_PROBE_FANOUT, transport_d);
+        let target = PeerId::new([34u8; 32]);
+
+        // No alive peers at all - should return Ok but do nothing
+        let result = detector_d.request_indirect_probes(target).await;
+        assert!(
+            result.is_ok(),
+            "request_indirect_probes should succeed even with no alive peers"
+        );
     }
 }

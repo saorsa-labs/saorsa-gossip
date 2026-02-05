@@ -266,30 +266,55 @@ Every peer has a long-term **ML-DSA keypair**:
 - Use peer scoring metrics
 - Maintain diversity (different ASes, geos)
 
-### SWIM: Failure Detection
+### SWIM: Failure Detection (Complete)
 
 **Purpose**: Quickly detect and disseminate peer failures.
 
+**Status**: Fully implemented with configurable fanout, direct and indirect probes, and suspect/dead state transitions.
+
 #### Protocol
 
-1. **Direct Probe** (every 1 second)
-   - Send PING to random active peer
-   - Expect ACK within timeout (e.g., 500ms)
+1. **K-Random-Peer Probing** (every 1 second)
+   - Each interval selects `SWIM_PROBE_FANOUT` (K=3) random alive peers
+   - Sends `SwimMessage::Ping` to each selected peer
+   - Expects `SwimMessage::Ack` within `SWIM_ACK_TIMEOUT_MS` (500ms)
 
-2. **Indirect Probe** (on timeout)
-   - Ask K random peers to probe the suspect
-   - If any receive ACK, suspect is alive
-   - Otherwise, mark as **suspected**
+2. **Indirect Probes** (on direct probe timeout)
+   - Selects `SWIM_INDIRECT_PROBE_FANOUT` (K=3) random alive peers as intermediaries
+   - Sends `SwimMessage::PingReq { target, requester }` to each intermediary
+   - Intermediaries probe the target and forward `SwimMessage::AckResponse { target, requester }` back
+   - If any intermediary receives an Ack, the suspect is cleared
 
 3. **State Transitions**
-   - **Alive** → **Suspect** (failed direct + indirect probes)
-   - **Suspect** → **Dead** (suspect timeout expires, e.g., 5s)
-   - **Dead** → removed from active view
+   - **Alive** -> **Suspect** (failed direct + indirect probes within ack timeout)
+   - **Suspect** -> **Dead** (suspect timeout expires, default 3s)
+   - **Dead** -> removed from active view, promoted from passive
+   - **Any state** + Ack/AckResponse -> **Alive** (clears suspicion immediately)
 
-4. **Piggyback Mechanism**
-   - Membership updates (join/leave/dead) piggyback on PING/ACK
-   - Lazy Plumtree IHAVE digests also piggyback
-   - Reduces control message overhead
+4. **Background Timeout Detection**
+   - A background task checks pending probes every 500ms
+   - Probes that exceed the ack timeout trigger indirect probing or suspect transitions
+
+5. **Message Dispatch**
+   - Unified `MembershipProtocolMessage` envelope routes both HyParView and SWIM messages
+   - All SWIM messages are serialized via CBOR and sent over the membership stream
+
+#### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `SWIM_PROBE_FANOUT` | 3 | Peers probed per interval |
+| `SWIM_INDIRECT_PROBE_FANOUT` | 3 | Intermediaries for indirect probes |
+| `SWIM_ACK_TIMEOUT_MS` | 500 | Milliseconds before marking probe as failed |
+| `SWIM_PROBE_INTERVAL_SECS` | 1 | Seconds between probe rounds |
+| `SWIM_SUSPECT_TIMEOUT_SECS` | 3 | Seconds before suspect becomes dead |
+
+#### Message Types
+
+- `SwimMessage::Ping` - Direct probe
+- `SwimMessage::Ack` - Response to Ping
+- `SwimMessage::PingReq { target, requester }` - Indirect probe request
+- `SwimMessage::AckResponse { target, requester }` - Forwarded ack from indirect probe
 
 ---
 

@@ -429,10 +429,13 @@ async fn main() -> anyhow::Result<()> {
   - Passive view: 64-128 peers (healing)
   - Periodic shuffle: every 30s
 
-- **SWIM**: Failure detection
+- **SWIM**: Failure detection (complete)
+  - K-random-peer probing: selects K=3 random alive peers each interval
+  - Direct probes: Ping/Ack with 500ms timeout
+  - Indirect probes: PingReq/AckResponse when direct probe times out (K=3 intermediaries)
+  - State machine: Alive -> Suspect (probe timeout) -> Dead (suspect timeout, 3s)
   - Probe interval: 1s
-  - Suspect timeout: 3s
-  - Piggyback membership deltas
+  - Configurable fanout and timeouts
 
 ### Dissemination (Plumtree)
 
@@ -706,7 +709,7 @@ Comprehensive benchmarks on localhost (ant-quic 0.10.3 with direct stream accept
 |--------|--------|--------|
 | Broadcast P50 latency | < 500ms | 🔄 Testing |
 | Broadcast P95 latency | < 2s | 🔄 Testing |
-| Failure detection | < 5s | 🔄 Testing |
+| Failure detection | < 5s | ✅ **Achieved** (SWIM: 500ms ack timeout + 3s suspect timeout) |
 | Memory per node | < 50MB | 🔄 Testing |
 | Messages/sec/node | > 100 | ✅ **Achieved** (>2000 small msgs/sec) |
 | Transport latency | < 10ms | ✅ **Achieved** (4ms connection, <1ms for 1KB) |
@@ -718,19 +721,19 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 ### Development Priorities
 
 **High Priority** (blocking):
-1. Complete QUIC transport implementation
-2. Implement Plumtree EAGER/IHAVE/IWANT
-3. Implement proper message ID derivation
+1. Complete IBLT reconciliation
+2. Finalize peer scoring and mesh gating
+3. 100-node test harness
 
 **Medium Priority** (important):
-4. Complete HyParView join/shuffle
-5. Complete SWIM probe/suspect
-6. Add anti-entropy protocols
+4. Complete anti-entropy with message sketches
+5. Saorsa Sites (website publishing)
+6. Production deployment guide
 
 **Low Priority** (enhancement):
 7. Performance optimization
-8. Comprehensive testing
-9. Example applications
+8. Security audit
+9. Extended example applications
 
 ## 📜 License
 

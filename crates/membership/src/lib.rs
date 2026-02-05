@@ -46,6 +46,27 @@ pub enum SwimMessage {
     Ping,
     /// Ack response to ping
     Ack,
+    /// PingReq message for indirect probing.
+    ///
+    /// When a direct probe times out, the node asks other peers to probe the suspect.
+    /// `target` is the suspect peer to probe, `requester` is the node requesting the probe.
+    PingReq {
+        /// The suspect peer to be probed
+        target: PeerId,
+        /// The node requesting the indirect probe
+        requester: PeerId,
+    },
+    /// AckResponse message - forwarded ack from indirect probe responder back to requester.
+    ///
+    /// When a node receives a PingReq and successfully probes the target, it sends this
+    /// message back to the original requester to confirm the target is alive.
+    /// `target` is the peer that responded to the probe, `requester` is the original requester.
+    AckResponse {
+        /// The peer that responded to the indirect probe
+        target: PeerId,
+        /// The original requester of the indirect probe
+        requester: PeerId,
+    },
 }
 
 /// Active random walk length for JOIN (per HyParView paper)
@@ -1444,5 +1465,129 @@ mod tests {
 
         // Fails when trying to send shuffle reply
         assert!(result.is_err());
+    }
+
+    // ===== SwimMessage Serialization Tests =====
+
+    #[test]
+    fn test_swim_message_ping_roundtrip() {
+        let msg = SwimMessage::Ping;
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+        let deserialized: SwimMessage = postcard::from_bytes(&bytes).expect("deserialize");
+
+        match deserialized {
+            SwimMessage::Ping => {}
+            _ => panic!("Expected Ping variant"),
+        }
+    }
+
+    #[test]
+    fn test_swim_message_ack_roundtrip() {
+        let msg = SwimMessage::Ack;
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+        let deserialized: SwimMessage = postcard::from_bytes(&bytes).expect("deserialize");
+
+        match deserialized {
+            SwimMessage::Ack => {}
+            _ => panic!("Expected Ack variant"),
+        }
+    }
+
+    #[test]
+    fn test_swim_message_pingreq_roundtrip() {
+        let target = PeerId::new([1u8; 32]);
+        let requester = PeerId::new([2u8; 32]);
+        let msg = SwimMessage::PingReq { target, requester };
+
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+        let deserialized: SwimMessage = postcard::from_bytes(&bytes).expect("deserialize");
+
+        match deserialized {
+            SwimMessage::PingReq {
+                target: t,
+                requester: r,
+            } => {
+                assert_eq!(t, target);
+                assert_eq!(r, requester);
+            }
+            _ => panic!("Expected PingReq variant"),
+        }
+    }
+
+    #[test]
+    fn test_swim_message_ackresponse_roundtrip() {
+        let target = PeerId::new([3u8; 32]);
+        let requester = PeerId::new([4u8; 32]);
+        let msg = SwimMessage::AckResponse { target, requester };
+
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+        let deserialized: SwimMessage = postcard::from_bytes(&bytes).expect("deserialize");
+
+        match deserialized {
+            SwimMessage::AckResponse {
+                target: t,
+                requester: r,
+            } => {
+                assert_eq!(t, target);
+                assert_eq!(r, requester);
+            }
+            _ => panic!("Expected AckResponse variant"),
+        }
+    }
+
+    #[test]
+    fn test_swim_message_pingreq_contains_correct_peer_ids() {
+        let target = PeerId::new([10u8; 32]);
+        let requester = PeerId::new([20u8; 32]);
+        let msg = SwimMessage::PingReq { target, requester };
+
+        match msg {
+            SwimMessage::PingReq {
+                target: t,
+                requester: r,
+            } => {
+                assert_eq!(t, target);
+                assert_eq!(r, requester);
+                assert_ne!(t, r); // Ensure they're different
+            }
+            _ => panic!("Expected PingReq variant"),
+        }
+    }
+
+    #[test]
+    fn test_swim_message_ackresponse_contains_correct_peer_ids() {
+        let target = PeerId::new([30u8; 32]);
+        let requester = PeerId::new([40u8; 32]);
+        let msg = SwimMessage::AckResponse { target, requester };
+
+        match msg {
+            SwimMessage::AckResponse {
+                target: t,
+                requester: r,
+            } => {
+                assert_eq!(t, target);
+                assert_eq!(r, requester);
+                assert_ne!(t, r); // Ensure they're different
+            }
+            _ => panic!("Expected AckResponse variant"),
+        }
+    }
+
+    #[test]
+    fn test_all_swim_message_variants_serialize() {
+        let target = PeerId::new([1u8; 32]);
+        let requester = PeerId::new([2u8; 32]);
+
+        let messages = vec![
+            SwimMessage::Ping,
+            SwimMessage::Ack,
+            SwimMessage::PingReq { target, requester },
+            SwimMessage::AckResponse { target, requester },
+        ];
+
+        for msg in messages {
+            let bytes = postcard::to_stdvec(&msg).expect("serialize");
+            let _deserialized: SwimMessage = postcard::from_bytes(&bytes).expect("deserialize");
+        }
     }
 }

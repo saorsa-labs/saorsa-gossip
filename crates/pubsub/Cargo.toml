@@ -24,6 +24,7 @@ postcard = { workspace = true }
 lru = { workspace = true }
 tracing = { workspace = true }
 blake3 = { workspace = true }
+saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }
 
 [dev-dependencies]
 proptest = { workspace = true }

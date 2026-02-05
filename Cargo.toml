@@ -13,6 +13,7 @@ members = [
     "crates/runtime",
     "bin/coordinator",
     "bin/cli",
+    "saorsa-gossip-workspace-hack",
 ]
 resolver = "2"
 

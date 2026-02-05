@@ -29,3 +29,4 @@ saorsa-gossip-pubsub = { workspace = true }
 saorsa-gossip-rendezvous = { workspace = true }
 saorsa-gossip-transport = { workspace = true }
 saorsa-gossip-types = { workspace = true }
+saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }

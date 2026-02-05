@@ -18,7 +18,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.7"
+version = "0.5.0"
 edition = "2021"
 authors = ["David Irvine <david@saorsalabs.com>"]
 license = "MIT OR Apache-2.0"
@@ -61,17 +61,17 @@ tracing = "0.1"
 # We'll need delta-CRDT implementations
 
 # Internal crates (keep versions in sync automatically)
-saorsa-gossip-types = { version = "0.4.7", path = "crates/types" }
-saorsa-gossip-transport = { version = "0.4.7", path = "crates/transport" }
-saorsa-gossip-membership = { version = "0.4.7", path = "crates/membership" }
-saorsa-gossip-pubsub = { version = "0.4.7", path = "crates/pubsub" }
-saorsa-gossip-presence = { version = "0.4.7", path = "crates/presence" }
-saorsa-gossip-crdt-sync = { version = "0.4.7", path = "crates/crdt-sync" }
-saorsa-gossip-groups = { version = "0.4.7", path = "crates/groups" }
-saorsa-gossip-identity = { version = "0.4.7", path = "crates/identity" }
-saorsa-gossip-coordinator = { version = "0.4.7", path = "crates/coordinator" }
-saorsa-gossip-rendezvous = { version = "0.4.7", path = "crates/rendezvous" }
-saorsa-gossip-runtime = { version = "0.4.7", path = "crates/runtime" }
+saorsa-gossip-types = { version = "0.5.0", path = "crates/types" }
+saorsa-gossip-transport = { version = "0.5.0", path = "crates/transport" }
+saorsa-gossip-membership = { version = "0.5.0", path = "crates/membership" }
+saorsa-gossip-pubsub = { version = "0.5.0", path = "crates/pubsub" }
+saorsa-gossip-presence = { version = "0.5.0", path = "crates/presence" }
+saorsa-gossip-crdt-sync = { version = "0.5.0", path = "crates/crdt-sync" }
+saorsa-gossip-groups = { version = "0.5.0", path = "crates/groups" }
+saorsa-gossip-identity = { version = "0.5.0", path = "crates/identity" }
+saorsa-gossip-coordinator = { version = "0.5.0", path = "crates/coordinator" }
+saorsa-gossip-rendezvous = { version = "0.5.0", path = "crates/rendezvous" }
+saorsa-gossip-runtime = { version = "0.5.0", path = "crates/runtime" }
 
 # Testing
 proptest = "1.4"

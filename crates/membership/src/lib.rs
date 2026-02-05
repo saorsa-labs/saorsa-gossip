@@ -137,6 +137,19 @@ pub enum HyParViewMessage {
     Disconnect,
 }
 
+/// Unified membership protocol message wrapper
+///
+/// Both HyParView and SWIM messages are sent on the `Membership` stream type.
+/// This wrapper provides a single dispatch point for all membership messages,
+/// allowing the receiver to route to the appropriate handler.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum MembershipProtocolMessage {
+    /// HyParView protocol message for partial view management
+    HyParView(HyParViewMessage),
+    /// SWIM protocol message for failure detection
+    Swim(SwimMessage),
+}
+
 /// Membership management trait
 #[async_trait::async_trait]
 pub trait Membership: Send + Sync {
@@ -328,9 +341,9 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
         self.mark_alive(sender).await;
         trace!(peer_id = %sender, "SWIM: Received Ping, sending Ack");
 
-        // Serialize and send Ack response
-        let ack_msg = SwimMessage::Ack;
-        let bytes = postcard::to_stdvec(&ack_msg)
+        // Serialize and send Ack response wrapped in MembershipProtocolMessage
+        let wrapped = MembershipProtocolMessage::Swim(SwimMessage::Ack);
+        let bytes = postcard::to_stdvec(&wrapped)
             .map_err(|e| anyhow!("Failed to serialize Ack message: {}", e))?;
 
         self.transport
@@ -396,11 +409,11 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
 
         // Send PingReq to each selected peer
         for peer in peers_to_ask {
-            let ping_req_msg = SwimMessage::PingReq {
+            let wrapped = MembershipProtocolMessage::Swim(SwimMessage::PingReq {
                 target,
                 requester: self.self_peer_id,
-            };
-            match postcard::to_stdvec(&ping_req_msg) {
+            });
+            match postcard::to_stdvec(&wrapped) {
                 Ok(bytes) => {
                     if let Err(e) = self
                         .transport
@@ -427,9 +440,9 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
             "SWIM: Received PingReq, probing target"
         );
 
-        // Send Ping to target
-        let ping_msg = SwimMessage::Ping;
-        let bytes = postcard::to_stdvec(&ping_msg)
+        // Send Ping to target wrapped in MembershipProtocolMessage
+        let wrapped = MembershipProtocolMessage::Swim(SwimMessage::Ping);
+        let bytes = postcard::to_stdvec(&wrapped)
             .map_err(|e| anyhow!("Failed to serialize Ping message: {}", e))?;
 
         self.transport
@@ -533,11 +546,11 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                         );
 
                         for indirect_peer in peers_to_ask {
-                            let ping_req_msg = SwimMessage::PingReq {
+                            let wrapped = MembershipProtocolMessage::Swim(SwimMessage::PingReq {
                                 target: peer,
                                 requester: self_peer_id,
-                            };
-                            match postcard::to_stdvec(&ping_req_msg) {
+                            });
+                            match postcard::to_stdvec(&wrapped) {
                                 Ok(bytes) => {
                                     if let Err(e) = transport
                                         .send_to_peer(
@@ -611,10 +624,10 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                         pending.entry(peer).or_insert_with(Instant::now);
                     }
 
-                    // Send PING to peer via transport
+                    // Send PING to peer via transport wrapped in MembershipProtocolMessage
                     trace!(peer_id = %peer, "SWIM: Probing peer");
-                    let ping_msg = SwimMessage::Ping;
-                    match postcard::to_stdvec(&ping_msg) {
+                    let wrapped = MembershipProtocolMessage::Swim(SwimMessage::Ping);
+                    match postcard::to_stdvec(&wrapped) {
                         Ok(bytes) => {
                             if let Err(e) = transport
                                 .send_to_peer(peer, GossipStreamType::Membership, bytes.into())
@@ -781,9 +794,12 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
 
     /// Send a HyParView message to a peer
     ///
-    /// Uses low-latency transport routing for control plane messages.
+    /// Wraps the message in [`MembershipProtocolMessage::HyParView`] for unified
+    /// dispatch on the receiving end, then serializes with postcard and sends
+    /// on the Membership stream.
     async fn send_hyparview_message(&self, peer: PeerId, msg: &HyParViewMessage) -> Result<()> {
-        let bytes = postcard::to_stdvec(msg)
+        let wrapped = MembershipProtocolMessage::HyParView(msg.clone());
+        let bytes = postcard::to_stdvec(&wrapped)
             .map_err(|e| anyhow!("Failed to serialize HyParView message: {}", e))?;
         self.transport
             .send_to_peer(peer, GossipStreamType::Membership, bytes.into())
@@ -793,6 +809,71 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     /// Get the SWIM detector
     pub fn swim(&self) -> &SwimDetector<T> {
         &self.swim
+    }
+
+    /// Dispatch an incoming membership message to the appropriate handler.
+    ///
+    /// Deserializes the raw bytes as a [`MembershipProtocolMessage`] using postcard,
+    /// then routes to either the HyParView or SWIM handler based on the variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deserialization fails or if the underlying handler
+    /// returns an error.
+    pub async fn dispatch_message(&self, sender: PeerId, data: &[u8]) -> Result<()> {
+        let msg: MembershipProtocolMessage = postcard::from_bytes(data)
+            .map_err(|e| anyhow!("Failed to deserialize membership message: {}", e))?;
+
+        match msg {
+            MembershipProtocolMessage::HyParView(hpv_msg) => {
+                self.dispatch_hyparview(sender, hpv_msg).await
+            }
+            MembershipProtocolMessage::Swim(swim_msg) => self.dispatch_swim(sender, swim_msg).await,
+        }
+    }
+
+    /// Dispatch a HyParView message to the appropriate handler method.
+    async fn dispatch_hyparview(&self, sender: PeerId, msg: HyParViewMessage) -> Result<()> {
+        match msg {
+            HyParViewMessage::Join {
+                sender: join_sender,
+                ttl,
+            } => self.handle_join(join_sender, ttl).await,
+            HyParViewMessage::ForwardJoin {
+                sender: fwd_sender,
+                new_peer,
+                ttl,
+            } => self.handle_forward_join(fwd_sender, new_peer, ttl).await,
+            HyParViewMessage::Neighbor {
+                sender: nbr_sender,
+                priority,
+            } => self.handle_neighbor(nbr_sender, priority).await,
+            HyParViewMessage::NeighborReply { accepted } => {
+                self.handle_neighbor_reply(sender, accepted).await
+            }
+            HyParViewMessage::Shuffle {
+                sender: shuf_sender,
+                peers,
+                ttl,
+            } => self.handle_shuffle(shuf_sender, peers, ttl).await,
+            HyParViewMessage::ShuffleReply { peers } => {
+                self.handle_shuffle_reply(peers).await;
+                Ok(())
+            }
+            HyParViewMessage::Disconnect => self.handle_disconnect(sender).await,
+        }
+    }
+
+    /// Dispatch a SWIM message to the appropriate handler method.
+    async fn dispatch_swim(&self, sender: PeerId, msg: SwimMessage) -> Result<()> {
+        match msg {
+            SwimMessage::Ping => self.swim.handle_ping(sender).await,
+            SwimMessage::Ack => self.swim.handle_ack(sender).await,
+            SwimMessage::PingReq { target, requester } => {
+                self.swim.handle_ping_req(requester, target).await
+            }
+            SwimMessage::AckResponse { target, .. } => self.swim.handle_ack_response(target).await,
+        }
     }
 
     /// Shuffle the passive view with a random peer (full HyParView protocol)
@@ -1094,14 +1175,15 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                     "HyParView: Periodic shuffle"
                 );
 
-                // Send SHUFFLE message
+                // Send SHUFFLE message wrapped in MembershipProtocolMessage
                 let shuffle_msg = HyParViewMessage::Shuffle {
                     sender: local_peer_id,
                     peers: shuffle_list,
                     ttl: PASSIVE_RANDOM_WALK_LENGTH,
                 };
+                let wrapped = MembershipProtocolMessage::HyParView(shuffle_msg);
 
-                match postcard::to_stdvec(&shuffle_msg) {
+                match postcard::to_stdvec(&wrapped) {
                     Ok(bytes) => {
                         if let Err(e) = transport
                             .send_to_peer(target, GossipStreamType::Membership, bytes.into())
@@ -2372,5 +2454,626 @@ mod tests {
         // Pending probe should be cleared
         let pending = swim.pending_probes.read().await;
         assert_eq!(pending.len(), 0);
+    }
+
+    // ===== MembershipProtocolMessage Serialization Tests =====
+
+    #[test]
+    fn test_membership_protocol_message_hyparview_join_roundtrip() {
+        let msg = MembershipProtocolMessage::HyParView(HyParViewMessage::Join {
+            sender: PeerId::new([1u8; 32]),
+            ttl: 6,
+        });
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+        let deserialized: MembershipProtocolMessage =
+            postcard::from_bytes(&bytes).expect("deserialize");
+
+        match deserialized {
+            MembershipProtocolMessage::HyParView(HyParViewMessage::Join { sender, ttl }) => {
+                assert_eq!(sender, PeerId::new([1u8; 32]));
+                assert_eq!(ttl, 6);
+            }
+            _ => panic!("Expected HyParView(Join)"),
+        }
+    }
+
+    #[test]
+    fn test_membership_protocol_message_hyparview_disconnect_roundtrip() {
+        let msg = MembershipProtocolMessage::HyParView(HyParViewMessage::Disconnect);
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+        let deserialized: MembershipProtocolMessage =
+            postcard::from_bytes(&bytes).expect("deserialize");
+
+        match deserialized {
+            MembershipProtocolMessage::HyParView(HyParViewMessage::Disconnect) => {}
+            _ => panic!("Expected HyParView(Disconnect)"),
+        }
+    }
+
+    #[test]
+    fn test_membership_protocol_message_swim_ping_roundtrip() {
+        let msg = MembershipProtocolMessage::Swim(SwimMessage::Ping);
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+        let deserialized: MembershipProtocolMessage =
+            postcard::from_bytes(&bytes).expect("deserialize");
+
+        match deserialized {
+            MembershipProtocolMessage::Swim(SwimMessage::Ping) => {}
+            _ => panic!("Expected Swim(Ping)"),
+        }
+    }
+
+    #[test]
+    fn test_membership_protocol_message_swim_ack_roundtrip() {
+        let msg = MembershipProtocolMessage::Swim(SwimMessage::Ack);
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+        let deserialized: MembershipProtocolMessage =
+            postcard::from_bytes(&bytes).expect("deserialize");
+
+        match deserialized {
+            MembershipProtocolMessage::Swim(SwimMessage::Ack) => {}
+            _ => panic!("Expected Swim(Ack)"),
+        }
+    }
+
+    #[test]
+    fn test_membership_protocol_message_swim_pingreq_roundtrip() {
+        let target = PeerId::new([1u8; 32]);
+        let requester = PeerId::new([2u8; 32]);
+        let msg = MembershipProtocolMessage::Swim(SwimMessage::PingReq { target, requester });
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+        let deserialized: MembershipProtocolMessage =
+            postcard::from_bytes(&bytes).expect("deserialize");
+
+        match deserialized {
+            MembershipProtocolMessage::Swim(SwimMessage::PingReq {
+                target: t,
+                requester: r,
+            }) => {
+                assert_eq!(t, target);
+                assert_eq!(r, requester);
+            }
+            _ => panic!("Expected Swim(PingReq)"),
+        }
+    }
+
+    #[test]
+    fn test_membership_protocol_message_swim_ackresponse_roundtrip() {
+        let target = PeerId::new([3u8; 32]);
+        let requester = PeerId::new([4u8; 32]);
+        let msg = MembershipProtocolMessage::Swim(SwimMessage::AckResponse { target, requester });
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+        let deserialized: MembershipProtocolMessage =
+            postcard::from_bytes(&bytes).expect("deserialize");
+
+        match deserialized {
+            MembershipProtocolMessage::Swim(SwimMessage::AckResponse {
+                target: t,
+                requester: r,
+            }) => {
+                assert_eq!(t, target);
+                assert_eq!(r, requester);
+            }
+            _ => panic!("Expected Swim(AckResponse)"),
+        }
+    }
+
+    #[test]
+    fn test_membership_protocol_message_all_hyparview_variants_roundtrip() {
+        let sender = PeerId::new([1u8; 32]);
+        let new_peer = PeerId::new([2u8; 32]);
+
+        let messages = vec![
+            MembershipProtocolMessage::HyParView(HyParViewMessage::Join { sender, ttl: 6 }),
+            MembershipProtocolMessage::HyParView(HyParViewMessage::ForwardJoin {
+                sender,
+                new_peer,
+                ttl: 3,
+            }),
+            MembershipProtocolMessage::HyParView(HyParViewMessage::Neighbor {
+                sender,
+                priority: NeighborPriority::High,
+            }),
+            MembershipProtocolMessage::HyParView(HyParViewMessage::NeighborReply {
+                accepted: true,
+            }),
+            MembershipProtocolMessage::HyParView(HyParViewMessage::Shuffle {
+                sender,
+                peers: vec![new_peer],
+                ttl: 3,
+            }),
+            MembershipProtocolMessage::HyParView(HyParViewMessage::ShuffleReply {
+                peers: vec![sender],
+            }),
+            MembershipProtocolMessage::HyParView(HyParViewMessage::Disconnect),
+        ];
+
+        for msg in messages {
+            let bytes = postcard::to_stdvec(&msg).expect("serialize");
+            let _: MembershipProtocolMessage = postcard::from_bytes(&bytes).expect("deserialize");
+        }
+    }
+
+    #[test]
+    fn test_membership_protocol_message_all_swim_variants_roundtrip() {
+        let target = PeerId::new([1u8; 32]);
+        let requester = PeerId::new([2u8; 32]);
+
+        let messages = vec![
+            MembershipProtocolMessage::Swim(SwimMessage::Ping),
+            MembershipProtocolMessage::Swim(SwimMessage::Ack),
+            MembershipProtocolMessage::Swim(SwimMessage::PingReq { target, requester }),
+            MembershipProtocolMessage::Swim(SwimMessage::AckResponse { target, requester }),
+        ];
+
+        for msg in messages {
+            let bytes = postcard::to_stdvec(&msg).expect("serialize");
+            let _: MembershipProtocolMessage = postcard::from_bytes(&bytes).expect("deserialize");
+        }
+    }
+
+    // ===== dispatch_message Tests =====
+
+    #[tokio::test]
+    async fn test_dispatch_swim_ping_routes_to_handle_ping() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([1u8; 32]);
+
+        // Serialize a SWIM Ping wrapped in MembershipProtocolMessage
+        let msg = MembershipProtocolMessage::Swim(SwimMessage::Ping);
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+
+        // Dispatch - handle_ping will mark sender alive and try to send Ack
+        // Ack send may fail without real transport, but state should be updated
+        let _ = membership.dispatch_message(sender, &bytes).await;
+
+        // Verify sender was marked as alive (handle_ping behavior)
+        assert_eq!(
+            membership.swim().get_state(&sender).await,
+            Some(PeerState::Alive)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_swim_ack_routes_to_handle_ack() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([1u8; 32]);
+
+        // Record a pending probe first
+        membership.swim().record_probe(sender).await;
+        let pending = membership.swim().pending_probes.read().await;
+        assert_eq!(pending.len(), 1);
+        drop(pending);
+
+        // Serialize a SWIM Ack wrapped in MembershipProtocolMessage
+        let msg = MembershipProtocolMessage::Swim(SwimMessage::Ack);
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+
+        // Dispatch
+        let result = membership.dispatch_message(sender, &bytes).await;
+        assert!(result.is_ok());
+
+        // Verify sender was marked as alive and probe was cleared
+        assert_eq!(
+            membership.swim().get_state(&sender).await,
+            Some(PeerState::Alive)
+        );
+        let pending = membership.swim().pending_probes.read().await;
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_swim_pingreq_routes_to_handle_ping_req() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([1u8; 32]);
+        let target = PeerId::new([2u8; 32]);
+        let requester = PeerId::new([3u8; 32]);
+
+        // Serialize a SWIM PingReq wrapped in MembershipProtocolMessage
+        let msg = MembershipProtocolMessage::Swim(SwimMessage::PingReq { target, requester });
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+
+        // Dispatch - will try to send Ping to target (will fail without real transport)
+        let result = membership.dispatch_message(sender, &bytes).await;
+
+        // Expected to fail due to no real transport, but should not panic
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_swim_ack_response_routes_to_handle_ack_response() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([1u8; 32]);
+        let target = PeerId::new([2u8; 32]);
+        let requester = PeerId::new([3u8; 32]);
+
+        // Mark target as suspect
+        membership.swim().mark_alive(target).await;
+        membership.swim().mark_suspect(target).await;
+        assert_eq!(
+            membership.swim().get_state(&target).await,
+            Some(PeerState::Suspect)
+        );
+
+        // Serialize an AckResponse wrapped in MembershipProtocolMessage
+        let msg = MembershipProtocolMessage::Swim(SwimMessage::AckResponse { target, requester });
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+
+        // Dispatch
+        let result = membership.dispatch_message(sender, &bytes).await;
+        assert!(result.is_ok());
+
+        // Verify target was marked as alive (handle_ack_response behavior)
+        assert_eq!(
+            membership.swim().get_state(&target).await,
+            Some(PeerState::Alive)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_hyparview_join_routes_correctly() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([1u8; 32]);
+        let join_sender = PeerId::new([5u8; 32]);
+
+        // Serialize a HyParView Join wrapped in MembershipProtocolMessage
+        let msg = MembershipProtocolMessage::HyParView(HyParViewMessage::Join {
+            sender: join_sender,
+            ttl: 2,
+        });
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+
+        // Dispatch - handle_join adds the peer to active view
+        let result = membership.dispatch_message(sender, &bytes).await;
+        assert!(result.is_ok());
+
+        // Verify the joining peer was added to active view
+        let active = membership.active_view();
+        assert!(active.contains(&join_sender));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_hyparview_disconnect_routes_correctly() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([1u8; 32]);
+
+        // Add sender to active view first
+        membership.add_active(sender).await.ok();
+        assert!(membership.active_view().contains(&sender));
+
+        // Serialize a HyParView Disconnect wrapped in MembershipProtocolMessage
+        let msg = MembershipProtocolMessage::HyParView(HyParViewMessage::Disconnect);
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+
+        // Dispatch - handle_disconnect removes the sender from active view
+        let result = membership.dispatch_message(sender, &bytes).await;
+        assert!(result.is_ok());
+
+        // Verify sender was removed from active view
+        assert!(!membership.active_view().contains(&sender));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_invalid_bytes_returns_error() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([1u8; 32]);
+
+        // Send garbage bytes
+        let invalid_bytes = [0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA];
+
+        let result = membership.dispatch_message(sender, &invalid_bytes).await;
+
+        // Should return an error, not panic
+        assert!(result.is_err());
+
+        let err_msg = format!("{}", result.err().unwrap());
+        assert!(
+            err_msg.contains("Failed to deserialize membership message"),
+            "Error should mention deserialization failure, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_empty_bytes_returns_error() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([1u8; 32]);
+
+        // Send empty bytes
+        let result = membership.dispatch_message(sender, &[]).await;
+
+        // Should return an error, not panic
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_hyparview_shuffle_reply_routes_correctly() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([1u8; 32]);
+        let peer_in_reply = PeerId::new([5u8; 32]);
+
+        // Serialize a ShuffleReply
+        let msg = MembershipProtocolMessage::HyParView(HyParViewMessage::ShuffleReply {
+            peers: vec![peer_in_reply],
+        });
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+
+        // Dispatch
+        let result = membership.dispatch_message(sender, &bytes).await;
+        assert!(result.is_ok());
+
+        // Verify the peer from the reply was added to passive view
+        let passive = membership.passive_view();
+        assert!(passive.contains(&peer_in_reply));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_hyparview_neighbor_reply_accepted() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([1u8; 32]);
+
+        // Serialize a NeighborReply(accepted=true)
+        let msg = MembershipProtocolMessage::HyParView(HyParViewMessage::NeighborReply {
+            accepted: true,
+        });
+        let bytes = postcard::to_stdvec(&msg).expect("serialize");
+
+        // Dispatch
+        let result = membership.dispatch_message(sender, &bytes).await;
+        assert!(result.is_ok());
+
+        // Verify sender was marked alive via SWIM
+        assert_eq!(
+            membership.swim().get_state(&sender).await,
+            Some(PeerState::Alive)
+        );
+    }
+
+    // ===== Property-Based Tests (proptest) =====
+
+    mod proptest_tests {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::{collection, proptest};
+
+        proptest! {
+            /// For random cluster sizes and fanout values, probe_fanout() returns the configured value.
+            #[test]
+            fn probe_fanout_respects_k(
+                _cluster_size in 3usize..=20,
+                fanout in 1usize..=10
+            ) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let transport = test_transport().await;
+                    let swim = SwimDetector::new(test_peer_id(), 1, 3, fanout, transport);
+                    assert_eq!(swim.probe_fanout(), fanout);
+                });
+            }
+
+            /// For random sets of peer IDs, marking them alive then querying returns all of them.
+            #[test]
+            fn alive_peers_tracked_correctly(
+                peer_bytes in collection::vec(any::<[u8; 32]>(), 1..=20)
+            ) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let transport = test_transport().await;
+                    let swim = SwimDetector::new(test_peer_id(), 100, 100, SWIM_PROBE_FANOUT, transport);
+
+                    // Deduplicate peer IDs (same bytes = same peer)
+                    let mut unique_peers = std::collections::HashSet::new();
+                    let peers: Vec<PeerId> = peer_bytes
+                        .into_iter()
+                        .filter(|b| *b != [0u8; 32]) // Exclude self peer ID
+                        .filter(|b| unique_peers.insert(*b))
+                        .map(PeerId::new)
+                        .collect();
+
+                    for &peer in &peers {
+                        swim.mark_alive(peer).await;
+                    }
+
+                    let alive = swim.get_peers_in_state(PeerState::Alive).await;
+                    assert_eq!(alive.len(), peers.len());
+                    for peer in &peers {
+                        assert!(alive.contains(peer));
+                    }
+                });
+            }
+
+            /// For random sets of peer IDs, marking some alive and some suspect returns correct sets.
+            #[test]
+            fn suspect_peers_tracked_correctly(
+                alive_bytes in collection::vec(any::<[u8; 32]>(), 1..=10),
+                suspect_bytes in collection::vec(any::<[u8; 32]>(), 1..=10)
+            ) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let transport = test_transport().await;
+                    let swim = SwimDetector::new(test_peer_id(), 100, 100, SWIM_PROBE_FANOUT, transport);
+
+                    // Build unique alive peers (exclude self)
+                    let mut seen = std::collections::HashSet::new();
+                    let alive_peers: Vec<PeerId> = alive_bytes
+                        .into_iter()
+                        .filter(|b| *b != [0u8; 32])
+                        .filter(|b| seen.insert(*b))
+                        .map(PeerId::new)
+                        .collect();
+
+                    // Build unique suspect peers (exclude self and already-alive peers)
+                    let suspect_peers: Vec<PeerId> = suspect_bytes
+                        .into_iter()
+                        .filter(|b| *b != [0u8; 32])
+                        .filter(|b| seen.insert(*b))
+                        .map(PeerId::new)
+                        .collect();
+
+                    // Mark alive peers
+                    for &peer in &alive_peers {
+                        swim.mark_alive(peer).await;
+                    }
+
+                    // For suspect peers: must mark alive first, then suspect
+                    for &peer in &suspect_peers {
+                        swim.mark_alive(peer).await;
+                        swim.mark_suspect(peer).await;
+                    }
+
+                    let alive_result = swim.get_peers_in_state(PeerState::Alive).await;
+                    let suspect_result = swim.get_peers_in_state(PeerState::Suspect).await;
+
+                    assert_eq!(alive_result.len(), alive_peers.len());
+                    assert_eq!(suspect_result.len(), suspect_peers.len());
+
+                    for peer in &alive_peers {
+                        assert!(alive_result.contains(peer));
+                    }
+                    for peer in &suspect_peers {
+                        assert!(suspect_result.contains(peer));
+                    }
+                });
+            }
+
+            /// For random sets of peer IDs, marking some dead returns the correct set.
+            #[test]
+            fn dead_peers_tracked_correctly(
+                dead_bytes in collection::vec(any::<[u8; 32]>(), 1..=20)
+            ) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let transport = test_transport().await;
+                    let swim = SwimDetector::new(test_peer_id(), 100, 100, SWIM_PROBE_FANOUT, transport);
+
+                    let mut unique_peers = std::collections::HashSet::new();
+                    let dead_peers: Vec<PeerId> = dead_bytes
+                        .into_iter()
+                        .filter(|b| *b != [0u8; 32])
+                        .filter(|b| unique_peers.insert(*b))
+                        .map(PeerId::new)
+                        .collect();
+
+                    for &peer in &dead_peers {
+                        swim.mark_dead(peer).await;
+                    }
+
+                    let dead_result = swim.get_peers_in_state(PeerState::Dead).await;
+                    assert_eq!(dead_result.len(), dead_peers.len());
+                    for peer in &dead_peers {
+                        assert!(dead_result.contains(peer));
+                    }
+                });
+            }
+
+            /// For any peer that's marked suspect, marking alive transitions them back.
+            #[test]
+            fn mark_alive_clears_suspect(peer_bytes in any::<[u8; 32]>()) {
+                // Skip self peer ID
+                prop_assume!(peer_bytes != [0u8; 32]);
+
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let transport = test_transport().await;
+                    let swim = SwimDetector::new(test_peer_id(), 100, 100, SWIM_PROBE_FANOUT, transport);
+                    let peer = PeerId::new(peer_bytes);
+
+                    // Mark alive then suspect
+                    swim.mark_alive(peer).await;
+                    swim.mark_suspect(peer).await;
+                    assert_eq!(swim.get_state(&peer).await, Some(PeerState::Suspect));
+
+                    // Mark alive again
+                    swim.mark_alive(peer).await;
+                    assert_eq!(swim.get_state(&peer).await, Some(PeerState::Alive));
+                });
+            }
+
+            /// All SwimMessage variants roundtrip through postcard serialization.
+            #[test]
+            fn swim_message_roundtrip(
+                target_bytes in any::<[u8; 32]>(),
+                requester_bytes in any::<[u8; 32]>()
+            ) {
+                let target = PeerId::new(target_bytes);
+                let requester = PeerId::new(requester_bytes);
+
+                let messages = vec![
+                    SwimMessage::Ping,
+                    SwimMessage::Ack,
+                    SwimMessage::PingReq { target, requester },
+                    SwimMessage::AckResponse { target, requester },
+                ];
+
+                for msg in messages {
+                    let bytes = postcard::to_stdvec(&msg).expect("serialize");
+                    let deserialized: SwimMessage =
+                        postcard::from_bytes(&bytes).expect("deserialize");
+
+                    // Verify variant and field equality
+                    match (&msg, &deserialized) {
+                        (SwimMessage::Ping, SwimMessage::Ping) => {}
+                        (SwimMessage::Ack, SwimMessage::Ack) => {}
+                        (
+                            SwimMessage::PingReq {
+                                target: t1,
+                                requester: r1,
+                            },
+                            SwimMessage::PingReq {
+                                target: t2,
+                                requester: r2,
+                            },
+                        ) => {
+                            assert_eq!(t1, t2);
+                            assert_eq!(r1, r2);
+                        }
+                        (
+                            SwimMessage::AckResponse {
+                                target: t1,
+                                requester: r1,
+                            },
+                            SwimMessage::AckResponse {
+                                target: t2,
+                                requester: r2,
+                            },
+                        ) => {
+                            assert_eq!(t1, t2);
+                            assert_eq!(r1, r2);
+                        }
+                        _ => panic!("Variant mismatch after roundtrip"),
+                    }
+                }
+            }
+
+            /// Recording a probe then handling an ack clears the pending probe.
+            #[test]
+            fn pending_probes_cleared_on_ack(peer_bytes in any::<[u8; 32]>()) {
+                // Skip self peer ID
+                prop_assume!(peer_bytes != [0u8; 32]);
+
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let transport = test_transport().await;
+                    let swim = SwimDetector::new(test_peer_id(), 100, 100, SWIM_PROBE_FANOUT, transport);
+                    let peer = PeerId::new(peer_bytes);
+
+                    // Record a probe
+                    swim.record_probe(peer).await;
+                    let pending = swim.pending_probes.read().await;
+                    assert!(pending.contains_key(&peer));
+                    drop(pending);
+
+                    // Handle ack
+                    swim.handle_ack(peer).await.expect("handle_ack");
+
+                    // Pending probe should be cleared
+                    let pending = swim.pending_probes.read().await;
+                    assert!(!pending.contains_key(&peer));
+
+                    // Peer should be alive
+                    assert_eq!(swim.get_state(&peer).await, Some(PeerState::Alive));
+                });
+            }
+        }
     }
 }

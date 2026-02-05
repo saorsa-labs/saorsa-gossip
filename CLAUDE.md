@@ -48,10 +48,10 @@ Subagents (via the `Task` tool) MUST be used whenever possible. They provide:
 cargo build --release
 
 # Run all tests
-cargo test
+cargo nextest run
 
 # Run with verbose output
-cargo test -- --nocapture
+cargo nextest run --no-capture
 
 # Format and lint
 cargo fmt --all
@@ -120,7 +120,7 @@ When writing integration tests that connect to VPS nodes:
 ```bash
 # ✅ CORRECT - Testing gossip with specific application
 # For saorsa-node integration (use 10000-10999)
-cargo test --features saorsa-node -- --test-threads=1
+cargo nextest run --features saorsa-node --test-threads=1
 
 # ❌ WRONG - Would disrupt other networks
 ssh root@saorsa-2.saorsalabs.com "pkill -f gossip"  # Too broad - affects all services

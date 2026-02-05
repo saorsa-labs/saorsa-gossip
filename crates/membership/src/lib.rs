@@ -179,6 +179,8 @@ struct SwimPeerEntry {
 
 /// SWIM failure detector
 pub struct SwimDetector<T: GossipTransport + 'static> {
+    /// Local peer ID
+    self_peer_id: PeerId,
     /// Peer states with timestamps
     states: Arc<RwLock<HashMap<PeerId, SwimPeerEntry>>>,
     /// Pending probes with timestamps for timeout detection
@@ -196,12 +198,14 @@ pub struct SwimDetector<T: GossipTransport + 'static> {
 impl<T: GossipTransport + 'static> SwimDetector<T> {
     /// Create a new SWIM detector
     pub fn new(
+        self_peer_id: PeerId,
         probe_period: u64,
         suspect_timeout: u64,
         probe_fanout: usize,
         transport: Arc<T>,
     ) -> Self {
         let detector = Self {
+            self_peer_id,
             states: Arc::new(RwLock::new(HashMap::new())),
             pending_probes: Arc::new(RwLock::new(HashMap::new())),
             probe_period,
@@ -213,6 +217,7 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
         // Start background probing task
         detector.spawn_probe_task();
         detector.spawn_suspect_timeout_task();
+        detector.spawn_probe_timeout_task();
 
         detector
     }
@@ -355,6 +360,207 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
         Ok(())
     }
 
+    /// Request indirect probes for a target peer from K random alive peers
+    pub async fn request_indirect_probes(&self, target: PeerId) -> Result<()> {
+        let states = self.states.read().await;
+        let alive_peers: Vec<PeerId> = states
+            .iter()
+            .filter(|(peer, entry)| {
+                entry.state == PeerState::Alive && **peer != target && **peer != self.self_peer_id
+            })
+            .map(|(peer, _)| *peer)
+            .collect();
+        drop(states);
+
+        if alive_peers.is_empty() {
+            debug!(target = %target, "SWIM: No alive peers for indirect probes");
+            return Ok(());
+        }
+
+        // Select K random alive peers for indirect probing
+        let probe_count = SWIM_INDIRECT_PROBE_FANOUT.min(alive_peers.len());
+        let peers_to_ask: Vec<PeerId> = {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::rngs::StdRng::from_entropy();
+            alive_peers
+                .choose_multiple(&mut rng, probe_count)
+                .copied()
+                .collect()
+        };
+
+        debug!(
+            target = %target,
+            indirect_probers = ?peers_to_ask,
+            "SWIM: Requesting indirect probes"
+        );
+
+        // Send PingReq to each selected peer
+        for peer in peers_to_ask {
+            let ping_req_msg = SwimMessage::PingReq {
+                target,
+                requester: self.self_peer_id,
+            };
+            match postcard::to_stdvec(&ping_req_msg) {
+                Ok(bytes) => {
+                    if let Err(e) = self
+                        .transport
+                        .send_to_peer(peer, GossipStreamType::Membership, bytes.into())
+                        .await
+                    {
+                        debug!(?e, peer_id = %peer, "SWIM: PingReq send failed");
+                    }
+                }
+                Err(e) => {
+                    warn!(?e, "SWIM: PingReq message serialization failed");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle incoming PingReq message - probe target on behalf of requester
+    pub async fn handle_ping_req(&self, requester: PeerId, target: PeerId) -> Result<()> {
+        trace!(
+            requester = %requester,
+            target = %target,
+            "SWIM: Received PingReq, probing target"
+        );
+
+        // Send Ping to target
+        let ping_msg = SwimMessage::Ping;
+        let bytes = postcard::to_stdvec(&ping_msg)
+            .map_err(|e| anyhow!("Failed to serialize Ping message: {}", e))?;
+
+        self.transport
+            .send_to_peer(target, GossipStreamType::Membership, bytes.into())
+            .await?;
+
+        trace!(target = %target, "SWIM: Indirect probe Ping sent to target");
+        Ok(())
+    }
+
+    /// Handle incoming AckResponse message from indirect probe
+    pub async fn handle_ack_response(&self, target: PeerId) -> Result<()> {
+        trace!(
+            target = %target,
+            "SWIM: Received AckResponse, marking target as alive"
+        );
+
+        // Mark target as alive (overrides suspect)
+        self.mark_alive(target).await;
+
+        // Clear any pending probe for this target
+        self.clear_probe(&target).await;
+
+        Ok(())
+    }
+
+    /// Spawn background task to check for probe timeouts
+    fn spawn_probe_timeout_task(&self) {
+        let pending_probes = self.pending_probes.clone();
+        let states = self.states.clone();
+        let self_peer_id = self.self_peer_id;
+        let transport = self.transport.clone();
+
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_millis(SWIM_ACK_TIMEOUT_MS));
+
+            loop {
+                interval.tick().await;
+
+                let now = Instant::now();
+                let mut timed_out_peers = Vec::new();
+
+                // Find probes that have timed out
+                {
+                    let pending = pending_probes.read().await;
+                    for (peer, probe_time) in pending.iter() {
+                        let elapsed = now.duration_since(*probe_time);
+                        if elapsed >= Duration::from_millis(SWIM_ACK_TIMEOUT_MS) {
+                            timed_out_peers.push(*peer);
+                        }
+                    }
+                }
+
+                // For each timed-out peer: mark as suspect and trigger indirect probes
+                for peer in timed_out_peers {
+                    debug!(peer_id = %peer, "SWIM: Probe timeout, marking suspect");
+
+                    // Mark as suspect
+                    {
+                        let mut states_guard = states.write().await;
+                        if let Some(entry) = states_guard.get_mut(&peer) {
+                            if entry.state == PeerState::Alive {
+                                entry.state = PeerState::Suspect;
+                                entry.last_update = now;
+                            }
+                        }
+                    }
+
+                    // Clear the timed-out probe
+                    {
+                        let mut pending = pending_probes.write().await;
+                        pending.remove(&peer);
+                    }
+
+                    // Request indirect probes
+                    let states_read = states.read().await;
+                    let alive_peers: Vec<PeerId> = states_read
+                        .iter()
+                        .filter(|(p, entry)| {
+                            entry.state == PeerState::Alive && **p != peer && **p != self_peer_id
+                        })
+                        .map(|(p, _)| *p)
+                        .collect();
+                    drop(states_read);
+
+                    if !alive_peers.is_empty() {
+                        use rand::seq::SliceRandom;
+                        let probe_count = SWIM_INDIRECT_PROBE_FANOUT.min(alive_peers.len());
+                        let peers_to_ask: Vec<PeerId> = {
+                            let mut rng = rand::rngs::StdRng::from_entropy();
+                            alive_peers
+                                .choose_multiple(&mut rng, probe_count)
+                                .copied()
+                                .collect()
+                        };
+
+                        debug!(
+                            target = %peer,
+                            indirect_probers = ?peers_to_ask,
+                            "SWIM: Requesting indirect probes after timeout"
+                        );
+
+                        for indirect_peer in peers_to_ask {
+                            let ping_req_msg = SwimMessage::PingReq {
+                                target: peer,
+                                requester: self_peer_id,
+                            };
+                            match postcard::to_stdvec(&ping_req_msg) {
+                                Ok(bytes) => {
+                                    if let Err(e) = transport
+                                        .send_to_peer(
+                                            indirect_peer,
+                                            GossipStreamType::Membership,
+                                            bytes.into(),
+                                        )
+                                        .await
+                                    {
+                                        debug!(?e, peer_id = %indirect_peer, "SWIM: PingReq send failed");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(?e, "SWIM: PingReq message serialization failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Spawn background task to probe random peers
     fn spawn_probe_task(&self) {
         let states = self.states.clone();
@@ -399,10 +605,10 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                 );
 
                 for peer in peers_to_probe {
-                    // Record probe for timeout tracking
+                    // Record probe for timeout tracking (don't overwrite existing pending probes)
                     {
                         let mut pending = pending_probes.write().await;
-                        pending.insert(peer, Instant::now());
+                        pending.entry(peer).or_insert_with(Instant::now);
                     }
 
                     // Send PING to peer via transport
@@ -501,6 +707,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
             passive: Arc::new(RwLock::new(HashSet::new())),
             peer_addrs: Arc::new(RwLock::new(HashMap::new())),
             swim: SwimDetector::new(
+                local_peer_id,
                 SWIM_PROBE_INTERVAL_SECS,
                 SWIM_SUSPECT_TIMEOUT_SECS,
                 SWIM_PROBE_FANOUT,
@@ -1217,7 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn test_swim_states() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let peer = PeerId::new([1u8; 32]);
 
         swim.mark_alive(peer).await;
@@ -1233,7 +1440,7 @@ mod tests {
     #[tokio::test]
     async fn test_swim_suspect_timeout() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 1, SWIM_PROBE_FANOUT, transport); // 1s timeout
+        let swim = SwimDetector::new(test_peer_id(), 1, 1, SWIM_PROBE_FANOUT, transport); // 1s timeout
         let peer = PeerId::new([1u8; 32]);
 
         swim.mark_alive(peer).await;
@@ -1291,7 +1498,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_peers_in_state() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 100, SWIM_PROBE_FANOUT, transport); // Long timeout so background task doesn't interfere
+        let swim = SwimDetector::new(test_peer_id(), 1, 100, SWIM_PROBE_FANOUT, transport); // Long timeout so background task doesn't interfere
 
         let peer1 = PeerId::new([1u8; 32]);
         let peer2 = PeerId::new([2u8; 32]);
@@ -1319,7 +1526,7 @@ mod tests {
     async fn test_swim_probe_fanout() {
         let transport = test_transport().await;
         let custom_fanout = 5;
-        let swim = SwimDetector::new(1, 3, custom_fanout, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, custom_fanout, transport);
 
         assert_eq!(swim.probe_fanout(), custom_fanout);
     }
@@ -1327,7 +1534,7 @@ mod tests {
     #[tokio::test]
     async fn test_swim_default_probe_fanout() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
 
         assert_eq!(swim.probe_fanout(), SWIM_PROBE_FANOUT);
         assert_eq!(SWIM_PROBE_FANOUT, 3);
@@ -1338,7 +1545,7 @@ mod tests {
     #[tokio::test]
     async fn test_record_probe_adds_entry() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let peer = PeerId::new([1u8; 32]);
 
         // Initially no pending probes
@@ -1358,7 +1565,7 @@ mod tests {
     #[tokio::test]
     async fn test_clear_probe_removes_entry() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let peer = PeerId::new([1u8; 32]);
 
         // Record a probe
@@ -1379,7 +1586,7 @@ mod tests {
     #[tokio::test]
     async fn test_clear_probe_returns_false_when_not_present() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let peer = PeerId::new([1u8; 32]);
 
         // Clear a probe that was never recorded
@@ -1390,7 +1597,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_simultaneous_probes() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let peer1 = PeerId::new([1u8; 32]);
         let peer2 = PeerId::new([2u8; 32]);
         let peer3 = PeerId::new([3u8; 32]);
@@ -1422,7 +1629,7 @@ mod tests {
     #[tokio::test]
     async fn test_record_probe_updates_existing_entry() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let peer = PeerId::new([1u8; 32]);
 
         // Record initial probe
@@ -1807,7 +2014,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_ping_marks_sender_alive() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let sender = PeerId::new([1u8; 32]);
 
         // Initially no state for this peer
@@ -1827,7 +2034,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_ack_marks_sender_alive() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let sender = PeerId::new([1u8; 32]);
 
         // Initially no state for this peer
@@ -1844,7 +2051,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_ack_clears_pending_probe() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let peer = PeerId::new([1u8; 32]);
 
         // Record a pending probe
@@ -1865,7 +2072,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_ack_unexpected_peer() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let unexpected_peer = PeerId::new([99u8; 32]);
 
         // Handle ack from peer we never probed
@@ -1884,7 +2091,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_ping_updates_suspect_to_alive() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let sender = PeerId::new([1u8; 32]);
 
         // Mark peer as suspect first
@@ -1902,7 +2109,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_ack_updates_dead_to_alive() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let sender = PeerId::new([1u8; 32]);
 
         // Mark peer as dead first
@@ -1920,7 +2127,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_multiple_pings_from_same_peer() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let sender = PeerId::new([1u8; 32]);
 
         // Handle multiple pings
@@ -1938,7 +2145,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_ack_multiple_times_same_peer() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let swim = SwimDetector::new(test_peer_id(), 1, 3, SWIM_PROBE_FANOUT, transport);
         let sender = PeerId::new([1u8; 32]);
 
         // Record probe and handle multiple acks
@@ -1965,7 +2172,7 @@ mod tests {
     async fn test_probe_task_probes_multiple_peers() {
         let transport = test_transport().await;
         let fanout = 3;
-        let swim = SwimDetector::new(10, 100, fanout, transport); // 10 second probe period to ensure only one round
+        let swim = SwimDetector::new(test_peer_id(), 10, 100, fanout, transport); // 10 second probe period to ensure only one round
 
         // Add 10 alive peers
         for i in 1..=10 {
@@ -1995,7 +2202,7 @@ mod tests {
     async fn test_probe_task_probes_all_when_fewer_than_fanout() {
         let transport = test_transport().await;
         let fanout = 3;
-        let swim = SwimDetector::new(10, 100, fanout, transport); // 10 second probe period to ensure only one round
+        let swim = SwimDetector::new(test_peer_id(), 10, 100, fanout, transport); // 10 second probe period to ensure only one round
 
         // Add only 2 alive peers (fewer than fanout)
         let peer1 = PeerId::new([1; 32]);
@@ -2016,5 +2223,154 @@ mod tests {
         );
         assert!(pending.contains_key(&peer1));
         assert!(pending.contains_key(&peer2));
+    }
+
+    // ===== Task 6: Probe Timeout Detection Tests =====
+
+    #[tokio::test]
+    async fn test_probe_timeout_marks_suspect() {
+        let transport = test_transport().await;
+        // Use short timeout for faster test
+        let swim = SwimDetector::new(test_peer_id(), 1, 100, SWIM_PROBE_FANOUT, transport);
+        let peer = PeerId::new([1u8; 32]);
+
+        // Mark peer as alive and record probe
+        swim.mark_alive(peer).await;
+        swim.record_probe(peer).await;
+
+        // Verify initially alive
+        assert_eq!(swim.get_state(&peer).await, Some(PeerState::Alive));
+
+        // Wait for timeout. The probe_timeout_task interval has an immediate first tick,
+        // then subsequent ticks every SWIM_ACK_TIMEOUT_MS (500ms).
+        // The timeout check looks for probes with elapsed >= SWIM_ACK_TIMEOUT_MS.
+        // Wait up to 3 seconds with polling to handle timing variations and system load
+        for _ in 0..15 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if swim.get_state(&peer).await == Some(PeerState::Suspect) {
+                // Success! Check probe was cleared
+                let pending = swim.pending_probes.read().await;
+                assert!(!pending.contains_key(&peer));
+                return;
+            }
+        }
+
+        // If we get here, the timeout never triggered
+        panic!(
+            "Probe timeout did not mark peer as suspect after 3 seconds. State: {:?}",
+            swim.get_state(&peer).await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_ack_before_timeout_stays_alive() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(test_peer_id(), 1, 100, SWIM_PROBE_FANOUT, transport);
+        let peer = PeerId::new([1u8; 32]);
+
+        // Mark peer as alive and record probe
+        swim.mark_alive(peer).await;
+        swim.record_probe(peer).await;
+
+        // Verify initially alive
+        assert_eq!(swim.get_state(&peer).await, Some(PeerState::Alive));
+
+        // Send ack within timeout (300ms < 500ms)
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        swim.handle_ack(peer).await.ok();
+
+        // Should still be alive
+        assert_eq!(swim.get_state(&peer).await, Some(PeerState::Alive));
+
+        // Wait past the original timeout
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Should still be alive (ack cleared the probe)
+        assert_eq!(swim.get_state(&peer).await, Some(PeerState::Alive));
+    }
+
+    // ===== Task 7: Indirect Probe Protocol Tests =====
+
+    #[tokio::test]
+    async fn test_request_indirect_probes_sends_ping_req() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(test_peer_id(), 1, 100, SWIM_PROBE_FANOUT, transport);
+        let target = PeerId::new([1u8; 32]);
+        let helper1 = PeerId::new([2u8; 32]);
+        let helper2 = PeerId::new([3u8; 32]);
+        let helper3 = PeerId::new([4u8; 32]);
+
+        // Add helper peers as alive
+        swim.mark_alive(helper1).await;
+        swim.mark_alive(helper2).await;
+        swim.mark_alive(helper3).await;
+
+        // Request indirect probes (will fail to send without real transport, but logs the attempt)
+        let result = swim.request_indirect_probes(target).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_request_indirect_probes_with_no_alive_peers() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(test_peer_id(), 1, 100, SWIM_PROBE_FANOUT, transport);
+        let target = PeerId::new([1u8; 32]);
+
+        // No alive peers - should return Ok but do nothing
+        let result = swim.request_indirect_probes(target).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_ping_req_pings_target() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(test_peer_id(), 1, 100, SWIM_PROBE_FANOUT, transport);
+        let requester = PeerId::new([1u8; 32]);
+        let target = PeerId::new([2u8; 32]);
+
+        // Handle PingReq (will fail without real transport, but shouldn't panic)
+        let result = swim.handle_ping_req(requester, target).await;
+        // Expected to fail due to no real transport connection
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_ack_response_marks_alive() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(test_peer_id(), 1, 100, SWIM_PROBE_FANOUT, transport);
+        let target = PeerId::new([1u8; 32]);
+
+        // Mark target as suspect first
+        swim.mark_alive(target).await;
+        swim.mark_suspect(target).await;
+        assert_eq!(swim.get_state(&target).await, Some(PeerState::Suspect));
+
+        // Handle AckResponse
+        let result = swim.handle_ack_response(target).await;
+        assert!(result.is_ok());
+
+        // Should be marked alive again
+        assert_eq!(swim.get_state(&target).await, Some(PeerState::Alive));
+    }
+
+    #[tokio::test]
+    async fn test_handle_ack_response_clears_pending_probe() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(test_peer_id(), 1, 100, SWIM_PROBE_FANOUT, transport);
+        let target = PeerId::new([1u8; 32]);
+
+        // Record a pending probe
+        swim.record_probe(target).await;
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 1);
+        drop(pending);
+
+        // Handle AckResponse
+        let result = swim.handle_ack_response(target).await;
+        assert!(result.is_ok());
+
+        // Pending probe should be cleared
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 0);
     }
 }

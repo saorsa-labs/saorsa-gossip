@@ -180,6 +180,8 @@ struct SwimPeerEntry {
 pub struct SwimDetector<T: GossipTransport + 'static> {
     /// Peer states with timestamps
     states: Arc<RwLock<HashMap<PeerId, SwimPeerEntry>>>,
+    /// Pending probes with timestamps for timeout detection
+    pending_probes: Arc<RwLock<HashMap<PeerId, Instant>>>,
     /// Probe period in seconds
     probe_period: u64,
     /// Suspect timeout in seconds
@@ -200,6 +202,7 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
     ) -> Self {
         let detector = Self {
             states: Arc::new(RwLock::new(HashMap::new())),
+            pending_probes: Arc::new(RwLock::new(HashMap::new())),
             probe_period,
             suspect_timeout,
             probe_fanout,
@@ -286,6 +289,29 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
     /// Get the probe fanout
     pub fn probe_fanout(&self) -> usize {
         self.probe_fanout
+    }
+
+    /// Record a probe sent to a peer for timeout tracking
+    ///
+    /// This method tracks when a probe was sent to enable timeout detection.
+    /// If the peer doesn't respond within the probe period, it can be marked as suspect.
+    pub async fn record_probe(&self, peer: PeerId) {
+        let mut pending = self.pending_probes.write().await;
+        pending.insert(peer, Instant::now());
+        trace!(peer_id = %peer, "SWIM: Recorded pending probe");
+    }
+
+    /// Clear a pending probe for a peer
+    ///
+    /// Called when an ack is received from a peer, indicating the probe succeeded.
+    /// Also used to clear timed-out probes before triggering indirect probing.
+    pub async fn clear_probe(&self, peer: &PeerId) -> bool {
+        let mut pending = self.pending_probes.write().await;
+        let was_present = pending.remove(peer).is_some();
+        if was_present {
+            trace!(peer_id = %peer, "SWIM: Cleared pending probe");
+        }
+        was_present
     }
 
     /// Spawn background task to probe random peers
@@ -1237,6 +1263,123 @@ mod tests {
 
         assert_eq!(swim.probe_fanout(), SWIM_PROBE_FANOUT);
         assert_eq!(SWIM_PROBE_FANOUT, 3);
+    }
+
+    // ===== Probe Timeout Tracking Tests =====
+
+    #[tokio::test]
+    async fn test_record_probe_adds_entry() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let peer = PeerId::new([1u8; 32]);
+
+        // Initially no pending probes
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 0);
+        drop(pending);
+
+        // Record a probe
+        swim.record_probe(peer).await;
+
+        // Should now have one pending probe
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&peer));
+    }
+
+    #[tokio::test]
+    async fn test_clear_probe_removes_entry() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let peer = PeerId::new([1u8; 32]);
+
+        // Record a probe
+        swim.record_probe(peer).await;
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 1);
+        drop(pending);
+
+        // Clear the probe
+        let was_present = swim.clear_probe(&peer).await;
+        assert!(was_present);
+
+        // Should now be empty
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_clear_probe_returns_false_when_not_present() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let peer = PeerId::new([1u8; 32]);
+
+        // Clear a probe that was never recorded
+        let was_present = swim.clear_probe(&peer).await;
+        assert!(!was_present);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_simultaneous_probes() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let peer1 = PeerId::new([1u8; 32]);
+        let peer2 = PeerId::new([2u8; 32]);
+        let peer3 = PeerId::new([3u8; 32]);
+
+        // Record multiple probes
+        swim.record_probe(peer1).await;
+        swim.record_probe(peer2).await;
+        swim.record_probe(peer3).await;
+
+        // Should have three pending probes
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 3);
+        assert!(pending.contains_key(&peer1));
+        assert!(pending.contains_key(&peer2));
+        assert!(pending.contains_key(&peer3));
+        drop(pending);
+
+        // Clear one probe
+        swim.clear_probe(&peer2).await;
+
+        // Should have two remaining
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains_key(&peer1));
+        assert!(!pending.contains_key(&peer2));
+        assert!(pending.contains_key(&peer3));
+    }
+
+    #[tokio::test]
+    async fn test_record_probe_updates_existing_entry() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let peer = PeerId::new([1u8; 32]);
+
+        // Record initial probe
+        swim.record_probe(peer).await;
+        let first_instant = {
+            let pending = swim.pending_probes.read().await;
+            *pending.get(&peer).expect("probe should exist")
+        };
+
+        // Wait a bit
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Record another probe for the same peer
+        swim.record_probe(peer).await;
+        let second_instant = {
+            let pending = swim.pending_probes.read().await;
+            *pending.get(&peer).expect("probe should exist")
+        };
+
+        // The timestamp should have been updated
+        assert!(second_instant > first_instant);
+
+        // Should still have only one entry
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 1);
     }
 
     // ===== Shuffle Protocol Tests =====

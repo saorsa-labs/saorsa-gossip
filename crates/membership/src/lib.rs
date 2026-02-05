@@ -32,6 +32,12 @@ pub const SHUFFLE_PERIOD_SECS: u64 = 30;
 pub const SWIM_PROBE_INTERVAL_SECS: u64 = 1;
 /// SWIM suspect timeout (per SPEC.md)
 pub const SWIM_SUSPECT_TIMEOUT_SECS: u64 = 3;
+/// Number of peers to probe per interval (per SPEC.md)
+pub const SWIM_PROBE_FANOUT: usize = 3;
+/// Number of peers for indirect probing (per SPEC.md)
+pub const SWIM_INDIRECT_PROBE_FANOUT: usize = 3;
+/// Timeout in milliseconds before marking probe as failed (per SPEC.md)
+pub const SWIM_ACK_TIMEOUT_MS: u64 = 500;
 
 /// SWIM protocol messages
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,17 +163,25 @@ pub struct SwimDetector<T: GossipTransport + 'static> {
     probe_period: u64,
     /// Suspect timeout in seconds
     suspect_timeout: u64,
+    /// Number of peers to probe per interval
+    probe_fanout: usize,
     /// Transport layer for sending probes
     transport: Arc<T>,
 }
 
 impl<T: GossipTransport + 'static> SwimDetector<T> {
     /// Create a new SWIM detector
-    pub fn new(probe_period: u64, suspect_timeout: u64, transport: Arc<T>) -> Self {
+    pub fn new(
+        probe_period: u64,
+        suspect_timeout: u64,
+        probe_fanout: usize,
+        transport: Arc<T>,
+    ) -> Self {
         let detector = Self {
             states: Arc::new(RwLock::new(HashMap::new())),
             probe_period,
             suspect_timeout,
+            probe_fanout,
             transport,
         };
 
@@ -246,6 +260,11 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
     /// Get the suspect timeout
     pub fn suspect_timeout(&self) -> u64 {
         self.suspect_timeout
+    }
+
+    /// Get the probe fanout
+    pub fn probe_fanout(&self) -> usize {
+        self.probe_fanout
     }
 
     /// Spawn background task to probe random peers
@@ -369,6 +388,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
             swim: SwimDetector::new(
                 SWIM_PROBE_INTERVAL_SECS,
                 SWIM_SUSPECT_TIMEOUT_SECS,
+                SWIM_PROBE_FANOUT,
                 transport.clone(),
             ),
             active_degree,
@@ -1082,7 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn test_swim_states() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 3, transport);
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
         let peer = PeerId::new([1u8; 32]);
 
         swim.mark_alive(peer).await;
@@ -1098,7 +1118,7 @@ mod tests {
     #[tokio::test]
     async fn test_swim_suspect_timeout() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 1, transport); // 1s timeout
+        let swim = SwimDetector::new(1, 1, SWIM_PROBE_FANOUT, transport); // 1s timeout
         let peer = PeerId::new([1u8; 32]);
 
         swim.mark_alive(peer).await;
@@ -1156,7 +1176,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_peers_in_state() {
         let transport = test_transport().await;
-        let swim = SwimDetector::new(1, 100, transport); // Long timeout so background task doesn't interfere
+        let swim = SwimDetector::new(1, 100, SWIM_PROBE_FANOUT, transport); // Long timeout so background task doesn't interfere
 
         let peer1 = PeerId::new([1u8; 32]);
         let peer2 = PeerId::new([2u8; 32]);
@@ -1178,6 +1198,24 @@ mod tests {
         assert!(alive.contains(&peer1));
         assert!(suspects.contains(&peer2));
         assert!(dead.contains(&peer3));
+    }
+
+    #[tokio::test]
+    async fn test_swim_probe_fanout() {
+        let transport = test_transport().await;
+        let custom_fanout = 5;
+        let swim = SwimDetector::new(1, 3, custom_fanout, transport);
+
+        assert_eq!(swim.probe_fanout(), custom_fanout);
+    }
+
+    #[tokio::test]
+    async fn test_swim_default_probe_fanout() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+
+        assert_eq!(swim.probe_fanout(), SWIM_PROBE_FANOUT);
+        assert_eq!(SWIM_PROBE_FANOUT, 3);
     }
 
     // ===== Shuffle Protocol Tests =====

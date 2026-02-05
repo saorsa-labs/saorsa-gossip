@@ -314,6 +314,46 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
         was_present
     }
 
+    /// Handle incoming Ping message and respond with Ack
+    ///
+    /// Marks the sender as alive (they're clearly responsive) and sends back an Ack message.
+    pub async fn handle_ping(&self, sender: PeerId) -> Result<()> {
+        // Mark sender as alive - they sent us a ping, so they're responding
+        self.mark_alive(sender).await;
+        trace!(peer_id = %sender, "SWIM: Received Ping, sending Ack");
+
+        // Serialize and send Ack response
+        let ack_msg = SwimMessage::Ack;
+        let bytes = postcard::to_stdvec(&ack_msg)
+            .map_err(|e| anyhow!("Failed to serialize Ack message: {}", e))?;
+
+        self.transport
+            .send_to_peer(sender, GossipStreamType::Membership, bytes.into())
+            .await?;
+
+        trace!(peer_id = %sender, "SWIM: Ack sent successfully");
+        Ok(())
+    }
+
+    /// Handle incoming Ack message
+    ///
+    /// Marks the sender as alive and clears any pending probe for this peer.
+    pub async fn handle_ack(&self, sender: PeerId) -> Result<()> {
+        // Mark sender as alive - they responded to our ping
+        self.mark_alive(sender).await;
+
+        // Clear pending probe if one exists
+        let was_pending = self.clear_probe(&sender).await;
+
+        if was_pending {
+            trace!(peer_id = %sender, "SWIM: Received Ack, cleared pending probe");
+        } else {
+            trace!(peer_id = %sender, "SWIM: Received Ack (no pending probe)");
+        }
+
+        Ok(())
+    }
+
     /// Spawn background task to probe random peers
     fn spawn_probe_task(&self) {
         let states = self.states.clone();
@@ -1732,5 +1772,162 @@ mod tests {
             let bytes = postcard::to_stdvec(&msg).expect("serialize");
             let _deserialized: SwimMessage = postcard::from_bytes(&bytes).expect("deserialize");
         }
+    }
+
+    // ===== handle_ping and handle_ack Tests =====
+
+    #[tokio::test]
+    async fn test_handle_ping_marks_sender_alive() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let sender = PeerId::new([1u8; 32]);
+
+        // Initially no state for this peer
+        assert_eq!(swim.get_state(&sender).await, None);
+
+        // Handle ping from sender
+        let result = swim.handle_ping(sender).await;
+
+        // Should succeed (send might fail without real connection, but that's OK for this test)
+        // The important part is marking as alive
+        assert_eq!(swim.get_state(&sender).await, Some(PeerState::Alive));
+
+        // Result may be Err due to send failing, but state should be updated
+        let _ = result;
+    }
+
+    #[tokio::test]
+    async fn test_handle_ack_marks_sender_alive() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let sender = PeerId::new([1u8; 32]);
+
+        // Initially no state for this peer
+        assert_eq!(swim.get_state(&sender).await, None);
+
+        // Handle ack from sender
+        let result = swim.handle_ack(sender).await;
+        assert!(result.is_ok());
+
+        // Sender should be marked as alive
+        assert_eq!(swim.get_state(&sender).await, Some(PeerState::Alive));
+    }
+
+    #[tokio::test]
+    async fn test_handle_ack_clears_pending_probe() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let peer = PeerId::new([1u8; 32]);
+
+        // Record a pending probe
+        swim.record_probe(peer).await;
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 1);
+        drop(pending);
+
+        // Handle ack from peer
+        let result = swim.handle_ack(peer).await;
+        assert!(result.is_ok());
+
+        // Pending probe should be cleared
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_ack_unexpected_peer() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let unexpected_peer = PeerId::new([99u8; 32]);
+
+        // Handle ack from peer we never probed
+        let result = swim.handle_ack(unexpected_peer).await;
+
+        // Should not panic and should succeed
+        assert!(result.is_ok());
+
+        // Peer should be marked as alive even if unexpected
+        assert_eq!(
+            swim.get_state(&unexpected_peer).await,
+            Some(PeerState::Alive)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_ping_updates_suspect_to_alive() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let sender = PeerId::new([1u8; 32]);
+
+        // Mark peer as suspect first
+        swim.mark_alive(sender).await;
+        swim.mark_suspect(sender).await;
+        assert_eq!(swim.get_state(&sender).await, Some(PeerState::Suspect));
+
+        // Handle ping from sender
+        let _ = swim.handle_ping(sender).await;
+
+        // Should be marked alive again
+        assert_eq!(swim.get_state(&sender).await, Some(PeerState::Alive));
+    }
+
+    #[tokio::test]
+    async fn test_handle_ack_updates_dead_to_alive() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let sender = PeerId::new([1u8; 32]);
+
+        // Mark peer as dead first
+        swim.mark_dead(sender).await;
+        assert_eq!(swim.get_state(&sender).await, Some(PeerState::Dead));
+
+        // Handle ack from sender (zombie!)
+        let result = swim.handle_ack(sender).await;
+        assert!(result.is_ok());
+
+        // Should be marked alive again
+        assert_eq!(swim.get_state(&sender).await, Some(PeerState::Alive));
+    }
+
+    #[tokio::test]
+    async fn test_handle_multiple_pings_from_same_peer() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let sender = PeerId::new([1u8; 32]);
+
+        // Handle multiple pings
+        for _ in 0..5 {
+            let _ = swim.handle_ping(sender).await;
+        }
+
+        // Should still be alive and only one entry
+        assert_eq!(swim.get_state(&sender).await, Some(PeerState::Alive));
+
+        let states = swim.states.read().await;
+        assert_eq!(states.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_ack_multiple_times_same_peer() {
+        let transport = test_transport().await;
+        let swim = SwimDetector::new(1, 3, SWIM_PROBE_FANOUT, transport);
+        let sender = PeerId::new([1u8; 32]);
+
+        // Record probe and handle multiple acks
+        swim.record_probe(sender).await;
+
+        for i in 0..3 {
+            let result = swim.handle_ack(sender).await;
+            assert!(result.is_ok());
+
+            // Only first ack should clear the probe
+            if i == 0 {
+                let pending = swim.pending_probes.read().await;
+                assert_eq!(pending.len(), 0);
+            }
+        }
+
+        // Should still be alive
+        assert_eq!(swim.get_state(&sender).await, Some(PeerState::Alive));
     }
 }

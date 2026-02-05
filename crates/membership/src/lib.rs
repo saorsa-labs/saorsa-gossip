@@ -357,10 +357,13 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
     /// Spawn background task to probe random peers
     fn spawn_probe_task(&self) {
         let states = self.states.clone();
+        let pending_probes = self.pending_probes.clone();
         let probe_period = self.probe_period;
+        let probe_fanout = self.probe_fanout;
         let transport = self.transport.clone();
 
         tokio::spawn(async move {
+            use rand::seq::SliceRandom;
             let mut interval = time::interval(Duration::from_secs(probe_period));
 
             loop {
@@ -374,7 +377,33 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                     .collect();
                 drop(states_guard);
 
-                if let Some(&peer) = alive_peers.first() {
+                if alive_peers.is_empty() {
+                    continue;
+                }
+
+                // Select min(probe_fanout, alive_peers.len()) random peers
+                // Create a new RNG for each iteration to avoid holding non-Send values across await
+                let probe_count = probe_fanout.min(alive_peers.len());
+                let peers_to_probe: Vec<PeerId> = {
+                    let mut rng = rand::thread_rng();
+                    alive_peers
+                        .choose_multiple(&mut rng, probe_count)
+                        .copied()
+                        .collect()
+                };
+
+                debug!(
+                    probe_count = peers_to_probe.len(),
+                    "SWIM: Probing multiple peers"
+                );
+
+                for peer in peers_to_probe {
+                    // Record probe for timeout tracking
+                    {
+                        let mut pending = pending_probes.write().await;
+                        pending.insert(peer, Instant::now());
+                    }
+
                     // Send PING to peer via transport
                     trace!(peer_id = %peer, "SWIM: Probing peer");
                     let ping_msg = SwimMessage::Ping;
@@ -391,8 +420,6 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                             warn!(?e, "SWIM: Ping message serialization failed");
                         }
                     }
-                    // Note: Response handling would mark peer alive/suspect
-                    // For now, we'll rely on manual state updates
                 }
             }
         });
@@ -1929,5 +1956,64 @@ mod tests {
 
         // Should still be alive
         assert_eq!(swim.get_state(&sender).await, Some(PeerState::Alive));
+    }
+
+    // ===== Probe Task Multiple Peers Tests =====
+
+    #[tokio::test]
+    async fn test_probe_task_probes_multiple_peers() {
+        let transport = test_transport().await;
+        let fanout = 3;
+        let swim = SwimDetector::new(10, 100, fanout, transport); // 10 second probe period to ensure only one round
+
+        // Add 10 alive peers
+        for i in 1..=10 {
+            let peer = PeerId::new([i; 32]);
+            swim.mark_alive(peer).await;
+        }
+
+        // Wait briefly for the immediate first tick of the interval
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Check pending_probes - should have multiple entries (at least 2, up to fanout)
+        let pending = swim.pending_probes.read().await;
+        assert!(
+            pending.len() >= 2,
+            "Expected at least 2 pending probes (multiple peers probed), got {}",
+            pending.len()
+        );
+        assert!(
+            pending.len() <= fanout,
+            "Expected at most {} pending probes, got {}",
+            fanout,
+            pending.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_task_probes_all_when_fewer_than_fanout() {
+        let transport = test_transport().await;
+        let fanout = 3;
+        let swim = SwimDetector::new(10, 100, fanout, transport); // 10 second probe period to ensure only one round
+
+        // Add only 2 alive peers (fewer than fanout)
+        let peer1 = PeerId::new([1; 32]);
+        let peer2 = PeerId::new([2; 32]);
+        swim.mark_alive(peer1).await;
+        swim.mark_alive(peer2).await;
+
+        // Wait briefly for the immediate first tick of the interval
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Check pending_probes - should have probed both peers
+        let pending = swim.pending_probes.read().await;
+        assert_eq!(
+            pending.len(),
+            2,
+            "Expected exactly 2 pending probes (both peers), got {}",
+            pending.len()
+        );
+        assert!(pending.contains_key(&peer1));
+        assert!(pending.contains_key(&peer2));
     }
 }

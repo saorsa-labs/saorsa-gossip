@@ -8,6 +8,7 @@
 //! - Periodic shuffling and anti-entropy
 
 use anyhow::{anyhow, Result};
+use rand::SeedableRng;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
@@ -382,10 +383,10 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                 }
 
                 // Select min(probe_fanout, alive_peers.len()) random peers
-                // Create a new RNG for each iteration to avoid holding non-Send values across await
+                // Use StdRng::from_entropy() instead of thread_rng() to be Send-safe
                 let probe_count = probe_fanout.min(alive_peers.len());
                 let peers_to_probe: Vec<PeerId> = {
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rngs::StdRng::from_entropy();
                     alive_peers
                         .choose_multiple(&mut rng, probe_count)
                         .copied()

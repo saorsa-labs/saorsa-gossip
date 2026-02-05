@@ -16,12 +16,13 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::{BootstrapCache, GossipStreamType, GossipTransport};
 
 // Import ant-quic types (v0.14+ API)
+use ant_quic::transport::TransportAddr;
 use ant_quic::{MlDsaPublicKey, MlDsaSecretKey, Node, NodeConfig, PeerId as AntPeerId};
 
 // Re-export key utils for tests
@@ -41,6 +42,10 @@ pub struct UdpTransportAdapterConfig {
     pub stream_read_limit: usize,
     /// Maximum number of peers to track (default: 1,000)
     pub max_peers: usize,
+    /// Maximum number of concurrent sends (default: 64)
+    pub max_inflight_sends: usize,
+    /// Send timeout for a single message (default: 15 seconds)
+    pub send_timeout: Duration,
     /// Optional ML-DSA keypair bytes (public_key, secret_key) for identity persistence
     /// If not provided, a fresh keypair is generated.
     /// This ensures the transport peer ID matches the application's identity peer ID.
@@ -56,6 +61,8 @@ impl UdpTransportAdapterConfig {
             channel_capacity: 10_000,
             stream_read_limit: 100 * 1024 * 1024, // 100 MB
             max_peers: 1_000,
+            max_inflight_sends: 64,
+            send_timeout: Duration::from_secs(15),
             keypair: None,
         }
     }
@@ -84,6 +91,18 @@ impl UdpTransportAdapterConfig {
         self.max_peers = max;
         self
     }
+
+    /// Set maximum number of concurrent sends
+    pub fn with_max_inflight_sends(mut self, max: usize) -> Self {
+        self.max_inflight_sends = max.max(1);
+        self
+    }
+
+    /// Set send timeout for a single message
+    pub fn with_send_timeout(mut self, timeout: Duration) -> Self {
+        self.send_timeout = timeout;
+        self
+    }
 }
 
 /// Ant-QUIC transport implementation
@@ -108,6 +127,10 @@ pub struct UdpTransportAdapter {
     bootstrap_cache: Option<Arc<BootstrapCache>>,
     /// Configuration
     config: UdpTransportAdapterConfig,
+    /// Limit concurrent send operations to avoid exhausting QUIC stream budgets.
+    send_semaphore: Arc<Semaphore>,
+    /// Serialize sends per peer to avoid exhausting per-connection stream budgets.
+    peer_send_locks: Arc<RwLock<HashMap<GossipPeerId, Arc<Mutex<()>>>>>,
 }
 
 impl UdpTransportAdapter {
@@ -195,6 +218,8 @@ impl UdpTransportAdapter {
             bootstrap_peer_ids: Arc::new(RwLock::new(HashMap::new())),
             bootstrap_cache: bootstrap_cache.clone(),
             config: config.clone(),
+            send_semaphore: Arc::new(Semaphore::new(config.max_inflight_sends)),
+            peer_send_locks: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Start receiving loop
@@ -205,20 +230,50 @@ impl UdpTransportAdapter {
         if !config.known_peers.is_empty() {
             let peer_count = config.known_peers.len();
             let node_clone = transport.node.clone();
+            let known_peers = config.known_peers.clone();
+            let peers_map = Arc::clone(&transport.connected_peers);
+            let max_peers = transport.config.max_peers;
             info!(
                 "Spawning background task to connect to {} known peer(s)...",
                 peer_count
             );
 
             tokio::spawn(async move {
-                match node_clone.connect_known_peers().await {
-                    Ok(connected) => {
-                        info!("✓ Connected to {}/{} known peer(s)", connected, peer_count);
+                let mut connected = 0usize;
+                for addr in known_peers {
+                    let already_connected = node_clone
+                        .connected_peers()
+                        .await
+                        .iter()
+                        .any(|peer| peer.remote_addr == TransportAddr::Udp(addr));
+
+                    if already_connected {
+                        debug!("Already connected to known peer {}", addr);
+                        connected += 1;
+                        continue;
                     }
-                    Err(e) => {
-                        warn!("Failed to connect to known peers: {}", e);
+
+                    match node_clone.connect_addr(addr).await {
+                        Ok(_) => {
+                            connected += 1;
+                            if let Some(peer_conn) = node_clone
+                                .connected_peers()
+                                .await
+                                .into_iter()
+                                .find(|conn| conn.remote_addr == TransportAddr::Udp(addr))
+                            {
+                                let gossip_id = ant_peer_id_to_gossip(&peer_conn.peer_id);
+                                add_peer_with_lru(&peers_map, gossip_id, addr, max_peers).await;
+                            }
+                            info!("Connected to known peer {}", addr);
+                        }
+                        Err(e) => {
+                            warn!("Failed to connect to known peer {}: {}", addr, e);
+                        }
                     }
                 }
+
+                info!("✓ Connected to {}/{} known peer(s)", connected, peer_count);
             });
         }
 
@@ -240,13 +295,41 @@ impl UdpTransportAdapter {
     /// Returns a vector of (PeerId, SocketAddr) tuples for all currently connected peers.
     /// Connections are tracked internally and expired after 5 minutes of inactivity.
     pub async fn connected_peers(&self) -> Vec<(GossipPeerId, SocketAddr)> {
-        let peers = self.connected_peers.read().await;
+        let ant_peers = self.node.connected_peers().await;
         let now = Instant::now();
+        const PEER_TTL: Duration = Duration::from_secs(300);
 
-        peers
-            .iter()
-            .filter(|(_, (_, last_seen))| now.duration_since(*last_seen) < Duration::from_secs(300))
-            .map(|(peer_id, (addr, _))| (*peer_id, *addr))
+        {
+            let mut peers = self.connected_peers.write().await;
+            // Refresh any active peers from the node.
+            for conn in &ant_peers {
+                let gossip_id = ant_peer_id_to_gossip(&conn.peer_id);
+                let addr = conn.remote_addr.to_synthetic_socket_addr();
+                if addr_is_usable(&addr) {
+                    peers.insert(gossip_id, (addr, now));
+                } else if let Some(existing_addr) = peers
+                    .get(&gossip_id)
+                    .map(|(existing_addr, _)| *existing_addr)
+                {
+                    peers.insert(gossip_id, (existing_addr, now));
+                } else {
+                    warn!("Ignoring unusable peer addr {} for {}", addr, gossip_id);
+                }
+            }
+            // Drop only peers that have been inactive for a while.
+            peers.retain(|_, (_addr, last_seen)| now.duration_since(*last_seen) <= PEER_TTL);
+        }
+
+        ant_peers
+            .into_iter()
+            .filter_map(|conn| {
+                let addr = conn.remote_addr.to_synthetic_socket_addr();
+                if addr_is_usable(&addr) {
+                    Some((ant_peer_id_to_gossip(&conn.peer_id), addr))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -401,8 +484,16 @@ impl UdpTransportAdapter {
 
                     info!("Accepted connection from {:?} at {}", peer_id, peer_addr);
 
-                    // Track the peer
-                    add_peer_with_lru(&peers_accept, gossip_peer_id, peer_addr, max_peers).await;
+                    // Track the peer if the address is usable.
+                    if addr_is_usable(&peer_addr) {
+                        add_peer_with_lru(&peers_accept, gossip_peer_id, peer_addr, max_peers)
+                            .await;
+                    } else {
+                        warn!(
+                            "Skipping unusable peer addr {} for {}",
+                            peer_addr, gossip_peer_id
+                        );
+                    }
                 }
 
                 // Small delay to prevent busy loop
@@ -413,6 +504,10 @@ impl UdpTransportAdapter {
 
     /// Add or update a peer in the connected peers map with LRU eviction
     async fn add_peer(&self, peer_id: GossipPeerId, addr: SocketAddr) {
+        if !addr_is_usable(&addr) {
+            warn!("Skipping unusable peer addr {} for {}", addr, peer_id);
+            return;
+        }
         add_peer_with_lru(&self.connected_peers, peer_id, addr, self.config.max_peers).await;
     }
 
@@ -422,7 +517,81 @@ impl UdpTransportAdapter {
         if peers.remove(peer_id).is_some() {
             debug!("Removed peer {:?} after connection failure", peer_id);
         }
+        self.peer_send_locks.write().await.remove(peer_id);
     }
+
+    async fn cached_peer_addr(&self, peer_id: GossipPeerId) -> Option<SocketAddr> {
+        {
+            let peers = self.connected_peers.read().await;
+            if let Some((addr, _)) = peers.get(&peer_id) {
+                if addr_is_usable(addr) {
+                    return Some(*addr);
+                }
+            }
+        }
+
+        let cache = self.bootstrap_cache.as_ref()?;
+        let ant_peer_id = gossip_peer_id_to_ant(&peer_id);
+        let cached = cache.get_peer(&ant_peer_id).await?;
+        let addr = cached
+            .addresses
+            .iter()
+            .copied()
+            .find(addr_is_usable)
+            .or_else(|| {
+                cached
+                    .capabilities
+                    .external_addresses
+                    .iter()
+                    .copied()
+                    .find(addr_is_usable)
+            })?;
+
+        self.add_peer(peer_id, addr).await;
+        Some(addr)
+    }
+
+    async fn peer_send_lock(&self, peer: GossipPeerId) -> Arc<Mutex<()>> {
+        let mut locks = self.peer_send_locks.write().await;
+        locks
+            .entry(peer)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn reconnect_peer(&self, peer: GossipPeerId, addr: SocketAddr) -> Result<()> {
+        debug!("Attempting reconnect to peer {} at {}", peer, addr);
+        match tokio::time::timeout(Duration::from_secs(2), self.node.connect_addr(addr)).await {
+            Ok(Ok(peer_conn)) => {
+                let gossip_id = ant_peer_id_to_gossip(&peer_conn.peer_id);
+                if gossip_id != peer {
+                    warn!(
+                        "Reconnect to {} returned unexpected peer {}",
+                        addr, gossip_id
+                    );
+                    self.remove_peer(&peer).await;
+                    return Err(anyhow!(
+                        "Reconnect returned unexpected peer {} for {}",
+                        gossip_id,
+                        peer
+                    ));
+                }
+                self.add_peer(peer, addr).await;
+                Ok(())
+            }
+            Ok(Err(err)) => Err(anyhow!(
+                "Reconnect to {} for peer {} failed: {}",
+                addr,
+                peer,
+                err
+            )),
+            Err(_) => Err(anyhow!("Reconnect to {} for peer {} timed out", addr, peer)),
+        }
+    }
+}
+
+fn addr_is_usable(addr: &SocketAddr) -> bool {
+    !addr.ip().is_unspecified() && addr.port() != 0
 }
 
 /// Add a peer with LRU eviction (standalone helper for use in spawned tasks)
@@ -483,6 +652,14 @@ impl GossipTransport for UdpTransportAdapter {
 
         // Connect to the peer by address
         let start = Instant::now();
+        let ant_peer_id = gossip_peer_id_to_ant(&peer);
+
+        if self.node.is_connected(&ant_peer_id).await {
+            info!("Already connected to peer {} at {}", peer, addr);
+            self.add_peer(peer, addr).await;
+            return Ok(());
+        }
+
         match self.node.connect_addr(addr).await {
             Ok(peer_conn) => {
                 let gossip_id = ant_peer_id_to_gossip(&peer_conn.peer_id);
@@ -587,6 +764,13 @@ impl GossipTransport for UdpTransportAdapter {
         stream_type: GossipStreamType,
         data: Bytes,
     ) -> Result<()> {
+        let _send_permit = self
+            .send_semaphore
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("Send semaphore closed"))?;
+        let peer_lock = self.peer_send_lock(peer).await;
+        let _peer_guard = peer_lock.lock().await;
         debug!(
             "Sending {} bytes to peer {} on {:?} stream",
             data.len(),
@@ -594,8 +778,29 @@ impl GossipTransport for UdpTransportAdapter {
             stream_type
         );
 
+        // Refresh connected peers from the underlying node to avoid stale state.
+        let _ = self.connected_peers().await;
+
         // Convert gossip PeerId to ant-quic PeerId
         let ant_peer_id = gossip_peer_id_to_ant(&peer);
+
+        if !self.node.is_connected(&ant_peer_id).await {
+            if let Some(addr) = self.cached_peer_addr(peer).await {
+                debug!(
+                    "Peer {} not connected; attempting reconnect to {}",
+                    peer, addr
+                );
+                if let Err(err) = self.reconnect_peer(peer, addr).await {
+                    warn!("Reconnect to {} for peer {} failed: {}", addr, peer, err);
+                    return Err(err);
+                }
+            } else {
+                return Err(anyhow!(
+                    "Peer {} not connected and no cached address is available",
+                    peer
+                ));
+            }
+        }
 
         // Prepare message: [stream_type_byte | data]
         let mut buf = Vec::with_capacity(1 + data.len());
@@ -603,17 +808,66 @@ impl GossipTransport for UdpTransportAdapter {
         buf.extend_from_slice(&data);
 
         // Send via the node
-        match self.node.send(&ant_peer_id, &buf).await {
-            Ok(()) => {
+        let mut last_err = match tokio::time::timeout(
+            self.config.send_timeout,
+            self.node.send(&ant_peer_id, &buf),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
                 info!("Successfully sent {} bytes to peer {}", buf.len(), peer);
-                Ok(())
+                return Ok(());
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Failed to send to peer {}: {}", peer, e);
-                self.remove_peer(&peer).await;
-                Err(anyhow!("Failed to send to peer: {}", e))
+                anyhow!("Failed to send to peer {}: {}", peer, e)
             }
+            Err(_) => {
+                warn!("Send to peer {} timed out", peer);
+                anyhow!("Send to peer {} timed out", peer)
+            }
+        };
+
+        let retry_addr = self.cached_peer_addr(peer).await;
+        if let Some(addr) = retry_addr {
+            debug!("Retrying send to peer {} via reconnect to {}", peer, addr);
+            let _ = self.node.disconnect(&ant_peer_id).await;
+            if let Err(err) = self.reconnect_peer(peer, addr).await {
+                warn!(
+                    "Retry reconnect to {} for peer {} failed: {}",
+                    addr, peer, err
+                );
+                return Err(err);
+            }
+            match tokio::time::timeout(self.config.send_timeout, self.node.send(&ant_peer_id, &buf))
+                .await
+            {
+                Ok(Ok(())) => {
+                    info!(
+                        "Successfully sent {} bytes to peer {} after reconnect",
+                        buf.len(),
+                        peer
+                    );
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    warn!("Retry send to peer {} failed: {}", peer, e);
+                    last_err = anyhow!("Retry send to peer {} failed: {}", peer, e);
+                }
+                Err(_) => {
+                    warn!("Retry send to peer {} timed out", peer);
+                    last_err = anyhow!("Retry send to peer {} timed out", peer);
+                }
+            }
+        } else {
+            return Err(anyhow!(
+                "Failed to send to peer {} (no cached address): {}",
+                peer,
+                last_err
+            ));
         }
+
+        Err(last_err)
     }
 
     async fn receive_message(&self) -> Result<(GossipPeerId, GossipStreamType, Bytes)> {
@@ -647,6 +901,16 @@ impl TransportAdapter for UdpTransportAdapter {
         debug!("TransportAdapter::dial to {}", addr);
 
         let start = Instant::now();
+        if let Some((peer_id, _)) = self
+            .connected_peers()
+            .await
+            .into_iter()
+            .find(|(_peer_id, peer_addr)| *peer_addr == addr)
+        {
+            debug!("Already connected to peer {} at {}", peer_id, addr);
+            return Ok(peer_id);
+        }
+
         match self.node.connect_addr(addr).await {
             Ok(peer_conn) => {
                 let gossip_peer_id = ant_peer_id_to_gossip(&peer_conn.peer_id);
@@ -684,7 +948,44 @@ impl TransportAdapter for UdpTransportAdapter {
         stream_type: GossipStreamType,
         data: Bytes,
     ) -> TransportResult<()> {
+        let _send_permit =
+            self.send_semaphore
+                .acquire()
+                .await
+                .map_err(|_| TransportError::SendFailed {
+                    peer_id,
+                    source: anyhow!("Send semaphore closed"),
+                })?;
+        let peer_lock = self.peer_send_lock(peer_id).await;
+        let _peer_guard = peer_lock.lock().await;
         let ant_peer_id = gossip_peer_id_to_ant(&peer_id);
+
+        // Refresh connected peers from the underlying node to avoid stale state.
+        let _ = self.connected_peers().await;
+
+        if !self.node.is_connected(&ant_peer_id).await {
+            if let Some(addr) = self.cached_peer_addr(peer_id).await {
+                debug!(
+                    "Peer {} not connected; attempting reconnect to {}",
+                    peer_id, addr
+                );
+                if let Err(err) = self.reconnect_peer(peer_id, addr).await {
+                    warn!("Reconnect to {} for peer {} failed: {}", addr, peer_id, err);
+                    return Err(TransportError::SendFailed {
+                        peer_id,
+                        source: err,
+                    });
+                }
+            } else {
+                return Err(TransportError::SendFailed {
+                    peer_id,
+                    source: anyhow!(
+                        "Peer {} not connected and no cached address is available",
+                        peer_id
+                    ),
+                });
+            }
+        }
 
         // Prepend stream type byte to payload (same format as GossipTransport)
         let mut payload = Vec::with_capacity(1 + data.len());
@@ -692,25 +993,87 @@ impl TransportAdapter for UdpTransportAdapter {
         payload.extend_from_slice(&data);
 
         // Use ant-quic's send() with peer ID and raw bytes
-        match self.node.send(&ant_peer_id, &payload).await {
-            Ok(()) => {
+        let mut last_err = match tokio::time::timeout(
+            self.config.send_timeout,
+            self.node.send(&ant_peer_id, &payload),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
                 debug!(
                     "Sent {} bytes to peer {} on {:?}",
                     data.len(),
                     peer_id,
                     stream_type
                 );
-                Ok(())
+                return Ok(());
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Failed to send to peer {}: {}", peer_id, e);
-                self.remove_peer(&peer_id).await;
-                Err(TransportError::SendFailed {
-                    peer_id,
-                    source: anyhow!("{}", e),
-                })
+                anyhow!("{}", e)
             }
+            Err(_) => {
+                warn!("Send to peer {} timed out", peer_id);
+                anyhow!("Send to peer timed out")
+            }
+        };
+
+        let retry_addr = self.cached_peer_addr(peer_id).await;
+        if let Some(addr) = retry_addr {
+            debug!(
+                "Retrying send to peer {} via reconnect to {}",
+                peer_id, addr
+            );
+            let _ = self.node.disconnect(&ant_peer_id).await;
+            if let Err(err) = self.reconnect_peer(peer_id, addr).await {
+                warn!(
+                    "Retry reconnect to {} for peer {} failed: {}",
+                    addr, peer_id, err
+                );
+                return Err(TransportError::SendFailed {
+                    peer_id,
+                    source: err,
+                });
+            }
+            match tokio::time::timeout(
+                self.config.send_timeout,
+                self.node.send(&ant_peer_id, &payload),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    debug!(
+                        "Sent {} bytes to peer {} on {:?} after reconnect",
+                        data.len(),
+                        peer_id,
+                        stream_type
+                    );
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    warn!("Retry send to peer {} failed: {}", peer_id, e);
+                    last_err = anyhow!("{}", e);
+                }
+                Err(_) => {
+                    warn!("Retry send to peer {} timed out", peer_id);
+                    last_err = anyhow!("Retry send to peer timed out");
+                }
+            }
+        } else {
+            return Err(TransportError::SendFailed {
+                peer_id,
+                source: anyhow!(
+                    "Failed to send to peer {} (no cached address): {}",
+                    peer_id,
+                    last_err
+                ),
+            });
         }
+
+        Err(TransportError::SendFailed {
+            peer_id,
+            source: last_err,
+        })
     }
 
     async fn recv(&self) -> TransportResult<(GossipPeerId, GossipStreamType, Bytes)> {
@@ -729,11 +1092,7 @@ impl TransportAdapter for UdpTransportAdapter {
     }
 
     async fn connected_peers(&self) -> Vec<(GossipPeerId, SocketAddr)> {
-        let peers = self.connected_peers.read().await;
-        peers
-            .iter()
-            .map(|(peer_id, (addr, _instant))| (*peer_id, *addr))
-            .collect()
+        self.connected_peers().await
     }
 
     fn capabilities(&self) -> TransportCapabilities {
@@ -775,6 +1134,8 @@ mod tests {
             channel_capacity: 10_000,
             stream_read_limit: 100 * 1024 * 1024,
             max_peers: 1_000,
+            max_inflight_sends: 64,
+            send_timeout: Duration::from_secs(15),
             keypair: None,
         };
         let transport = UdpTransportAdapter::with_config(config, None)
@@ -830,6 +1191,8 @@ mod tests {
             channel_capacity: 10_000,
             stream_read_limit: 100 * 1024 * 1024,
             max_peers: 1_000,
+            max_inflight_sends: 64,
+            send_timeout: Duration::from_secs(15),
             keypair: None,
         };
         assert_eq!(config.channel_capacity, 10_000);
@@ -849,6 +1212,8 @@ mod tests {
             channel_capacity: 5_000,
             stream_read_limit: 50 * 1024 * 1024,
             max_peers: 500,
+            max_inflight_sends: 64,
+            send_timeout: Duration::from_secs(15),
             keypair: None,
         };
 
@@ -870,6 +1235,8 @@ mod tests {
             channel_capacity: 10_000,
             stream_read_limit: 100 * 1024 * 1024,
             max_peers: 1_000,
+            max_inflight_sends: 64,
+            send_timeout: Duration::from_secs(15),
             keypair: Some((test_public_key.clone(), test_secret_key.clone())),
         };
 
@@ -1043,7 +1410,23 @@ mod tests {
     #[ignore] // Integration test - requires running ant-quic nodes
     async fn test_two_node_communication() {
         use std::net::{IpAddr, Ipv4Addr};
+        use std::sync::Once;
         use tokio::time::{sleep, timeout, Duration};
+
+        fn init_tracing() {
+            static INIT: Once = Once::new();
+            INIT.call_once(|| {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::from_default_env()
+                            .add_directive("info".parse().expect("directive")),
+                    )
+                    .with_test_writer()
+                    .try_init();
+            });
+        }
+
+        init_tracing();
 
         // Dynamic port allocation to avoid conflicts
         let base_port = 20000
@@ -1062,7 +1445,7 @@ mod tests {
         // Give node1 time to start
         sleep(Duration::from_millis(100)).await;
 
-        // Create second node that knows about first
+        // Create second node (also includes node1 as known peer)
         let node2_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), base_port + 1);
         let node2 = UdpTransportAdapter::new(node2_addr, vec![node1_addr])
             .await
@@ -1080,8 +1463,37 @@ mod tests {
             .await
             .expect("Failed to dial node1");
 
-        // Give connection time to establish
-        sleep(Duration::from_millis(500)).await;
+        // Give connection time to establish and be accepted
+        let start = std::time::Instant::now();
+        let timeout_wait = Duration::from_secs(5);
+        loop {
+            if start.elapsed() > timeout_wait {
+                let node1_peers = node1.connected_peers().await;
+                let node2_peers = node2.connected_peers().await;
+                panic!(
+                    "Timed out waiting for node1 to accept node2. node1_peers={:?} node2_peers={:?}",
+                    node1_peers, node2_peers
+                );
+            }
+
+            let node1_peers = node1.connected_peers().await;
+            if node1_peers
+                .iter()
+                .any(|(peer_id, _)| *peer_id == node2.peer_id())
+            {
+                break;
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        let node1_ant_peers = node1.node().connected_peers().await;
+        let node2_ant_peers = node2.node().connected_peers().await;
+        tracing::info!(
+            node1_peers = ?node1_ant_peers,
+            node2_peers = ?node2_ant_peers,
+            "Ant-QUIC connected peers after accept"
+        );
 
         // Send message
         node2

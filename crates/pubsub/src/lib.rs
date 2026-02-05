@@ -357,12 +357,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         drop(topics); // Release lock before network I/O
 
         for peer in eager_peers {
-            trace!(peer_id = %peer, msg_id = ?msg_id, "Sending EAGER");
-            let bytes = postcard::to_stdvec(&_message)
-                .map_err(|e| anyhow!("Serialization failed: {}", e))?;
-            self.transport
-                .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
-                .await?;
+            let transport = self.transport.clone();
+            let message = _message.clone();
+            tokio::spawn(async move {
+                trace!(peer_id = %peer, msg_id = ?msg_id, "Sending EAGER");
+                let bytes = match postcard::to_stdvec(&message) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        warn!(peer_id = %peer, msg_id = ?msg_id, "EAGER serialize failed: {e}");
+                        return;
+                    }
+                };
+                match transport
+                    .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(err) => {
+                        warn!(peer_id = %peer, msg_id = ?msg_id, "EAGER send failed: {err}");
+                    }
+                }
+            });
         }
 
         // Batch msg_id to pending_ihave

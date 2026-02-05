@@ -143,6 +143,8 @@ pub struct PresenceManager {
     broadcast_peers: Arc<RwLock<HashSet<PeerId>>>,
     /// Our address hints for connectivity (local, reflexive, relay addresses)
     addr_hints: Arc<RwLock<Vec<String>>>,
+    /// Optional four-word identity for discovery beacons
+    four_words: Arc<RwLock<Option<String>>>,
     /// Seen query IDs with timestamps to prevent query loops (age-based cleanup)
     seen_queries: Arc<RwLock<HashMap<[u8; 32], Instant>>>,
     /// Pending queries we initiated (query_id -> PendingQuery)
@@ -156,6 +158,16 @@ impl PresenceManager {
         transport: Arc<dyn GossipTransport>,
         groups: Arc<RwLock<HashMap<TopicId, GroupContext>>>,
     ) -> Self {
+        Self::new_with_four_words(peer_id, transport, groups, None)
+    }
+
+    /// Create a new presence manager with an optional four-word identity.
+    pub fn new_with_four_words(
+        peer_id: PeerId,
+        transport: Arc<dyn GossipTransport>,
+        groups: Arc<RwLock<HashMap<TopicId, GroupContext>>>,
+        four_words: Option<String>,
+    ) -> Self {
         Self {
             peer_id,
             transport,
@@ -165,6 +177,7 @@ impl PresenceManager {
             received_beacons: Arc::new(RwLock::new(HashMap::new())),
             broadcast_peers: Arc::new(RwLock::new(HashSet::new())),
             addr_hints: Arc::new(RwLock::new(Vec::new())),
+            four_words: Arc::new(RwLock::new(four_words)),
             seen_queries: Arc::new(RwLock::new(HashMap::new())),
             pending_queries: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -202,6 +215,12 @@ impl PresenceManager {
     pub async fn set_addr_hints(&self, hints: Vec<String>) {
         let mut addr = self.addr_hints.write().await;
         *addr = hints;
+    }
+
+    /// Set our four-word identity for discovery beacons
+    pub async fn set_four_words(&self, four_words: String) {
+        let mut identity = self.four_words.write().await;
+        *identity = Some(four_words);
     }
 
     /// Add a single address hint
@@ -246,6 +265,16 @@ impl PresenceManager {
         let received_beacons = self.received_beacons.clone();
         let broadcast_peers = self.broadcast_peers.clone();
         let addr_hints = self.addr_hints.clone();
+        let four_words = self.four_words.clone();
+
+        let allow_plaintext = matches!(
+            std::env::var("COMMUNITAS_PRESENCE_ALLOW_PLAINTEXT")
+                .unwrap_or_else(|_| "1".to_string())
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes"
+        );
 
         // Spawn background task for beacon broadcasting
         let task_handle = tokio::spawn(async move {
@@ -267,13 +296,24 @@ impl PresenceManager {
                                 .unwrap_or(0);
                             let time_slice = now / 3600; // Hourly rotation
 
-                            // Derive presence tag using MLS group's exporter secret
-                            let Some(exporter_secret) = group_ctx.presence_exporter() else {
-                                warn!(
-                                    ?topic_id,
-                                    "Skipping beacon broadcast: missing MLS exporter secret"
-                                );
-                                continue;
+                            // Derive presence tag using MLS group's exporter secret.
+                            // If MLS isn't configured yet, fall back to a plaintext tag for discovery.
+                            let exporter_secret = match group_ctx.presence_exporter() {
+                                Some(secret) => secret,
+                                None => {
+                                    if !allow_plaintext {
+                                        warn!(
+                                            ?topic_id,
+                                            "Skipping beacon broadcast: missing MLS exporter secret"
+                                        );
+                                        continue;
+                                    }
+                                    debug!(
+                                        ?topic_id,
+                                        "Presence exporter missing; using plaintext fallback"
+                                    );
+                                    [0u8; 32]
+                                }
                             };
 
                             let presence_tag =
@@ -290,7 +330,21 @@ impl PresenceManager {
 
                             // Create presence record with 3x interval TTL
                             let ttl_seconds = interval_secs * 3;
-                            let record = PresenceRecord::new(presence_tag, record_addr_hints, ttl_seconds);
+                            let record = match four_words.read().await.clone() {
+                                Some(fw) => {
+                                    PresenceRecord::with_four_words(
+                                        presence_tag,
+                                        record_addr_hints,
+                                        ttl_seconds,
+                                        fw,
+                                    )
+                                }
+                                None => PresenceRecord::new(
+                                    presence_tag,
+                                    record_addr_hints,
+                                    ttl_seconds,
+                                ),
+                            };
 
                             // Store our own beacon locally
                             {
@@ -765,14 +819,19 @@ impl PresenceManager {
                     // FOAF random walk: forward to up to 3 random peers (fanout)
                     let fanout = std::cmp::min(3, peers.len());
                     if fanout > 0 {
-                        let mut rng = rand::thread_rng();
-                        let mut indices: Vec<usize> = (0..peers.len()).collect();
+                        // Select peers before any awaits (ThreadRng is not Send).
+                        let selected_peers: Vec<PeerId> = {
+                            let mut rng = rand::thread_rng();
+                            let mut indices: Vec<usize> = (0..peers.len()).collect();
 
-                        // Shuffle and take first fanout peers
-                        for i in 0..fanout {
-                            let j = rng.gen_range(i..peers.len());
-                            indices.swap(i, j);
-                        }
+                            // Shuffle and take first fanout peers
+                            for i in 0..fanout {
+                                let j = rng.gen_range(i..peers.len());
+                                indices.swap(i, j);
+                            }
+
+                            indices.iter().take(fanout).map(|&idx| peers[idx]).collect()
+                        };
 
                         let forward_msg = PresenceMessage::Query {
                             query_id,
@@ -784,8 +843,7 @@ impl PresenceManager {
                         match postcard::to_stdvec(&forward_msg) {
                             Ok(data) => {
                                 let data = bytes::Bytes::from(data);
-                                for &idx in indices.iter().take(fanout) {
-                                    let peer = peers[idx];
+                                for peer in selected_peers {
                                     // Do not forward back to origin
                                     if peer == origin {
                                         continue;

@@ -267,10 +267,25 @@ pub struct PresenceRecord {
     pub seq: u64,
     /// Optional four-word identity for FOAF discovery
     pub four_words: Option<String>,
+    /// ML-DSA-65 signature over the signable portion
+    pub signature: Vec<u8>,
+    /// ML-DSA-65 public key of the signer
+    pub signer_pubkey: Vec<u8>,
+}
+
+/// Helper struct for deterministic serialization of signable fields
+#[derive(Serialize)]
+struct SignablePresenceRecord<'a> {
+    presence_tag: &'a [u8; 32],
+    addr_hints: &'a [String],
+    since: u64,
+    expires: u64,
+    seq: u64,
+    four_words: &'a Option<String>,
 }
 
 impl PresenceRecord {
-    /// Create a new presence record
+    /// Create a new presence record (unsigned)
     pub fn new(presence_tag: [u8; 32], addr_hints: Vec<String>, ttl_seconds: u64) -> Self {
         let now = unix_secs();
         Self {
@@ -280,10 +295,12 @@ impl PresenceRecord {
             expires: now + ttl_seconds,
             seq: 0,
             four_words: None,
+            signature: Vec::new(),
+            signer_pubkey: Vec::new(),
         }
     }
 
-    /// Create a new presence record with four-word identity
+    /// Create a new presence record with four-word identity (unsigned)
     pub fn with_four_words(
         presence_tag: [u8; 32],
         addr_hints: Vec<String>,
@@ -298,10 +315,12 @@ impl PresenceRecord {
             expires: now + ttl_seconds,
             seq: 0,
             four_words: Some(four_words),
+            signature: Vec::new(),
+            signer_pubkey: Vec::new(),
         }
     }
 
-    /// Create a new presence record with explicit sequence number
+    /// Create a new presence record with explicit sequence number (unsigned)
     ///
     /// Useful for testing sequence-based deduplication.
     pub fn new_with_seq(
@@ -318,7 +337,30 @@ impl PresenceRecord {
             expires: now + ttl_seconds,
             seq,
             four_words: None,
+            signature: Vec::new(),
+            signer_pubkey: Vec::new(),
         }
+    }
+
+    /// Generate deterministic bytes for signing/verification
+    ///
+    /// Creates a canonical byte representation of all signable fields
+    /// (everything except `signature` and `signer_pubkey`).
+    /// Uses postcard serialization for deterministic encoding.
+    ///
+    /// # Returns
+    /// * `Vec<u8>` - Deterministic byte representation
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let signable = SignablePresenceRecord {
+            presence_tag: &self.presence_tag,
+            addr_hints: &self.addr_hints,
+            since: self.since,
+            expires: self.expires,
+            seq: self.seq,
+            four_words: &self.four_words,
+        };
+        // postcard::to_stdvec is infallible for simple types
+        postcard::to_stdvec(&signable).unwrap_or_default()
     }
 
     /// Check if the presence record is expired
@@ -573,5 +615,193 @@ mod tests {
         let topic = TopicId::from_entity(hex_entity);
 
         assert_eq!(topic.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn test_presence_record_has_signature_fields() {
+        // Test that new fields exist and default to empty Vec
+        let record = PresenceRecord::new([0u8; 32], vec![], 3600);
+        assert_eq!(
+            record.signature.len(),
+            0,
+            "Signature should default to empty"
+        );
+        assert_eq!(
+            record.signer_pubkey.len(),
+            0,
+            "Signer pubkey should default to empty"
+        );
+    }
+
+    #[test]
+    fn test_presence_record_signable_bytes_deterministic() {
+        // Test that signable_bytes produces deterministic output
+        let record = PresenceRecord::new([42u8; 32], vec!["127.0.0.1:8080".to_string()], 3600);
+
+        let bytes1 = record.signable_bytes();
+        let bytes2 = record.signable_bytes();
+
+        assert_eq!(
+            bytes1, bytes2,
+            "signable_bytes must be deterministic for the same record"
+        );
+        assert!(!bytes1.is_empty(), "signable_bytes should not be empty");
+    }
+
+    #[test]
+    fn test_presence_record_signable_bytes_changes_with_fields() {
+        // Test that signable_bytes changes when signable fields change
+        let record1 = PresenceRecord::new([1u8; 32], vec!["127.0.0.1:8080".to_string()], 3600);
+        let record2 = PresenceRecord::new(
+            [2u8; 32], // Different presence_tag
+            vec!["127.0.0.1:8080".to_string()],
+            3600,
+        );
+
+        let bytes1 = record1.signable_bytes();
+        let bytes2 = record2.signable_bytes();
+
+        assert_ne!(
+            bytes1, bytes2,
+            "signable_bytes should differ when presence_tag differs"
+        );
+    }
+
+    #[test]
+    fn test_presence_record_signable_bytes_addr_hints_sensitivity() {
+        // Test that signable_bytes changes with different addr_hints
+        let record1 = PresenceRecord::new([1u8; 32], vec!["127.0.0.1:8080".to_string()], 3600);
+        let record2 = PresenceRecord::new(
+            [1u8; 32],
+            vec!["192.168.1.1:9000".to_string()], // Different addr
+            3600,
+        );
+
+        let bytes1 = record1.signable_bytes();
+        let bytes2 = record2.signable_bytes();
+
+        assert_ne!(
+            bytes1, bytes2,
+            "signable_bytes should differ when addr_hints differ"
+        );
+    }
+
+    #[test]
+    fn test_presence_record_signable_bytes_seq_sensitivity() {
+        // Test that signable_bytes changes with different sequence numbers
+        let record1 =
+            PresenceRecord::new_with_seq([1u8; 32], vec!["127.0.0.1:8080".to_string()], 3600, 0);
+        let record2 = PresenceRecord::new_with_seq(
+            [1u8; 32],
+            vec!["127.0.0.1:8080".to_string()],
+            3600,
+            1, // Different seq
+        );
+
+        let bytes1 = record1.signable_bytes();
+        let bytes2 = record2.signable_bytes();
+
+        assert_ne!(
+            bytes1, bytes2,
+            "signable_bytes should differ when seq differs"
+        );
+    }
+
+    #[test]
+    fn test_presence_record_signable_bytes_four_words_sensitivity() {
+        // Test that signable_bytes changes with four_words
+        let record1 = PresenceRecord::new([1u8; 32], vec![], 3600);
+        let record2 = PresenceRecord::with_four_words(
+            [1u8; 32],
+            vec![],
+            3600,
+            "ocean-forest-moon-star".to_string(),
+        );
+
+        let bytes1 = record1.signable_bytes();
+        let bytes2 = record2.signable_bytes();
+
+        assert_ne!(
+            bytes1, bytes2,
+            "signable_bytes should differ when four_words differs"
+        );
+    }
+
+    #[test]
+    fn test_presence_record_signable_bytes_ignores_signature_fields() {
+        // Test that signature and signer_pubkey do NOT affect signable_bytes
+        let mut record1 = PresenceRecord::new([1u8; 32], vec!["127.0.0.1:8080".to_string()], 3600);
+        let bytes1 = record1.signable_bytes();
+
+        // Modify signature fields
+        record1.signature = vec![99u8; 64];
+        record1.signer_pubkey = vec![88u8; 32];
+        let bytes2 = record1.signable_bytes();
+
+        assert_eq!(
+            bytes1, bytes2,
+            "signable_bytes should be identical even when signature fields change"
+        );
+    }
+
+    #[test]
+    fn test_presence_record_serialization_roundtrip_with_new_fields() {
+        // Test that serialization/deserialization works with new fields
+        let mut record = PresenceRecord::new([42u8; 32], vec!["127.0.0.1:8080".to_string()], 3600);
+        record.signature = vec![1, 2, 3, 4];
+        record.signer_pubkey = vec![5, 6, 7, 8];
+
+        // Serialize with postcard
+        let serialized = postcard::to_stdvec(&record).expect("serialization should succeed");
+
+        // Deserialize
+        let deserialized: PresenceRecord =
+            postcard::from_bytes(&serialized).expect("deserialization should succeed");
+
+        // Verify all fields match
+        assert_eq!(deserialized.presence_tag, record.presence_tag);
+        assert_eq!(deserialized.addr_hints, record.addr_hints);
+        assert_eq!(deserialized.seq, record.seq);
+        assert_eq!(deserialized.signature, record.signature);
+        assert_eq!(deserialized.signer_pubkey, record.signer_pubkey);
+    }
+
+    #[test]
+    fn test_presence_record_with_four_words_initializes_signature_fields() {
+        // Test that with_four_words also initializes signature fields to empty
+        let record = PresenceRecord::with_four_words(
+            [1u8; 32],
+            vec![],
+            3600,
+            "ocean-forest-moon-star".to_string(),
+        );
+
+        assert_eq!(
+            record.signature.len(),
+            0,
+            "Signature should default to empty"
+        );
+        assert_eq!(
+            record.signer_pubkey.len(),
+            0,
+            "Signer pubkey should default to empty"
+        );
+    }
+
+    #[test]
+    fn test_presence_record_new_with_seq_initializes_signature_fields() {
+        // Test that new_with_seq also initializes signature fields to empty
+        let record = PresenceRecord::new_with_seq([1u8; 32], vec![], 3600, 42);
+
+        assert_eq!(
+            record.signature.len(),
+            0,
+            "Signature should default to empty"
+        );
+        assert_eq!(
+            record.signer_pubkey.len(),
+            0,
+            "Signer pubkey should default to empty"
+        );
     }
 }

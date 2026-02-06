@@ -31,9 +31,9 @@ regex-automata = { version = "0.4", default-features = false, features = ["dfa-b
 regex-syntax = { version = "0.8" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "default-tls", "json", "rustls-tls"] }
 serde = { version = "1", features = ["alloc", "derive"] }
-serde_core = { version = "1", default-features = false, features = ["alloc", "result", "std"] }
 smallvec = { version = "1", default-features = false, features = ["const_generics"] }
 subtle = { version = "2", features = ["const-generics"] }
+thiserror = { version = "2" }
 time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing = { version = "0.1", features = ["log"] }

@@ -8,9 +8,14 @@
 //! - FOAF random-walk queries
 //! - IBLT summaries for efficient reconciliation
 
+mod rate_limiter;
+
+pub use rate_limiter::{RateLimitConfig, RateLimiter};
+
 use anyhow::{Context, Result};
 use rand::Rng;
 use saorsa_gossip_groups::GroupContext;
+use saorsa_gossip_identity::MlDsaKeyPair;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::{PeerId, PresenceRecord, TopicId};
 use serde::{Deserialize, Serialize};
@@ -149,6 +154,10 @@ pub struct PresenceManager {
     seen_queries: Arc<RwLock<HashMap<[u8; 32], Instant>>>,
     /// Pending queries we initiated (query_id -> PendingQuery)
     pending_queries: Arc<RwLock<HashMap<[u8; 32], PendingQuery>>>,
+    /// Optional ML-DSA identity for signing beacons
+    identity: Arc<RwLock<Option<Arc<MlDsaKeyPair>>>>,
+    /// Per-peer rate limiter for presence messages
+    rate_limiter: Arc<RwLock<RateLimiter>>,
 }
 
 impl PresenceManager {
@@ -180,7 +189,53 @@ impl PresenceManager {
             four_words: Arc::new(RwLock::new(four_words)),
             seen_queries: Arc::new(RwLock::new(HashMap::new())),
             pending_queries: Arc::new(RwLock::new(HashMap::new())),
+            identity: Arc::new(RwLock::new(None)),
+            rate_limiter: Arc::new(RwLock::new(RateLimiter::new(RateLimitConfig::default()))),
         }
+    }
+
+    /// Create a new presence manager with an ML-DSA identity for signing beacons
+    ///
+    /// # Arguments
+    /// * `peer_id` - Our peer ID
+    /// * `transport` - Transport layer for sending beacons
+    /// * `groups` - MLS groups we've joined
+    /// * `four_words` - Optional four-word identity for discovery
+    /// * `identity` - ML-DSA key pair for signing beacons
+    pub fn new_with_identity(
+        peer_id: PeerId,
+        transport: Arc<dyn GossipTransport>,
+        groups: Arc<RwLock<HashMap<TopicId, GroupContext>>>,
+        four_words: Option<String>,
+        identity: MlDsaKeyPair,
+    ) -> Self {
+        Self {
+            peer_id,
+            transport,
+            groups,
+            beacon_task: Arc::new(RwLock::new(None)),
+            shutdown_tx: Arc::new(RwLock::new(None)),
+            received_beacons: Arc::new(RwLock::new(HashMap::new())),
+            broadcast_peers: Arc::new(RwLock::new(HashSet::new())),
+            addr_hints: Arc::new(RwLock::new(Vec::new())),
+            four_words: Arc::new(RwLock::new(four_words)),
+            seen_queries: Arc::new(RwLock::new(HashMap::new())),
+            pending_queries: Arc::new(RwLock::new(HashMap::new())),
+            identity: Arc::new(RwLock::new(Some(Arc::new(identity)))),
+            rate_limiter: Arc::new(RwLock::new(RateLimiter::new(RateLimitConfig::default()))),
+        }
+    }
+
+    /// Set the ML-DSA identity for signing beacons (late binding)
+    ///
+    /// This allows setting the identity after construction, useful when the identity
+    /// needs to be loaded asynchronously or is not available at construction time.
+    ///
+    /// # Arguments
+    /// * `keypair` - ML-DSA key pair to use for signing beacons
+    pub async fn set_identity(&self, keypair: MlDsaKeyPair) {
+        let mut identity = self.identity.write().await;
+        *identity = Some(Arc::new(keypair));
     }
 
     /// Add a peer to broadcast beacons to
@@ -266,6 +321,8 @@ impl PresenceManager {
         let broadcast_peers = self.broadcast_peers.clone();
         let addr_hints = self.addr_hints.clone();
         let four_words = self.four_words.clone();
+        let identity = self.identity.clone();
+        let rate_limiter = self.rate_limiter.clone();
 
         let allow_plaintext = matches!(
             std::env::var("COMMUNITAS_PRESENCE_ALLOW_PLAINTEXT")
@@ -281,6 +338,7 @@ impl PresenceManager {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick_count = 0u64;
 
             loop {
                 tokio::select! {
@@ -330,7 +388,7 @@ impl PresenceManager {
 
                             // Create presence record with 3x interval TTL
                             let ttl_seconds = interval_secs * 3;
-                            let record = match four_words.read().await.clone() {
+                            let mut record = match four_words.read().await.clone() {
                                 Some(fw) => {
                                     PresenceRecord::with_four_words(
                                         presence_tag,
@@ -345,6 +403,23 @@ impl PresenceManager {
                                     ttl_seconds,
                                 ),
                             };
+
+                            // Sign the beacon if identity is available
+                            let identity_guard = identity.read().await;
+                            if let Some(keypair) = identity_guard.as_ref() {
+                                let signable = record.signable_bytes();
+                                match keypair.sign(&signable) {
+                                    Ok(signature) => {
+                                        record.signature = signature;
+                                        record.signer_pubkey = keypair.public_key.clone();
+                                        debug!(?topic_id, "Signed presence beacon");
+                                    }
+                                    Err(e) => {
+                                        warn!(?e, ?topic_id, "Failed to sign beacon, sending unsigned");
+                                    }
+                                }
+                            }
+                            drop(identity_guard);
 
                             // Store our own beacon locally
                             {
@@ -387,6 +462,16 @@ impl PresenceManager {
                                 peer_count = peers.len(),
                                 "Broadcast presence beacon"
                             );
+                        }
+
+                        // Periodic cleanup every 10 ticks (rate limiter stale entries)
+                        tick_count += 1;
+                        if tick_count.is_multiple_of(10) {
+                            let mut limiter = rate_limiter.write().await;
+                            let removed = limiter.cleanup_stale(std::time::Duration::from_secs(300));
+                            if removed > 0 {
+                                debug!(removed, "Cleaned up stale rate limiter entries");
+                            }
                         }
                     }
                     _ = shutdown_rx.recv() => {
@@ -729,6 +814,21 @@ impl PresenceManager {
         let message: PresenceMessage =
             postcard::from_bytes(data).context("Failed to deserialize presence message")?;
 
+        // Check rate limit based on message type
+        let rate_limit_peer = match &message {
+            PresenceMessage::Beacon { sender, .. } => Some(*sender),
+            PresenceMessage::Query { origin, .. } => Some(*origin),
+            PresenceMessage::QueryResponse { .. } => None, // No rate limiting for responses
+        };
+
+        if let Some(peer) = rate_limit_peer {
+            let mut limiter = self.rate_limiter.write().await;
+            if !limiter.check_rate_limit(peer) {
+                debug!(?peer, "Rate limited presence message");
+                return Ok(None);
+            }
+        }
+
         match message {
             PresenceMessage::Beacon {
                 topic_id,
@@ -741,6 +841,54 @@ impl PresenceManager {
                 if !groups.contains_key(&topic_id) {
                     debug!(?topic_id, "Received beacon for unknown topic");
                     return Ok(None);
+                }
+                drop(groups);
+
+                // Verify signature if present
+                if !record.signature.is_empty() && !record.signer_pubkey.is_empty() {
+                    let signable = record.signable_bytes();
+                    match MlDsaKeyPair::verify(&record.signer_pubkey, &signable, &record.signature)
+                    {
+                        Ok(true) => {
+                            debug!(?sender, ?topic_id, "Beacon signature verified");
+                        }
+                        Ok(false) => {
+                            warn!(
+                                ?sender,
+                                ?topic_id,
+                                "Beacon signature verification failed (invalid)"
+                            );
+                            return Ok(None);
+                        }
+                        Err(e) => {
+                            warn!(
+                                ?sender,
+                                ?topic_id,
+                                ?e,
+                                "Beacon signature verification failed (error)"
+                            );
+                            return Ok(None);
+                        }
+                    }
+                } else if record.signature.is_empty() {
+                    // Check if unsigned beacons are allowed
+                    let require_signed = matches!(
+                        std::env::var("COMMUNITAS_PRESENCE_REQUIRE_SIGNED")
+                            .unwrap_or_else(|_| "0".to_string())
+                            .trim()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "1" | "true" | "yes"
+                    );
+
+                    if require_signed {
+                        warn!(
+                            ?sender,
+                            ?topic_id,
+                            "Rejecting unsigned beacon (REQUIRE_SIGNED enabled)"
+                        );
+                        return Ok(None);
+                    }
                 }
 
                 // Store the beacon
@@ -1916,5 +2064,370 @@ mod tests {
         let stored = pending.responses.get(&peer).expect("should exist");
         assert_eq!(stored.seq, 10, "Should keep the record with higher seq");
         assert_eq!(stored.addr_hints, vec!["192.168.1.1:8080".to_string()]);
+    }
+
+    // =========================================================================
+    // Rate Limiting Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_rate_limited_beacons_dropped() {
+        // Test that beacons exceeding rate limit are dropped
+        let manager = create_test_manager().await;
+        let topic = TopicId::new([1u8; 32]);
+        let sender = PeerId::new([42u8; 32]);
+
+        // Add topic to groups so beacons are accepted
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+
+        // Send 4 beacons rapidly (default limit is 3)
+        let mut accepted_count = 0;
+        for i in 0..4 {
+            let record =
+                PresenceRecord::new([i as u8; 32], vec!["127.0.0.1:8080".to_string()], 900);
+            let message = PresenceMessage::Beacon {
+                topic_id: topic,
+                sender,
+                record,
+                epoch: 0,
+            };
+            let data = postcard::to_stdvec(&message).expect("serialize");
+            let result = manager.handle_presence_message(&data).await;
+
+            if let Ok(Some(_)) = result {
+                accepted_count += 1;
+            }
+        }
+
+        // Should accept first 3 (burst), drop the 4th
+        assert_eq!(
+            accepted_count, 3,
+            "Should accept exactly 3 beacons (burst limit)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_normal_rate_passes() {
+        // Test that normal-rate beacons are all accepted
+        let manager = create_test_manager().await;
+        let topic = TopicId::new([1u8; 32]);
+        let sender = PeerId::new([43u8; 32]);
+
+        // Add topic to groups
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+
+        // Send 2 beacons (under burst limit)
+        for i in 0..2 {
+            let record =
+                PresenceRecord::new([i as u8; 32], vec!["127.0.0.1:8080".to_string()], 900);
+            let message = PresenceMessage::Beacon {
+                topic_id: topic,
+                sender,
+                record,
+                epoch: 0,
+            };
+            let data = postcard::to_stdvec(&message).expect("serialize");
+            let result = manager.handle_presence_message(&data).await;
+
+            assert!(
+                result.is_ok(),
+                "Normal rate beacons should be accepted (iteration {})",
+                i
+            );
+            assert_eq!(
+                result.unwrap(),
+                Some(sender),
+                "Should return sender for accepted beacon"
+            );
+        }
+    }
+
+    // =========================================================================
+    // TDD: Task 3+4+5 - Identity signing and verification
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_presence_manager_with_identity() {
+        // Test creating PresenceManager with identity
+        let peer_id = PeerId::new([1u8; 32]);
+        let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+        let transport = Arc::new(
+            UdpTransportAdapter::new(bind, vec![])
+                .await
+                .expect("transport"),
+        );
+        let groups = Arc::new(RwLock::new(HashMap::new()));
+        let identity = MlDsaKeyPair::generate().expect("keygen");
+
+        let manager =
+            PresenceManager::new_with_identity(peer_id, transport, groups, None, identity.clone());
+
+        // Verify identity is stored
+        let stored = manager.identity.read().await;
+        assert!(stored.is_some(), "Identity should be stored in manager");
+        let stored_kp = stored.as_ref().expect("identity");
+        assert_eq!(
+            stored_kp.public_key, identity.public_key,
+            "Stored identity should match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_identity_late_binding() {
+        // Test setting identity after construction
+        let manager = create_test_manager().await;
+
+        // Initially no identity
+        {
+            let identity = manager.identity.read().await;
+            assert!(identity.is_none(), "Initially no identity");
+        }
+
+        // Set identity
+        let keypair = MlDsaKeyPair::generate().expect("keygen");
+        let pubkey = keypair.public_key.clone();
+        manager.set_identity(keypair).await;
+
+        // Verify identity is now set
+        {
+            let identity = manager.identity.read().await;
+            assert!(identity.is_some(), "Identity should be set");
+            let stored = identity.as_ref().expect("identity");
+            assert_eq!(stored.public_key, pubkey, "Public key should match");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_signed_beacon_contains_valid_signature() {
+        // Test that beacons are signed when identity is present
+        let peer_id = PeerId::new([1u8; 32]);
+        let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+        let transport = Arc::new(
+            UdpTransportAdapter::new(bind, vec![])
+                .await
+                .expect("transport"),
+        );
+        let groups = Arc::new(RwLock::new(HashMap::new()));
+        let identity = MlDsaKeyPair::generate().expect("keygen");
+        let topic = TopicId::new([10u8; 32]);
+
+        // Add group
+        {
+            let mut g = groups.write().await;
+            g.insert(topic, group_ctx_with_secret(topic));
+        }
+
+        let manager =
+            PresenceManager::new_with_identity(peer_id, transport, groups, None, identity.clone());
+
+        // Start beacons with short interval
+        manager.start_beacons(1).await.expect("start beacons");
+
+        // Wait for first beacon
+        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+
+        // Get stored beacon
+        let beacons = manager.received_beacons.read().await;
+        let topic_beacons = beacons.get(&topic).expect("topic beacons");
+        let record = topic_beacons.get(&peer_id).expect("our beacon");
+
+        // Verify signature is not empty
+        assert!(
+            !record.signature.is_empty(),
+            "Beacon should have a signature"
+        );
+        assert!(
+            !record.signer_pubkey.is_empty(),
+            "Beacon should have a signer pubkey"
+        );
+        assert_eq!(
+            record.signer_pubkey, identity.public_key,
+            "Signer pubkey should match identity"
+        );
+
+        // Verify signature is valid
+        let signable = record.signable_bytes();
+        let valid = MlDsaKeyPair::verify(&record.signer_pubkey, &signable, &record.signature)
+            .expect("verification");
+        assert!(valid, "Signature should be valid");
+
+        // Cleanup
+        manager.stop_beacons().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_unsigned_beacon_has_empty_signature() {
+        // Test that beacons are unsigned when no identity is present
+        let manager = create_test_manager().await;
+        let topic = TopicId::new([11u8; 32]);
+
+        // Add group
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+
+        // Start beacons
+        manager.start_beacons(1).await.expect("start beacons");
+
+        // Wait for first beacon
+        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+
+        // Get stored beacon
+        let beacons = manager.received_beacons.read().await;
+        let topic_beacons = beacons.get(&topic).expect("topic beacons");
+        let record = topic_beacons.get(&manager.peer_id).expect("our beacon");
+
+        // Verify signature is empty
+        assert!(
+            record.signature.is_empty(),
+            "Beacon should have empty signature"
+        );
+        assert!(
+            record.signer_pubkey.is_empty(),
+            "Beacon should have empty pubkey"
+        );
+
+        // Cleanup
+        manager.stop_beacons().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_valid_signature_accepted() {
+        // Test that valid signed beacons are accepted
+        let manager = create_test_manager().await;
+        let topic = TopicId::new([1u8; 32]);
+        let sender = PeerId::new([2u8; 32]);
+        let identity = MlDsaKeyPair::generate().expect("keygen");
+
+        // Add topic to groups
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+
+        // Create a signed beacon
+        let mut record = PresenceRecord::new([3u8; 32], vec!["127.0.0.1:8080".to_string()], 900);
+        let signable = record.signable_bytes();
+        record.signature = identity.sign(&signable).expect("sign");
+        record.signer_pubkey = identity.public_key.clone();
+
+        let message = PresenceMessage::Beacon {
+            topic_id: topic,
+            sender,
+            record,
+            epoch: 0,
+        };
+
+        let data = postcard::to_stdvec(&message).expect("serialize");
+        let result = manager.handle_presence_message(&data).await;
+
+        assert!(result.is_ok(), "Valid signed beacon should be accepted");
+        assert_eq!(
+            result.unwrap(),
+            Some(sender),
+            "Should return sender peer ID"
+        );
+
+        // Verify beacon was stored
+        let status = manager.get_status(sender, topic).await;
+        assert_eq!(status, PresenceStatus::Online);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_signature_rejected() {
+        // Test that beacons with invalid signatures are rejected
+        let manager = create_test_manager().await;
+        let topic = TopicId::new([1u8; 32]);
+        let sender = PeerId::new([2u8; 32]);
+        let identity = MlDsaKeyPair::generate().expect("keygen");
+
+        // Add topic to groups
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+
+        // Create a beacon with invalid signature (wrong data signed)
+        let mut record = PresenceRecord::new([3u8; 32], vec!["127.0.0.1:8080".to_string()], 900);
+        let wrong_data = b"wrong data to sign";
+        record.signature = identity.sign(wrong_data).expect("sign");
+        record.signer_pubkey = identity.public_key.clone();
+
+        let message = PresenceMessage::Beacon {
+            topic_id: topic,
+            sender,
+            record,
+            epoch: 0,
+        };
+
+        let data = postcard::to_stdvec(&message).expect("serialize");
+        let result = manager.handle_presence_message(&data).await;
+
+        assert!(result.is_ok(), "Should not error");
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "Invalid signature should be rejected"
+        );
+
+        // Verify beacon was NOT stored
+        let status = manager.get_status(sender, topic).await;
+        assert_eq!(
+            status,
+            PresenceStatus::Unknown,
+            "Beacon should not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_signature_accepted_by_default() {
+        // Test that unsigned beacons are accepted when REQUIRE_SIGNED is not set
+        let manager = create_test_manager().await;
+        let topic = TopicId::new([1u8; 32]);
+        let sender = PeerId::new([2u8; 32]);
+
+        // Add topic to groups
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+
+        // Create unsigned beacon
+        let record = PresenceRecord::new([3u8; 32], vec!["127.0.0.1:8080".to_string()], 900);
+
+        let message = PresenceMessage::Beacon {
+            topic_id: topic,
+            sender,
+            record,
+            epoch: 0,
+        };
+
+        let data = postcard::to_stdvec(&message).expect("serialize");
+
+        // Ensure REQUIRE_SIGNED is not set
+        std::env::remove_var("COMMUNITAS_PRESENCE_REQUIRE_SIGNED");
+
+        let result = manager.handle_presence_message(&data).await;
+
+        assert!(
+            result.is_ok(),
+            "Unsigned beacon should be accepted by default"
+        );
+        assert_eq!(
+            result.unwrap(),
+            Some(sender),
+            "Should return sender peer ID"
+        );
+
+        // Verify beacon was stored
+        let status = manager.get_status(sender, topic).await;
+        assert_eq!(status, PresenceStatus::Online);
     }
 }

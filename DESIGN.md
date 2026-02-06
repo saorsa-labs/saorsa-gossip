@@ -637,7 +637,7 @@ SiteId (SID) = BLAKE3(site_signing_pubkey)[0..32]
 
 **Problem**: How do you know if a friend is online without centralized status servers?
 
-**Solution**: Periodic presence beacons scoped to MLS groups.
+**Solution**: Periodic presence beacons scoped to MLS groups, cryptographically signed for authenticity.
 
 #### Beacon Format
 
@@ -650,9 +650,17 @@ For each MLS group the user is in:
   "since": 1735000000000,             // When user came online
   "expires": 1735000900000,           // TTL (15 minutes)
   "seq": 42,                          // Sequence number for ordering
-  "status": "online"                  // or "away", "busy"
+  "four_words": "ocean-forest-moon-star",  // Optional four-word identity
+  "signature": "< ML-DSA-65 signature >",   // Post-quantum signature
+  "signer_pubkey": "< ML-DSA-65 public key >"  // Signer's public key
 }
 ```
+
+**Cryptographic Security:**
+- **Signatures**: All beacons signed with ML-DSA-65 (FIPS 204 post-quantum)
+- **Verification**: Incoming beacons verified on receipt; invalid signatures rejected
+- **Canonical Serialization**: `signable_bytes()` ensures deterministic signing
+- **Optional Strict Mode**: Set `COMMUNITAS_PRESENCE_REQUIRE_SIGNED=1` to reject unsigned beacons
 
 **Encryption:**
 - Encrypted to MLS group with ChaCha20-Poly1305
@@ -668,6 +676,12 @@ For each MLS group the user is in:
 - Only shared groups see presence
 - `presence_tag` is pseudonymous (not raw user_id)
 - Address hints reveal IP but only to group members
+
+**Rate Limiting:**
+- Per-peer token bucket limiting (default: burst of 3, refill 0.2/sec = 12/min)
+- Applied to incoming beacons and FOAF queries
+- Prevents spam and denial-of-service attacks
+- Stale peer entries automatically cleaned up
 
 ### Finding Users
 
@@ -691,8 +705,11 @@ If you don't share a group but are socially connected:
 4. **Connect** using received `addr_hints`
 
 **Abuse Prevention:**
+- **Per-Peer Rate Limiting**: Token bucket limiting (burst of 3, refill 0.2/sec)
+  - Applied to all incoming queries and beacons
+  - Prevents spam and DoS attacks
+  - Automatic cleanup of stale peer entries
 - **Capability Tokens**: Require signed capability from mutual friend
-- **Rate Limiting**: Max 10 FIND_USER queries per hour per peer
 - **Proximity Check**: Only propagate within 2-hop social distance
 - **Scoring Penalty**: Peers who spam queries get low score
 

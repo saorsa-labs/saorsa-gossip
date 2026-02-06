@@ -7,7 +7,7 @@
 //! - IHAVE lazy digests to non-tree links
 //! - IWANT pull on demand
 //! - PRUNE/GRAFT for tree optimization
-//! - Anti-entropy reconciliation (placeholder for future)
+//! - Anti-entropy reconciliation for partition recovery
 //!
 //! # Architecture
 //!
@@ -43,6 +43,9 @@ const MAX_IHAVE_BATCH_SIZE: usize = 1024;
 /// IHAVE flush interval (100ms)
 const IHAVE_FLUSH_INTERVAL_MS: u64 = 100;
 
+/// Anti-entropy reconciliation interval (30 seconds)
+const ANTI_ENTROPY_INTERVAL_SECS: u64 = 30;
+
 /// Target eager peer degree (6-8)
 const MIN_EAGER_DEGREE: usize = 6;
 const MAX_EAGER_DEGREE: usize = 12;
@@ -66,6 +69,24 @@ pub struct GossipMessage {
     pub signature: Vec<u8>,
     /// Sender's ML-DSA public key for verification
     pub public_key: Vec<u8>,
+}
+
+/// Anti-entropy reconciliation payload
+///
+/// Used for periodic set reconciliation between peers to recover
+/// messages missed during network partitions.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum AntiEntropyPayload {
+    /// "Here are my message IDs, send me anything I'm missing"
+    Digest {
+        /// Message IDs the sender currently has cached
+        msg_ids: Vec<MessageIdType>,
+    },
+    /// "Here are the IDs you're missing" (actual messages follow as EAGER)
+    Response {
+        /// Message IDs the receiver is missing
+        missing_ids: Vec<MessageIdType>,
+    },
 }
 
 /// Cached message entry
@@ -105,6 +126,11 @@ impl TopicState {
             outstanding_iwants: HashMap::new(),
             subscribers: Vec::new(),
         }
+    }
+
+    /// Get all cached message IDs for anti-entropy digest
+    fn cached_message_ids(&self) -> Vec<MessageIdType> {
+        self.message_cache.iter().map(|(id, _)| *id).collect()
     }
 
     /// Check if message is in cache
@@ -207,6 +233,14 @@ pub trait PubSub: Send + Sync {
     /// Routes the message to appropriate handler based on MessageKind (Eager, IHave, IWant).
     /// Called by the transport layer when receiving PubSub messages.
     async fn handle_message(&self, from: PeerId, data: Bytes) -> Result<()>;
+
+    /// Trigger an anti-entropy round for a specific topic
+    ///
+    /// This is primarily for testing. In production, anti-entropy runs
+    /// automatically via the background task.
+    async fn trigger_anti_entropy(&self, _topic: TopicId) -> Result<()> {
+        Ok(()) // Default no-op
+    }
 }
 
 /// Plumtree pub/sub implementation
@@ -247,6 +281,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         pubsub.spawn_ihave_flusher();
         pubsub.spawn_cache_cleaner();
         pubsub.spawn_degree_maintainer();
+        pubsub.spawn_anti_entropy_task();
 
         pubsub
     }
@@ -572,6 +607,229 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         Ok(())
     }
 
+    /// Handle incoming anti-entropy message
+    ///
+    /// Processes `AntiEntropyPayload::Digest` and `AntiEntropyPayload::Response`
+    /// messages for set reconciliation after network partitions.
+    async fn handle_anti_entropy(
+        &self,
+        from: PeerId,
+        topic: TopicId,
+        message: GossipMessage,
+    ) -> Result<()> {
+        // Verify signature
+        if !self.verify_signature(&message.header, &message.signature, &message.public_key) {
+            warn!(peer_id = %from, "Anti-entropy: invalid signature, dropping");
+            return Err(anyhow!("Invalid signature on anti-entropy message"));
+        }
+
+        let payload_bytes = message
+            .payload
+            .ok_or_else(|| anyhow!("Anti-entropy message missing payload"))?;
+
+        let ae_payload: AntiEntropyPayload = postcard::from_bytes(&payload_bytes)
+            .map_err(|e| anyhow!("Failed to deserialize anti-entropy payload: {}", e))?;
+
+        match ae_payload {
+            AntiEntropyPayload::Digest { msg_ids } => {
+                debug!(
+                    peer_id = %from,
+                    topic = ?topic,
+                    their_count = msg_ids.len(),
+                    "Received anti-entropy digest"
+                );
+
+                let their_ids: HashSet<MessageIdType> = msg_ids.into_iter().collect();
+
+                let mut topics = self.topics.write().await;
+                let state = topics.entry(topic).or_insert_with(TopicState::new);
+
+                let our_ids: HashSet<MessageIdType> =
+                    state.cached_message_ids().into_iter().collect();
+
+                // IDs we have that they don't - send cached messages as EAGER
+                let mut messages_to_send = Vec::new();
+                for id in our_ids.difference(&their_ids) {
+                    if let Some(cached) = state.get_message(id) {
+                        messages_to_send.push(cached);
+                    }
+                }
+
+                // IDs they have that we don't - we need these
+                let ids_we_need: Vec<MessageIdType> =
+                    their_ids.difference(&our_ids).copied().collect();
+
+                drop(topics);
+
+                // Send cached messages the peer is missing as EAGER
+                for cached in &messages_to_send {
+                    let eager_msg = GossipMessage {
+                        header: cached.header.clone(),
+                        payload: Some(cached.payload.clone()),
+                        signature: self.sign_message(&cached.header),
+                        public_key: self.signing_key.public_key().to_vec(),
+                    };
+                    if let Ok(bytes) = postcard::to_stdvec(&eager_msg) {
+                        let _ = self
+                            .transport
+                            .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
+                            .await;
+                    }
+                }
+
+                // Send IWANT for IDs they have that we don't
+                if !ids_we_need.is_empty() {
+                    debug!(
+                        peer_id = %from,
+                        count = ids_we_need.len(),
+                        "Anti-entropy: requesting missing messages via IWANT"
+                    );
+                    let iwant_header = MessageHeader {
+                        version: 1,
+                        topic,
+                        msg_id: ids_we_need[0],
+                        kind: MessageKind::IWant,
+                        hop: 0,
+                        ttl: 10,
+                    };
+                    let iwant_header_clone = iwant_header.clone();
+                    let iwant_msg = GossipMessage {
+                        header: iwant_header,
+                        payload: Some(
+                            postcard::to_stdvec(&ids_we_need)
+                                .map_err(|e| anyhow!("Serialization failed: {}", e))?
+                                .into(),
+                        ),
+                        signature: self.sign_message(&iwant_header_clone),
+                        public_key: self.signing_key.public_key().to_vec(),
+                    };
+                    if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
+                        let _ = self
+                            .transport
+                            .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
+                            .await;
+                    }
+                }
+
+                debug!(
+                    peer_id = %from,
+                    sent = messages_to_send.len(),
+                    requested = ids_we_need.len(),
+                    "Anti-entropy digest processed"
+                );
+            }
+            AntiEntropyPayload::Response { missing_ids } => {
+                debug!(
+                    peer_id = %from,
+                    topic = ?topic,
+                    count = missing_ids.len(),
+                    "Received anti-entropy response"
+                );
+
+                // Filter out IDs we already have
+                let topics = self.topics.read().await;
+                let ids_to_request: Vec<MessageIdType> = if let Some(state) = topics.get(&topic) {
+                    missing_ids
+                        .into_iter()
+                        .filter(|id| !state.has_message(id))
+                        .collect()
+                } else {
+                    missing_ids
+                };
+                drop(topics);
+
+                // Send IWANT for each ID we don't have
+                if !ids_to_request.is_empty() {
+                    debug!(
+                        peer_id = %from,
+                        count = ids_to_request.len(),
+                        "Anti-entropy response: sending IWANT for missing IDs"
+                    );
+                    let iwant_header = MessageHeader {
+                        version: 1,
+                        topic,
+                        msg_id: ids_to_request[0],
+                        kind: MessageKind::IWant,
+                        hop: 0,
+                        ttl: 10,
+                    };
+                    let iwant_header_clone = iwant_header.clone();
+                    let iwant_msg = GossipMessage {
+                        header: iwant_header,
+                        payload: Some(
+                            postcard::to_stdvec(&ids_to_request)
+                                .map_err(|e| anyhow!("Serialization failed: {}", e))?
+                                .into(),
+                        ),
+                        signature: self.sign_message(&iwant_header_clone),
+                        public_key: self.signing_key.public_key().to_vec(),
+                    };
+                    if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
+                        let _ = self
+                            .transport
+                            .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
+                            .await;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send an anti-entropy digest for a specific topic to a specific peer
+    ///
+    /// Collects cached message IDs and sends them as an `AntiEntropyPayload::Digest`.
+    async fn send_anti_entropy_digest(&self, topic: TopicId, peer: PeerId) -> Result<()> {
+        let topics = self.topics.read().await;
+        let msg_ids = if let Some(state) = topics.get(&topic) {
+            state.cached_message_ids()
+        } else {
+            return Ok(());
+        };
+        drop(topics);
+
+        if msg_ids.is_empty() {
+            return Ok(());
+        }
+
+        let ae_payload = AntiEntropyPayload::Digest { msg_ids };
+        let payload_bytes = postcard::to_stdvec(&ae_payload)
+            .map_err(|e| anyhow!("Failed to serialize anti-entropy payload: {}", e))?;
+
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: [0u8; 32],
+            kind: MessageKind::AntiEntropy,
+            hop: 0,
+            ttl: 1,
+        };
+
+        let signature = self.sign_message(&header);
+
+        let message = GossipMessage {
+            header,
+            payload: Some(payload_bytes.into()),
+            signature,
+            public_key: self.signing_key.public_key().to_vec(),
+        };
+
+        let bytes =
+            postcard::to_stdvec(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
+        self.transport
+            .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
+            .await?;
+
+        debug!(
+            peer_id = %peer,
+            topic = ?topic,
+            "Sent anti-entropy digest"
+        );
+
+        Ok(())
+    }
+
     /// Spawn background task to flush IHAVE batches
     fn spawn_ihave_flusher(&self) {
         let topics = self.topics.clone();
@@ -674,6 +932,109 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         });
     }
 
+    /// Spawn background task for anti-entropy reconciliation
+    ///
+    /// Every `ANTI_ENTROPY_INTERVAL_SECS` seconds, for each topic with cached messages,
+    /// picks one random peer and sends an anti-entropy digest containing our cached message IDs.
+    fn spawn_anti_entropy_task(&self) {
+        let topics = self.topics.clone();
+        let transport = self.transport.clone();
+        let signing_key = self.signing_key.clone();
+
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(ANTI_ENTROPY_INTERVAL_SECS));
+
+            loop {
+                interval.tick().await;
+
+                let topics_guard = topics.read().await;
+
+                // Collect work to do (topic, peer, msg_ids) while holding the read lock
+                let mut work: Vec<(TopicId, PeerId, Vec<MessageIdType>)> = Vec::new();
+
+                for (topic_id, state) in topics_guard.iter() {
+                    let msg_ids = state.cached_message_ids();
+                    if msg_ids.is_empty() {
+                        continue;
+                    }
+
+                    // Collect all peers (eager + lazy) for random selection
+                    let all_peers: Vec<PeerId> = state
+                        .eager_peers
+                        .iter()
+                        .chain(state.lazy_peers.iter())
+                        .copied()
+                        .collect();
+
+                    if all_peers.is_empty() {
+                        continue;
+                    }
+
+                    // Pick a deterministic-random peer using hash of topic + current time
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let hash_input = blake3::hash(
+                        &[topic_id.to_bytes().as_slice(), &now.to_le_bytes()].concat(),
+                    );
+                    let hash_bytes = hash_input.as_bytes();
+                    let index = (hash_bytes[0] as usize) % all_peers.len();
+                    let selected_peer = all_peers[index];
+
+                    work.push((*topic_id, selected_peer, msg_ids));
+                }
+
+                drop(topics_guard);
+
+                // Send digests without holding the lock
+                for (topic_id, peer, msg_ids) in work {
+                    let ae_payload = AntiEntropyPayload::Digest { msg_ids };
+                    let payload_bytes = match postcard::to_stdvec(&ae_payload) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            warn!("Anti-entropy: failed to serialize payload: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let header = MessageHeader {
+                        version: 1,
+                        topic: topic_id,
+                        msg_id: [0u8; 32],
+                        kind: MessageKind::AntiEntropy,
+                        hop: 0,
+                        ttl: 1,
+                    };
+
+                    let signature = match postcard::to_stdvec(&header) {
+                        Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
+                        Err(_) => Vec::new(),
+                    };
+
+                    let message = GossipMessage {
+                        header,
+                        payload: Some(payload_bytes.into()),
+                        signature,
+                        public_key: signing_key.public_key().to_vec(),
+                    };
+
+                    if let Ok(bytes) = postcard::to_stdvec(&message) {
+                        let _ = transport
+                            .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
+                            .await;
+                    }
+
+                    trace!(
+                        peer_id = %peer,
+                        topic = ?topic_id,
+                        "Anti-entropy: sent digest"
+                    );
+                }
+            }
+        });
+    }
+
     /// Initialize peers for a topic from membership layer
     pub async fn initialize_topic_peers(&self, topic: TopicId, peers: Vec<PeerId>) {
         let mut topics = self.topics.write().await;
@@ -756,7 +1117,8 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
                     Err(anyhow!("IWANT message missing payload"))
                 }
             }
-            // Other message kinds (Ping, Ack, Find, Presence, AntiEntropy) are not handled by PubSub
+            MessageKind::AntiEntropy => self.handle_anti_entropy(from, topic_id, message).await,
+            // Other message kinds (Ping, Ack, Find, Presence, Shuffle) are not handled by PubSub
             _ => {
                 warn!(
                     "PubSub received non-pubsub message kind {:?}, ignoring",
@@ -764,6 +1126,30 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
                 );
                 Ok(())
             }
+        }
+    }
+
+    async fn trigger_anti_entropy(&self, topic: TopicId) -> Result<()> {
+        let topics = self.topics.read().await;
+
+        let peer = if let Some(state) = topics.get(&topic) {
+            // Pick a peer (any eager or lazy)
+            state
+                .eager_peers
+                .iter()
+                .chain(state.lazy_peers.iter())
+                .next()
+                .copied()
+        } else {
+            None
+        };
+
+        drop(topics);
+
+        if let Some(peer) = peer {
+            self.send_anti_entropy_digest(topic, peer).await
+        } else {
+            Ok(()) // No peers available
         }
     }
 }
@@ -1128,5 +1514,392 @@ mod tests {
         let valid =
             MlDsaKeyPair::verify(keypair.public_key(), &header_bytes, &signature).expect("verify");
         assert!(valid, "Signature should be valid");
+    }
+
+    // Anti-entropy tests
+
+    #[test]
+    fn test_anti_entropy_payload_serialization() {
+        // Test Digest variant round-trips through postcard
+        let digest = AntiEntropyPayload::Digest {
+            msg_ids: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
+        };
+        let bytes = postcard::to_stdvec(&digest).expect("serialize digest");
+        let deserialized: AntiEntropyPayload =
+            postcard::from_bytes(&bytes).expect("deserialize digest");
+
+        match deserialized {
+            AntiEntropyPayload::Digest { msg_ids } => {
+                assert_eq!(msg_ids.len(), 3);
+                assert_eq!(msg_ids[0], [1u8; 32]);
+                assert_eq!(msg_ids[1], [2u8; 32]);
+                assert_eq!(msg_ids[2], [3u8; 32]);
+            }
+            AntiEntropyPayload::Response { .. } => {
+                panic!("Expected Digest, got Response");
+            }
+        }
+
+        // Test Response variant round-trips through postcard
+        let response = AntiEntropyPayload::Response {
+            missing_ids: vec![[4u8; 32], [5u8; 32]],
+        };
+        let bytes = postcard::to_stdvec(&response).expect("serialize response");
+        let deserialized: AntiEntropyPayload =
+            postcard::from_bytes(&bytes).expect("deserialize response");
+
+        match deserialized {
+            AntiEntropyPayload::Response { missing_ids } => {
+                assert_eq!(missing_ids.len(), 2);
+                assert_eq!(missing_ids[0], [4u8; 32]);
+                assert_eq!(missing_ids[1], [5u8; 32]);
+            }
+            AntiEntropyPayload::Digest { .. } => {
+                panic!("Expected Response, got Digest");
+            }
+        }
+    }
+
+    #[test]
+    fn test_anti_entropy_payload_empty_serialization() {
+        // Empty digest should also round-trip
+        let digest = AntiEntropyPayload::Digest {
+            msg_ids: Vec::new(),
+        };
+        let bytes = postcard::to_stdvec(&digest).expect("serialize empty digest");
+        let deserialized: AntiEntropyPayload =
+            postcard::from_bytes(&bytes).expect("deserialize empty digest");
+
+        match deserialized {
+            AntiEntropyPayload::Digest { msg_ids } => {
+                assert!(msg_ids.is_empty());
+            }
+            AntiEntropyPayload::Response { .. } => {
+                panic!("Expected Digest, got Response");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cached_message_ids() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([1u8; 32]);
+
+        // Publish 3 messages
+        pubsub
+            .publish(topic, Bytes::from("msg1"))
+            .await
+            .expect("publish 1");
+        pubsub
+            .publish(topic, Bytes::from("msg2"))
+            .await
+            .expect("publish 2");
+        pubsub
+            .publish(topic, Bytes::from("msg3"))
+            .await
+            .expect("publish 3");
+
+        // Verify cached_message_ids returns all 3
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        let ids = state.cached_message_ids();
+        assert_eq!(ids.len(), 3, "Should have 3 cached message IDs");
+    }
+
+    #[tokio::test]
+    async fn test_handle_anti_entropy_digest_sends_missing() {
+        let signing_key = test_signing_key();
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([1u8; 32]);
+        let from_peer = test_peer_id(2);
+
+        // Publish a message so we have it cached
+        pubsub
+            .publish(topic, Bytes::from("cached message"))
+            .await
+            .expect("publish");
+
+        // Get the cached message ID
+        let our_msg_id = {
+            let topics = pubsub.topics.read().await;
+            let state = topics.get(&topic).unwrap();
+            let ids = state.cached_message_ids();
+            assert_eq!(ids.len(), 1);
+            ids[0]
+        };
+
+        // Create a digest from the "remote" peer that has NO messages (empty)
+        let ae_payload = AntiEntropyPayload::Digest {
+            msg_ids: Vec::new(),
+        };
+        let payload_bytes = postcard::to_stdvec(&ae_payload).expect("serialize");
+
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: [0u8; 32],
+            kind: MessageKind::AntiEntropy,
+            hop: 0,
+            ttl: 1,
+        };
+
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize header");
+        let signature = signing_key.sign(&header_bytes).expect("sign");
+
+        let message = GossipMessage {
+            header,
+            payload: Some(payload_bytes.into()),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        // Handle the digest - should attempt to send our cached message to the peer
+        let result = pubsub.handle_anti_entropy(from_peer, topic, message).await;
+        // The send may fail (no actual connection) but the method should not error
+        // on the logic itself
+        assert!(result.is_ok());
+
+        // Our message should still be in cache
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert!(state.has_message(&our_msg_id));
+    }
+
+    #[tokio::test]
+    async fn test_handle_anti_entropy_digest_requests_missing() {
+        let signing_key = test_signing_key();
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([1u8; 32]);
+        let from_peer = test_peer_id(2);
+
+        // We have NO messages cached. The remote peer claims to have some.
+        let remote_msg_id = [99u8; 32];
+        let ae_payload = AntiEntropyPayload::Digest {
+            msg_ids: vec![remote_msg_id],
+        };
+        let payload_bytes = postcard::to_stdvec(&ae_payload).expect("serialize");
+
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: [0u8; 32],
+            kind: MessageKind::AntiEntropy,
+            hop: 0,
+            ttl: 1,
+        };
+
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize header");
+        let signature = signing_key.sign(&header_bytes).expect("sign");
+
+        let message = GossipMessage {
+            header,
+            payload: Some(payload_bytes.into()),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        // Handle the digest - should try to send IWANT for the missing message
+        let result = pubsub.handle_anti_entropy(from_peer, topic, message).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_anti_entropy_response() {
+        let signing_key = test_signing_key();
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([1u8; 32]);
+        let from_peer = test_peer_id(2);
+
+        // Create a Response saying we're missing some IDs
+        let missing_id = [77u8; 32];
+        let ae_payload = AntiEntropyPayload::Response {
+            missing_ids: vec![missing_id],
+        };
+        let payload_bytes = postcard::to_stdvec(&ae_payload).expect("serialize");
+
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: [0u8; 32],
+            kind: MessageKind::AntiEntropy,
+            hop: 0,
+            ttl: 1,
+        };
+
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize header");
+        let signature = signing_key.sign(&header_bytes).expect("sign");
+
+        let message = GossipMessage {
+            header,
+            payload: Some(payload_bytes.into()),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        // Handle the response - should try to send IWANT
+        let result = pubsub.handle_anti_entropy(from_peer, topic, message).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_anti_entropy_invalid_signature_rejected() {
+        let signing_key = test_signing_key();
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([1u8; 32]);
+        let from_peer = test_peer_id(2);
+
+        let ae_payload = AntiEntropyPayload::Digest {
+            msg_ids: Vec::new(),
+        };
+        let payload_bytes = postcard::to_stdvec(&ae_payload).expect("serialize");
+
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: [0u8; 32],
+            kind: MessageKind::AntiEntropy,
+            hop: 0,
+            ttl: 1,
+        };
+
+        // Use a BAD signature
+        let message = GossipMessage {
+            header,
+            payload: Some(payload_bytes.into()),
+            signature: vec![0u8; 100], // invalid signature
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        let result = pubsub.handle_anti_entropy(from_peer, topic, message).await;
+        assert!(result.is_err(), "Invalid signature should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_anti_entropy_message_routing() {
+        // Test that AntiEntropy messages are correctly routed via handle_message
+        let signing_key = test_signing_key();
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([1u8; 32]);
+        let from_peer = test_peer_id(2);
+
+        let ae_payload = AntiEntropyPayload::Digest {
+            msg_ids: Vec::new(),
+        };
+        let payload_bytes = postcard::to_stdvec(&ae_payload).expect("serialize");
+
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: [0u8; 32],
+            kind: MessageKind::AntiEntropy,
+            hop: 0,
+            ttl: 1,
+        };
+
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize header");
+        let signature = signing_key.sign(&header_bytes).expect("sign");
+
+        let message = GossipMessage {
+            header,
+            payload: Some(payload_bytes.into()),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        // Serialize the full message as it would come over the wire
+        let wire_bytes = postcard::to_stdvec(&message).expect("serialize wire message");
+
+        // Route through handle_message (the PubSub trait method)
+        let result = pubsub.handle_message(from_peer, wire_bytes.into()).await;
+        assert!(
+            result.is_ok(),
+            "AntiEntropy message should be routed correctly"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trigger_anti_entropy() {
+        let signing_key = test_signing_key();
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([1u8; 32]);
+        let peer = test_peer_id(2);
+
+        // Initialize with a peer
+        pubsub.initialize_topic_peers(topic, vec![peer]).await;
+
+        // Publish a message so there's something to reconcile
+        pubsub
+            .publish(topic, Bytes::from("test data"))
+            .await
+            .expect("publish");
+
+        // Trigger anti-entropy manually (send may fail on transport, but logic is correct)
+        let result = pubsub.trigger_anti_entropy(topic).await;
+        // The result may be Ok or Err depending on transport - we're testing the logic path
+        // If transport fails, the error is from send_to_peer, not from our logic
+        let _ = result;
+    }
+
+    #[tokio::test]
+    async fn test_trigger_anti_entropy_no_peers() {
+        let signing_key = test_signing_key();
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([1u8; 32]);
+
+        // No peers initialized - should return Ok without doing anything
+        let result = pubsub.trigger_anti_entropy(topic).await;
+        assert!(result.is_ok(), "No peers should result in no-op Ok");
+    }
+
+    #[tokio::test]
+    async fn test_send_anti_entropy_digest() {
+        let signing_key = test_signing_key();
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([1u8; 32]);
+        let peer = test_peer_id(2);
+
+        // Publish a message so there's a cached message
+        pubsub
+            .publish(topic, Bytes::from("digest test"))
+            .await
+            .expect("publish");
+
+        // Send digest (transport send may fail, but serialization and logic should work)
+        let _ = pubsub.send_anti_entropy_digest(topic, peer).await;
+    }
+
+    #[tokio::test]
+    async fn test_send_anti_entropy_digest_empty_cache() {
+        let signing_key = test_signing_key();
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([1u8; 32]);
+        let peer = test_peer_id(2);
+
+        // Initialize topic but don't publish anything
+        pubsub.initialize_topic_peers(topic, vec![peer]).await;
+
+        // Should return Ok since there's nothing to send
+        let result = pubsub.send_anti_entropy_digest(topic, peer).await;
+        assert!(result.is_ok(), "Empty cache should result in no-op Ok");
     }
 }

@@ -89,6 +89,72 @@ enum AntiEntropyPayload {
     },
 }
 
+/// Per-peer quality score for tree optimization
+///
+/// Tracks delivery metrics to enable score-based promotion/demotion
+/// decisions in the Plumtree spanning tree.
+struct PeerScore {
+    /// Count of EAGER messages received from this peer
+    messages_delivered: u64,
+    /// Count of IWANTs we sent to this peer
+    iwant_requests: u64,
+    /// Count of responses received after sending IWANT
+    iwant_responses: u64,
+    /// Last time we received any message from this peer
+    last_seen: Instant,
+}
+
+impl PeerScore {
+    /// Create a new peer score with default values
+    fn new() -> Self {
+        Self {
+            messages_delivered: 0,
+            iwant_requests: 0,
+            iwant_responses: 0,
+            last_seen: Instant::now(),
+        }
+    }
+
+    /// Calculate peer quality score (0.0 to 1.0)
+    ///
+    /// Score = (iwant_response_rate * 0.6) + (recency_factor * 0.4)
+    fn score(&self) -> f64 {
+        let response_rate = if self.iwant_requests > 0 {
+            self.iwant_responses as f64 / self.iwant_requests as f64
+        } else {
+            // No IWANT requests means peer has been responsive enough via EAGER
+            // Give benefit of the doubt with a moderate score
+            if self.messages_delivered > 0 {
+                0.8
+            } else {
+                0.5
+            }
+        };
+
+        let secs_since_seen = self.last_seen.elapsed().as_secs_f64();
+        let recency = (1.0 - (secs_since_seen / 300.0)).max(0.0);
+
+        (response_rate.min(1.0) * 0.6) + (recency * 0.4)
+    }
+
+    /// Record a message delivery from this peer
+    fn record_delivery(&mut self) {
+        self.messages_delivered += 1;
+        self.last_seen = Instant::now();
+    }
+
+    /// Record that we sent an IWANT request to this peer
+    fn record_iwant_request(&mut self) {
+        self.iwant_requests += 1;
+    }
+
+    /// Record that this peer responded to an IWANT request
+    fn record_iwant_response(&mut self) {
+        self.iwant_responses += 1;
+        self.last_seen = Instant::now();
+    }
+}
+
 /// Cached message entry
 #[derive(Clone)]
 struct CachedMessage {
@@ -112,6 +178,8 @@ struct TopicState {
     pending_ihave: Vec<MessageIdType>,
     /// Outstanding IWANT requests: msg_id -> (peer, timestamp)
     outstanding_iwants: HashMap<MessageIdType, (PeerId, Instant)>,
+    /// Per-peer quality scores for tree optimization
+    peer_scores: HashMap<PeerId, PeerScore>,
     /// Local subscribers
     subscribers: Vec<mpsc::UnboundedSender<(PeerId, Bytes)>>,
 }
@@ -124,6 +192,7 @@ impl TopicState {
             message_cache: LruCache::new(message_cache_capacity()),
             pending_ihave: Vec::new(),
             outstanding_iwants: HashMap::new(),
+            peer_scores: HashMap::new(),
             subscribers: Vec::new(),
         }
     }
@@ -170,6 +239,11 @@ impl TopicState {
         for msg_id in expired {
             self.message_cache.pop(&msg_id);
         }
+
+        // Clean stale peer scores (10 minute expiry)
+        let score_expiry = Duration::from_secs(600);
+        self.peer_scores
+            .retain(|_, score| score.last_seen.elapsed() < score_expiry);
     }
 
     /// Move peer from eager to lazy
@@ -188,21 +262,50 @@ impl TopicState {
         }
     }
 
-    /// Maintain eager peer degree (6-12)
+    /// Maintain eager peer degree (6-12) using score-based selection
+    ///
+    /// Promotes the highest-scoring lazy peers when below minimum degree,
+    /// and demotes the lowest-scoring eager peers when above maximum degree.
     fn maintain_degree(&mut self) {
         let eager_count = self.eager_peers.len();
 
         if eager_count < MIN_EAGER_DEGREE && !self.lazy_peers.is_empty() {
-            // Promote random lazy peers
+            // Promote highest-scoring lazy peers
             let to_promote = MIN_EAGER_DEGREE - eager_count;
-            let peers: Vec<PeerId> = self.lazy_peers.iter().take(to_promote).copied().collect();
+            let mut scored_lazy: Vec<(PeerId, f64)> = self
+                .lazy_peers
+                .iter()
+                .map(|&p| {
+                    let score = self.peer_scores.get(&p).map_or(0.5, |s| s.score());
+                    (p, score)
+                })
+                .collect();
+            scored_lazy.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let peers: Vec<PeerId> = scored_lazy
+                .iter()
+                .take(to_promote)
+                .map(|(p, _)| *p)
+                .collect();
             for peer in peers {
                 self.graft_peer(peer);
             }
         } else if eager_count > MAX_EAGER_DEGREE {
-            // Demote random eager peers
+            // Demote lowest-scoring eager peers
             let to_demote = eager_count - MAX_EAGER_DEGREE;
-            let peers: Vec<PeerId> = self.eager_peers.iter().take(to_demote).copied().collect();
+            let mut scored_eager: Vec<(PeerId, f64)> = self
+                .eager_peers
+                .iter()
+                .map(|&p| {
+                    let score = self.peer_scores.get(&p).map_or(0.5, |s| s.score());
+                    (p, score)
+                })
+                .collect();
+            scored_eager.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let peers: Vec<PeerId> = scored_eager
+                .iter()
+                .take(to_demote)
+                .map(|(p, _)| *p)
+                .collect();
             for peer in peers {
                 self.prune_peer(peer);
             }
@@ -460,6 +563,22 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .ok_or_else(|| anyhow!("EAGER missing payload"))?;
         state.cache_message(msg_id, payload.clone(), message.header.clone());
 
+        // Update peer score for the sender
+        state
+            .peer_scores
+            .entry(from)
+            .or_insert_with(PeerScore::new)
+            .record_delivery();
+
+        // Check if this message was requested via IWANT (anti-entropy or IHAVE recovery)
+        if state.outstanding_iwants.remove(&msg_id).is_some() {
+            state
+                .peer_scores
+                .entry(from)
+                .or_insert_with(PeerScore::new)
+                .record_iwant_response();
+        }
+
         // Add sender to eager_peers if not already present
         // This ensures bidirectional message flow - if a peer sends us messages
         // on a topic, they've subscribed and should receive our messages too.
@@ -526,6 +645,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             state
                 .outstanding_iwants
                 .insert(msg_id, (from, Instant::now()));
+
+            // Track IWANT request for scoring
+            state
+                .peer_scores
+                .entry(from)
+                .or_insert_with(PeerScore::new)
+                .record_iwant_request();
         }
 
         drop(topics); // Release lock
@@ -1901,5 +2027,356 @@ mod tests {
         // Should return Ok since there's nothing to send
         let result = pubsub.send_anti_entropy_digest(topic, peer).await;
         assert!(result.is_ok(), "Empty cache should result in no-op Ok");
+    }
+
+    // Peer scoring tests
+
+    #[test]
+    fn test_peer_score_no_requests_no_deliveries() {
+        // A brand-new peer with no activity should get a moderate score
+        let score = PeerScore::new();
+        let s = score.score();
+        // No deliveries, no IWANT requests => response_rate = 0.5
+        // Recency should be ~1.0 (just created)
+        // Score = 0.5 * 0.6 + ~1.0 * 0.4 = 0.3 + 0.4 = ~0.7
+        assert!(
+            s > 0.6,
+            "New peer with no activity should have moderate score, got {s}"
+        );
+        assert!(s < 1.0, "Score should be below 1.0, got {s}");
+    }
+
+    #[test]
+    fn test_peer_score_with_deliveries_no_iwant() {
+        // Peer that has delivered messages but no IWANT requests
+        let mut score = PeerScore::new();
+        score.record_delivery();
+        score.record_delivery();
+        score.record_delivery();
+        let s = score.score();
+        // deliveries > 0, no IWANT => response_rate = 0.8
+        // Recency ~1.0
+        // Score = 0.8 * 0.6 + ~1.0 * 0.4 = 0.48 + 0.4 = ~0.88
+        assert!(
+            s > 0.8,
+            "Peer with deliveries should have high score, got {s}"
+        );
+        assert!(s <= 1.0, "Score should be at most 1.0, got {s}");
+    }
+
+    #[test]
+    fn test_peer_score_perfect_iwant_response_rate() {
+        // Peer with perfect IWANT response rate
+        let mut score = PeerScore::new();
+        score.record_iwant_request();
+        score.record_iwant_response();
+        score.record_iwant_request();
+        score.record_iwant_response();
+        let s = score.score();
+        // response_rate = 2/2 = 1.0
+        // Recency ~1.0
+        // Score = 1.0 * 0.6 + ~1.0 * 0.4 = ~1.0
+        assert!(
+            s > 0.9,
+            "Perfect IWANT response rate should give high score, got {s}"
+        );
+    }
+
+    #[test]
+    fn test_peer_score_50_percent_iwant_response_rate() {
+        // Peer with 50% IWANT response rate
+        let mut score = PeerScore::new();
+        score.record_iwant_request();
+        score.record_iwant_response();
+        score.record_iwant_request();
+        // 1 response out of 2 requests = 50%
+        let s = score.score();
+        // response_rate = 1/2 = 0.5
+        // Recency ~1.0
+        // Score = 0.5 * 0.6 + ~1.0 * 0.4 = 0.3 + 0.4 = ~0.7
+        assert!(
+            s > 0.6,
+            "50% IWANT response rate should give moderate score, got {s}"
+        );
+        assert!(s < 0.85, "50% rate should be below perfect, got {s}");
+    }
+
+    #[test]
+    fn test_peer_score_recency_decay() {
+        // Test that a peer unseen for a long time has lower score
+        let mut score = PeerScore::new();
+        score.record_delivery();
+        // Simulate the peer being unseen for 5+ minutes
+        score.last_seen = Instant::now() - Duration::from_secs(350);
+        let s = score.score();
+        // deliveries > 0, no IWANT => response_rate = 0.8
+        // secs_since_seen = 350, recency = max(0, 1 - 350/300) = 0.0
+        // Score = 0.8 * 0.6 + 0.0 * 0.4 = 0.48
+        assert!(
+            s < 0.55,
+            "Stale peer should have low score due to recency decay, got {s}"
+        );
+        assert!(
+            s > 0.4,
+            "Stale peer should still have some score from response rate, got {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eager_records_delivery_score() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([1u8; 32]);
+        let from_peer = test_peer_id(2);
+
+        // Initialize peer as eager
+        pubsub.initialize_topic_peers(topic, vec![from_peer]).await;
+
+        let payload = Bytes::from("test delivery");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize");
+        let signature = signing_key.sign(&header_bytes).expect("sign");
+
+        let message = GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        pubsub
+            .handle_eager(from_peer, topic, message)
+            .await
+            .expect("handle_eager");
+
+        // Verify peer score has messages_delivered == 1
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        let peer_score = state
+            .peer_scores
+            .get(&from_peer)
+            .expect("peer score should exist");
+        assert_eq!(
+            peer_score.messages_delivered, 1,
+            "Should have 1 delivery recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ihave_iwant_eager_flow_updates_scores() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([1u8; 32]);
+        let from_peer = test_peer_id(2);
+
+        let unknown_msg_id = [42u8; 32];
+
+        // Step 1: IHAVE from peer triggers IWANT
+        pubsub
+            .handle_ihave(from_peer, topic, vec![unknown_msg_id])
+            .await
+            .ok();
+
+        // Verify IWANT request was tracked in score
+        {
+            let topics = pubsub.topics.read().await;
+            let state = topics.get(&topic).unwrap();
+            let peer_score = state
+                .peer_scores
+                .get(&from_peer)
+                .expect("peer score should exist");
+            assert_eq!(
+                peer_score.iwant_requests, 1,
+                "Should have 1 IWANT request recorded"
+            );
+            assert_eq!(
+                peer_score.iwant_responses, 0,
+                "Should have 0 IWANT responses yet"
+            );
+        }
+
+        // Step 2: EAGER arrives with the requested message - should record IWANT response
+        let payload = Bytes::from("requested message");
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: unknown_msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize");
+        let signature = signing_key.sign(&header_bytes).expect("sign");
+
+        let message = GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        pubsub
+            .handle_eager(from_peer, topic, message)
+            .await
+            .expect("handle_eager");
+
+        // Verify IWANT response was recorded
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        let peer_score = state
+            .peer_scores
+            .get(&from_peer)
+            .expect("peer score should exist");
+        assert_eq!(
+            peer_score.iwant_responses, 1,
+            "Should have 1 IWANT response recorded"
+        );
+        assert_eq!(
+            peer_score.messages_delivered, 1,
+            "Should have 1 delivery recorded"
+        );
+    }
+
+    #[test]
+    fn test_score_based_promotion_highest_first() {
+        // Create lazy peers with different scores - highest should be promoted first
+        let mut state = TopicState::new();
+
+        let peer_high = test_peer_id(10);
+        let peer_low = test_peer_id(11);
+        let peer_mid = test_peer_id(12);
+
+        state.lazy_peers.insert(peer_high);
+        state.lazy_peers.insert(peer_low);
+        state.lazy_peers.insert(peer_mid);
+
+        // Give peer_high the best score (many deliveries)
+        let mut high_score = PeerScore::new();
+        high_score.messages_delivered = 100;
+        state.peer_scores.insert(peer_high, high_score);
+
+        // Give peer_low a poor score (no deliveries, stale)
+        let mut low_score = PeerScore::new();
+        low_score.last_seen = Instant::now() - Duration::from_secs(250);
+        state.peer_scores.insert(peer_low, low_score);
+
+        // Give peer_mid a moderate score
+        let mut mid_score = PeerScore::new();
+        mid_score.messages_delivered = 10;
+        state.peer_scores.insert(peer_mid, mid_score);
+
+        // Eager is empty, so maintain_degree should promote up to MIN_EAGER_DEGREE
+        // But we only have 3 lazy peers, so all 3 get promoted
+        state.maintain_degree();
+
+        // All should be promoted since we're below MIN_EAGER_DEGREE
+        assert!(
+            state.eager_peers.contains(&peer_high),
+            "High-scoring peer should be promoted"
+        );
+        assert!(
+            state.eager_peers.contains(&peer_mid),
+            "Mid-scoring peer should be promoted"
+        );
+        assert!(
+            state.eager_peers.contains(&peer_low),
+            "Low-scoring peer should be promoted (not enough peers)"
+        );
+    }
+
+    #[test]
+    fn test_score_based_demotion_lowest_first() {
+        // Create too many eager peers with different scores using IWANT response rates
+        // which create a continuous gradient (unlike messages_delivered which is binary).
+        let mut state = TopicState::new();
+
+        // Add MAX_EAGER_DEGREE + 2 eager peers
+        let mut peers = Vec::new();
+        for i in 0..(MAX_EAGER_DEGREE + 2) {
+            let peer = test_peer_id(i as u8 + 10);
+            peers.push(peer);
+            state.eager_peers.insert(peer);
+
+            // Use IWANT response rates to create clearly different scores.
+            // All peers have 10 IWANT requests; peer i responds to i of them.
+            // This gives response_rate = i/10, creating a gradient from 0.0 to ~1.0.
+            let mut score = PeerScore::new();
+            score.iwant_requests = 10;
+            score.iwant_responses = i as u64;
+            state.peer_scores.insert(peer, score);
+        }
+
+        // The first peer (i=0) has the worst score (0% IWANT response rate)
+        let worst_peer = peers[0];
+        let second_worst = peers[1];
+
+        state.maintain_degree();
+
+        // Should have demoted 2 peers (down to MAX_EAGER_DEGREE)
+        assert_eq!(
+            state.eager_peers.len(),
+            MAX_EAGER_DEGREE,
+            "Should have MAX_EAGER_DEGREE eager peers"
+        );
+
+        // The worst-scoring peers should have been demoted
+        assert!(
+            state.lazy_peers.contains(&worst_peer),
+            "Worst-scoring peer should be demoted"
+        );
+        assert!(
+            state.lazy_peers.contains(&second_worst),
+            "Second-worst peer should be demoted"
+        );
+
+        // The best-scoring peer should still be eager
+        let best_peer = peers[MAX_EAGER_DEGREE + 1];
+        assert!(
+            state.eager_peers.contains(&best_peer),
+            "Best-scoring peer should remain eager"
+        );
+    }
+
+    #[test]
+    fn test_stale_peer_scores_cleaned() {
+        let mut state = TopicState::new();
+
+        let fresh_peer = test_peer_id(20);
+        let stale_peer = test_peer_id(21);
+
+        // Fresh peer score (just created)
+        state.peer_scores.insert(fresh_peer, PeerScore::new());
+
+        // Stale peer score (last seen > 10 minutes ago)
+        let mut stale_score = PeerScore::new();
+        stale_score.last_seen = Instant::now() - Duration::from_secs(700);
+        state.peer_scores.insert(stale_peer, stale_score);
+
+        // Clean cache (which also cleans peer scores)
+        state.clean_cache();
+
+        assert!(
+            state.peer_scores.contains_key(&fresh_peer),
+            "Fresh peer score should be retained"
+        );
+        assert!(
+            !state.peer_scores.contains_key(&stale_peer),
+            "Stale peer score should be cleaned up"
+        );
     }
 }

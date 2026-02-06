@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Default active view degree (8-12 peers)
 pub const DEFAULT_ACTIVE_DEGREE: usize = 8;
@@ -688,6 +688,93 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
     }
 }
 
+/// Configuration for HyParView membership protocol.
+///
+/// Controls view sizes, shuffle parameters, and adaptive degree bounds.
+/// Use `Default::default()` for standard HyParView parameters.
+#[derive(Debug, Clone)]
+pub struct MembershipConfig {
+    /// Target active view size (default: 8)
+    pub active_degree: usize,
+    /// Maximum active view size (default: 12)
+    pub max_active_degree: usize,
+    /// Maximum passive view size (default: 128)
+    pub max_passive_degree: usize,
+    /// Shuffle period (default: 30s)
+    pub shuffle_period: Duration,
+    /// Peers from active view included in shuffle (default: 3)
+    pub shuffle_active_size: usize,
+    /// Peers from passive view included in shuffle (default: 4)
+    pub shuffle_passive_size: usize,
+    /// Enable adaptive degree scaling based on network size (default: true)
+    pub adaptive_enabled: bool,
+}
+
+impl Default for MembershipConfig {
+    fn default() -> Self {
+        Self {
+            active_degree: DEFAULT_ACTIVE_DEGREE,
+            max_active_degree: MAX_ACTIVE_DEGREE,
+            max_passive_degree: MAX_PASSIVE_DEGREE,
+            shuffle_period: Duration::from_secs(SHUFFLE_PERIOD_SECS),
+            shuffle_active_size: SHUFFLE_ACTIVE_SIZE,
+            shuffle_passive_size: SHUFFLE_PASSIVE_SIZE,
+            adaptive_enabled: true,
+        }
+    }
+}
+
+impl MembershipConfig {
+    /// Set the target active view degree.
+    #[must_use]
+    pub fn with_active_degree(mut self, degree: usize) -> Self {
+        self.active_degree = degree;
+        self
+    }
+
+    /// Set the maximum active view degree.
+    #[must_use]
+    pub fn with_max_active_degree(mut self, degree: usize) -> Self {
+        self.max_active_degree = degree;
+        self
+    }
+
+    /// Set the maximum passive view degree.
+    #[must_use]
+    pub fn with_max_passive_degree(mut self, degree: usize) -> Self {
+        self.max_passive_degree = degree;
+        self
+    }
+
+    /// Set the shuffle period.
+    #[must_use]
+    pub fn with_shuffle_period(mut self, period: Duration) -> Self {
+        self.shuffle_period = period;
+        self
+    }
+
+    /// Set the number of active peers included in shuffles.
+    #[must_use]
+    pub fn with_shuffle_active_size(mut self, size: usize) -> Self {
+        self.shuffle_active_size = size;
+        self
+    }
+
+    /// Set the number of passive peers included in shuffles.
+    #[must_use]
+    pub fn with_shuffle_passive_size(mut self, size: usize) -> Self {
+        self.shuffle_passive_size = size;
+        self
+    }
+
+    /// Enable or disable adaptive degree scaling.
+    #[must_use]
+    pub fn with_adaptive_enabled(mut self, enabled: bool) -> Self {
+        self.adaptive_enabled = enabled;
+        self
+    }
+}
+
 /// HyParView membership implementation
 pub struct HyParViewMembership<T: GossipTransport + 'static> {
     /// Local peer ID
@@ -700,22 +787,17 @@ pub struct HyParViewMembership<T: GossipTransport + 'static> {
     peer_addrs: Arc<RwLock<HashMap<PeerId, std::net::SocketAddr>>>,
     /// SWIM failure detector
     swim: SwimDetector<T>,
-    /// Active view degree
-    active_degree: usize,
-    /// Passive view degree
-    passive_degree: usize,
+    /// Membership configuration
+    config: MembershipConfig,
+    /// Unique peers seen for network size estimation
+    seen_peers: Arc<RwLock<HashMap<PeerId, Instant>>>,
     /// Transport layer for sending messages
     transport: Arc<T>,
 }
 
 impl<T: GossipTransport + 'static> HyParViewMembership<T> {
-    /// Create a new HyParView membership manager
-    pub fn new(
-        local_peer_id: PeerId,
-        active_degree: usize,
-        passive_degree: usize,
-        transport: Arc<T>,
-    ) -> Self {
+    /// Create a new HyParView membership manager with the given configuration.
+    pub fn new(local_peer_id: PeerId, config: MembershipConfig, transport: Arc<T>) -> Self {
         let membership = Self {
             local_peer_id,
             active: Arc::new(RwLock::new(HashSet::new())),
@@ -728,8 +810,8 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                 SWIM_PROBE_FANOUT,
                 transport.clone(),
             ),
-            active_degree,
-            passive_degree,
+            config,
+            seen_peers: Arc::new(RwLock::new(HashMap::new())),
             transport,
         };
 
@@ -738,6 +820,59 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         membership.spawn_degree_maintenance_task();
 
         membership
+    }
+
+    /// Create with explicit degree parameters (convenience for existing callers).
+    pub fn with_degrees(
+        local_peer_id: PeerId,
+        active_degree: usize,
+        passive_degree: usize,
+        transport: Arc<T>,
+    ) -> Self {
+        let config = MembershipConfig {
+            active_degree,
+            max_passive_degree: passive_degree.max(MAX_PASSIVE_DEGREE),
+            ..MembershipConfig::default()
+        };
+        Self::new(local_peer_id, config, transport)
+    }
+
+    /// Estimate the current network size based on unique peers seen.
+    pub async fn estimated_network_size(&self) -> usize {
+        let active_count = self.active.read().await.len();
+        let passive_count = self.passive.read().await.len();
+        let seen = self.seen_peers.read().await;
+
+        // Filter to peers seen in last 5 minutes
+        let cutoff = Instant::now() - Duration::from_secs(300);
+        let recent_count = seen.values().filter(|&&t| t > cutoff).count();
+
+        // Use max of (active + passive + 1) and recent unique peers
+        (active_count + passive_count + 1).max(recent_count)
+    }
+
+    /// Calculate adaptive active and passive view sizes based on estimated network size.
+    ///
+    /// Uses logarithmic scaling: `active_degree = clamp(ceil(ln(N) * 2), min, max)`.
+    /// Passive degree scales as 8x the active degree, clamped to configured max.
+    pub async fn calculate_adaptive_degrees(&self) -> (usize, usize) {
+        if !self.config.adaptive_enabled {
+            return (self.config.active_degree, self.config.max_passive_degree);
+        }
+
+        let n = self.estimated_network_size().await;
+
+        // Logarithmic scaling for active degree
+        let ln_n = (n as f64).ln();
+        let target_active = (ln_n * 2.0).ceil() as usize;
+        let active = target_active.clamp(self.config.active_degree, self.config.max_active_degree);
+
+        // Passive scales as 8x active, clamped
+        let target_passive = active * 8;
+        let passive =
+            target_passive.clamp(self.config.active_degree * 8, self.config.max_passive_degree);
+
+        (active, passive)
     }
 
     /// Get local peer ID
@@ -770,7 +905,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         drop(active);
 
         let mut passive = self.passive.write().await;
-        if passive.len() < MAX_PASSIVE_DEGREE {
+        if passive.len() < self.config.max_passive_degree {
             passive.insert(peer);
             trace!(peer_id = %peer, "Added to passive view");
         }
@@ -894,8 +1029,8 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
 
         // Build shuffle list: self + random sample from active + passive
         let mut shuffle_list = vec![self.local_peer_id];
-        shuffle_list.extend(self.sample_active(SHUFFLE_ACTIVE_SIZE).await);
-        shuffle_list.extend(self.sample_passive(SHUFFLE_PASSIVE_SIZE).await);
+        shuffle_list.extend(self.sample_active(self.config.shuffle_active_size).await);
+        shuffle_list.extend(self.sample_passive(self.config.shuffle_passive_size).await);
 
         debug!(
             target = %target,
@@ -919,6 +1054,9 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         peers: Vec<PeerId>,
         ttl: usize,
     ) -> Result<()> {
+        // Track sender for network size estimation
+        self.seen_peers.write().await.insert(sender, Instant::now());
+
         let active = self.active.read().await;
 
         // If TTL > 0 and we have active peers besides sender, forward
@@ -969,6 +1107,12 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
             "HyParView: Received JOIN request"
         );
 
+        // Track peer for network size estimation
+        self.seen_peers
+            .write()
+            .await
+            .insert(new_peer, Instant::now());
+
         // Add new peer to active view
         self.add_active(new_peer).await?;
 
@@ -1000,12 +1144,18 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         new_peer: PeerId,
         ttl: usize,
     ) -> Result<()> {
+        // Track peer for network size estimation
+        self.seen_peers
+            .write()
+            .await
+            .insert(new_peer, Instant::now());
+
         let active = self.active.read().await;
         let active_count = active.len();
         drop(active);
 
         // If TTL is 0 or active view has room, accept the new peer
-        if ttl == 0 || active_count < DEFAULT_ACTIVE_DEGREE {
+        if ttl == 0 || active_count < self.config.active_degree {
             debug!(
                 new_peer = %new_peer,
                 reason = if ttl == 0 { "TTL expired" } else { "active view has room" },
@@ -1046,12 +1196,18 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
 
     /// Handle incoming NEIGHBOR request
     pub async fn handle_neighbor(&self, sender: PeerId, priority: NeighborPriority) -> Result<()> {
+        // Track peer for network size estimation
+        self.seen_peers
+            .write()
+            .await
+            .insert(sender, Instant::now());
+
         let active = self.active.read().await;
         let active_count = active.len();
         drop(active);
 
         // Accept if high priority, or if we have room
-        let accepted = priority == NeighborPriority::High || active_count < MAX_ACTIVE_DEGREE;
+        let accepted = priority == NeighborPriority::High || active_count < self.config.max_active_degree;
 
         if accepted {
             self.add_active(sender).await?;
@@ -1104,10 +1260,10 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         let mut active = self.active.write().await;
         let mut passive = self.passive.write().await;
 
-        // Enforce active degree limits (8-12)
-        if active.len() < DEFAULT_ACTIVE_DEGREE && !passive.is_empty() {
+        // Enforce active degree limits
+        if active.len() < self.config.active_degree && !passive.is_empty() {
             // Promote from passive
-            let to_promote = DEFAULT_ACTIVE_DEGREE - active.len();
+            let to_promote = self.config.active_degree - active.len();
             let peers: Vec<PeerId> = passive.iter().take(to_promote).copied().collect();
 
             for peer in peers {
@@ -1115,23 +1271,23 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                 active.insert(peer);
                 debug!(peer_id = %peer, "Promoted from passive to active");
             }
-        } else if active.len() > MAX_ACTIVE_DEGREE {
+        } else if active.len() > self.config.max_active_degree {
             // Demote to passive
-            let to_demote = active.len() - MAX_ACTIVE_DEGREE;
+            let to_demote = active.len() - self.config.max_active_degree;
             let peers: Vec<PeerId> = active.iter().take(to_demote).copied().collect();
 
             for peer in peers {
                 active.remove(&peer);
-                if passive.len() < MAX_PASSIVE_DEGREE {
+                if passive.len() < self.config.max_passive_degree {
                     passive.insert(peer);
                     debug!(peer_id = %peer, "Demoted from active to passive");
                 }
             }
         }
 
-        // Enforce passive degree limit (max 128)
-        if passive.len() > MAX_PASSIVE_DEGREE {
-            let to_remove = passive.len() - MAX_PASSIVE_DEGREE;
+        // Enforce passive degree limit
+        if passive.len() > self.config.max_passive_degree {
+            let to_remove = passive.len() - self.config.max_passive_degree;
             let peers: Vec<PeerId> = passive.iter().take(to_remove).copied().collect();
 
             for peer in peers {
@@ -1147,9 +1303,12 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         let passive = self.passive.clone();
         let transport = self.transport.clone();
         let local_peer_id = self.local_peer_id;
+        let shuffle_active_size = self.config.shuffle_active_size;
+        let shuffle_passive_size = self.config.shuffle_passive_size;
+        let shuffle_period = self.config.shuffle_period;
 
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(SHUFFLE_PERIOD_SECS));
+            let mut interval = time::interval(shuffle_period);
 
             loop {
                 interval.tick().await;
@@ -1164,11 +1323,11 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
 
                 // Build shuffle list: self + sample from active + passive
                 let mut shuffle_list = vec![local_peer_id];
-                shuffle_list.extend(active_guard.iter().take(SHUFFLE_ACTIVE_SIZE).copied());
+                shuffle_list.extend(active_guard.iter().take(shuffle_active_size).copied());
                 drop(active_guard);
 
                 let passive_guard = passive.read().await;
-                shuffle_list.extend(passive_guard.iter().take(SHUFFLE_PASSIVE_SIZE).copied());
+                shuffle_list.extend(passive_guard.iter().take(shuffle_passive_size).copied());
                 drop(passive_guard);
 
                 debug!(
@@ -1202,16 +1361,67 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         });
     }
 
-    /// Spawn background task for degree maintenance
+    /// Spawn background task for degree maintenance with adaptive scaling.
     fn spawn_degree_maintenance_task(&self) {
         let active = self.active.clone();
         let passive = self.passive.clone();
+        let seen_peers = self.seen_peers.clone();
+        let config = self.config.clone();
 
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(10));
+            let mut prev_active_target = config.active_degree;
+            let mut prev_passive_max = config.max_passive_degree;
 
             loop {
                 interval.tick().await;
+
+                // Calculate adaptive degrees inline (mirrors calculate_adaptive_degrees)
+                let (target_active, target_passive) = if config.adaptive_enabled {
+                    let active_count = active.read().await.len();
+                    let passive_count = passive.read().await.len();
+                    let seen = seen_peers.read().await;
+                    let cutoff = Instant::now() - Duration::from_secs(300);
+                    let recent_count = seen.values().filter(|&&t| t > cutoff).count();
+                    let n = (active_count + passive_count + 1).max(recent_count);
+                    drop(seen);
+
+                    let ln_n = (n as f64).ln();
+                    let raw_active = (ln_n * 2.0).ceil() as usize;
+                    let active_deg =
+                        raw_active.clamp(config.active_degree, config.max_active_degree);
+                    let raw_passive = active_deg * 8;
+                    let passive_deg =
+                        raw_passive.clamp(config.active_degree * 8, config.max_passive_degree);
+                    (active_deg, passive_deg)
+                } else {
+                    (config.active_degree, config.max_passive_degree)
+                };
+
+                // Apply smoothing: don't change by more than 2 peers per interval
+                let smoothed_active = if target_active > prev_active_target {
+                    prev_active_target + (target_active - prev_active_target).min(2)
+                } else {
+                    prev_active_target - (prev_active_target - target_active).min(2)
+                };
+                let smoothed_passive = if target_passive > prev_passive_max {
+                    prev_passive_max + (target_passive - prev_passive_max).min(2)
+                } else {
+                    prev_passive_max - (prev_passive_max - target_passive).min(2)
+                };
+
+                if smoothed_active != prev_active_target || smoothed_passive != prev_passive_max {
+                    info!(
+                        active_target = smoothed_active,
+                        passive_max = smoothed_passive,
+                        prev_active = prev_active_target,
+                        prev_passive = prev_passive_max,
+                        "Adaptive degrees changed"
+                    );
+                }
+
+                prev_active_target = smoothed_active;
+                prev_passive_max = smoothed_passive;
 
                 let mut active_guard = active.write().await;
                 let mut passive_guard = passive.write().await;
@@ -1220,8 +1430,8 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                 let passive_count = passive_guard.len();
 
                 // Promote from passive if active is low
-                if active_count < DEFAULT_ACTIVE_DEGREE && !passive_guard.is_empty() {
-                    let to_promote = DEFAULT_ACTIVE_DEGREE - active_count;
+                if active_count < smoothed_active && !passive_guard.is_empty() {
+                    let to_promote = smoothed_active - active_count;
                     let peers: Vec<PeerId> =
                         passive_guard.iter().take(to_promote).copied().collect();
 
@@ -1233,13 +1443,13 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                 }
 
                 // Demote to passive if active is high
-                if active_count > MAX_ACTIVE_DEGREE {
-                    let to_demote = active_count - MAX_ACTIVE_DEGREE;
+                if active_count > config.max_active_degree {
+                    let to_demote = active_count - config.max_active_degree;
                     let peers: Vec<PeerId> = active_guard.iter().take(to_demote).copied().collect();
 
                     for peer in peers {
                         active_guard.remove(&peer);
-                        if passive_guard.len() < MAX_PASSIVE_DEGREE {
+                        if passive_guard.len() < smoothed_passive {
                             passive_guard.insert(peer);
                             debug!(peer_id = %peer, "Degree maintenance: demoted to passive");
                         }
@@ -1247,8 +1457,8 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                 }
 
                 // Trim passive if over capacity
-                if passive_count > MAX_PASSIVE_DEGREE {
-                    let to_remove = passive_count - MAX_PASSIVE_DEGREE;
+                if passive_count > smoothed_passive {
+                    let to_remove = passive_count - smoothed_passive;
                     let peers: Vec<PeerId> =
                         passive_guard.iter().take(to_remove).copied().collect();
 
@@ -1257,6 +1467,14 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                         trace!(peer_id = %peer, "Degree maintenance: removed from passive");
                     }
                 }
+
+                drop(active_guard);
+                drop(passive_guard);
+
+                // Clean up stale seen_peers entries (older than 5 minutes)
+                let mut seen = seen_peers.write().await;
+                let cutoff = Instant::now() - Duration::from_secs(300);
+                seen.retain(|_, t| *t > cutoff);
             }
         });
     }
@@ -1379,12 +1597,12 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
         let mut active = self.active.write().await;
 
         // If active view is full, demote one peer to passive
-        if active.len() >= self.active_degree {
+        if active.len() >= self.config.active_degree {
             if let Some(&to_demote) = active.iter().next() {
                 active.remove(&to_demote);
                 // Move to passive view
                 let mut passive = self.passive.write().await;
-                if passive.len() < self.passive_degree {
+                if passive.len() < self.config.max_passive_degree {
                     passive.insert(to_demote);
                     debug!(peer_id = %to_demote, "Demoted to passive (active view full)");
                 }
@@ -1449,8 +1667,7 @@ mod tests {
     async fn test_membership() -> HyParViewMembership<UdpTransportAdapter> {
         HyParViewMembership::new(
             test_peer_id(),
-            DEFAULT_ACTIVE_DEGREE,
-            DEFAULT_PASSIVE_DEGREE,
+            MembershipConfig::default(),
             test_transport().await,
         )
     }
@@ -1488,7 +1705,7 @@ mod tests {
     #[tokio::test]
     async fn test_active_view_capacity() {
         let transport = test_transport().await;
-        let membership = HyParViewMembership::new(test_peer_id(), 3, 10, transport);
+        let membership = HyParViewMembership::with_degrees(test_peer_id(), 3, 10, transport);
 
         // Add 5 peers (more than capacity)
         for i in 0..5 {
@@ -1561,7 +1778,7 @@ mod tests {
     #[tokio::test]
     async fn test_degree_maintenance() {
         let transport = test_transport().await;
-        let membership = HyParViewMembership::new(test_peer_id(), 5, 20, transport);
+        let membership = HyParViewMembership::with_degrees(test_peer_id(), 5, 20, transport);
 
         // Add many peers to passive
         for i in 0..15 {
@@ -3324,5 +3541,170 @@ mod tests {
             result.is_ok(),
             "request_indirect_probes should succeed even with no alive peers"
         );
+    }
+
+    // ===== MembershipConfig and Adaptive Degree Tests =====
+
+    #[test]
+    fn test_membership_config_default() {
+        let config = MembershipConfig::default();
+        assert_eq!(config.active_degree, DEFAULT_ACTIVE_DEGREE);
+        assert_eq!(config.max_active_degree, MAX_ACTIVE_DEGREE);
+        assert_eq!(config.max_passive_degree, MAX_PASSIVE_DEGREE);
+        assert!(config.adaptive_enabled);
+    }
+
+    #[test]
+    fn test_membership_config_builder_methods() {
+        let config = MembershipConfig::default()
+            .with_active_degree(4)
+            .with_max_active_degree(6)
+            .with_max_passive_degree(64)
+            .with_shuffle_period(Duration::from_secs(60))
+            .with_shuffle_active_size(2)
+            .with_shuffle_passive_size(3)
+            .with_adaptive_enabled(false);
+
+        assert_eq!(config.active_degree, 4);
+        assert_eq!(config.max_active_degree, 6);
+        assert_eq!(config.max_passive_degree, 64);
+        assert_eq!(config.shuffle_period, Duration::from_secs(60));
+        assert_eq!(config.shuffle_active_size, 2);
+        assert_eq!(config.shuffle_passive_size, 3);
+        assert!(!config.adaptive_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_estimated_network_size_empty() {
+        let membership = test_membership().await;
+        let size = membership.estimated_network_size().await;
+        assert_eq!(size, 1); // Just self
+    }
+
+    #[tokio::test]
+    async fn test_estimated_network_size_with_active_peers() {
+        let membership = test_membership().await;
+        // Add 3 active peers
+        for i in 1..=3 {
+            let peer = PeerId::new([i; 32]);
+            membership.add_active(peer).await.unwrap();
+        }
+        let size = membership.estimated_network_size().await;
+        // 3 active + 0 passive + 1 = 4
+        assert_eq!(size, 4);
+    }
+
+    #[tokio::test]
+    async fn test_estimated_network_size_with_seen_peers() {
+        let membership = test_membership().await;
+        // Manually insert seen peers
+        {
+            let mut seen = membership.seen_peers.write().await;
+            for i in 1..=10 {
+                seen.insert(PeerId::new([i; 32]), Instant::now());
+            }
+        }
+        let size = membership.estimated_network_size().await;
+        // max(0 + 0 + 1, 10) = 10
+        assert_eq!(size, 10);
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_degrees_small_network() {
+        let membership = test_membership().await;
+        let (active, passive) = membership.calculate_adaptive_degrees().await;
+        // Small network (1 peer) should use minimum degrees
+        assert_eq!(active, DEFAULT_ACTIVE_DEGREE);
+        assert!(passive >= DEFAULT_ACTIVE_DEGREE * 8);
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_degrees_disabled() {
+        let transport = test_transport().await;
+        let config = MembershipConfig {
+            adaptive_enabled: false,
+            ..MembershipConfig::default()
+        };
+        let membership = HyParViewMembership::new(test_peer_id(), config, transport);
+        let (active, passive) = membership.calculate_adaptive_degrees().await;
+        assert_eq!(active, DEFAULT_ACTIVE_DEGREE);
+        assert_eq!(passive, MAX_PASSIVE_DEGREE);
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_degrees_large_network() {
+        let transport = test_transport().await;
+        let config = MembershipConfig::default();
+        let membership = HyParViewMembership::new(test_peer_id(), config, transport);
+
+        // Simulate a large network by adding many seen peers
+        {
+            let mut seen = membership.seen_peers.write().await;
+            for i in 1..=200 {
+                seen.insert(PeerId::new([(i & 0xFF) as u8; 32]), Instant::now());
+            }
+        }
+
+        let (active, passive) = membership.calculate_adaptive_degrees().await;
+        // With many peers, active should scale up (but stay within bounds)
+        assert!(active >= DEFAULT_ACTIVE_DEGREE);
+        assert!(active <= MAX_ACTIVE_DEGREE);
+        assert!(passive <= MAX_PASSIVE_DEGREE);
+    }
+
+    #[tokio::test]
+    async fn test_config_used_in_add_active() {
+        // Verify that config.active_degree is respected, not hardcoded constants
+        let transport = test_transport().await;
+        let config = MembershipConfig {
+            active_degree: 3,
+            max_active_degree: 5,
+            ..MembershipConfig::default()
+        };
+        let membership = HyParViewMembership::new(test_peer_id(), config, transport);
+
+        // Add 4 peers - should demote one since active_degree is 3
+        for i in 1..=4 {
+            let peer = PeerId::new([i; 32]);
+            membership.add_active(peer).await.unwrap();
+        }
+        // Active should be at most 3 (demoted the excess)
+        assert!(membership.active_view().len() <= 3);
+    }
+
+    #[tokio::test]
+    async fn test_with_degrees_convenience_constructor() {
+        let transport = test_transport().await;
+        let membership = HyParViewMembership::with_degrees(test_peer_id(), 4, 32, transport);
+
+        assert_eq!(membership.config.active_degree, 4);
+        // max_passive_degree = max(32, MAX_PASSIVE_DEGREE) = 128
+        assert_eq!(membership.config.max_passive_degree, MAX_PASSIVE_DEGREE);
+    }
+
+    #[tokio::test]
+    async fn test_seen_peers_tracked_on_join() {
+        let membership = test_membership().await;
+        let new_peer = PeerId::new([42u8; 32]);
+
+        // handle_join should track the peer
+        let _ = membership.handle_join(new_peer, 0).await;
+
+        let seen = membership.seen_peers.read().await;
+        assert!(seen.contains_key(&new_peer));
+    }
+
+    #[tokio::test]
+    async fn test_seen_peers_tracked_on_neighbor() {
+        let membership = test_membership().await;
+        let sender = PeerId::new([42u8; 32]);
+
+        // handle_neighbor should track the peer
+        let _ = membership
+            .handle_neighbor(sender, NeighborPriority::Low)
+            .await;
+
+        let seen = membership.seen_peers.read().await;
+        assert!(seen.contains_key(&sender));
     }
 }

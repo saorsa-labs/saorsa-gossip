@@ -2,9 +2,7 @@ use crate::{CoordinatorClient, RendezvousClient};
 use anyhow::Result;
 use saorsa_gossip_groups::GroupContext;
 use saorsa_gossip_identity::MlDsaKeyPair;
-use saorsa_gossip_membership::{
-    HyParViewMembership, Membership, DEFAULT_ACTIVE_DEGREE, DEFAULT_PASSIVE_DEGREE,
-};
+use saorsa_gossip_membership::{HyParViewMembership, Membership, MembershipConfig};
 use saorsa_gossip_presence::PresenceManager;
 use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
 use saorsa_gossip_transport::{GossipTransport, UdpTransportAdapter, UdpTransportAdapterConfig};
@@ -117,8 +115,7 @@ impl GossipRuntimeBuilder {
 
         let membership_impl = HyParViewMembership::new(
             peer_id,
-            DEFAULT_ACTIVE_DEGREE,
-            DEFAULT_PASSIVE_DEGREE,
+            MembershipConfig::default(),
             transport.clone(),
         );
         let membership: Arc<RwLock<Box<dyn Membership>>> =

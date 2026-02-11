@@ -22,3 +22,6 @@ saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-wo
 [dev-dependencies]
 proptest = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -31,3 +31,6 @@ saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-wo
 proptest = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = "3.8"
+
+[lints]
+workspace = true

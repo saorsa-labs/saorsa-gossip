@@ -8,9 +8,12 @@ use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
 use saorsa_gossip_transport::{GossipTransport, UdpTransportAdapter, UdpTransportAdapterConfig};
 use saorsa_gossip_types::{PeerId, TopicId};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Default bind address for the runtime (0.0.0.0:0 - bind to all interfaces, OS-assigned port)
+const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
 /// Configuration for the [`GossipRuntimeBuilder`].
 #[derive(Clone, Debug)]
@@ -24,7 +27,7 @@ pub struct GossipRuntimeConfig {
 impl Default for GossipRuntimeConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:0".parse().expect("valid addr"),
+            bind_addr: DEFAULT_BIND_ADDR,
             known_peers: Vec::new(),
         }
     }
@@ -113,11 +116,8 @@ impl GossipRuntimeBuilder {
             }
         };
 
-        let membership_impl = HyParViewMembership::new(
-            peer_id,
-            MembershipConfig::default(),
-            transport.clone(),
-        );
+        let membership_impl =
+            HyParViewMembership::new(peer_id, MembershipConfig::default(), transport.clone());
         let membership: Arc<RwLock<Box<dyn Membership>>> =
             Arc::new(RwLock::new(Box::new(membership_impl)));
 

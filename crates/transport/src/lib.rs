@@ -342,6 +342,7 @@ impl<T: GossipTransport + ?Sized> GossipTransport for std::sync::Arc<T> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

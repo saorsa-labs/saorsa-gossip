@@ -869,8 +869,10 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
 
         // Passive scales as 8x active, clamped
         let target_passive = active * 8;
-        let passive =
-            target_passive.clamp(self.config.active_degree * 8, self.config.max_passive_degree);
+        let passive = target_passive.clamp(
+            self.config.active_degree * 8,
+            self.config.max_passive_degree,
+        );
 
         (active, passive)
     }
@@ -1197,17 +1199,15 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     /// Handle incoming NEIGHBOR request
     pub async fn handle_neighbor(&self, sender: PeerId, priority: NeighborPriority) -> Result<()> {
         // Track peer for network size estimation
-        self.seen_peers
-            .write()
-            .await
-            .insert(sender, Instant::now());
+        self.seen_peers.write().await.insert(sender, Instant::now());
 
         let active = self.active.read().await;
         let active_count = active.len();
         drop(active);
 
         // Accept if high priority, or if we have room
-        let accepted = priority == NeighborPriority::High || active_count < self.config.max_active_degree;
+        let accepted =
+            priority == NeighborPriority::High || active_count < self.config.max_active_degree;
 
         if accepted {
             self.add_active(sender).await?;
@@ -1646,6 +1646,7 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use saorsa_gossip_transport::UdpTransportAdapter;

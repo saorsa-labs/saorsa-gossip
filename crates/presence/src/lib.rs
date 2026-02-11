@@ -1122,6 +1122,7 @@ pub fn derive_presence_tag(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use saorsa_gossip_transport::UdpTransportAdapter;

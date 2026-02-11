@@ -18,11 +18,11 @@ bytes = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }
 tokio = { workspace = true }
-saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }
 
 [dev-dependencies]
 proptest = { workspace = true }
 tokio-test = { workspace = true }
+saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }
 
 [lints]
 workspace = true

@@ -31,7 +31,6 @@ futures = "0.3"
 [dev-dependencies]
 proptest = { workspace = true }
 tracing-subscriber = "0.3"
-saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }
 
 [[example]]
 name = "throughput_test"

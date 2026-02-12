@@ -30,7 +30,6 @@ tracing = { workspace = true }
 proptest = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = "3.8"
-saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }
 
 [lints]
 workspace = true

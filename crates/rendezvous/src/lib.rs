@@ -145,6 +145,20 @@ pub struct ProviderSummary {
     pub summary: Option<SummaryData>,
     /// Expiration timestamp (unix ms)
     pub exp: u64,
+    /// Arbitrary caller-defined extension data.
+    ///
+    /// This field is included in the signed payload when present.
+    /// When `None`, it is omitted from the wire format via `skip_serializing_if`,
+    /// so existing signatures over records without `extensions` remain valid.
+    ///
+    /// x0x uses this field to embed serialized `Vec<SocketAddr>` (bincode format)
+    /// so that agent reachability addresses are available from the rendezvous record.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_serde_bytes"
+    )]
+    pub extensions: Option<Vec<u8>>,
     /// ML-DSA signature over all fields except sig
     #[serde(with = "serde_bytes")]
     pub sig: Vec<u8>,
@@ -300,6 +314,7 @@ impl ProviderSummary {
             manifest_ver: None,
             summary: None,
             exp: now + validity_ms,
+            extensions: None,
             sig: Vec::new(),
         }
     }
@@ -319,6 +334,15 @@ impl ProviderSummary {
     /// Set summary data
     pub fn with_summary(mut self, summary: SummaryData) -> Self {
         self.summary = Some(summary);
+        self
+    }
+
+    /// Set caller-defined extension data.
+    ///
+    /// The extension bytes are included in the signed payload.
+    /// x0x uses this field to encode agent socket addresses.
+    pub fn with_extensions(mut self, data: Vec<u8>) -> Self {
+        self.extensions = Some(data);
         self
     }
 
@@ -348,6 +372,7 @@ impl ProviderSummary {
                 manifest_ver: self.manifest_ver,
                 summary: &self.summary,
                 exp: self.exp,
+                extensions: &self.extensions,
             },
             &mut to_sign,
         )?;
@@ -379,6 +404,7 @@ impl ProviderSummary {
                 manifest_ver: self.manifest_ver,
                 summary: &self.summary,
                 exp: self.exp,
+                extensions: &self.extensions,
             },
             &mut to_verify,
         )?;
@@ -388,6 +414,35 @@ impl ProviderSummary {
         let sig = MlDsaSignature::from_bytes(&self.sig)?;
 
         Ok(verifier.verify(public_key, &to_verify, &sig)?)
+    }
+
+    /// Sign the summary using raw ML-DSA-65 secret key bytes.
+    ///
+    /// Equivalent to [`Self::sign`] but accepts raw bytes instead of a typed key.
+    /// Allows callers using different key wrappers (e.g., `ant-quic`) to sign
+    /// without depending on `saorsa-pqc` directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key bytes are not a valid ML-DSA-65 secret key
+    /// or if signing fails.
+    pub fn sign_raw(&mut self, secret_key_bytes: &[u8]) -> anyhow::Result<()> {
+        let key = saorsa_pqc::MlDsaSecretKey::from_bytes(secret_key_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid secret key bytes: {:?}", e))?;
+        self.sign(&key)
+    }
+
+    /// Verify the summary signature using raw ML-DSA-65 public key bytes.
+    ///
+    /// Equivalent to [`Self::verify`] but accepts raw bytes instead of a typed key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key bytes are invalid or signature verification fails.
+    pub fn verify_raw(&self, public_key_bytes: &[u8]) -> anyhow::Result<bool> {
+        let key = saorsa_pqc::MlDsaPublicKey::from_bytes(public_key_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid public key bytes: {:?}", e))?;
+        self.verify(&key)
     }
 
     /// Serialize to CBOR wire format (RFC 8949)
@@ -430,6 +485,8 @@ struct SignableFields<'a> {
     manifest_ver: Option<u64>,
     summary: &'a Option<SummaryData>,
     exp: u64,
+    #[serde(skip_serializing_if = "Option::is_none", with = "optional_serde_bytes")]
+    extensions: &'a Option<Vec<u8>>,
 }
 
 #[cfg(test)]

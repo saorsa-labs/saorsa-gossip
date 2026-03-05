@@ -380,7 +380,7 @@ use std::{net::SocketAddr, sync::Arc};
 use bytes::Bytes;
 use saorsa_gossip_identity::MlDsaKeyPair;
 use saorsa_gossip_membership::{
-    Membership, HyParViewMembership, DEFAULT_ACTIVE_DEGREE, DEFAULT_PASSIVE_DEGREE,
+    Membership, HyParViewMembership, MembershipConfig,
 };
 use saorsa_gossip_pubsub::{PubSub, PlumtreePubSub};
 use saorsa_gossip_transport::UdpTransportAdapter;
@@ -397,8 +397,7 @@ async fn main() -> anyhow::Result<()> {
     // Membership can run without seeds for local experimentation.
     let membership = HyParViewMembership::new(
         peer_id,
-        DEFAULT_ACTIVE_DEGREE,
-        DEFAULT_PASSIVE_DEGREE,
+        MembershipConfig::default(),
         transport.clone(),
     );
     membership.join(vec![]).await?;

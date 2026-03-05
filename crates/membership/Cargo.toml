@@ -20,7 +20,6 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 postcard = { workspace = true }
 rand = { workspace = true }
-saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }
 
 [dev-dependencies]
 proptest = { workspace = true }

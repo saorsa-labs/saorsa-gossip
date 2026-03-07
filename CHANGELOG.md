@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-03-07
+
+### Fixed
+
+- **Best-effort EAGER forwarding**: A single `send_to_peer` failure no longer aborts the
+  entire forwarding loop. Failures are logged as warnings and forwarding continues to
+  remaining peers.
+- **Serialization error propagation**: Re-serialization failures in `handle_eager` now
+  propagate as `Err` rather than being silently swallowed as `Ok(())`.
+- **Serialization hoisted outside loop**: `postcard::to_stdvec` is now called once before
+  the per-peer forwarding loop instead of once per peer.
+
+### Added
+
+- **`set_topic_peers`** on `PubSub` trait and `PlumtreePubSub`: atomically replaces topic
+  peer membership by pruning disconnected peers from eager/lazy sets and adding newly
+  connected peers as eager peers. Respects existing PRUNE decisions (lazy peers that are
+  still connected remain lazy). Default trait implementation falls back to
+  `initialize_topic_peers` (add-only); override for full prune-and-replace semantics.
+
 ## [0.4.3] - 2026-02-01
 
 ### Changed

@@ -616,13 +616,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         drop(topics); // Release lock
 
         // Serialize once — the payload is the same for all peers
-        let bytes: Bytes = match postcard::to_stdvec(&message) {
-            Ok(bytes) => bytes.into(),
-            Err(e) => {
-                warn!(msg_id = ?msg_id, "EAGER forward serialize failed: {e}");
-                return Ok(());
-            }
-        };
+        let bytes: Bytes = postcard::to_stdvec(&message)
+            .map_err(|e| anyhow!("EAGER forward serialize failed: {e}"))?
+            .into();
 
         // Forward EAGER (best-effort: log failures, don't abort the loop)
         for peer in eager_peers {

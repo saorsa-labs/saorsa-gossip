@@ -331,6 +331,17 @@ pub trait PubSub: Send + Sync {
     /// with currently connected peers for message dissemination.
     async fn initialize_topic_peers(&self, topic: TopicId, peers: Vec<PeerId>);
 
+    /// Replace topic peers with exactly the given set of connected peers.
+    ///
+    /// Removes stale/disconnected peers and adds newly connected ones.
+    ///
+    /// The default implementation falls back to [`Self::initialize_topic_peers`]
+    /// (add-only). Override this method to get full prune-and-replace semantics.
+    async fn set_topic_peers(&self, topic: TopicId, connected: Vec<PeerId>) {
+        // Default: fall back to initialize (add-only)
+        self.initialize_topic_peers(topic, connected).await;
+    }
+
     /// Handle an incoming pubsub message from a peer
     ///
     /// Routes the message to appropriate handler based on MessageKind (Eager, IHave, IWant).
@@ -604,14 +615,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         drop(topics); // Release lock
 
-        // Forward EAGER
+        // Serialize once — the payload is the same for all peers
+        let bytes: Bytes = postcard::to_stdvec(&message)
+            .map_err(|e| anyhow!("EAGER forward serialize failed: {e}"))?
+            .into();
+
+        // Forward EAGER (best-effort: log failures, don't abort the loop)
         for peer in eager_peers {
             trace!(peer_id = %peer, msg_id = ?msg_id, "Forwarding EAGER");
-            let bytes = postcard::to_stdvec(&message)
-                .map_err(|e| anyhow!("Serialization failed: {}", e))?;
-            self.transport
-                .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
-                .await?;
+            if let Err(e) = self
+                .transport
+                .send_to_peer(peer, GossipStreamType::PubSub, bytes.clone())
+                .await
+            {
+                warn!(peer_id = %peer, msg_id = ?msg_id, "EAGER forward failed: {e}");
+            }
         }
 
         Ok(())
@@ -1173,6 +1191,36 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         debug!(topic = ?topic, peer_count = state.eager_peers.len(), "Initialized topic peers");
     }
+
+    /// Replace topic peers with exactly the given set of connected peers.
+    ///
+    /// Removes stale peers that are no longer connected and adds new ones.
+    /// Peers that were previously moved to `lazy_peers` via PRUNE are left
+    /// in lazy if they are still connected; otherwise they are removed.
+    pub async fn set_topic_peers(&self, topic: TopicId, connected: Vec<PeerId>) {
+        let mut topics = self.topics.write().await;
+        let state = topics.entry(topic).or_insert_with(TopicState::new);
+
+        let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
+
+        // Remove stale peers from eager and lazy sets
+        state.eager_peers.retain(|p| connected_set.contains(p));
+        state.lazy_peers.retain(|p| connected_set.contains(p));
+
+        // Add new connected peers as eager (if not already in eager or lazy)
+        for peer in connected {
+            if !state.eager_peers.contains(&peer) && !state.lazy_peers.contains(&peer) {
+                state.eager_peers.insert(peer);
+            }
+        }
+
+        debug!(
+            topic = ?topic,
+            eager = state.eager_peers.len(),
+            lazy = state.lazy_peers.len(),
+            "Set topic peers"
+        );
+    }
 }
 
 #[async_trait::async_trait]
@@ -1202,6 +1250,10 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
 
     async fn initialize_topic_peers(&self, topic: TopicId, peers: Vec<PeerId>) {
         PlumtreePubSub::initialize_topic_peers(self, topic, peers).await
+    }
+
+    async fn set_topic_peers(&self, topic: TopicId, connected: Vec<PeerId>) {
+        PlumtreePubSub::set_topic_peers(self, topic, connected).await
     }
 
     async fn handle_message(&self, from: PeerId, data: Bytes) -> Result<()> {
@@ -2377,6 +2429,156 @@ mod tests {
         assert!(
             !state.peer_scores.contains_key(&stale_peer),
             "Stale peer score should be cleaned up"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_topic_peers_prunes_stale_eager() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([1u8; 32]);
+
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+
+        // Initialize with two eager peers
+        pubsub
+            .initialize_topic_peers(topic, vec![peer_a, peer_b])
+            .await;
+
+        // Only peer_a is still connected
+        pubsub.set_topic_peers(topic, vec![peer_a]).await;
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert!(state.eager_peers.contains(&peer_a));
+        assert!(!state.eager_peers.contains(&peer_b));
+    }
+
+    #[tokio::test]
+    async fn test_set_topic_peers_prunes_stale_lazy() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([1u8; 32]);
+
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+
+        // Manually set up: peer_a eager, peer_b lazy
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(peer_a);
+            state.lazy_peers.insert(peer_b);
+        }
+
+        // Only peer_a is still connected — peer_b should be pruned from lazy
+        pubsub.set_topic_peers(topic, vec![peer_a]).await;
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert!(state.eager_peers.contains(&peer_a));
+        assert!(!state.lazy_peers.contains(&peer_b));
+    }
+
+    #[tokio::test]
+    async fn test_set_topic_peers_adds_new_as_eager() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([1u8; 32]);
+
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+
+        // Initialize with only peer_a
+        pubsub.initialize_topic_peers(topic, vec![peer_a]).await;
+
+        // Now peer_b has connected too
+        pubsub.set_topic_peers(topic, vec![peer_a, peer_b]).await;
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert!(state.eager_peers.contains(&peer_a));
+        assert!(state.eager_peers.contains(&peer_b));
+    }
+
+    #[tokio::test]
+    async fn test_set_topic_peers_retains_lazy_if_connected() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([1u8; 32]);
+
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+
+        // peer_a eager, peer_b lazy (simulating a prior PRUNE)
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(peer_a);
+            state.lazy_peers.insert(peer_b);
+        }
+
+        // Both still connected — peer_b should stay lazy, not be promoted to eager
+        pubsub.set_topic_peers(topic, vec![peer_a, peer_b]).await;
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert!(state.eager_peers.contains(&peer_a));
+        assert!(
+            state.lazy_peers.contains(&peer_b),
+            "Lazy peer should remain lazy when still connected"
+        );
+        assert!(
+            !state.eager_peers.contains(&peer_b),
+            "Lazy peer should not be promoted to eager"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_topic_peers_combined_prune_and_add() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([1u8; 32]);
+
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+        let peer_c = test_peer_id(4);
+
+        // Start with peer_a eager, peer_b lazy
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(peer_a);
+            state.lazy_peers.insert(peer_b);
+        }
+
+        // peer_a disconnected, peer_b still connected, peer_c is new
+        pubsub.set_topic_peers(topic, vec![peer_b, peer_c]).await;
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert!(
+            !state.eager_peers.contains(&peer_a),
+            "Disconnected eager peer should be removed"
+        );
+        assert!(
+            state.lazy_peers.contains(&peer_b),
+            "Connected lazy peer should be retained"
+        );
+        assert!(
+            state.eager_peers.contains(&peer_c),
+            "New peer should be added as eager"
         );
     }
 }

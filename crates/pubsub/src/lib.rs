@@ -1221,6 +1221,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             "Set topic peers"
         );
     }
+
+    /// Return all topic IDs known to PlumTree (subscribed or pass-through).
+    ///
+    /// This includes topics that have local subscribers AND topics that only
+    /// exist because an EAGER message was received and forwarded. The caller
+    /// should use this to refresh peer sets for all topics, not just locally
+    /// subscribed ones — otherwise pass-through topics lose their forwarding
+    /// peers and gossip messages cannot propagate through relay nodes.
+    pub async fn all_topic_ids(&self) -> Vec<TopicId> {
+        self.topics.read().await.keys().copied().collect()
+    }
 }
 
 #[async_trait::async_trait]

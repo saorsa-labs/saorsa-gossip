@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Maximum message cache size per topic (10,000 messages)
 const MAX_CACHE_SIZE: usize = 10_000;
@@ -599,8 +599,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
 
         // Deliver to local subscribers
+        let sub_count = state.subscribers.len();
         let data = (from, payload.clone());
         state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
+        let delivered = state.subscribers.len();
+        info!(
+            topic = ?topic,
+            subscribers = sub_count,
+            delivered = delivered,
+            "[3/6 plumtree] handle_eager delivering to local subscribers"
+        );
 
         // Forward to eager_peers (except sender)
         let eager_peers: Vec<PeerId> = state

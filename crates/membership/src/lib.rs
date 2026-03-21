@@ -837,6 +837,23 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         Self::new(local_peer_id, config, transport)
     }
 
+    /// Send a SWIM Ping to a specific peer.
+    ///
+    /// Used by the application-level keepalive mechanism to prevent QUIC idle
+    /// timeout on direct peer connections. The remote peer will respond with Ack,
+    /// keeping both directions of the connection alive.
+    pub async fn send_ping(&self, target: PeerId) -> Result<()> {
+        let wrapped = MembershipProtocolMessage::Swim(SwimMessage::Ping);
+        let bytes = postcard::to_stdvec(&wrapped)
+            .map_err(|e| anyhow!("Failed to serialize Ping message: {}", e))?;
+
+        self.transport
+            .send_to_peer(target, GossipStreamType::Membership, bytes.into())
+            .await?;
+
+        Ok(())
+    }
+
     /// Estimate the current network size based on unique peers seen.
     pub async fn estimated_network_size(&self) -> usize {
         let active_count = self.active.read().await.len();

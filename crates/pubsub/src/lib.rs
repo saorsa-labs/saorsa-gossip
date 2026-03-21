@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Maximum message cache size per topic (10,000 messages)
 const MAX_CACHE_SIZE: usize = 10_000;
@@ -603,11 +603,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let data = (from, payload.clone());
         state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
         let delivered = state.subscribers.len();
-        info!(
+        debug!(
             topic = ?topic,
             subscribers = sub_count,
             delivered = delivered,
-            "[3/6 plumtree] handle_eager delivering to local subscribers"
+            "plumtree handle_eager: delivered to local subscribers"
         );
 
         // Forward to eager_peers (except sender)
@@ -1211,13 +1211,24 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
 
-        // Remove stale peers from eager and lazy sets
+        // Remove stale peers (no longer connected) from both sets.
         state.eager_peers.retain(|p| connected_set.contains(p));
         state.lazy_peers.retain(|p| connected_set.contains(p));
 
-        // Add new connected peers as eager (if not already in eager or lazy)
+        // Promote all connected lazy peers back to eager. PlumTree's PRUNE
+        // optimization moves peers to lazy when duplicate messages are detected,
+        // but the periodic peer refresh should restore them. Without this,
+        // peers pruned during a message burst stay lazy permanently, breaking
+        // gossip routing after the burst ends.
+        let to_promote: Vec<PeerId> = state.lazy_peers.iter().copied().collect();
+        for peer in to_promote {
+            state.lazy_peers.remove(&peer);
+            state.eager_peers.insert(peer);
+        }
+
+        // Add any remaining connected peers not in either set as eager.
         for peer in connected {
-            if !state.eager_peers.contains(&peer) && !state.lazy_peers.contains(&peer) {
+            if !state.eager_peers.contains(&peer) {
                 state.eager_peers.insert(peer);
             }
         }
@@ -2546,19 +2557,21 @@ mod tests {
             state.lazy_peers.insert(peer_b);
         }
 
-        // Both still connected — peer_b should stay lazy, not be promoted to eager
+        // Both still connected — peer_b should be promoted back to eager
+        // during the periodic refresh so that PRUNE optimizations don't
+        // permanently break gossip routing.
         pubsub.set_topic_peers(topic, vec![peer_a, peer_b]).await;
 
         let topics = pubsub.topics.read().await;
         let state = topics.get(&topic).unwrap();
         assert!(state.eager_peers.contains(&peer_a));
         assert!(
-            state.lazy_peers.contains(&peer_b),
-            "Lazy peer should remain lazy when still connected"
+            state.eager_peers.contains(&peer_b),
+            "Lazy peer should be promoted to eager during refresh"
         );
         assert!(
-            !state.eager_peers.contains(&peer_b),
-            "Lazy peer should not be promoted to eager"
+            !state.lazy_peers.contains(&peer_b),
+            "Promoted peer should no longer be in lazy set"
         );
     }
 
@@ -2592,8 +2605,12 @@ mod tests {
             "Disconnected eager peer should be removed"
         );
         assert!(
-            state.lazy_peers.contains(&peer_b),
-            "Connected lazy peer should be retained"
+            state.eager_peers.contains(&peer_b),
+            "Connected lazy peer should be promoted to eager"
+        );
+        assert!(
+            !state.lazy_peers.contains(&peer_b),
+            "Promoted peer should no longer be in lazy set"
         );
         assert!(
             state.eager_peers.contains(&peer_c),

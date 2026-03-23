@@ -2419,8 +2419,14 @@ mod tests {
         state.peer_scores.insert(fresh_peer, PeerScore::new());
 
         // Stale peer score (last seen > 10 minutes ago)
+        // Use checked_sub because on some platforms (Windows CI) the
+        // monotonic clock epoch may be too recent for a 700s subtraction.
         let mut stale_score = PeerScore::new();
-        stale_score.last_seen = Instant::now() - Duration::from_secs(700);
+        let Some(past) = Instant::now().checked_sub(Duration::from_secs(700)) else {
+            // Platform doesn't have enough headroom — skip test gracefully
+            return;
+        };
+        stale_score.last_seen = past;
         state.peer_scores.insert(stale_peer, stale_score);
 
         // Clean cache (which also cleans peer scores)

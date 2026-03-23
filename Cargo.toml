@@ -18,7 +18,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 authors = ["David Irvine <david@saorsalabs.com>"]
 license = "MIT OR Apache-2.0"
@@ -39,7 +39,7 @@ saorsa-pqc = "0.4"
 saorsa-mls = "0.3.4"
 
 # QUIC transport
-ant-quic = "0.21"
+ant-quic = "0.22"
 
 # Shared transport layer
 

@@ -131,7 +131,9 @@ impl PeerScore {
             }
         };
 
-        let secs_since_seen = self.last_seen.elapsed().as_secs_f64();
+        let secs_since_seen = Instant::now()
+            .saturating_duration_since(self.last_seen)
+            .as_secs_f64();
         let recency = (1.0 - (secs_since_seen / 300.0)).max(0.0);
 
         (response_rate.min(1.0) * 0.6) + (recency * 0.4)
@@ -241,9 +243,11 @@ impl TopicState {
         }
 
         // Clean stale peer scores (10 minute expiry)
+        // Use saturating_duration_since to avoid panic on Windows (coarse timer)
         let score_expiry = Duration::from_secs(600);
+        let now = Instant::now();
         self.peer_scores
-            .retain(|_, score| score.last_seen.elapsed() < score_expiry);
+            .retain(|_, score| now.saturating_duration_since(score.last_seen) < score_expiry);
     }
 
     /// Move peer from eager to lazy

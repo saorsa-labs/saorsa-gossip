@@ -37,6 +37,12 @@ const MAX_CACHE_SIZE: usize = 10_000;
 /// Message cache TTL (5 minutes)
 const CACHE_TTL_SECS: u64 = 300;
 
+/// Maximum payload replay cache size per topic.
+const REPLAY_CACHE_MAX_ENTRIES: usize = 10_000;
+
+/// Payload replay cache TTL (5 minutes).
+const REPLAY_CACHE_TTL_SECS: u64 = 300;
+
 /// Maximum IHAVE batch size (per SPEC.md)
 const MAX_IHAVE_BATCH_SIZE: usize = 1024;
 
@@ -56,6 +62,11 @@ type MessageIdType = [u8; 32];
 const fn message_cache_capacity() -> NonZeroUsize {
     // SAFETY: MAX_CACHE_SIZE is a positive constant (10,000)
     unsafe { NonZeroUsize::new_unchecked(MAX_CACHE_SIZE) }
+}
+
+const fn replay_cache_capacity() -> NonZeroUsize {
+    // SAFETY: REPLAY_CACHE_MAX_ENTRIES is a positive constant (10,000)
+    unsafe { NonZeroUsize::new_unchecked(REPLAY_CACHE_MAX_ENTRIES) }
 }
 
 /// Gossip message wrapper
@@ -184,6 +195,13 @@ struct TopicState {
     peer_scores: HashMap<PeerId, PeerScore>,
     /// Local subscribers
     subscribers: Vec<mpsc::UnboundedSender<(PeerId, Bytes)>>,
+    /// Payload-level replay cache: BLAKE3(payload) -> insertion time.
+    ///
+    /// Catches replays where the same application payload is wrapped in a
+    /// different gossip envelope (different epoch, sender, msg_id).
+    replay_cache: LruCache<[u8; 32], Instant>,
+    /// TTL for replay cache entries.
+    replay_ttl: Duration,
 }
 
 impl TopicState {
@@ -196,7 +214,25 @@ impl TopicState {
             outstanding_iwants: HashMap::new(),
             peer_scores: HashMap::new(),
             subscribers: Vec::new(),
+            replay_cache: LruCache::new(replay_cache_capacity()),
+            replay_ttl: Duration::from_secs(REPLAY_CACHE_TTL_SECS),
         }
+    }
+
+    /// Check if a payload has been seen before (replay detection).
+    ///
+    /// Returns `true` if this is a replay (payload hash already in cache
+    /// and not expired). Returns `false` if this is a new payload (and
+    /// inserts the hash into the cache).
+    fn is_payload_replay(&mut self, payload: &[u8]) -> bool {
+        let key: [u8; 32] = *blake3::hash(payload).as_bytes();
+        if let Some(ts) = self.replay_cache.get(&key) {
+            if ts.elapsed() < self.replay_ttl {
+                return true;
+            }
+        }
+        self.replay_cache.put(key, Instant::now());
+        false
     }
 
     /// Get all cached message IDs for anti-entropy digest
@@ -240,6 +276,18 @@ impl TopicState {
         // Remove expired entries
         for msg_id in expired {
             self.message_cache.pop(&msg_id);
+        }
+
+        // Clean expired replay cache entries
+        let replay_ttl = self.replay_ttl;
+        let mut expired_replay = Vec::new();
+        for (hash, ts) in self.replay_cache.iter() {
+            if now.saturating_duration_since(*ts) > replay_ttl {
+                expired_replay.push(*hash);
+            }
+        }
+        for hash in expired_replay {
+            self.replay_cache.pop(&hash);
         }
 
         // Clean stale peer scores (10 minute expiry)
@@ -505,6 +553,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Add to cache
         state.cache_message(msg_id, payload.clone(), header);
 
+        // Seed the replay cache so network echoes of our own publish are
+        // detected as replays (defense-in-depth alongside msg_id dedup).
+        let _ = state.is_payload_replay(&payload);
+
         // Send EAGER to eager_peers
         let eager_peers: Vec<PeerId> = state.eager_peers.iter().copied().collect();
         drop(topics); // Release lock before network I/O
@@ -592,6 +644,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 .entry(from)
                 .or_insert_with(PeerScore::new)
                 .record_iwant_response();
+        }
+
+        // Payload-level replay detection: catches re-wrapped payloads where
+        // the gossip envelope (msg_id) is new but the application payload is identical.
+        // We keep the msg_id cache entry (already done above) so PlumTree's
+        // PRUNE/GRAFT still works, but skip subscriber delivery and forwarding.
+        if state.is_payload_replay(&payload) {
+            debug!(
+                topic = ?topic,
+                msg_id = ?msg_id,
+                "Payload replay detected — msg_id new but payload hash seen before"
+            );
+            return Ok(());
         }
 
         // Add sender to eager_peers if not already present
@@ -2625,6 +2690,229 @@ mod tests {
         assert!(
             state.eager_peers.contains(&peer_c),
             "New peer should be added as eager"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Payload replay cache tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_payload_replay_detected() {
+        let mut state = TopicState::new();
+        let payload = b"hello world";
+
+        assert!(
+            !state.is_payload_replay(payload),
+            "First insert should be new"
+        );
+        assert!(
+            state.is_payload_replay(payload),
+            "Second insert should be replay"
+        );
+    }
+
+    #[test]
+    fn test_payload_replay_different_payloads_pass() {
+        let mut state = TopicState::new();
+
+        assert!(!state.is_payload_replay(b"message 1"));
+        assert!(!state.is_payload_replay(b"message 2"));
+        assert!(!state.is_payload_replay(b"message 3"));
+    }
+
+    #[test]
+    fn test_payload_replay_lru_eviction() {
+        let mut state = TopicState::new();
+
+        // Fill the cache beyond capacity
+        for i in 0..REPLAY_CACHE_MAX_ENTRIES + 100 {
+            let payload = format!("payload-{i}");
+            assert!(!state.is_payload_replay(payload.as_bytes()));
+        }
+
+        // Cache should not exceed max entries
+        assert!(state.replay_cache.len() <= REPLAY_CACHE_MAX_ENTRIES);
+
+        // The very first entry should have been evicted
+        assert!(
+            !state.is_payload_replay(b"payload-0"),
+            "Evicted entry should be accepted as new again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_eager_drops_replayed_payload() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([1u8; 32]);
+
+        // Subscribe to receive messages
+        let mut rx = pubsub.subscribe(topic);
+        tokio::task::yield_now().await;
+
+        let payload = Bytes::from("important data");
+
+        // First EAGER with one msg_id
+        let msg_id_1 = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(topic.as_bytes());
+            hasher.update(&1u64.to_le_bytes()); // epoch 1
+            hasher.update(test_peer_id(2).as_bytes());
+            hasher.update(blake3::hash(&payload).as_bytes());
+            let hash = hasher.finalize();
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&hash.as_bytes()[..32]);
+            id
+        };
+
+        let header1 = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: msg_id_1,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let header_bytes1 = postcard::to_stdvec(&header1).expect("serialize");
+        let signature1 = signing_key.sign(&header_bytes1).expect("sign");
+        let message1 = GossipMessage {
+            header: header1,
+            payload: Some(payload.clone()),
+            signature: signature1,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        // Second EAGER: same payload but different msg_id (simulating re-wrapped replay)
+        let msg_id_2 = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(topic.as_bytes());
+            hasher.update(&2u64.to_le_bytes()); // epoch 2 — different!
+            hasher.update(test_peer_id(3).as_bytes()); // different sender
+            hasher.update(blake3::hash(&payload).as_bytes());
+            let hash = hasher.finalize();
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&hash.as_bytes()[..32]);
+            id
+        };
+
+        let header2 = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: msg_id_2,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let header_bytes2 = postcard::to_stdvec(&header2).expect("serialize");
+        let signature2 = signing_key.sign(&header_bytes2).expect("sign");
+        let message2 = GossipMessage {
+            header: header2,
+            payload: Some(payload.clone()),
+            signature: signature2,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        let from_peer = test_peer_id(2);
+
+        // Handle first EAGER — should deliver to subscriber
+        pubsub
+            .handle_eager(from_peer, topic, message1)
+            .await
+            .expect("first handle_eager");
+
+        // Handle second EAGER (replay) — should NOT deliver
+        let from_peer_2 = test_peer_id(3);
+        pubsub
+            .handle_eager(from_peer_2, topic, message2)
+            .await
+            .expect("second handle_eager");
+
+        // Subscriber should receive exactly one message
+        let msg = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("should receive first message")
+            .expect("channel should not be closed");
+        assert_eq!(msg.1, payload);
+
+        // No second message should arrive
+        let replay = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            replay.is_err(),
+            "Replayed payload should NOT be delivered to subscriber"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_local_seeds_replay_cache() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([1u8; 32]);
+
+        // Subscribe
+        let mut rx = pubsub.subscribe(topic);
+        tokio::task::yield_now().await;
+
+        let payload = Bytes::from("local message");
+
+        // Publish locally — should deliver to subscriber AND seed replay cache
+        pubsub
+            .publish(topic, payload.clone())
+            .await
+            .expect("publish");
+
+        // Receive the local publish
+        let msg = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("should receive local publish")
+            .expect("channel open");
+        assert_eq!(msg.1, payload);
+
+        // Now simulate an EAGER from the network with the same payload
+        let msg_id = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(topic.as_bytes());
+            hasher.update(&99u64.to_le_bytes());
+            hasher.update(test_peer_id(5).as_bytes());
+            hasher.update(blake3::hash(&payload).as_bytes());
+            let hash = hasher.finalize();
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&hash.as_bytes()[..32]);
+            id
+        };
+
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize");
+        let signature = signing_key.sign(&header_bytes).expect("sign");
+        let message = GossipMessage {
+            header,
+            payload: Some(payload.clone()),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        let from_peer = test_peer_id(5);
+        pubsub
+            .handle_eager(from_peer, topic, message)
+            .await
+            .expect("handle_eager echo");
+
+        // The echo should be caught by the replay cache — no second delivery
+        let echo = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            echo.is_err(),
+            "Network echo of locally published payload should be dropped by replay cache"
         );
     }
 }

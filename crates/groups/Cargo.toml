@@ -13,7 +13,6 @@ categories = ["cryptography"]
 saorsa-gossip-types = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
-saorsa-mls = { workspace = true }
 saorsa-pqc = { workspace = true }
 blake3 = { workspace = true }
 

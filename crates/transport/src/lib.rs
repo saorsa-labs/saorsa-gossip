@@ -55,6 +55,9 @@ pub use ant_quic::bootstrap_cache::{
     ConnectionStats as BootstrapConnectionStats, NatType as BootstrapNatType, PeerCapabilities,
     PeerSource, RelayPathHint,
 };
+
+// Re-export ant-quic's connection strategy types for NAT traversal fallback
+pub use ant_quic::connection_strategy::{ConnectionMethod, StrategyConfig};
 pub use ant_quic::{
     BootstrapCache, BootstrapCacheConfig, BootstrapCacheConfigBuilder, CacheEvent, CacheStats,
 };

@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::{BootstrapCache, GossipStreamType, GossipTransport};
 
 // Import ant-quic types (v0.14+ API)
+use ant_quic::connection_strategy::{ConnectionMethod, StrategyConfig};
 use ant_quic::transport::TransportAddr;
 use ant_quic::{MlDsaPublicKey, MlDsaSecretKey, Node, NodeConfig, PeerId as AntPeerId};
 
@@ -588,6 +589,58 @@ impl UdpTransportAdapter {
             Err(_) => Err(anyhow!("Reconnect to {} for peer {} timed out", addr, peer)),
         }
     }
+
+    /// Connect to a peer using ant-quic's progressive NAT traversal fallback.
+    ///
+    /// Attempts connection in order: Direct IPv4/IPv6 → Hole-punch → Relay.
+    /// This enables connectivity to peers behind symmetric NAT by using
+    /// ant-quic's native hole-punching with port prediction, falling back to
+    /// MASQUE relay only if hole-punching fails.
+    ///
+    /// Use this instead of `connect_addr` when the peer may be behind NAT.
+    async fn connect_with_nat_fallback(
+        &self,
+        addr: SocketAddr,
+        peer_id: Option<GossipPeerId>,
+    ) -> Result<(GossipPeerId, ConnectionMethod)> {
+        let endpoint = self.node.inner_endpoint();
+
+        let (target_ipv4, target_ipv6) = if addr.is_ipv4() {
+            (Some(addr), None)
+        } else {
+            (None, Some(addr))
+        };
+
+        let ant_peer_id = peer_id.map(|id| gossip_peer_id_to_ant(&id));
+
+        let strategy_config = StrategyConfig::default();
+
+        match endpoint
+            .connect_with_fallback(target_ipv4, target_ipv6, Some(strategy_config), ant_peer_id)
+            .await
+        {
+            Ok((peer_conn, method)) => {
+                let gossip_id = ant_peer_id_to_gossip(&peer_conn.peer_id);
+                let remote_addr = peer_conn.remote_addr.to_synthetic_socket_addr();
+                let effective_addr = if addr_is_usable(&remote_addr) {
+                    remote_addr
+                } else {
+                    addr
+                };
+                self.add_peer(gossip_id, effective_addr).await;
+                info!(
+                    "Connected to peer {} via {} (target was {})",
+                    gossip_id, method, addr
+                );
+                Ok((gossip_id, method))
+            }
+            Err(e) => Err(anyhow!(
+                "All connection strategies failed for {}: {}",
+                addr,
+                e
+            )),
+        }
+    }
 }
 
 fn addr_is_usable(addr: &SocketAddr) -> bool {
@@ -650,7 +703,6 @@ impl GossipTransport for UdpTransportAdapter {
     async fn dial(&self, peer: GossipPeerId, addr: SocketAddr) -> Result<()> {
         info!("Dialing peer {} at {}", peer, addr);
 
-        // Connect to the peer by address
         let start = Instant::now();
         let ant_peer_id = gossip_peer_id_to_ant(&peer);
 
@@ -660,12 +712,13 @@ impl GossipTransport for UdpTransportAdapter {
             return Ok(());
         }
 
+        // Try direct connection first (fast path)
         match self.node.connect_addr(addr).await {
             Ok(peer_conn) => {
                 let gossip_id = ant_peer_id_to_gossip(&peer_conn.peer_id);
                 let rtt_ms = start.elapsed().as_millis() as u32;
                 info!(
-                    "Successfully connected to peer {} at {} (rtt: {}ms)",
+                    "Direct connection to peer {} at {} (rtt: {}ms)",
                     gossip_id, addr, rtt_ms
                 );
 
@@ -682,10 +735,8 @@ impl GossipTransport for UdpTransportAdapter {
                     ));
                 }
 
-                // Track the connection
                 self.add_peer(gossip_id, addr).await;
 
-                // Update bootstrap cache if present
                 if let Some(cache) = &self.bootstrap_cache {
                     let ant_peer_id = gossip_peer_id_to_ant(&gossip_id);
                     cache.record_success(&ant_peer_id, rtt_ms).await;
@@ -693,17 +744,58 @@ impl GossipTransport for UdpTransportAdapter {
 
                 Ok(())
             }
-            Err(e) => {
-                warn!("Failed to connect to peer at {}: {}", addr, e);
+            Err(direct_err) => {
+                info!(
+                    "Direct connection to {} failed ({}), trying NAT traversal fallback",
+                    addr, direct_err
+                );
 
-                // Record failure in bootstrap cache
-                if let Some(cache) = &self.bootstrap_cache {
-                    let ant_peer_id = gossip_peer_id_to_ant(&peer);
-                    cache.record_failure(&ant_peer_id).await;
+                // Direct failed — use progressive fallback: hole-punch → relay
+                match self.connect_with_nat_fallback(addr, Some(peer)).await {
+                    Ok((gossip_id, method)) => {
+                        if gossip_id != peer {
+                            warn!(
+                                "NAT fallback connected to {} but expected {}",
+                                gossip_id, peer
+                            );
+                            self.remove_peer(&peer).await;
+                            return Err(anyhow!(
+                                "Connected to unexpected peer {} when dialing {}",
+                                gossip_id,
+                                peer
+                            ));
+                        }
+
+                        if let Some(cache) = &self.bootstrap_cache {
+                            let rtt_ms = start.elapsed().as_millis() as u32;
+                            let ant_peer_id = gossip_peer_id_to_ant(&gossip_id);
+                            cache.record_success(&ant_peer_id, rtt_ms).await;
+                        }
+
+                        info!(
+                            "Connected to peer {} via NAT fallback ({})",
+                            gossip_id, method
+                        );
+                        Ok(())
+                    }
+                    Err(fallback_err) => {
+                        warn!(
+                            "All connection strategies failed for peer {} at {}: direct={}, fallback={}",
+                            peer, addr, direct_err, fallback_err
+                        );
+
+                        if let Some(cache) = &self.bootstrap_cache {
+                            let ant_peer_id = gossip_peer_id_to_ant(&peer);
+                            cache.record_failure(&ant_peer_id).await;
+                        }
+
+                        self.remove_peer(&peer).await;
+                        Err(anyhow!(
+                            "Failed to connect to peer {} at {}: direct failed ({}), NAT fallback failed ({})",
+                            peer, addr, direct_err, fallback_err
+                        ))
+                    }
                 }
-
-                self.remove_peer(&peer).await;
-                Err(anyhow!("Failed to connect to peer: {}", e))
             }
         }
     }
@@ -911,19 +1003,18 @@ impl TransportAdapter for UdpTransportAdapter {
             return Ok(peer_id);
         }
 
+        // Try direct connection first (fast path)
         match self.node.connect_addr(addr).await {
             Ok(peer_conn) => {
                 let gossip_peer_id = ant_peer_id_to_gossip(&peer_conn.peer_id);
                 let rtt_ms = start.elapsed().as_millis() as u32;
                 info!(
-                    "Connected to peer {} at {} (rtt: {}ms)",
+                    "Direct connection to peer {} at {} (rtt: {}ms)",
                     gossip_peer_id, addr, rtt_ms
                 );
 
-                // Track the connection
                 self.add_peer(gossip_peer_id, addr).await;
 
-                // Update bootstrap cache if present
                 if let Some(cache) = &self.bootstrap_cache {
                     let ant_peer_id = gossip_peer_id_to_ant(&gossip_peer_id);
                     cache.record_success(&ant_peer_id, rtt_ms).await;
@@ -931,13 +1022,43 @@ impl TransportAdapter for UdpTransportAdapter {
 
                 Ok(gossip_peer_id)
             }
-            Err(e) => {
-                warn!("Failed to dial {}: {}", addr, e);
+            Err(direct_err) => {
+                info!(
+                    "Direct dial to {} failed ({}), trying NAT traversal fallback",
+                    addr, direct_err
+                );
 
-                Err(TransportError::DialFailed {
-                    addr,
-                    source: anyhow!("{}", e),
-                })
+                // Direct failed — use progressive fallback: hole-punch → relay
+                match self.connect_with_nat_fallback(addr, None).await {
+                    Ok((gossip_peer_id, method)) => {
+                        if let Some(cache) = &self.bootstrap_cache {
+                            let rtt_ms = start.elapsed().as_millis() as u32;
+                            let ant_peer_id = gossip_peer_id_to_ant(&gossip_peer_id);
+                            cache.record_success(&ant_peer_id, rtt_ms).await;
+                        }
+
+                        info!(
+                            "Connected to peer {} via NAT fallback ({})",
+                            gossip_peer_id, method
+                        );
+                        Ok(gossip_peer_id)
+                    }
+                    Err(fallback_err) => {
+                        warn!(
+                            "All connection strategies failed for {}: direct={}, fallback={}",
+                            addr, direct_err, fallback_err
+                        );
+
+                        Err(TransportError::DialFailed {
+                            addr,
+                            source: anyhow!(
+                                "direct failed ({}), NAT fallback failed ({})",
+                                direct_err,
+                                fallback_err
+                            ),
+                        })
+                    }
+                }
             }
         }
     }

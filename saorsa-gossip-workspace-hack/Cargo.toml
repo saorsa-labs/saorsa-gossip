@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 bytes = { version = "1", features = ["serde"] }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 digest = { version = "0.10", features = ["mac", "std"] }
 either = { version = "1" }
 futures-channel = { version = "0.3", default-features = false, features = ["sink", "std"] }
@@ -39,6 +40,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "local-time"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zeroize = { version = "1", features = ["derive"] }
 

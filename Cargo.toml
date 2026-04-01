@@ -18,7 +18,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.11"
+version = "0.5.12"
 edition = "2021"
 authors = ["David Irvine <david@saorsalabs.com>"]
 license = "MIT OR Apache-2.0"
@@ -38,7 +38,7 @@ anyhow = "1.0"
 saorsa-pqc = "0.5"
 
 # QUIC transport
-ant-quic = "0.24.5"
+ant-quic = "0.25.1"
 
 # Shared transport layer
 
@@ -60,17 +60,17 @@ tracing = "0.1"
 # We'll need delta-CRDT implementations
 
 # Internal crates (keep versions in sync automatically)
-saorsa-gossip-types = { version = "0.5.11", path = "crates/types" }
-saorsa-gossip-transport = { version = "0.5.11", path = "crates/transport" }
-saorsa-gossip-membership = { version = "0.5.11", path = "crates/membership" }
-saorsa-gossip-pubsub = { version = "0.5.11", path = "crates/pubsub" }
-saorsa-gossip-presence = { version = "0.5.11", path = "crates/presence" }
-saorsa-gossip-crdt-sync = { version = "0.5.11", path = "crates/crdt-sync" }
-saorsa-gossip-groups = { version = "0.5.11", path = "crates/groups" }
-saorsa-gossip-identity = { version = "0.5.11", path = "crates/identity" }
-saorsa-gossip-coordinator = { version = "0.5.11", path = "crates/coordinator" }
-saorsa-gossip-rendezvous = { version = "0.5.11", path = "crates/rendezvous" }
-saorsa-gossip-runtime = { version = "0.5.11", path = "crates/runtime" }
+saorsa-gossip-types = { version = "0.5.12", path = "crates/types" }
+saorsa-gossip-transport = { version = "0.5.12", path = "crates/transport" }
+saorsa-gossip-membership = { version = "0.5.12", path = "crates/membership" }
+saorsa-gossip-pubsub = { version = "0.5.12", path = "crates/pubsub" }
+saorsa-gossip-presence = { version = "0.5.12", path = "crates/presence" }
+saorsa-gossip-crdt-sync = { version = "0.5.12", path = "crates/crdt-sync" }
+saorsa-gossip-groups = { version = "0.5.12", path = "crates/groups" }
+saorsa-gossip-identity = { version = "0.5.12", path = "crates/identity" }
+saorsa-gossip-coordinator = { version = "0.5.12", path = "crates/coordinator" }
+saorsa-gossip-rendezvous = { version = "0.5.12", path = "crates/rendezvous" }
+saorsa-gossip-runtime = { version = "0.5.12", path = "crates/runtime" }
 
 # Testing
 proptest = "1.4"

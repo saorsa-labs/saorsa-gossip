@@ -360,6 +360,8 @@ fn roles_to_capabilities(roles: &PeerRoles, nat_class: &NatClass) -> PeerCapabil
         protocols: Default::default(),
         nat_type: Some(nat_class_to_nat_type(nat_class)),
         external_addresses: Vec::new(),
+        reachable_addresses: Vec::new(),
+        direct_reachability_scope: None,
     }
 }
 
@@ -649,6 +651,8 @@ mod tests {
             protocols: Default::default(),
             nat_type: Some(NatType::AddressRestrictedCone),
             external_addresses: Vec::new(),
+            reachable_addresses: Vec::new(),
+            direct_reachability_scope: None,
         };
 
         let roles = capabilities_to_roles(&caps);

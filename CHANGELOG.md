@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.14] - 2026-04-09
+
+### Changed
+
+- Updated `ant-quic` to `0.26.1`
+- Saorsa Gossip now relies on ant-quic's built-in first-party mDNS discovery and additive UPnP handling for zero-config transport connectivity
+
+### Documentation
+
+- Updated transport documentation to reflect that local discovery and router-assisted reachability live in ant-quic rather than in gossip-specific code
+- Refreshed ADR-011 to note the expanded ant-quic transport responsibilities in the current stack
+
 ## [0.5.11] - 2026-04-01
 
 ### Changed

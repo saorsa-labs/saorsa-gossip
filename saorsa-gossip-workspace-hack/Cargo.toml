@@ -14,7 +14,7 @@ crypto-common = { version = "0.1", default-features = false, features = ["getran
 curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 digest = { version = "0.10", features = ["mac", "std"] }
 either = { version = "1" }
-futures-channel = { version = "0.3", default-features = false, features = ["sink", "std"] }
+futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
@@ -23,6 +23,7 @@ getrandom = { version = "0.2", default-features = false, features = ["std"] }
 hashbrown = { version = "0.16" }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
+mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2", default-features = false, features = ["std"] }
 once_cell = { version = "1" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
@@ -32,7 +33,7 @@ regex-automata = { version = "0.4", default-features = false, features = ["dfa-b
 regex-syntax = { version = "0.8" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "default-tls", "json", "rustls-tls"] }
 serde = { version = "1", features = ["alloc", "derive"] }
-smallvec = { version = "1", default-features = false, features = ["const_generics"] }
+smallvec = { version = "1", default-features = false, features = ["const_new"] }
 subtle = { version = "2", features = ["const-generics"] }
 thiserror = { version = "2" }
 time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }

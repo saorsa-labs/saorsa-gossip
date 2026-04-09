@@ -91,13 +91,13 @@ Saorsa Gossip implements a complete gossip overlay with:
 
 ### Core Crates
 
-This repository tracks the Saorsa Gossip workspace at **v0.2.1**. Some crates are published on [crates.io](https://crates.io) already, but others are only available from source while the alpha stabilises.
+This repository tracks the Saorsa Gossip workspace at **v0.5.14**. Some crates are published on [crates.io](https://crates.io) already, but others are only available from source while the alpha stabilises.
 
 | Crate | Purpose | Why It's Important |
 |-------|---------|-------------------|
 | [**types**](https://crates.io/crates/saorsa-gossip-types) | Core types (TopicId, PeerId, MessageHeader, wire formats) | **Foundation** - Defines all fundamental data structures and message formats used across the entire network. Includes BLAKE3-based message ID generation and CBOR wire serialization. |
 | [**identity**](https://crates.io/crates/saorsa-gossip-identity) | ML-DSA-65 key generation, signing, and verification | **Security Core** - Provides quantum-resistant digital signatures for all messages. Every peer identity is backed by ML-DSA-65 keypairs, ensuring authenticity in a post-quantum world. |
-| [**transport**](https://crates.io/crates/saorsa-gossip-transport) | QUIC transport with ant-quic, NAT traversal | **Network Layer** - Handles all peer-to-peer communication with low-latency QUIC streams. Includes hole-punching for NAT traversal and connection migration for mobile nodes. |
+| [**transport**](https://crates.io/crates/saorsa-gossip-transport) | QUIC transport with ant-quic, NAT traversal | **Network Layer** - Handles all peer-to-peer communication with low-latency QUIC streams. ant-quic now owns first-party mDNS discovery, additive UPnP port mapping, hole-punching, and connection migration for mobile nodes. |
 | [**membership**](https://crates.io/crates/saorsa-gossip-membership) | HyParView partial views + SWIM failure detection | **Peer Discovery** - Maintains partial views of the network (8-12 active peers, 64-128 passive). SWIM detects failures in <5s, HyParView heals partitions through periodic shuffles. Critical for network connectivity. |
 | [**pubsub**](https://crates.io/crates/saorsa-gossip-pubsub) | Plumtree epidemic broadcast with EAGER/IHAVE/IWANT | **Message Dissemination** - Efficiently broadcasts messages to all topic subscribers. Uses spanning tree (EAGER) for low latency and lazy links (IHAVE) for redundancy. Achieves <500ms P50 broadcast latency. |
 | [**coordinator**](https://crates.io/crates/saorsa-gossip-coordinator) | Bootstrap node discovery, address reflection, relay | **Network Bootstrap** - Publishes Coordinator Adverts (ML-DSA signed) as *hints*. Peers validate reachability and success rates before selecting coordinators/relays ("measure, don't trust"). |

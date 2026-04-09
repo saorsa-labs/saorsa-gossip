@@ -307,13 +307,16 @@ mod tests {
         let action = bootstrap.find_coordinator().await;
 
         // Empty cache should trigger FOAF query per SPEC2 §7.4
-        match action {
-            BootstrapAction::SendQuery(query) => {
-                assert_eq!(query.origin, peer_id, "Query origin should be local peer");
-                assert_eq!(query.ttl, 3, "TTL should be 3 per SPEC2 §7.3");
-            }
-            _ => panic!("Expected SendQuery action for empty cache"),
-        }
+        let query = match action {
+            BootstrapAction::SendQuery(query) => Some(query),
+            _ => None,
+        };
+        assert!(query.is_some(), "Expected SendQuery action for empty cache");
+        let Some(query) = query else {
+            return;
+        };
+        assert_eq!(query.origin, peer_id, "Query origin should be local peer");
+        assert_eq!(query.ttl, 3, "TTL should be 3 per SPEC2 §7.3");
     }
 
     #[tokio::test]
@@ -343,14 +346,17 @@ mod tests {
         let action = bootstrap.find_coordinator().await;
 
         // Warm cache should return Connect action
-        match action {
-            BootstrapAction::Connect(result) => {
-                assert_eq!(result.peer_id, coord_peer);
-                assert_eq!(result.addr, addr);
-                assert_eq!(result.method, TraversalMethod::Direct);
-            }
-            _ => panic!("Expected Connect action for warm cache"),
-        }
+        let result = match action {
+            BootstrapAction::Connect(result) => Some(result),
+            _ => None,
+        };
+        assert!(result.is_some(), "Expected Connect action for warm cache");
+        let Some(result) = result else {
+            return;
+        };
+        assert_eq!(result.peer_id, coord_peer);
+        assert_eq!(result.addr, addr);
+        assert_eq!(result.method, TraversalMethod::Direct);
     }
 
     #[tokio::test]
@@ -379,16 +385,19 @@ mod tests {
         let bootstrap = Bootstrap::new(peer_id, cache, handler);
         let action = bootstrap.find_coordinator().await;
 
-        match action {
-            BootstrapAction::Connect(result) => {
-                assert_eq!(
-                    result.method,
-                    TraversalMethod::Direct,
-                    "Should prefer direct connection"
-                );
-            }
-            _ => panic!("Expected Connect action"),
-        }
+        let result = match action {
+            BootstrapAction::Connect(result) => Some(result),
+            _ => None,
+        };
+        assert!(result.is_some(), "Expected Connect action");
+        let Some(result) = result else {
+            return;
+        };
+        assert_eq!(
+            result.method,
+            TraversalMethod::Direct,
+            "Should prefer direct connection"
+        );
     }
 
     #[test]
@@ -419,17 +428,19 @@ mod tests {
         // Empty cache triggers FOAF query
         let action = bootstrap.find_coordinator().await;
 
-        match action {
-            BootstrapAction::SendQuery(query) => {
-                // Query should be tracked
-                let pending = bootstrap.pending_queries.lock().expect("lock");
-                assert!(
-                    pending.contains_key(&query.query_id),
-                    "Query should be tracked"
-                );
-            }
-            _ => panic!("Expected SendQuery action"),
-        }
+        let query = match action {
+            BootstrapAction::SendQuery(query) => Some(query),
+            _ => None,
+        };
+        assert!(query.is_some(), "Expected SendQuery action");
+        let Some(query) = query else {
+            return;
+        };
+        let pending = bootstrap.pending_queries.lock().expect("lock");
+        assert!(
+            pending.contains_key(&query.query_id),
+            "Query should be tracked"
+        );
     }
 
     /// Test handling FOAF query response
@@ -445,10 +456,15 @@ mod tests {
 
         // Issue query first
         let action = bootstrap.find_coordinator().await;
-        let query_id = match action {
-            BootstrapAction::SendQuery(query) => query.query_id,
-            _ => panic!("Expected SendQuery"),
+        let query = match action {
+            BootstrapAction::SendQuery(query) => Some(query),
+            _ => None,
         };
+        assert!(query.is_some(), "Expected SendQuery");
+        let Some(query) = query else {
+            return;
+        };
+        let query_id = query.query_id;
 
         // Create a response with a coordinator advert
         let coord_peer = PeerId::new([12u8; 32]);
@@ -481,13 +497,16 @@ mod tests {
             .expect("should return action");
 
         // Should return Connect action with coordinator
-        match result_action {
-            BootstrapAction::Connect(result) => {
-                assert_eq!(result.peer_id, coord_peer);
-                assert_eq!(result.addr, addr);
-            }
-            _ => panic!("Expected Connect action after response"),
-        }
+        let result = match result_action {
+            BootstrapAction::Connect(result) => Some(result),
+            _ => None,
+        };
+        assert!(result.is_some(), "Expected Connect action after response");
+        let Some(result) = result else {
+            return;
+        };
+        assert_eq!(result.peer_id, coord_peer);
+        assert_eq!(result.addr, addr);
 
         // Query should be removed from pending
         let pending = bootstrap.pending_queries.lock().expect("lock");
@@ -563,10 +582,15 @@ mod tests {
 
         // Issue query
         let action = bootstrap.find_coordinator().await;
-        let query_id = match action {
-            BootstrapAction::SendQuery(query) => query.query_id,
-            _ => panic!("Expected SendQuery"),
+        let query = match action {
+            BootstrapAction::SendQuery(query) => Some(query),
+            _ => None,
         };
+        assert!(query.is_some(), "Expected SendQuery");
+        let Some(query) = query else {
+            return;
+        };
+        let query_id = query.query_id;
 
         // Create response with 3 coordinators
         let signer = MlDsa65::new();
@@ -603,12 +627,14 @@ mod tests {
             .await
             .expect("should return action");
 
-        match result_action {
-            BootstrapAction::Connect(result) => {
-                // Just verify we got a coordinator back
-                assert!(result.addr.port() >= 8080);
-            }
-            _ => panic!("Expected Connect action"),
-        }
+        let result = match result_action {
+            BootstrapAction::Connect(result) => Some(result),
+            _ => None,
+        };
+        assert!(result.is_some(), "Expected Connect action");
+        let Some(result) = result else {
+            return;
+        };
+        assert!(result.addr.port() >= 8080);
     }
 }

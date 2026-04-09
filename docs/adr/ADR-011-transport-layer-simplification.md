@@ -34,7 +34,8 @@ Remove the custom transport multiplexer infrastructure and rely on ant-quic's na
 2. **Simplify GossipTransport trait**: Remove `send_with_request()` method, use `send_to_peer()` for all cases
 3. **Update runtime**: Use `UdpTransportAdapter` directly instead of wrapping in `MultiplexedGossipTransport`
 4. **Re-export ant-quic types**: Provide `AntTransportRegistry`, `TransportType`, etc. from transport crate
-5. **Update documentation**: Reflect simplified architecture
+5. **Keep discovery in ant-quic**: Local mDNS discovery, additive UPnP port mapping, and unified outbound orchestration stay in the transport layer instead of being reimplemented in gossip
+6. **Update documentation**: Reflect simplified architecture
 
 ## Consequences
 
@@ -44,6 +45,7 @@ Remove the custom transport multiplexer infrastructure and rely on ant-quic's na
 - **Simpler architecture** - One less abstraction layer between gossip and network
 - **Better performance** - ant-quic's native routing is optimized for their connection model
 - **Future compatibility** - Automatic access to new ant-quic transport features
+- **Zero-config improvements** - Saorsa Gossip inherits ant-quic's built-in local discovery and router-assisted reachability without extra gossip-specific runtime
 - **Reduced testing surface** - No need to maintain custom multiplexer tests
 
 ### Negative

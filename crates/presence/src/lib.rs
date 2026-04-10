@@ -101,7 +101,7 @@ impl PendingQuery {
     ///
     /// If we already have a record for a peer, keeps the one with higher sequence
     /// number. A record with a *lower* seq but a `since` timestamp more than
-    /// [`REBOOT_GRACE_SECS`] newer than the existing record is accepted as a
+    /// `REBOOT_GRACE_SECS` (120 s) newer than the existing record is accepted as a
     /// likely reboot.
     fn add_responses(&mut self, records: &[(PeerId, PresenceRecord)]) {
         /// Grace period (seconds) before treating a lower-seq beacon as a reboot.

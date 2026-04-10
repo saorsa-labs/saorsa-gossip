@@ -357,6 +357,8 @@ fn roles_to_capabilities(roles: &PeerRoles, nat_class: &NatClass) -> PeerCapabil
     PeerCapabilities {
         supports_relay: roles.relay,
         supports_coordination: roles.coordinator || roles.rendezvous,
+        hinted_supports_relay: roles.relay,
+        hinted_supports_coordination: roles.coordinator || roles.rendezvous,
         protocols: Default::default(),
         nat_type: Some(nat_class_to_nat_type(nat_class)),
         external_addresses: Vec::new(),
@@ -648,6 +650,8 @@ mod tests {
         let caps = PeerCapabilities {
             supports_relay: true,
             supports_coordination: true,
+            hinted_supports_relay: true,
+            hinted_supports_coordination: true,
             protocols: Default::default(),
             nat_type: Some(NatType::AddressRestrictedCone),
             external_addresses: Vec::new(),

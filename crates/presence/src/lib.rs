@@ -20,6 +20,7 @@ use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::{PeerId, PresenceRecord, TopicId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -96,16 +97,31 @@ impl PendingQuery {
         }
     }
 
-    /// Add records to aggregated responses, deduplicating by PeerId
+    /// Add records to aggregated responses, deduplicating by PeerId.
     ///
-    /// If we already have a record for a peer, keeps the one with higher sequence number.
+    /// If we already have a record for a peer, keeps the one with higher sequence
+    /// number. A record with a *lower* seq but a `since` timestamp more than
+    /// [`REBOOT_GRACE_SECS`] newer than the existing record is accepted as a
+    /// likely reboot.
     fn add_responses(&mut self, records: &[(PeerId, PresenceRecord)]) {
+        /// Grace period (seconds) before treating a lower-seq beacon as a reboot.
+        const REBOOT_GRACE_SECS: u64 = 120;
+
         for (peer_id, record) in records {
             self.responses
                 .entry(*peer_id)
                 .and_modify(|existing| {
-                    // Keep the record with higher sequence number
                     if record.seq > existing.seq {
+                        // Normal case: higher seq wins.
+                        *existing = record.clone();
+                    } else if record.since > existing.since.saturating_add(REBOOT_GRACE_SECS) {
+                        // Reboot case: lower/equal seq but significantly newer timestamp.
+                        debug!(
+                            ?peer_id,
+                            old_seq = existing.seq,
+                            new_seq = record.seq,
+                            "accepting beacon with lower seq — likely reboot"
+                        );
                         *existing = record.clone();
                     }
                 })
@@ -158,6 +174,8 @@ pub struct PresenceManager {
     identity: Arc<RwLock<Option<Arc<MlDsaKeyPair>>>>,
     /// Per-peer rate limiter for presence messages
     rate_limiter: Arc<RwLock<RateLimiter>>,
+    /// Monotonically increasing sequence number for beacons from this manager.
+    beacon_seq: Arc<AtomicU64>,
 }
 
 impl PresenceManager {
@@ -191,6 +209,7 @@ impl PresenceManager {
             pending_queries: Arc::new(RwLock::new(HashMap::new())),
             identity: Arc::new(RwLock::new(None)),
             rate_limiter: Arc::new(RwLock::new(RateLimiter::new(RateLimitConfig::default()))),
+            beacon_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -223,6 +242,7 @@ impl PresenceManager {
             pending_queries: Arc::new(RwLock::new(HashMap::new())),
             identity: Arc::new(RwLock::new(Some(Arc::new(identity)))),
             rate_limiter: Arc::new(RwLock::new(RateLimiter::new(RateLimitConfig::default()))),
+            beacon_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -323,6 +343,7 @@ impl PresenceManager {
         let four_words = self.four_words.clone();
         let identity = self.identity.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let beacon_seq = self.beacon_seq.clone();
 
         let allow_plaintext = matches!(
             std::env::var("COMMUNITAS_PRESENCE_ALLOW_PLAINTEXT")
@@ -403,6 +424,8 @@ impl PresenceManager {
                                     ttl_seconds,
                                 ),
                             };
+                            record.seq =
+                                beacon_seq.fetch_add(1, Ordering::Relaxed);
 
                             // Sign the beacon if identity is available
                             let identity_guard = identity.read().await;
@@ -795,10 +818,22 @@ impl PresenceManager {
         peer: PeerId,
         record: PresenceRecord,
     ) -> Result<()> {
+        /// Grace period (seconds) before treating a lower-seq beacon as a reboot.
+        const REBOOT_GRACE_SECS: u64 = 120;
+
         let mut beacons = self.received_beacons.write().await;
 
         // Get or create topic beacon map
         let topic_beacons = beacons.entry(topic).or_default();
+
+        // Dedup: only accept if newer seq or likely reboot
+        if let Some(existing) = topic_beacons.get(&peer) {
+            let is_newer_seq = record.seq > existing.seq;
+            let is_reboot = record.since > existing.since.saturating_add(REBOOT_GRACE_SECS);
+            if !is_newer_seq && !is_reboot {
+                return Ok(());
+            }
+        }
 
         // Store the beacon
         topic_beacons.insert(peer, record);
@@ -2430,5 +2465,61 @@ mod tests {
         // Verify beacon was stored
         let status = manager.get_status(sender, topic).await;
         assert_eq!(status, PresenceStatus::Online);
+    }
+
+    #[test]
+    fn test_reboot_detection_accepts_lower_seq_with_newer_timestamp() {
+        let topic = TopicId::new([1u8; 32]);
+        let mut query = PendingQuery::new(topic);
+        let peer = PeerId::new([10u8; 32]);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Old record: seq=5, since=600 seconds ago
+        let mut old_record =
+            PresenceRecord::new_with_seq([1u8; 32], vec!["127.0.0.1:8080".to_string()], 900, 5);
+        old_record.since = now.saturating_sub(600);
+        query.add_responses(&[(peer, old_record)]);
+        assert_eq!(query.responses.get(&peer).unwrap().seq, 5);
+
+        // New record after reboot: seq=0, since=now (>120s newer)
+        let mut new_record =
+            PresenceRecord::new_with_seq([1u8; 32], vec!["127.0.0.1:8080".to_string()], 900, 0);
+        new_record.since = now;
+        query.add_responses(&[(peer, new_record)]);
+
+        // New record wins: since gap (600s) > REBOOT_GRACE_SECS (120s)
+        assert_eq!(query.responses.get(&peer).unwrap().seq, 0);
+        assert_eq!(query.responses.get(&peer).unwrap().since, now);
+    }
+
+    #[test]
+    fn test_reboot_grace_period_rejects_within_window() {
+        let topic = TopicId::new([1u8; 32]);
+        let mut query = PendingQuery::new(topic);
+        let peer = PeerId::new([10u8; 32]);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Old record: seq=5, since=30 seconds ago (within grace window)
+        let mut old_record =
+            PresenceRecord::new_with_seq([1u8; 32], vec!["127.0.0.1:8080".to_string()], 900, 5);
+        old_record.since = now.saturating_sub(30);
+        query.add_responses(&[(peer, old_record)]);
+
+        // New record with lower seq: seq=0, since=now (only 30s newer)
+        let mut new_record =
+            PresenceRecord::new_with_seq([1u8; 32], vec!["127.0.0.1:8080".to_string()], 900, 0);
+        new_record.since = now;
+        query.add_responses(&[(peer, new_record)]);
+
+        // Old record kept: since gap (30s) < REBOOT_GRACE_SECS (120s)
+        assert_eq!(query.responses.get(&peer).unwrap().seq, 5);
     }
 }

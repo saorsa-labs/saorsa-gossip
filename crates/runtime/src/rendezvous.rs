@@ -119,7 +119,7 @@ impl RendezvousClient {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         scored.into_iter().map(|(summary, _)| summary).collect()
     }
 

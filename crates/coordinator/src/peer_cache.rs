@@ -202,7 +202,7 @@ impl PeerCache {
             .unwrap_or_default();
 
         // Sort by last_success descending (most recent first)
-        coordinators.sort_by(|a, b| b.last_success.cmp(&a.last_success));
+        coordinators.sort_by_key(|c| std::cmp::Reverse(c.last_success));
         coordinators
     }
 

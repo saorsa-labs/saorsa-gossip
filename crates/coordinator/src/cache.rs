@@ -125,7 +125,7 @@ impl AdvertCache {
             .collect();
 
         // Sort by score (descending)
-        adverts.sort_by(|a, b| b.score.cmp(&a.score));
+        adverts.sort_by_key(|a| std::cmp::Reverse(a.score));
         adverts
     }
 

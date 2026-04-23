@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.20] - 2026-04-23
+
+### Changed
+
+- Bumped `ant-quic` to `0.27.4`, picking up the dual-stack CPU-spin fix in
+  `DualStackSocket::create_io_poller` (AND-combine v4/v6 writability). No
+  saorsa-gossip source changes; all 11 workspace crates re-published at
+  0.5.20 for a consistent lockstep upgrade across `saorsa-gossip-{types,
+  transport, membership, pubsub, presence, crdt-sync, groups, identity,
+  coordinator, rendezvous, runtime}`.
+
 ## [0.5.14] - 2026-04-09
 
 ### Changed

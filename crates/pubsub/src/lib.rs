@@ -31,17 +31,39 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time;
 use tracing::{debug, error, trace, warn};
 
-/// Maximum message cache size per topic (10,000 messages)
-const MAX_CACHE_SIZE: usize = 10_000;
+/// Maximum message cache size per topic.
+///
+/// Sized at 2× the IHAVE batch (1024) so PlumTree IWANT recovery still has
+/// the full last-batch window of payloads to serve. Worst case payload
+/// retention per topic: 2048 × max-payload-size. Was 10_000 — too generous
+/// for memory-constrained nodes (would retain up to ~90 MB per topic at
+/// 9 KB/payload).
+const MAX_CACHE_SIZE: usize = 2_048;
 
-/// Message cache TTL (5 minutes)
-const CACHE_TTL_SECS: u64 = 300;
+/// Message cache TTL (60 s).
+///
+/// PlumTree IWANT recovery typically resolves within RTTs (sub-second).
+/// 60 s is generous for partition recovery while bounding steady-state
+/// retention to (msg_rate × 60) × payload_size per topic. Was 300 s —
+/// 5× more retention than required for the recovery window.
+const CACHE_TTL_SECS: u64 = 60;
 
 /// Maximum payload replay cache size per topic.
 const REPLAY_CACHE_MAX_ENTRIES: usize = 10_000;
 
 /// Payload replay cache TTL (5 minutes).
 const REPLAY_CACHE_TTL_SECS: u64 = 300;
+
+/// Idle TTL for an entire `TopicState` entry (10 min).
+///
+/// When a topic has had no incoming gossip / publishes / IHAVE for this
+/// long and has no live local subscribers, the whole `TopicState` is dropped
+/// from the `topics` HashMap — freeing its message_cache, replay_cache,
+/// peer_scores, eager/lazy peer sets, etc. Without this, ephemeral topics
+/// (e.g. per-peer beacons, per-session announcements) accumulated forever,
+/// contributing to slow idle-traffic RSS drift observed during the
+/// 2026-04-25 soak validation.
+const TOPIC_IDLE_TTL_SECS: u64 = 600;
 
 /// Maximum IHAVE batch size (per SPEC.md)
 const MAX_IHAVE_BATCH_SIZE: usize = 1024;
@@ -60,7 +82,7 @@ const MAX_EAGER_DEGREE: usize = 12;
 type MessageIdType = [u8; 32];
 
 const fn message_cache_capacity() -> NonZeroUsize {
-    // SAFETY: MAX_CACHE_SIZE is a positive constant (10,000)
+    // SAFETY: MAX_CACHE_SIZE is a positive constant.
     unsafe { NonZeroUsize::new_unchecked(MAX_CACHE_SIZE) }
 }
 
@@ -202,6 +224,10 @@ struct TopicState {
     replay_cache: LruCache<[u8; 32], Instant>,
     /// TTL for replay cache entries.
     replay_ttl: Duration,
+    /// Last time this topic saw any activity (publish, incoming, IHAVE, etc).
+    /// When this exceeds TOPIC_IDLE_TTL_SECS, the entire entry is dropped
+    /// from the parent `topics` HashMap.
+    last_activity: Instant,
 }
 
 impl TopicState {
@@ -216,7 +242,21 @@ impl TopicState {
             subscribers: Vec::new(),
             replay_cache: LruCache::new(replay_cache_capacity()),
             replay_ttl: Duration::from_secs(REPLAY_CACHE_TTL_SECS),
+            last_activity: Instant::now(),
         }
+    }
+
+    /// Mark this topic as having seen data-plane activity now.
+    fn touch(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    fn is_idle(&self, ttl: Duration) -> bool {
+        self.last_activity.elapsed() > ttl && !self.has_live_subscribers()
+    }
+
+    fn has_live_subscribers(&self) -> bool {
+        self.subscribers.iter().any(|tx| !tx.is_closed())
     }
 
     /// Check if a payload has been seen before (replay detection).
@@ -225,6 +265,7 @@ impl TopicState {
     /// and not expired). Returns `false` if this is a new payload (and
     /// inserts the hash into the cache).
     fn is_payload_replay(&mut self, payload: &[u8]) -> bool {
+        self.touch();
         let key: [u8; 32] = *blake3::hash(payload).as_bytes();
         if let Some(ts) = self.replay_cache.get(&key) {
             if ts.elapsed() < self.replay_ttl {
@@ -253,6 +294,7 @@ impl TopicState {
             header,
         };
         self.message_cache.put(msg_id, cached);
+        self.touch();
     }
 
     /// Get cached message
@@ -296,6 +338,10 @@ impl TopicState {
         let now = Instant::now();
         self.peer_scores
             .retain(|_, score| now.saturating_duration_since(score.last_seen) < score_expiry);
+
+        // Quiet topics do not send through the subscriber list, so closed
+        // receivers would otherwise keep an idle topic alive forever.
+        self.subscribers.retain(|tx| !tx.is_closed());
     }
 
     /// Move peer from eager to lazy
@@ -363,6 +409,27 @@ impl TopicState {
             }
         }
     }
+}
+
+fn clean_and_reap_topics(
+    topics: &mut HashMap<TopicId, TopicState>,
+    topic_idle_ttl: Duration,
+) -> usize {
+    for state in topics.values_mut() {
+        state.clean_cache();
+    }
+
+    let idle: Vec<TopicId> = topics
+        .iter()
+        .filter(|(_, s)| s.is_idle(topic_idle_ttl))
+        .map(|(id, _)| *id)
+        .collect();
+    let idle_count = idle.len();
+    for id in idle {
+        topics.remove(&id);
+    }
+
+    idle_count
 }
 
 /// Pub/sub trait for message dissemination
@@ -435,6 +502,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         transport: Arc<T>,
         signing_key: saorsa_gossip_identity::MlDsaKeyPair,
     ) -> Self {
+        Self::new_with_task_control(peer_id, transport, signing_key, true)
+    }
+
+    fn new_with_task_control(
+        peer_id: PeerId,
+        transport: Arc<T>,
+        signing_key: saorsa_gossip_identity::MlDsaKeyPair,
+        start_background_tasks: bool,
+    ) -> Self {
         let pubsub = Self {
             topics: Arc::new(RwLock::new(HashMap::new())),
             peer_id,
@@ -443,11 +519,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             signing_key: Arc::new(signing_key),
         };
 
-        // Start background tasks
-        pubsub.spawn_ihave_flusher();
-        pubsub.spawn_cache_cleaner();
-        pubsub.spawn_degree_maintainer();
-        pubsub.spawn_anti_entropy_task();
+        if start_background_tasks {
+            pubsub.spawn_ihave_flusher();
+            pubsub.spawn_cache_cleaner();
+            pubsub.spawn_degree_maintainer();
+            pubsub.spawn_anti_entropy_task();
+        }
 
         pubsub
     }
@@ -561,28 +638,29 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let eager_peers: Vec<PeerId> = state.eager_peers.iter().copied().collect();
         drop(topics); // Release lock before network I/O
 
+        // Serialize ONCE (the wire bytes are identical for every peer) and
+        // await each fan-out send sequentially. This mirrors `handle_eager`
+        // forwarding and applies natural back-pressure to publish() when
+        // peer-side throughput can't keep up — without it, the previous
+        // `tokio::spawn`-and-forget pattern accumulated outbound messages
+        // unboundedly per slow peer (root cause of the 2026-04-25 publish-
+        // stress soak's helsinki/nyc OOM at +177 MB/min).
+        let bytes: Bytes = match postcard::to_stdvec(&_message) {
+            Ok(b) => b.into(),
+            Err(e) => {
+                warn!(msg_id = ?msg_id, "EAGER serialize failed: {e}");
+                return Ok(());
+            }
+        };
         for peer in eager_peers {
-            let transport = self.transport.clone();
-            let message = _message.clone();
-            tokio::spawn(async move {
-                trace!(peer_id = %peer, msg_id = ?msg_id, "Sending EAGER");
-                let bytes = match postcard::to_stdvec(&message) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        warn!(peer_id = %peer, msg_id = ?msg_id, "EAGER serialize failed: {e}");
-                        return;
-                    }
-                };
-                match transport
-                    .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(err) => {
-                        warn!(peer_id = %peer, msg_id = ?msg_id, "EAGER send failed: {err}");
-                    }
-                }
-            });
+            trace!(peer_id = %peer, msg_id = ?msg_id, "Sending EAGER");
+            if let Err(err) = self
+                .transport
+                .send_to_peer(peer, GossipStreamType::PubSub, bytes.clone())
+                .await
+            {
+                warn!(peer_id = %peer, msg_id = ?msg_id, "EAGER send failed: {err}");
+            }
         }
 
         // Batch msg_id to pending_ihave
@@ -615,6 +693,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         let mut topics = self.topics.write().await;
         let state = topics.entry(topic).or_insert_with(TopicState::new);
+        state.touch();
 
         // Check for duplicate
         if state.has_message(&msg_id) {
@@ -721,6 +800,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ) -> Result<()> {
         let mut topics = self.topics.write().await;
         let state = topics.entry(topic).or_insert_with(TopicState::new);
+        state.touch();
 
         let mut requested = Vec::new();
 
@@ -792,6 +872,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ) -> Result<()> {
         let mut topics = self.topics.write().await;
         let state = topics.entry(topic).or_insert_with(TopicState::new);
+        state.touch();
 
         let mut to_send = Vec::new();
 
@@ -864,6 +945,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
                 let mut topics = self.topics.write().await;
                 let state = topics.entry(topic).or_insert_with(TopicState::new);
+                state.touch();
 
                 let our_ids: HashSet<MessageIdType> =
                     state.cached_message_ids().into_iter().collect();
@@ -947,9 +1029,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     "Received anti-entropy response"
                 );
 
-                // Filter out IDs we already have
-                let topics = self.topics.read().await;
-                let ids_to_request: Vec<MessageIdType> = if let Some(state) = topics.get(&topic) {
+                // Filter out IDs we already have.
+                let mut topics = self.topics.write().await;
+                let ids_to_request: Vec<MessageIdType> = if let Some(state) = topics.get_mut(&topic)
+                {
+                    state.touch();
                     missing_ids
                         .into_iter()
                         .filter(|id| !state.has_message(id))
@@ -1063,61 +1147,107 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             loop {
                 interval.tick().await;
 
-                let mut topics_guard = topics.write().await;
-
-                for (topic_id, state) in topics_guard.iter_mut() {
-                    if state.pending_ihave.is_empty() {
-                        continue;
-                    }
-
-                    // Take up to MAX_IHAVE_BATCH_SIZE
-                    let batch: Vec<MessageIdType> = state
-                        .pending_ihave
-                        .drain(..state.pending_ihave.len().min(MAX_IHAVE_BATCH_SIZE))
-                        .collect();
-
-                    let lazy_peers: Vec<PeerId> = state.lazy_peers.iter().copied().collect();
-
-                    trace!(topic = ?topic_id, batch_size = batch.len(), peer_count = lazy_peers.len(), "Flushing IHAVE batch");
-
-                    // Send IHAVE to each lazy peer
-                    for peer in lazy_peers {
-                        let ihave_header = MessageHeader {
-                            version: 1,
-                            topic: *topic_id,
-                            msg_id: batch[0], // Use first ID as header
-                            kind: MessageKind::IHave,
-                            hop: 0,
-                            ttl: 10,
-                        };
-                        let ihave_header_clone = ihave_header.clone();
-
-                        // Sign the header
-                        let signature = match postcard::to_stdvec(&ihave_header_clone) {
-                            Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
-                            Err(_) => Vec::new(),
-                        };
-
-                        let ihave_msg = GossipMessage {
-                            header: ihave_header,
-                            payload: Some(postcard::to_stdvec(&batch).unwrap_or_default().into()),
-                            signature,
-                            public_key: signing_key.public_key().to_vec(),
-                        };
-                        if let Ok(bytes) = postcard::to_stdvec(&ihave_msg) {
-                            let _ = transport
-                                .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
-                                .await;
-                        }
-                    }
-                }
+                Self::flush_ihave_batches(&topics, &transport, &signing_key).await;
             }
         });
     }
 
-    /// Spawn background task to clean expired cache entries
+    async fn flush_ihave_batches(
+        topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
+        transport: &Arc<T>,
+        signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
+    ) {
+        let work: Vec<(TopicId, Vec<MessageIdType>, Vec<PeerId>)> = {
+            let mut topics_guard = topics.write().await;
+            let mut work = Vec::new();
+
+            for (topic_id, state) in topics_guard.iter_mut() {
+                if state.pending_ihave.is_empty() {
+                    continue;
+                }
+
+                let batch: Vec<MessageIdType> = state
+                    .pending_ihave
+                    .drain(..state.pending_ihave.len().min(MAX_IHAVE_BATCH_SIZE))
+                    .collect();
+
+                let lazy_peers: Vec<PeerId> = state.lazy_peers.iter().copied().collect();
+                work.push((*topic_id, batch, lazy_peers));
+            }
+
+            work
+        };
+
+        for (topic_id, batch, lazy_peers) in work {
+            if lazy_peers.is_empty() {
+                continue;
+            }
+
+            trace!(topic = ?topic_id, batch_size = batch.len(), peer_count = lazy_peers.len(), "Flushing IHAVE batch");
+
+            let ihave_header = MessageHeader {
+                version: 1,
+                topic: topic_id,
+                msg_id: batch[0],
+                kind: MessageKind::IHave,
+                hop: 0,
+                ttl: 10,
+            };
+
+            let signature = match postcard::to_stdvec(&ihave_header) {
+                Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
+                Err(e) => {
+                    warn!(topic = ?topic_id, "IHAVE header serialize failed: {e}");
+                    continue;
+                }
+            };
+
+            let payload = match postcard::to_stdvec(&batch) {
+                Ok(bytes) => bytes.into(),
+                Err(e) => {
+                    warn!(topic = ?topic_id, "IHAVE batch serialize failed: {e}");
+                    continue;
+                }
+            };
+
+            let ihave_msg = GossipMessage {
+                header: ihave_header,
+                payload: Some(payload),
+                signature,
+                public_key: signing_key.public_key().to_vec(),
+            };
+            let bytes: Bytes = match postcard::to_stdvec(&ihave_msg) {
+                Ok(bytes) => bytes.into(),
+                Err(e) => {
+                    warn!(topic = ?topic_id, "IHAVE message serialize failed: {e}");
+                    continue;
+                }
+            };
+
+            for peer in lazy_peers {
+                if let Err(e) = transport
+                    .send_to_peer(peer, GossipStreamType::PubSub, bytes.clone())
+                    .await
+                {
+                    warn!(peer_id = %peer, topic = ?topic_id, "IHAVE send failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Spawn background task to clean expired cache entries.
+    ///
+    /// Two passes per tick:
+    /// 1. Per-topic cache TTL sweep — evicts stale `CachedMessage` and
+    ///    `replay_cache` entries from each topic's LRUs.
+    /// 2. Topic-level idle TTL sweep — drops the entire `TopicState`
+    ///    (caches + peer sets + scores) for topics that have seen no
+    ///    activity in `TOPIC_IDLE_TTL_SECS` and have no live subscribers.
+    ///    Keeps the parent `topics` HashMap from accumulating ephemeral topics
+    ///    forever without silently closing quiet local subscriptions.
     fn spawn_cache_cleaner(&self) {
         let topics = self.topics.clone();
+        let topic_idle_ttl = Duration::from_secs(TOPIC_IDLE_TTL_SECS);
 
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(60));
@@ -1126,9 +1256,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 interval.tick().await;
 
                 let mut topics_guard = topics.write().await;
-
-                for state in topics_guard.values_mut() {
-                    state.clean_cache();
+                let idle_count = clean_and_reap_topics(&mut topics_guard, topic_idle_ttl);
+                if idle_count > 0 {
+                    debug!(
+                        idle_count = idle_count,
+                        remaining = topics_guard.len(),
+                        "Reaped idle TopicState entries"
+                    );
                 }
             }
         });
@@ -1335,6 +1469,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
         tokio::spawn(async move {
             let mut topics_guard = topics.write().await;
             let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
+            state.touch();
             state.subscribers.push(tx);
         });
 
@@ -1437,6 +1572,8 @@ mod tests {
     use super::*;
     use saorsa_gossip_transport::UdpTransportAdapter;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
 
     fn test_peer_id(id: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -1455,6 +1592,106 @@ mod tests {
 
     fn test_signing_key() -> saorsa_gossip_identity::MlDsaKeyPair {
         saorsa_gossip_identity::MlDsaKeyPair::generate().expect("Failed to generate test key pair")
+    }
+
+    #[derive(Debug)]
+    struct SendRecord {
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        data_ptr: usize,
+        data_len: usize,
+    }
+
+    struct BlockingTransport {
+        local_peer: PeerId,
+        started_tx: mpsc::UnboundedSender<SendRecord>,
+        release: Arc<Semaphore>,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        send_count: AtomicUsize,
+    }
+
+    impl BlockingTransport {
+        fn new(local_peer: PeerId) -> (Arc<Self>, mpsc::UnboundedReceiver<SendRecord>) {
+            let (started_tx, started_rx) = mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    local_peer,
+                    started_tx,
+                    release: Arc::new(Semaphore::new(0)),
+                    in_flight: AtomicUsize::new(0),
+                    max_in_flight: AtomicUsize::new(0),
+                    send_count: AtomicUsize::new(0),
+                }),
+                started_rx,
+            )
+        }
+
+        fn release_sends(&self, count: usize) {
+            self.release.add_permits(count);
+        }
+
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(Ordering::SeqCst)
+        }
+
+        fn send_count(&self) -> usize {
+            self.send_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for BlockingTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(self.local_peer)
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            peer: PeerId,
+            stream_type: GossipStreamType,
+            data: Bytes,
+        ) -> Result<()> {
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+            let _ = self.started_tx.send(SendRecord {
+                peer,
+                stream_type,
+                data_ptr: data.as_ptr() as usize,
+                data_len: data.len(),
+            });
+
+            let permit = self
+                .release
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore should stay open");
+            permit.forget();
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+            Err(anyhow!("blocking test transport does not receive"))
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.local_peer
+        }
     }
 
     #[tokio::test]
@@ -1485,6 +1722,145 @@ mod tests {
         assert!(received.is_ok());
         let (_, payload) = received.unwrap().unwrap();
         assert_eq!(payload, data);
+    }
+
+    #[tokio::test]
+    async fn test_publish_local_backpressures_eager_fanout_and_releases_topic_lock() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([2u8; 32]);
+        let eager_peers: Vec<PeerId> = (2..6).map(test_peer_id).collect();
+        pubsub
+            .initialize_topic_peers(topic, eager_peers.clone())
+            .await;
+
+        let publish_pubsub = Arc::clone(&pubsub);
+        let publish = tokio::spawn(async move {
+            publish_pubsub
+                .publish_local(topic, Bytes::from_static(b"backpressure"))
+                .await
+                .expect("publish should complete");
+        });
+
+        let first = tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("first send should start")
+            .expect("send channel should stay open");
+        assert_eq!(first.stream_type, GossipStreamType::PubSub);
+        assert!(first.data_len > 0);
+        assert!(
+            eager_peers.contains(&first.peer),
+            "send should target one of the eager peers"
+        );
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            started_rx.try_recv().is_err(),
+            "publish_local should not start the next peer send while the first send is blocked"
+        );
+        assert_eq!(
+            transport.max_in_flight(),
+            1,
+            "eager fan-out should have at most one blocked send in flight"
+        );
+        assert!(
+            !publish.is_finished(),
+            "publish_local should apply back-pressure instead of returning before sends drain"
+        );
+
+        let topic_ids = tokio::time::timeout(Duration::from_millis(50), pubsub.all_topic_ids())
+            .await
+            .expect("topic lock should not be held while send_to_peer is blocked");
+        assert!(
+            topic_ids.contains(&topic),
+            "topic should be visible while publish is blocked on network I/O"
+        );
+
+        let mut data_ptrs = vec![first.data_ptr];
+        for _ in 1..eager_peers.len() {
+            transport.release_sends(1);
+            let record = tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .expect("next send should start after releasing prior send")
+                .expect("send channel should stay open");
+            assert_eq!(record.stream_type, GossipStreamType::PubSub);
+            assert!(
+                eager_peers.contains(&record.peer),
+                "send should target one of the eager peers"
+            );
+            data_ptrs.push(record.data_ptr);
+            assert_eq!(
+                transport.max_in_flight(),
+                1,
+                "fan-out should remain sequential under back-pressure"
+            );
+        }
+
+        transport.release_sends(1);
+        tokio::time::timeout(Duration::from_millis(100), publish)
+            .await
+            .expect("publish task should finish after all sends are released")
+            .expect("publish task should not panic");
+
+        assert_eq!(transport.send_count(), eager_peers.len());
+        assert!(
+            data_ptrs.iter().all(|ptr| *ptr == data_ptrs[0]),
+            "all eager sends should share the same serialized Bytes allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ihave_flush_releases_topic_lock_before_network_io() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let topics = Arc::new(RwLock::new(HashMap::new()));
+        let signing_key = Arc::new(test_signing_key());
+        let topic = TopicId::new([6u8; 32]);
+        let lazy_peer = test_peer_id(2);
+
+        {
+            let mut topics_guard = topics.write().await;
+            let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(lazy_peer);
+            state.pending_ihave.push([7u8; 32]);
+        }
+
+        let flush_topics = Arc::clone(&topics);
+        let flush_transport = Arc::clone(&transport);
+        let flush_signing_key = Arc::clone(&signing_key);
+        let flush = tokio::spawn(async move {
+            PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
+                &flush_topics,
+                &flush_transport,
+                &flush_signing_key,
+            )
+            .await;
+        });
+
+        let record = tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("IHAVE send should start")
+            .expect("send channel should stay open");
+        assert_eq!(record.peer, lazy_peer);
+        assert_eq!(record.stream_type, GossipStreamType::PubSub);
+
+        let read_guard = tokio::time::timeout(Duration::from_millis(50), topics.read())
+            .await
+            .expect("IHAVE flush must not hold the topic lock while send_to_peer is blocked");
+        assert!(read_guard.contains_key(&topic));
+        drop(read_guard);
+
+        transport.release_sends(1);
+        tokio::time::timeout(Duration::from_millis(100), flush)
+            .await
+            .expect("IHAVE flush should finish after send is released")
+            .expect("IHAVE flush task should not panic");
     }
 
     #[tokio::test]
@@ -1672,6 +2048,138 @@ mod tests {
 
             assert_eq!(state.message_cache.len(), 0);
         }
+    }
+
+    #[test]
+    fn test_message_cache_capacity_is_bounded() {
+        let mut state = TopicState::new();
+        let topic = TopicId::new([1u8; 32]);
+
+        for i in 0..(MAX_CACHE_SIZE + 128) {
+            let mut msg_id = [0u8; 32];
+            msg_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let header = MessageHeader {
+                version: 1,
+                topic,
+                msg_id,
+                kind: MessageKind::Eager,
+                hop: 0,
+                ttl: 10,
+            };
+            state.cache_message(msg_id, Bytes::from(vec![i as u8]), header);
+        }
+
+        assert_eq!(
+            state.message_cache.len(),
+            MAX_CACHE_SIZE,
+            "message cache must not grow beyond the configured per-topic cap"
+        );
+
+        let mut first_msg_id = [0u8; 32];
+        first_msg_id[..8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(
+            !state.has_message(&first_msg_id),
+            "oldest message should be evicted after capacity is exceeded"
+        );
+    }
+
+    #[test]
+    fn test_idle_topic_reaper_drops_unsubscribed_topic() {
+        let Some(old_activity) =
+            Instant::now().checked_sub(Duration::from_secs(TOPIC_IDLE_TTL_SECS + 1))
+        else {
+            return;
+        };
+        let topic = TopicId::new([3u8; 32]);
+        let mut state = TopicState::new();
+        state.last_activity = old_activity;
+
+        let mut topics = HashMap::new();
+        topics.insert(topic, state);
+
+        let reaped = clean_and_reap_topics(&mut topics, Duration::from_secs(TOPIC_IDLE_TTL_SECS));
+
+        assert_eq!(reaped, 1);
+        assert!(
+            !topics.contains_key(&topic),
+            "idle topic with no live subscriber should be reaped"
+        );
+    }
+
+    #[test]
+    fn test_idle_topic_reaper_preserves_live_subscriber() {
+        let Some(old_activity) =
+            Instant::now().checked_sub(Duration::from_secs(TOPIC_IDLE_TTL_SECS + 1))
+        else {
+            return;
+        };
+        let topic = TopicId::new([4u8; 32]);
+        let mut state = TopicState::new();
+        state.last_activity = old_activity;
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.subscribers.push(tx);
+
+        let mut topics = HashMap::new();
+        topics.insert(topic, state);
+
+        let reaped = clean_and_reap_topics(&mut topics, Duration::from_secs(TOPIC_IDLE_TTL_SECS));
+
+        assert_eq!(reaped, 0);
+        assert!(
+            topics.contains_key(&topic),
+            "live local subscribers must not be silently dropped by idle reaping"
+        );
+
+        drop(rx);
+        let reaped = clean_and_reap_topics(&mut topics, Duration::from_secs(TOPIC_IDLE_TTL_SECS));
+
+        assert_eq!(reaped, 1);
+        assert!(
+            !topics.contains_key(&topic),
+            "closed subscriber should not keep a quiet topic alive forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_ihave_refreshes_topic_activity() {
+        let Some(old_activity) =
+            Instant::now().checked_sub(Duration::from_secs(TOPIC_IDLE_TTL_SECS + 1))
+        else {
+            return;
+        };
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([5u8; 32]);
+        let from_peer = test_peer_id(2);
+        let known_msg_id = [9u8; 32];
+
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            let header = MessageHeader {
+                version: 1,
+                topic,
+                msg_id: known_msg_id,
+                kind: MessageKind::Eager,
+                hop: 0,
+                ttl: 10,
+            };
+            state.cache_message(known_msg_id, Bytes::from_static(b"known"), header);
+            state.last_activity = old_activity;
+        }
+
+        pubsub
+            .handle_ihave(from_peer, topic, vec![known_msg_id])
+            .await
+            .expect("IHAVE with known message should be handled");
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).expect("topic should still exist");
+        assert!(
+            state.last_activity > old_activity,
+            "incoming IHAVE traffic should refresh topic activity"
+        );
     }
 
     // TDD: RED phase - These tests will fail until we implement real ML-DSA signing

@@ -22,10 +22,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
+
+/// Maximum time to spend attempting a single presence beacon send.
+///
+/// Presence beacons are periodic best-effort liveness hints. A stalled peer must
+/// not be able to wedge the single beacon broadcast task indefinitely.
+const BEACON_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Presence status for a peer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +282,23 @@ impl PresenceManager {
         debug!(?peer, "Removed broadcast peer");
     }
 
+    /// Replace the beacon broadcast peer set with a fresh membership snapshot.
+    ///
+    /// Callers that have an authoritative current peer view should prefer this
+    /// over repeated add-only updates so stale disconnected peers do not remain
+    /// in the beacon fanout set indefinitely.
+    pub async fn replace_broadcast_peers(&self, peers: impl IntoIterator<Item = PeerId>) {
+        let mut broadcast_peers = self.broadcast_peers.write().await;
+        *broadcast_peers = peers
+            .into_iter()
+            .filter(|peer| *peer != self.peer_id)
+            .collect();
+        debug!(
+            peer_count = broadcast_peers.len(),
+            "Replaced broadcast peers"
+        );
+    }
+
     /// Get current broadcast peer count
     pub async fn broadcast_peer_count(&self) -> usize {
         self.broadcast_peers.read().await.len()
@@ -360,14 +383,22 @@ impl PresenceManager {
                 tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut tick_count = 0u64;
+            let mut unexpected_exit = false;
 
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        // Broadcast beacons to all joined groups
-                        let groups_lock = groups.read().await;
+                        // Snapshot joined groups before doing any network I/O.
+                        // Holding the groups lock across beacon sends would let one
+                        // stalled send block group updates and make diagnostics harder.
+                        let group_snapshot: Vec<(TopicId, GroupContext)> = groups
+                            .read()
+                            .await
+                            .iter()
+                            .map(|(topic_id, group_ctx)| (*topic_id, group_ctx.clone()))
+                            .collect();
 
-                        for (topic_id, group_ctx) in groups_lock.iter() {
+                        for (topic_id, group_ctx) in group_snapshot {
                             // Derive presence tag for current time slice
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -424,8 +455,7 @@ impl PresenceManager {
                                     ttl_seconds,
                                 ),
                             };
-                            record.seq =
-                                beacon_seq.fetch_add(1, Ordering::Relaxed);
+                            record.seq = beacon_seq.fetch_add(1, Ordering::Relaxed);
 
                             // Sign the beacon if identity is available
                             let identity_guard = identity.read().await;
@@ -447,13 +477,13 @@ impl PresenceManager {
                             // Store our own beacon locally
                             {
                                 let mut beacons = received_beacons.write().await;
-                                let topic_beacons = beacons.entry(*topic_id).or_insert_with(HashMap::new);
+                                let topic_beacons = beacons.entry(topic_id).or_insert_with(HashMap::new);
                                 topic_beacons.insert(peer_id, record.clone());
                             }
 
                             // Create wire message
                             let message = PresenceMessage::Beacon {
-                                topic_id: *topic_id,
+                                topic_id,
                                 sender: peer_id,
                                 record,
                                 epoch: group_ctx.epoch,
@@ -468,15 +498,44 @@ impl PresenceManager {
                                 }
                             };
 
-                            // Broadcast to all known peers
-                            let peers = broadcast_peers.read().await;
-                            for target_peer in peers.iter() {
-                                if let Err(e) = transport
-                                    .send_to_peer(*target_peer, GossipStreamType::Bulk, data.clone())
-                                    .await
-                                {
-                                    debug!(?target_peer, ?e, "Failed to send beacon to peer");
-                                    // Continue to next peer - don't fail entire broadcast
+                            // Snapshot peers before sending. Never hold the
+                            // broadcast_peers read lock across network awaits:
+                            // one stalled send would otherwise wedge the beacon
+                            // loop and block writer-side peer refresh/cleanup.
+                            let peers: Vec<PeerId> = broadcast_peers
+                                .read()
+                                .await
+                                .iter()
+                                .copied()
+                                .collect();
+                            let mut timed_out_peers = Vec::new();
+                            for target_peer in peers.iter().copied() {
+                                let send = transport.send_to_peer(
+                                    target_peer,
+                                    GossipStreamType::Bulk,
+                                    data.clone(),
+                                );
+                                match tokio::time::timeout(BEACON_SEND_TIMEOUT, send).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        debug!(?target_peer, ?e, "Failed to send beacon to peer");
+                                        // Continue to next peer - don't fail entire broadcast
+                                    }
+                                    Err(_) => {
+                                        warn!(
+                                            ?target_peer,
+                                            timeout_secs = BEACON_SEND_TIMEOUT.as_secs(),
+                                            "Timed out sending beacon to peer"
+                                        );
+                                        timed_out_peers.push(target_peer);
+                                    }
+                                }
+                            }
+
+                            if !timed_out_peers.is_empty() {
+                                let mut peers = broadcast_peers.write().await;
+                                for peer in timed_out_peers {
+                                    peers.remove(&peer);
                                 }
                             }
 
@@ -497,11 +556,22 @@ impl PresenceManager {
                             }
                         }
                     }
-                    _ = shutdown_rx.recv() => {
-                        // Shutdown signal received
+                    maybe_shutdown = shutdown_rx.recv() => {
+                        match maybe_shutdown {
+                            Some(()) => debug!("Presence beacon task received shutdown signal"),
+                            None => {
+                                unexpected_exit = true;
+                                warn!("Presence beacon task shutdown channel closed unexpectedly");
+                            }
+                        }
                         break;
                     }
                 }
+            }
+            if unexpected_exit {
+                warn!("Presence beacon task exited unexpectedly");
+            } else {
+                debug!("Presence beacon task exited");
             }
         });
 
@@ -1162,6 +1232,49 @@ mod tests {
     use super::*;
     use saorsa_gossip_transport::UdpTransportAdapter;
     use std::net::SocketAddr;
+    use tokio::sync::Notify;
+
+    struct BlockingSendTransport {
+        peer_id: PeerId,
+        send_entered: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for BlockingSendTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(self.peer_id)
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            _peer: PeerId,
+            _stream_type: GossipStreamType,
+            _data: bytes::Bytes,
+        ) -> Result<()> {
+            self.send_entered.notify_waiters();
+            std::future::pending::<Result<()>>().await
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)> {
+            std::future::pending::<Result<(PeerId, GossipStreamType, bytes::Bytes)>>().await
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.peer_id
+        }
+    }
 
     // Helper: Create test presence manager
     async fn create_test_manager() -> PresenceManager {
@@ -1248,6 +1361,46 @@ mod tests {
 
         // Clean up
         manager.stop_beacons().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_beacon_send_does_not_hold_broadcast_peer_lock() {
+        let peer_id = PeerId::new([1u8; 32]);
+        let send_entered = Arc::new(Notify::new());
+        let transport = Arc::new(BlockingSendTransport {
+            peer_id,
+            send_entered: Arc::clone(&send_entered),
+        });
+        let groups = Arc::new(RwLock::new(HashMap::new()));
+        let manager = PresenceManager::new(peer_id, transport, groups);
+        let topic = TopicId::new([12u8; 32]);
+
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+        manager.add_broadcast_peer(PeerId::new([2u8; 32])).await;
+        manager.start_beacons(1).await.expect("start beacons");
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), send_entered.notified())
+            .await
+            .expect("beacon send should start");
+
+        let write_lock = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            manager.broadcast_peers.write(),
+        )
+        .await;
+        assert!(
+            write_lock.is_ok(),
+            "broadcast peer write lock must not be blocked by an in-flight send"
+        );
+        drop(write_lock);
+
+        if let Some(handle) = manager.beacon_task.write().await.take() {
+            handle.abort();
+        }
+        manager.shutdown_tx.write().await.take();
     }
 
     #[tokio::test]
@@ -1512,6 +1665,18 @@ mod tests {
         // Remove peer
         manager.remove_broadcast_peer(peer1).await;
         assert_eq!(manager.broadcast_peer_count().await, 1);
+
+        // Replace peers removes stale entries and ignores self.
+        manager
+            .replace_broadcast_peers(vec![peer1, manager.peer_id, peer1])
+            .await;
+        assert_eq!(manager.broadcast_peer_count().await, 1);
+        assert!(manager.broadcast_peers.read().await.contains(&peer1));
+        assert!(!manager
+            .broadcast_peers
+            .read()
+            .await
+            .contains(&manager.peer_id));
     }
 
     #[tokio::test]

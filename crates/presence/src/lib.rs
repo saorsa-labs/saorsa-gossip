@@ -24,14 +24,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, warn};
 
 /// Maximum time to spend attempting a single presence beacon send.
 ///
 /// Presence beacons are periodic best-effort liveness hints. A stalled peer must
 /// not be able to wedge the single beacon broadcast task indefinitely.
-const BEACON_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const BEACON_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Presence status for a peer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,26 +508,39 @@ impl PresenceManager {
                                 .iter()
                                 .copied()
                                 .collect();
-                            let mut timed_out_peers = Vec::new();
+                            let mut send_tasks = JoinSet::new();
                             for target_peer in peers.iter().copied() {
-                                let send = transport.send_to_peer(
-                                    target_peer,
-                                    GossipStreamType::Bulk,
-                                    data.clone(),
-                                );
-                                match tokio::time::timeout(BEACON_SEND_TIMEOUT, send).await {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(e)) => {
+                                let transport = Arc::clone(&transport);
+                                let data = data.clone();
+                                send_tasks.spawn(async move {
+                                    let send = transport.send_to_peer(
+                                        target_peer,
+                                        GossipStreamType::Bulk,
+                                        data,
+                                    );
+                                    let result = tokio::time::timeout(BEACON_SEND_TIMEOUT, send).await;
+                                    (target_peer, result)
+                                });
+                            }
+
+                            let mut timed_out_peers = Vec::new();
+                            while let Some(result) = send_tasks.join_next().await {
+                                match result {
+                                    Ok((_, Ok(Ok(())))) => {}
+                                    Ok((target_peer, Ok(Err(e)))) => {
                                         debug!(?target_peer, ?e, "Failed to send beacon to peer");
                                         // Continue to next peer - don't fail entire broadcast
                                     }
-                                    Err(_) => {
+                                    Ok((target_peer, Err(_))) => {
                                         warn!(
                                             ?target_peer,
                                             timeout_secs = BEACON_SEND_TIMEOUT.as_secs(),
                                             "Timed out sending beacon to peer"
                                         );
                                         timed_out_peers.push(target_peer);
+                                    }
+                                    Err(e) => {
+                                        warn!(?e, "Presence beacon send task failed");
                                     }
                                 }
                             }

@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.23] - 2026-04-27
+
+### Fixed
+
+- Presence beacon fanout now sends to peers concurrently with a bounded timeout,
+  preventing one slow or wedged peer from delaying delivery to the rest of the
+  mesh.
+- Increased the per-peer presence beacon send timeout to 15 seconds now that
+  fanout is concurrent, reducing false timeouts on high-latency live links
+  without reintroducing head-of-line blocking.
+
+## [0.5.22] - 2026-04-26
+
+### Fixed
+
+- Presence beacon sends are bounded by a timeout so a stalled peer cannot wedge
+  the beacon task indefinitely.
+- Presence beacon fanout snapshots groups and broadcast peers before network I/O,
+  so no broadcast peer lock is held across awaited sends.
+- Added `PresenceManager::replace_broadcast_peers()` for authoritative fanout
+  refresh and stale-peer pruning by callers.
+
 ## [0.5.20] - 2026-04-23
 
 ### Changed

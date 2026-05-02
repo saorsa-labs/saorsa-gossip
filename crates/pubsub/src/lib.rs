@@ -94,6 +94,85 @@ const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(750);
 /// Message ID type alias
 type MessageIdType = [u8; 32];
 
+/// Counters for inbound PubSub wire classes plus local PlumTree tree changes.
+#[derive(Debug, Default)]
+pub struct PubSubMessageKindStats {
+    eager: AtomicU64,
+    ihave: AtomicU64,
+    iwant: AtomicU64,
+    anti_entropy: AtomicU64,
+    other: AtomicU64,
+    decode_failed: AtomicU64,
+    prune: AtomicU64,
+    graft: AtomicU64,
+}
+
+/// JSON-friendly snapshot of [`PubSubMessageKindStats`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PubSubMessageKindStatsSnapshot {
+    /// Inbound EAGER messages.
+    pub eager: u64,
+    /// Inbound IHAVE messages.
+    pub ihave: u64,
+    /// Inbound IWANT messages.
+    pub iwant: u64,
+    /// Inbound anti-entropy messages.
+    pub anti_entropy: u64,
+    /// Inbound messages decoded as non-PubSub wire kinds.
+    pub other: u64,
+    /// PubSub envelopes or control payloads that failed to decode.
+    pub decode_failed: u64,
+    /// Local PRUNE transitions from eager to lazy.
+    pub prune: u64,
+    /// Local GRAFT transitions from lazy to eager.
+    pub graft: u64,
+}
+
+impl PubSubMessageKindStats {
+    fn record_kind(&self, kind: MessageKind) {
+        match kind {
+            MessageKind::Eager => self.eager.fetch_add(1, Ordering::Relaxed),
+            MessageKind::IHave => self.ihave.fetch_add(1, Ordering::Relaxed),
+            MessageKind::IWant => self.iwant.fetch_add(1, Ordering::Relaxed),
+            MessageKind::AntiEntropy => self.anti_entropy.fetch_add(1, Ordering::Relaxed),
+            _ => self.other.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    fn record_decode_failed(&self) {
+        self.decode_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_prune(&self) {
+        self.prune.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_graft(&self) {
+        self.graft.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_prunes(&self, count: usize) {
+        self.prune.fetch_add(usize_to_u64(count), Ordering::Relaxed);
+    }
+
+    fn record_grafts(&self, count: usize) {
+        self.graft.fetch_add(usize_to_u64(count), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PubSubMessageKindStatsSnapshot {
+        PubSubMessageKindStatsSnapshot {
+            eager: self.eager.load(Ordering::Relaxed),
+            ihave: self.ihave.load(Ordering::Relaxed),
+            iwant: self.iwant.load(Ordering::Relaxed),
+            anti_entropy: self.anti_entropy.load(Ordering::Relaxed),
+            other: self.other.load(Ordering::Relaxed),
+            decode_failed: self.decode_failed.load(Ordering::Relaxed),
+            prune: self.prune.load(Ordering::Relaxed),
+            graft: self.graft.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Timing counters for one PubSub processing stage.
 #[derive(Debug, Default)]
 pub struct StageTimingStats {
@@ -154,6 +233,7 @@ impl StageTimingStats {
 /// Per-stage timing counters for inbound PubSub message handling.
 #[derive(Debug, Default)]
 pub struct PubSubStageStats {
+    message_kinds: PubSubMessageKindStats,
     decode: StageTimingStats,
     verify: StageTimingStats,
     dedupe_lock_acquire: StageTimingStats,
@@ -170,6 +250,8 @@ pub struct PubSubStageStats {
 /// JSON-friendly snapshot of per-stage PubSub handling timings.
 #[derive(Debug, Clone, Serialize)]
 pub struct PubSubStageStatsSnapshot {
+    /// Inbound PubSub wire classes and local PRUNE/GRAFT tree transitions.
+    pub message_kinds: PubSubMessageKindStatsSnapshot,
     /// Wire-envelope and control-payload decode time.
     pub decode: StageTimingStatsSnapshot,
     /// ML-DSA-65 signature verification time.
@@ -211,6 +293,7 @@ impl PubSubStageStats {
 
     fn snapshot(&self) -> PubSubStageStatsSnapshot {
         PubSubStageStatsSnapshot {
+            message_kinds: self.message_kinds.snapshot(),
             decode: self.decode.snapshot(),
             verify: self.verify.snapshot(),
             dedupe_lock_acquire: self.dedupe_lock_acquire.snapshot(),
@@ -225,10 +308,57 @@ impl PubSubStageStats {
         self.republish_per_peer_timeout
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    fn record_message_kind(&self, kind: MessageKind) {
+        self.message_kinds.record_kind(kind);
+    }
+
+    fn record_decode_failed(&self) {
+        self.message_kinds.record_decode_failed();
+    }
+
+    fn record_prune(&self) {
+        self.message_kinds.record_prune();
+    }
+
+    fn record_graft(&self) {
+        self.message_kinds.record_graft();
+    }
+
+    fn record_prunes(&self, count: usize) {
+        self.message_kinds.record_prunes(count);
+    }
+
+    fn record_grafts(&self, count: usize) {
+        self.message_kinds.record_grafts(count);
+    }
 }
 
 fn duration_to_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).ok().map_or(u64::MAX, |v| v)
+}
+
+fn deterministic_jitter(peer_id: PeerId, salt: &[u8], max: Duration) -> Duration {
+    if max.is_zero() {
+        return Duration::ZERO;
+    }
+    let max_ms = u64::try_from(max.as_millis())
+        .ok()
+        .filter(|ms| *ms > 0)
+        .map_or(1, |ms| ms);
+    let mut input = Vec::with_capacity(peer_id.as_bytes().len() + salt.len());
+    input.extend_from_slice(peer_id.as_bytes());
+    input.extend_from_slice(salt);
+    let hash = blake3::hash(&input);
+    let bytes = hash.as_bytes();
+    let raw = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    Duration::from_millis(raw % max_ms)
 }
 
 const fn message_cache_capacity() -> NonZeroUsize {
@@ -495,18 +625,24 @@ impl TopicState {
     }
 
     /// Move peer from eager to lazy
-    fn prune_peer(&mut self, peer: PeerId) {
+    fn prune_peer(&mut self, peer: PeerId) -> bool {
         if self.eager_peers.remove(&peer) {
             self.lazy_peers.insert(peer);
             debug!(peer_id = %peer, "PRUNE: moved peer from eager to lazy");
+            true
+        } else {
+            false
         }
     }
 
     /// Move peer from lazy to eager
-    fn graft_peer(&mut self, peer: PeerId) {
+    fn graft_peer(&mut self, peer: PeerId) -> bool {
         if self.lazy_peers.remove(&peer) {
             self.eager_peers.insert(peer);
             debug!(peer_id = %peer, "GRAFT: moved peer from lazy to eager");
+            true
+        } else {
+            false
         }
     }
 
@@ -514,7 +650,9 @@ impl TopicState {
     ///
     /// Promotes the highest-scoring lazy peers when below minimum degree,
     /// and demotes the lowest-scoring eager peers when above maximum degree.
-    fn maintain_degree(&mut self) {
+    fn maintain_degree(&mut self) -> (usize, usize) {
+        let mut pruned = 0;
+        let mut grafted = 0;
         let eager_count = self.eager_peers.len();
 
         if eager_count < MIN_EAGER_DEGREE && !self.lazy_peers.is_empty() {
@@ -535,7 +673,9 @@ impl TopicState {
                 .map(|(p, _)| *p)
                 .collect();
             for peer in peers {
-                self.graft_peer(peer);
+                if self.graft_peer(peer) {
+                    grafted += 1;
+                }
             }
         } else if eager_count > MAX_EAGER_DEGREE {
             // Demote lowest-scoring eager peers
@@ -555,9 +695,12 @@ impl TopicState {
                 .map(|(p, _)| *p)
                 .collect();
             for peer in peers {
-                self.prune_peer(peer);
+                if self.prune_peer(peer) {
+                    pruned += 1;
+                }
             }
         }
+        (pruned, grafted)
     }
 }
 
@@ -691,6 +834,60 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         self.stage_stats.record(stage, started.elapsed());
     }
 
+    async fn send_to_peer_with_timeout(
+        transport: Arc<T>,
+        stage_stats: Arc<PubSubStageStats>,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        bytes: Bytes,
+        op: &'static str,
+    ) -> Result<()> {
+        match tokio::time::timeout(
+            PER_PEER_REPUBLISH_TIMEOUT,
+            transport.send_to_peer(peer, stream_type, bytes),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                warn!(
+                    peer_id = %peer,
+                    op,
+                    "{op} per-peer send failed: {e}"
+                );
+                Err(e)
+            }
+            Err(_) => {
+                stage_stats.record_per_peer_timeout();
+                warn!(
+                    peer_id = %peer,
+                    op,
+                    timeout_ms = PER_PEER_REPUBLISH_TIMEOUT.as_millis() as u64,
+                    "{op} per-peer send timed out — peer skipped, recorded in republish_per_peer_timeout"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn send_to_peer_bounded(
+        &self,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        bytes: Bytes,
+        op: &'static str,
+    ) -> Result<()> {
+        Self::send_to_peer_with_timeout(
+            Arc::clone(&self.transport),
+            Arc::clone(&self.stage_stats),
+            peer,
+            stream_type,
+            bytes,
+            op,
+        )
+        .await
+    }
+
     /// Send `bytes` to every peer in `peers` concurrently with a per-peer
     /// `PER_PEER_REPUBLISH_TIMEOUT` budget.
     ///
@@ -718,32 +915,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let transport = Arc::clone(&self.transport);
             let bytes = bytes.clone();
             let stage_stats = Arc::clone(&self.stage_stats);
-            set.spawn(async move {
-                match tokio::time::timeout(
-                    PER_PEER_REPUBLISH_TIMEOUT,
-                    transport.send_to_peer(peer, stream_type, bytes),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        warn!(
-                            peer_id = %peer,
-                            op,
-                            "{op} per-peer send failed: {e}"
-                        );
-                    }
-                    Err(_) => {
-                        stage_stats.record_per_peer_timeout();
-                        warn!(
-                            peer_id = %peer,
-                            op,
-                            timeout_ms = PER_PEER_REPUBLISH_TIMEOUT.as_millis() as u64,
-                            "{op} per-peer send timed out — peer skipped, recorded in republish_per_peer_timeout"
-                        );
-                    }
-                }
-            });
+            set.spawn(Self::send_to_peer_with_timeout(
+                transport,
+                stage_stats,
+                peer,
+                stream_type,
+                bytes,
+                op,
+            ));
         }
         // Drain the JoinSet so the helper actually returns when all sends
         // have either completed, errored, or hit the per-peer timeout. Each
@@ -751,8 +930,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // (panicked task) but otherwise ignored — we never want one panic to
         // poison the dispatcher.
         while let Some(joined) = set.join_next().await {
-            if let Err(e) = joined {
-                warn!(op, "{op} per-peer send task panicked: {e}");
+            match joined {
+                Ok(Ok(())) | Ok(Err(_)) => {}
+                Err(e) => warn!(op, "{op} per-peer send task panicked: {e}"),
             }
         }
     }
@@ -928,7 +1108,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Check for duplicate
         if state.has_message(&msg_id) {
             // PRUNE: move sender from eager to lazy
-            state.prune_peer(from);
+            if state.prune_peer(from) {
+                self.stage_stats.record_prune();
+            }
             self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
             return Ok(());
         }
@@ -1109,8 +1291,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
             let send_result = self
-                .transport
-                .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
+                .send_to_peer_bounded(from, GossipStreamType::PubSub, bytes.into(), "IWANT")
                 .await;
             self.record_stage(PubSubStage::Republish, republish_started);
             send_result?;
@@ -1139,7 +1320,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if let Some(cached) = state.get_message(&msg_id) {
                 to_send.push((msg_id, cached));
                 // GRAFT: move peer from lazy to eager
-                state.graft_peer(from);
+                if state.graft_peer(from) {
+                    self.stage_stats.record_graft();
+                }
             } else {
                 warn!(msg_id = ?msg_id, "IWANT for unknown message");
             }
@@ -1168,8 +1351,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
             let send_result = self
-                .transport
-                .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
+                .send_to_peer_bounded(from, GossipStreamType::PubSub, bytes.into(), "EAGER")
                 .await;
             if let Err(e) = send_result {
                 self.record_stage(PubSubStage::Republish, republish_started);
@@ -1201,16 +1383,22 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             return Err(anyhow!("Invalid signature on anti-entropy message"));
         }
 
-        let payload_bytes = message
-            .payload
-            .ok_or_else(|| anyhow!("Anti-entropy message missing payload"))?;
+        let payload_bytes = message.payload.ok_or_else(|| {
+            self.stage_stats.record_decode_failed();
+            anyhow!("Anti-entropy message missing payload")
+        })?;
 
         let decode_started = Instant::now();
         let decoded: std::result::Result<AntiEntropyPayload, _> =
             postcard::from_bytes(&payload_bytes);
         self.record_stage(PubSubStage::Decode, decode_started);
-        let ae_payload =
-            decoded.map_err(|e| anyhow!("Failed to deserialize anti-entropy payload: {}", e))?;
+        let ae_payload = match decoded {
+            Ok(payload) => payload,
+            Err(e) => {
+                self.stage_stats.record_decode_failed();
+                return Err(anyhow!("Failed to deserialize anti-entropy payload: {}", e));
+            }
+        };
 
         match ae_payload {
             AntiEntropyPayload::Digest { msg_ids } => {
@@ -1259,8 +1447,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     };
                     if let Ok(bytes) = postcard::to_stdvec(&eager_msg) {
                         let _ = self
-                            .transport
-                            .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
+                            .send_to_peer_bounded(
+                                from,
+                                GossipStreamType::PubSub,
+                                bytes.into(),
+                                "EAGER",
+                            )
                             .await;
                     }
                 }
@@ -1293,8 +1485,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     };
                     if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
                         let _ = self
-                            .transport
-                            .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
+                            .send_to_peer_bounded(
+                                from,
+                                GossipStreamType::PubSub,
+                                bytes.into(),
+                                "IWANT",
+                            )
                             .await;
                     }
                 }
@@ -1362,8 +1558,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     };
                     if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
                         let _ = self
-                            .transport
-                            .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
+                            .send_to_peer_bounded(
+                                from,
+                                GossipStreamType::PubSub,
+                                bytes.into(),
+                                "IWANT",
+                            )
                             .await;
                     }
                 }
@@ -1414,8 +1614,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         let bytes =
             postcard::to_stdvec(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
-        self.transport
-            .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
+        self.send_to_peer_bounded(peer, GossipStreamType::PubSub, bytes.into(), "ANTI_ENTROPY")
             .await?;
 
         debug!(
@@ -1433,9 +1632,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let transport = self.transport.clone();
         let signing_key = self.signing_key.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
+        let initial_jitter = deterministic_jitter(
+            self.peer_id,
+            b"pubsub-ihave-flush",
+            Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS),
+        );
 
         tokio::spawn(async move {
+            if !initial_jitter.is_zero() {
+                time::sleep(initial_jitter).await;
+            }
             let mut interval = time::interval(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS));
+            interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
             loop {
                 interval.tick().await;
@@ -1531,32 +1739,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     let transport = Arc::clone(transport);
                     let bytes = bytes.clone();
                     let stage_stats = Arc::clone(stage_stats);
-                    set.spawn(async move {
-                        match tokio::time::timeout(
-                            PER_PEER_REPUBLISH_TIMEOUT,
-                            transport.send_to_peer(peer, GossipStreamType::PubSub, bytes),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                warn!(peer_id = %peer, topic = ?topic_id, "IHAVE send failed: {e}");
-                            }
-                            Err(_) => {
-                                stage_stats.record_per_peer_timeout();
-                                warn!(
-                                    peer_id = %peer,
-                                    topic = ?topic_id,
-                                    timeout_ms = PER_PEER_REPUBLISH_TIMEOUT.as_millis() as u64,
-                                    "IHAVE per-peer send timed out — peer skipped"
-                                );
-                            }
-                        }
-                    });
+                    set.spawn(Self::send_to_peer_with_timeout(
+                        transport,
+                        stage_stats,
+                        peer,
+                        GossipStreamType::PubSub,
+                        bytes,
+                        "IHAVE",
+                    ));
                 }
                 while let Some(joined) = set.join_next().await {
-                    if let Err(e) = joined {
-                        warn!(topic = ?topic_id, "IHAVE per-peer send task panicked: {e}");
+                    match joined {
+                        Ok(Ok(())) | Ok(Err(_)) => {}
+                        Err(e) => {
+                            warn!(topic = ?topic_id, "IHAVE per-peer send task panicked: {e}")
+                        }
                     }
                 }
             }
@@ -1599,17 +1796,35 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// Spawn background task to maintain eager peer degree
     fn spawn_degree_maintainer(&self) {
         let topics = self.topics.clone();
+        let stage_stats = Arc::clone(&self.stage_stats);
+        let initial_jitter =
+            deterministic_jitter(self.peer_id, b"pubsub-degree", Duration::from_secs(30));
 
         tokio::spawn(async move {
+            if !initial_jitter.is_zero() {
+                time::sleep(initial_jitter).await;
+            }
             let mut interval = time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
             loop {
                 interval.tick().await;
 
                 let mut topics_guard = topics.write().await;
+                let mut pruned = 0;
+                let mut grafted = 0;
 
                 for state in topics_guard.values_mut() {
-                    state.maintain_degree();
+                    let (state_pruned, state_grafted) = state.maintain_degree();
+                    pruned += state_pruned;
+                    grafted += state_grafted;
+                }
+                drop(topics_guard);
+                if pruned > 0 {
+                    stage_stats.record_prunes(pruned);
+                }
+                if grafted > 0 {
+                    stage_stats.record_grafts(grafted);
                 }
             }
         });
@@ -1623,9 +1838,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let topics = self.topics.clone();
         let transport = self.transport.clone();
         let signing_key = self.signing_key.clone();
+        let stage_stats = Arc::clone(&self.stage_stats);
+        let initial_jitter = deterministic_jitter(
+            self.peer_id,
+            b"pubsub-anti-entropy",
+            Duration::from_secs(ANTI_ENTROPY_INTERVAL_SECS),
+        );
 
         tokio::spawn(async move {
+            if !initial_jitter.is_zero() {
+                time::sleep(initial_jitter).await;
+            }
             let mut interval = time::interval(Duration::from_secs(ANTI_ENTROPY_INTERVAL_SECS));
+            interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
             loop {
                 interval.tick().await;
@@ -1703,9 +1928,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     };
 
                     if let Ok(bytes) = postcard::to_stdvec(&message) {
-                        let _ = transport
-                            .send_to_peer(peer, GossipStreamType::PubSub, bytes.into())
-                            .await;
+                        let _ = Self::send_to_peer_with_timeout(
+                            Arc::clone(&transport),
+                            Arc::clone(&stage_stats),
+                            peer,
+                            GossipStreamType::PubSub,
+                            bytes.into(),
+                            "ANTI_ENTROPY",
+                        )
+                        .await;
                     }
 
                     trace!(
@@ -1823,11 +2054,17 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
         let decode_started = Instant::now();
         let decoded: std::result::Result<GossipMessage, _> = postcard::from_bytes(&data);
         self.record_stage(PubSubStage::Decode, decode_started);
-        let message =
-            decoded.map_err(|e| anyhow!("Failed to deserialize PubSub message: {}", e))?;
+        let message = match decoded {
+            Ok(message) => message,
+            Err(e) => {
+                self.stage_stats.record_decode_failed();
+                return Err(anyhow!("Failed to deserialize PubSub message: {}", e));
+            }
+        };
 
         let topic_id = message.header.topic;
         let msg_kind = message.header.kind;
+        self.stage_stats.record_message_kind(msg_kind);
 
         debug!(
             msg_kind = ?msg_kind,
@@ -1847,10 +2084,16 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
                     let decoded: std::result::Result<Vec<MessageIdType>, _> =
                         postcard::from_bytes(payload);
                     self.record_stage(PubSubStage::Decode, decode_started);
-                    let msg_ids = decoded
-                        .map_err(|e| anyhow!("Failed to deserialize IHAVE payload: {}", e))?;
+                    let msg_ids = match decoded {
+                        Ok(msg_ids) => msg_ids,
+                        Err(e) => {
+                            self.stage_stats.record_decode_failed();
+                            return Err(anyhow!("Failed to deserialize IHAVE payload: {}", e));
+                        }
+                    };
                     self.handle_ihave(from, topic_id, msg_ids).await
                 } else {
+                    self.stage_stats.record_decode_failed();
                     Err(anyhow!("IHAVE message missing payload"))
                 }
             }
@@ -1861,10 +2104,16 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
                     let decoded: std::result::Result<Vec<MessageIdType>, _> =
                         postcard::from_bytes(payload);
                     self.record_stage(PubSubStage::Decode, decode_started);
-                    let msg_ids = decoded
-                        .map_err(|e| anyhow!("Failed to deserialize IWANT payload: {}", e))?;
+                    let msg_ids = match decoded {
+                        Ok(msg_ids) => msg_ids,
+                        Err(e) => {
+                            self.stage_stats.record_decode_failed();
+                            return Err(anyhow!("Failed to deserialize IWANT payload: {}", e));
+                        }
+                    };
                     self.handle_iwant(from, topic_id, msg_ids).await
                 } else {
+                    self.stage_stats.record_decode_failed();
                     Err(anyhow!("IWANT message missing payload"))
                 }
             }
@@ -1944,6 +2193,31 @@ mod tests {
             topic,
             msg_id,
             kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let header_bytes = postcard::to_stdvec(&header).expect("header serializes");
+        let signature = signing_key.sign(&header_bytes).expect("header signs");
+        GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        }
+    }
+
+    fn signed_control_message(
+        signing_key: &saorsa_gossip_identity::MlDsaKeyPair,
+        topic: TopicId,
+        msg_id: MessageIdType,
+        kind: MessageKind,
+        payload: Bytes,
+    ) -> GossipMessage {
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id,
+            kind,
             hop: 0,
             ttl: 10,
         };
@@ -2064,6 +2338,126 @@ mod tests {
         let transport = test_transport().await;
         let signing_key = test_signing_key();
         let _pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+    }
+
+    #[tokio::test]
+    async fn test_stage_stats_record_message_kinds_and_tree_ops() {
+        let peer_id = test_peer_id(1);
+        let from_peer = test_peer_id(2);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        transport.release_sends(8);
+        let sender_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([8u8; 32]);
+        let msg_id = [9u8; 32];
+        let eager = signed_eager_message(
+            &sender_key,
+            topic,
+            msg_id,
+            Bytes::from_static(b"kind-counter-payload"),
+        );
+        let eager_bytes: Bytes = postcard::to_stdvec(&eager)
+            .expect("eager message serializes")
+            .into();
+
+        pubsub
+            .handle_message(from_peer, eager_bytes.clone())
+            .await
+            .expect("first eager handled");
+        pubsub
+            .handle_message(from_peer, eager_bytes)
+            .await
+            .expect("duplicate eager prunes sender");
+
+        let iwant_payload: Bytes = postcard::to_stdvec(&vec![msg_id])
+            .expect("iwant payload serializes")
+            .into();
+        let iwant = signed_control_message(
+            &sender_key,
+            topic,
+            msg_id,
+            MessageKind::IWant,
+            iwant_payload,
+        );
+        pubsub
+            .handle_message(
+                from_peer,
+                postcard::to_stdvec(&iwant)
+                    .expect("iwant message serializes")
+                    .into(),
+            )
+            .await
+            .expect("iwant grafts sender");
+
+        let missing_id = [7u8; 32];
+        let ihave_payload: Bytes = postcard::to_stdvec(&vec![missing_id])
+            .expect("ihave payload serializes")
+            .into();
+        let ihave = signed_control_message(
+            &sender_key,
+            topic,
+            missing_id,
+            MessageKind::IHave,
+            ihave_payload,
+        );
+        pubsub
+            .handle_message(
+                from_peer,
+                postcard::to_stdvec(&ihave)
+                    .expect("ihave message serializes")
+                    .into(),
+            )
+            .await
+            .expect("ihave handled");
+
+        let ae_payload: Bytes =
+            postcard::to_stdvec(&AntiEntropyPayload::Digest { msg_ids: vec![] })
+                .expect("anti-entropy payload serializes")
+                .into();
+        let anti_entropy = signed_control_message(
+            &sender_key,
+            topic,
+            [0u8; 32],
+            MessageKind::AntiEntropy,
+            ae_payload,
+        );
+        pubsub
+            .handle_message(
+                from_peer,
+                postcard::to_stdvec(&anti_entropy)
+                    .expect("anti-entropy message serializes")
+                    .into(),
+            )
+            .await
+            .expect("anti-entropy handled");
+
+        let stats = pubsub.stage_stats().message_kinds;
+        assert_eq!(stats.eager, 2);
+        assert_eq!(stats.ihave, 1);
+        assert_eq!(stats.iwant, 1);
+        assert_eq!(stats.anti_entropy, 1);
+        assert_eq!(stats.prune, 1);
+        assert_eq!(stats.graft, 1);
+        assert_eq!(stats.decode_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_stage_stats_record_pubsub_decode_failures() {
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(peer_id, transport, test_signing_key(), false);
+
+        let err = pubsub
+            .handle_message(test_peer_id(2), Bytes::from_static(b"not-postcard"))
+            .await;
+        assert!(err.is_err());
+        assert_eq!(pubsub.stage_stats().message_kinds.decode_failed, 1);
     }
 
     #[tokio::test]

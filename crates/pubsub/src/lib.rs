@@ -25,6 +25,7 @@ use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
@@ -78,8 +79,157 @@ const ANTI_ENTROPY_INTERVAL_SECS: u64 = 30;
 const MIN_EAGER_DEGREE: usize = 6;
 const MAX_EAGER_DEGREE: usize = 12;
 
+/// Per-peer budget for an EAGER republish / IHAVE flush send.
+///
+/// X0X-0006 telemetry showed the dispatcher's 30 s blocks were dominated
+/// by the EAGER republish loop sequentially awaiting `send_to_peer` for
+/// every peer in the topic mesh — a single slow peer (high RTT, congested,
+/// NAT renegotiation, receive-pump back-pressure) pinned the whole loop.
+/// X0X-0007 replaces the sequential await with concurrent sends and gives
+/// each per-peer send this bounded budget; on timeout the peer is skipped
+/// and `republish_per_peer_timeout` is incremented so the operator can see
+/// which peer is the slow one without a hung dispatcher.
+const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(750);
+
 /// Message ID type alias
 type MessageIdType = [u8; 32];
+
+/// Timing counters for one PubSub processing stage.
+#[derive(Debug, Default)]
+pub struct StageTimingStats {
+    count: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+    over_1s_count: AtomicU64,
+    over_5s_count: AtomicU64,
+    over_30s_count: AtomicU64,
+}
+
+/// JSON-friendly snapshot of one PubSub processing stage.
+#[derive(Debug, Clone, Serialize)]
+pub struct StageTimingStatsSnapshot {
+    /// Number of observations recorded for the stage.
+    pub count: u64,
+    /// Cumulative wall-clock time spent in this stage, in nanoseconds.
+    pub total_ns: u64,
+    /// Slowest observed stage execution, in nanoseconds.
+    pub max_ns: u64,
+    /// Number of observations that took at least 1 second.
+    pub over_1s_count: u64,
+    /// Number of observations that took at least 5 seconds.
+    pub over_5s_count: u64,
+    /// Number of observations that took at least 30 seconds.
+    pub over_30s_count: u64,
+}
+
+impl StageTimingStats {
+    fn record(&self, duration: Duration) {
+        let ns = duration_to_ns(duration);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        if duration >= Duration::from_secs(1) {
+            self.over_1s_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if duration >= Duration::from_secs(5) {
+            self.over_5s_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if duration >= Duration::from_secs(30) {
+            self.over_30s_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> StageTimingStatsSnapshot {
+        StageTimingStatsSnapshot {
+            count: self.count.load(Ordering::Relaxed),
+            total_ns: self.total_ns.load(Ordering::Relaxed),
+            max_ns: self.max_ns.load(Ordering::Relaxed),
+            over_1s_count: self.over_1s_count.load(Ordering::Relaxed),
+            over_5s_count: self.over_5s_count.load(Ordering::Relaxed),
+            over_30s_count: self.over_30s_count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Per-stage timing counters for inbound PubSub message handling.
+#[derive(Debug, Default)]
+pub struct PubSubStageStats {
+    decode: StageTimingStats,
+    verify: StageTimingStats,
+    dedupe_lock_acquire: StageTimingStats,
+    dedupe_check: StageTimingStats,
+    eager_fanout: StageTimingStats,
+    republish: StageTimingStats,
+    /// Per-peer EAGER/IHAVE sends that hit `PER_PEER_REPUBLISH_TIMEOUT`.
+    /// Surfaced separately so operators can distinguish "the dispatcher is
+    /// healthy but one specific peer is slow" from "the whole pipeline is
+    /// degrading".
+    republish_per_peer_timeout: AtomicU64,
+}
+
+/// JSON-friendly snapshot of per-stage PubSub handling timings.
+#[derive(Debug, Clone, Serialize)]
+pub struct PubSubStageStatsSnapshot {
+    /// Wire-envelope and control-payload decode time.
+    pub decode: StageTimingStatsSnapshot,
+    /// ML-DSA-65 signature verification time.
+    pub verify: StageTimingStatsSnapshot,
+    /// Time waiting to acquire the per-topic PlumTree write lock.
+    pub dedupe_lock_acquire: StageTimingStatsSnapshot,
+    /// Time spent under the per-topic lock for dedupe/cache/bookkeeping.
+    pub dedupe_check: StageTimingStatsSnapshot,
+    /// Time spent delivering accepted messages to local PlumTree subscribers.
+    pub eager_fanout: StageTimingStatsSnapshot,
+    /// Time spent re-publishing/forwarding messages to remote peers.
+    pub republish: StageTimingStatsSnapshot,
+    /// Cumulative count of per-peer sends that hit
+    /// `PER_PEER_REPUBLISH_TIMEOUT` during EAGER republish or IHAVE flush.
+    pub republish_per_peer_timeout: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PubSubStage {
+    Decode,
+    Verify,
+    DedupeLockAcquire,
+    DedupeCheck,
+    EagerFanout,
+    Republish,
+}
+
+impl PubSubStageStats {
+    fn record(&self, stage: PubSubStage, duration: Duration) {
+        match stage {
+            PubSubStage::Decode => self.decode.record(duration),
+            PubSubStage::Verify => self.verify.record(duration),
+            PubSubStage::DedupeLockAcquire => self.dedupe_lock_acquire.record(duration),
+            PubSubStage::DedupeCheck => self.dedupe_check.record(duration),
+            PubSubStage::EagerFanout => self.eager_fanout.record(duration),
+            PubSubStage::Republish => self.republish.record(duration),
+        }
+    }
+
+    fn snapshot(&self) -> PubSubStageStatsSnapshot {
+        PubSubStageStatsSnapshot {
+            decode: self.decode.snapshot(),
+            verify: self.verify.snapshot(),
+            dedupe_lock_acquire: self.dedupe_lock_acquire.snapshot(),
+            dedupe_check: self.dedupe_check.snapshot(),
+            eager_fanout: self.eager_fanout.snapshot(),
+            republish: self.republish.snapshot(),
+            republish_per_peer_timeout: self.republish_per_peer_timeout.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_per_peer_timeout(&self) {
+        self.republish_per_peer_timeout
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn duration_to_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
 
 const fn message_cache_capacity() -> NonZeroUsize {
     // SAFETY: MAX_CACHE_SIZE is a positive constant.
@@ -488,6 +638,8 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     transport: Arc<T>,
     /// ML-DSA key pair for signing messages
     signing_key: Arc<saorsa_gossip_identity::MlDsaKeyPair>,
+    /// Low-overhead timing counters for inbound PubSub processing stages.
+    stage_stats: Arc<PubSubStageStats>,
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
@@ -517,6 +669,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             epoch_start: std::time::SystemTime::UNIX_EPOCH,
             transport,
             signing_key: Arc::new(signing_key),
+            stage_stats: Arc::new(PubSubStageStats::default()),
         };
 
         if start_background_tasks {
@@ -527,6 +680,81 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
 
         pubsub
+    }
+
+    /// Snapshot per-stage timings for inbound PubSub message handling.
+    pub fn stage_stats(&self) -> PubSubStageStatsSnapshot {
+        self.stage_stats.snapshot()
+    }
+
+    fn record_stage(&self, stage: PubSubStage, started: Instant) {
+        self.stage_stats.record(stage, started.elapsed());
+    }
+
+    /// Send `bytes` to every peer in `peers` concurrently with a per-peer
+    /// `PER_PEER_REPUBLISH_TIMEOUT` budget.
+    ///
+    /// X0X-0007: replaces the previous sequential
+    /// `for peer in eager_peers { transport.send_to_peer(peer, ...).await }`
+    /// pattern that pinned the dispatcher behind the slowest peer in the
+    /// fanout set. Now every send runs concurrently and any individual send
+    /// that exceeds the per-peer budget is skipped (incrementing
+    /// `republish_per_peer_timeout`) so a single stuck peer cannot pin the
+    /// dispatcher.
+    ///
+    /// `op` is the short label that appears in WARN logs ("EAGER", "IHAVE").
+    async fn parallel_send_to_peers(
+        &self,
+        peers: Vec<PeerId>,
+        stream_type: GossipStreamType,
+        bytes: Bytes,
+        op: &'static str,
+    ) {
+        if peers.is_empty() {
+            return;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for peer in peers {
+            let transport = Arc::clone(&self.transport);
+            let bytes = bytes.clone();
+            let stage_stats = Arc::clone(&self.stage_stats);
+            set.spawn(async move {
+                match tokio::time::timeout(
+                    PER_PEER_REPUBLISH_TIMEOUT,
+                    transport.send_to_peer(peer, stream_type, bytes),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!(
+                            peer_id = %peer,
+                            op,
+                            "{op} per-peer send failed: {e}"
+                        );
+                    }
+                    Err(_) => {
+                        stage_stats.record_per_peer_timeout();
+                        warn!(
+                            peer_id = %peer,
+                            op,
+                            timeout_ms = PER_PEER_REPUBLISH_TIMEOUT.as_millis() as u64,
+                            "{op} per-peer send timed out — peer skipped, recorded in republish_per_peer_timeout"
+                        );
+                    }
+                }
+            });
+        }
+        // Drain the JoinSet so the helper actually returns when all sends
+        // have either completed, errored, or hit the per-peer timeout. Each
+        // task swallows its own errors, so JoinError outcomes are logged
+        // (panicked task) but otherwise ignored — we never want one panic to
+        // poison the dispatcher.
+        while let Some(joined) = set.join_next().await {
+            if let Err(e) = joined {
+                warn!(op, "{op} per-peer send task panicked: {e}");
+            }
+        }
     }
 
     /// Get current epoch (seconds since UNIX_EPOCH)
@@ -638,13 +866,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let eager_peers: Vec<PeerId> = state.eager_peers.iter().copied().collect();
         drop(topics); // Release lock before network I/O
 
-        // Serialize ONCE (the wire bytes are identical for every peer) and
-        // await each fan-out send sequentially. This mirrors `handle_eager`
-        // forwarding and applies natural back-pressure to publish() when
-        // peer-side throughput can't keep up — without it, the previous
-        // `tokio::spawn`-and-forget pattern accumulated outbound messages
-        // unboundedly per slow peer (root cause of the 2026-04-25 publish-
-        // stress soak's helsinki/nyc OOM at +177 MB/min).
+        // Serialize ONCE (the wire bytes are identical for every peer). The
+        // previous version awaited each `send_to_peer` sequentially, which
+        // pinned the dispatcher behind the slowest peer in the EAGER set
+        // (X0X-0006 measured this at ~73% of dispatcher wall-clock). Now the
+        // sends run concurrently with a per-peer `PER_PEER_REPUBLISH_TIMEOUT`
+        // budget so a single stuck peer cannot pin the whole loop. The
+        // 2026-04-25 OOM-on-spawn issue stays addressed: this is a bounded
+        // concurrent send (one task per peer that completes within the
+        // budget), not a fire-and-forget spawn that can accumulate.
         let bytes: Bytes = match postcard::to_stdvec(&_message) {
             Ok(b) => b.into(),
             Err(e) => {
@@ -652,16 +882,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 return Ok(());
             }
         };
-        for peer in eager_peers {
-            trace!(peer_id = %peer, msg_id = ?msg_id, "Sending EAGER");
-            if let Err(err) = self
-                .transport
-                .send_to_peer(peer, GossipStreamType::PubSub, bytes.clone())
-                .await
-            {
-                warn!(peer_id = %peer, msg_id = ?msg_id, "EAGER send failed: {err}");
-            }
-        }
+        trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Sending EAGER fan-out");
+        self.parallel_send_to_peers(eager_peers, GossipStreamType::PubSub, bytes, "EAGER")
+            .await;
 
         // Batch msg_id to pending_ihave
         let mut topics = self.topics.write().await;
@@ -686,12 +909,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let msg_id = message.header.msg_id;
 
         // Verify signature
-        if !self.verify_signature(&message.header, &message.signature, &message.public_key) {
+        let verify_started = Instant::now();
+        let verified =
+            self.verify_signature(&message.header, &message.signature, &message.public_key);
+        self.record_stage(PubSubStage::Verify, verify_started);
+        if !verified {
             warn!(peer_id = %from, msg_id = ?msg_id, "Invalid signature, dropping");
             return Err(anyhow!("Invalid signature"));
         }
 
+        let lock_started = Instant::now();
         let mut topics = self.topics.write().await;
+        self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
+        let dedupe_started = Instant::now();
         let state = topics.entry(topic).or_insert_with(TopicState::new);
         state.touch();
 
@@ -699,14 +929,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if state.has_message(&msg_id) {
             // PRUNE: move sender from eager to lazy
             state.prune_peer(from);
+            self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
             return Ok(());
         }
 
         // New message - add to cache
-        let payload = message
-            .payload
-            .clone()
-            .ok_or_else(|| anyhow!("EAGER missing payload"))?;
+        let payload = match message.payload.clone() {
+            Some(payload) => payload,
+            None => {
+                self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+                return Err(anyhow!("EAGER missing payload"));
+            }
+        };
         state.cache_message(msg_id, payload.clone(), message.header.clone());
 
         // Update peer score for the sender
@@ -735,6 +969,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 msg_id = ?msg_id,
                 "Payload replay detected — msg_id new but payload hash seen before"
             );
+            self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
             return Ok(());
         }
 
@@ -746,18 +981,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             debug!(peer_id = %from, topic = ?topic, "Added sender to eager_peers");
         }
 
-        // Deliver to local subscribers
-        let sub_count = state.subscribers.len();
-        let data = (from, payload.clone());
-        state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
-        let delivered = state.subscribers.len();
-        debug!(
-            topic = ?topic,
-            subscribers = sub_count,
-            delivered = delivered,
-            "plumtree handle_eager: delivered to local subscribers"
-        );
-
         // Forward to eager_peers (except sender)
         let eager_peers: Vec<PeerId> = state
             .eager_peers
@@ -768,25 +991,42 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         // Batch msg_id to pending_ihave for lazy_peers
         state.pending_ihave.push(msg_id);
+        self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+
+        // Deliver to local subscribers
+        let fanout_started = Instant::now();
+        let sub_count = state.subscribers.len();
+        let data = (from, payload.clone());
+        state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
+        let delivered = state.subscribers.len();
+        self.record_stage(PubSubStage::EagerFanout, fanout_started);
+        debug!(
+            topic = ?topic,
+            subscribers = sub_count,
+            delivered = delivered,
+            "plumtree handle_eager: delivered to local subscribers"
+        );
 
         drop(topics); // Release lock
 
+        let republish_started = Instant::now();
         // Serialize once — the payload is the same for all peers
-        let bytes: Bytes = postcard::to_stdvec(&message)
-            .map_err(|e| anyhow!("EAGER forward serialize failed: {e}"))?
-            .into();
-
-        // Forward EAGER (best-effort: log failures, don't abort the loop)
-        for peer in eager_peers {
-            trace!(peer_id = %peer, msg_id = ?msg_id, "Forwarding EAGER");
-            if let Err(e) = self
-                .transport
-                .send_to_peer(peer, GossipStreamType::PubSub, bytes.clone())
-                .await
-            {
-                warn!(peer_id = %peer, msg_id = ?msg_id, "EAGER forward failed: {e}");
+        let bytes: Bytes = match postcard::to_stdvec(&message) {
+            Ok(bytes) => bytes.into(),
+            Err(e) => {
+                self.record_stage(PubSubStage::Republish, republish_started);
+                return Err(anyhow!("EAGER forward serialize failed: {e}"));
             }
-        }
+        };
+
+        // Forward EAGER (best-effort: log failures, don't abort the loop).
+        // X0X-0007: parallel send with per-peer timeout — was a sequential
+        // `for peer { send.await }` which made one slow peer pin the entire
+        // dispatcher (X0X-0006: 73% of dispatcher wall-clock).
+        trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Forwarding EAGER");
+        self.parallel_send_to_peers(eager_peers, GossipStreamType::PubSub, bytes, "EAGER")
+            .await;
+        self.record_stage(PubSubStage::Republish, republish_started);
 
         Ok(())
     }
@@ -798,7 +1038,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
+        let lock_started = Instant::now();
         let mut topics = self.topics.write().await;
+        self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
+        let dedupe_started = Instant::now();
         let state = topics.entry(topic).or_insert_with(TopicState::new);
         state.touch();
 
@@ -828,10 +1071,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 .or_insert_with(PeerScore::new)
                 .record_iwant_request();
         }
+        self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
 
         drop(topics); // Release lock
 
         if !requested.is_empty() {
+            let republish_started = Instant::now();
             debug!(peer_id = %from, count = requested.len(), "Sending IWANT");
             // Create IWANT message
             let iwant_header = MessageHeader {
@@ -843,21 +1088,32 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 ttl: 10,
             };
             let iwant_header_clone = iwant_header.clone();
+            let payload = match postcard::to_stdvec(&requested) {
+                Ok(payload) => payload.into(),
+                Err(e) => {
+                    self.record_stage(PubSubStage::Republish, republish_started);
+                    return Err(anyhow!("Serialization failed: {}", e));
+                }
+            };
             let iwant_msg = GossipMessage {
                 header: iwant_header,
-                payload: Some(
-                    postcard::to_stdvec(&requested)
-                        .map_err(|e| anyhow!("Serialization failed: {}", e))?
-                        .into(),
-                ),
+                payload: Some(payload),
                 signature: self.sign_message(&iwant_header_clone),
                 public_key: self.signing_key.public_key().to_vec(),
             };
-            let bytes = postcard::to_stdvec(&iwant_msg)
-                .map_err(|e| anyhow!("Serialization failed: {}", e))?;
-            self.transport
+            let bytes = match postcard::to_stdvec(&iwant_msg) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.record_stage(PubSubStage::Republish, republish_started);
+                    return Err(anyhow!("Serialization failed: {}", e));
+                }
+            };
+            let send_result = self
+                .transport
                 .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
-                .await?;
+                .await;
+            self.record_stage(PubSubStage::Republish, republish_started);
+            send_result?;
         }
 
         Ok(())
@@ -870,7 +1126,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
+        let lock_started = Instant::now();
         let mut topics = self.topics.write().await;
+        self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
+        let dedupe_started = Instant::now();
         let state = topics.entry(topic).or_insert_with(TopicState::new);
         state.touch();
 
@@ -885,9 +1144,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 warn!(msg_id = ?msg_id, "IWANT for unknown message");
             }
         }
+        self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
 
         drop(topics); // Release lock
 
+        let republish_started = Instant::now();
         // Send EAGER with payloads
         for (msg_id, cached) in to_send {
             debug!(peer_id = %from, msg_id = ?msg_id, "Sending EAGER in response to IWANT");
@@ -899,12 +1160,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 public_key: self.signing_key.public_key().to_vec(),
             };
 
-            let bytes = postcard::to_stdvec(&_message)
-                .map_err(|e| anyhow!("Serialization failed: {}", e))?;
-            self.transport
+            let bytes = match postcard::to_stdvec(&_message) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.record_stage(PubSubStage::Republish, republish_started);
+                    return Err(anyhow!("Serialization failed: {}", e));
+                }
+            };
+            let send_result = self
+                .transport
                 .send_to_peer(from, GossipStreamType::PubSub, bytes.into())
-                .await?;
+                .await;
+            if let Err(e) = send_result {
+                self.record_stage(PubSubStage::Republish, republish_started);
+                return Err(e);
+            }
         }
+        self.record_stage(PubSubStage::Republish, republish_started);
 
         Ok(())
     }
@@ -920,7 +1192,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         message: GossipMessage,
     ) -> Result<()> {
         // Verify signature
-        if !self.verify_signature(&message.header, &message.signature, &message.public_key) {
+        let verify_started = Instant::now();
+        let verified =
+            self.verify_signature(&message.header, &message.signature, &message.public_key);
+        self.record_stage(PubSubStage::Verify, verify_started);
+        if !verified {
             warn!(peer_id = %from, "Anti-entropy: invalid signature, dropping");
             return Err(anyhow!("Invalid signature on anti-entropy message"));
         }
@@ -929,8 +1205,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .payload
             .ok_or_else(|| anyhow!("Anti-entropy message missing payload"))?;
 
-        let ae_payload: AntiEntropyPayload = postcard::from_bytes(&payload_bytes)
-            .map_err(|e| anyhow!("Failed to deserialize anti-entropy payload: {}", e))?;
+        let decode_started = Instant::now();
+        let decoded: std::result::Result<AntiEntropyPayload, _> =
+            postcard::from_bytes(&payload_bytes);
+        self.record_stage(PubSubStage::Decode, decode_started);
+        let ae_payload =
+            decoded.map_err(|e| anyhow!("Failed to deserialize anti-entropy payload: {}", e))?;
 
         match ae_payload {
             AntiEntropyPayload::Digest { msg_ids } => {
@@ -943,7 +1223,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
                 let their_ids: HashSet<MessageIdType> = msg_ids.into_iter().collect();
 
+                let lock_started = Instant::now();
                 let mut topics = self.topics.write().await;
+                self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
+                let dedupe_started = Instant::now();
                 let state = topics.entry(topic).or_insert_with(TopicState::new);
                 state.touch();
 
@@ -961,9 +1244,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // IDs they have that we don't - we need these
                 let ids_we_need: Vec<MessageIdType> =
                     their_ids.difference(&our_ids).copied().collect();
+                self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
 
                 drop(topics);
 
+                let republish_started = Instant::now();
                 // Send cached messages the peer is missing as EAGER
                 for cached in &messages_to_send {
                     let eager_msg = GossipMessage {
@@ -1013,6 +1298,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             .await;
                     }
                 }
+                self.record_stage(PubSubStage::Republish, republish_started);
 
                 debug!(
                     peer_id = %from,
@@ -1030,7 +1316,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 );
 
                 // Filter out IDs we already have.
+                let lock_started = Instant::now();
                 let mut topics = self.topics.write().await;
+                self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
+                let dedupe_started = Instant::now();
                 let ids_to_request: Vec<MessageIdType> = if let Some(state) = topics.get_mut(&topic)
                 {
                     state.touch();
@@ -1041,8 +1330,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 } else {
                     missing_ids
                 };
+                self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
                 drop(topics);
 
+                let republish_started = Instant::now();
                 // Send IWANT for each ID we don't have
                 if !ids_to_request.is_empty() {
                     debug!(
@@ -1076,6 +1367,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             .await;
                     }
                 }
+                self.record_stage(PubSubStage::Republish, republish_started);
             }
         }
 
@@ -1140,6 +1432,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let topics = self.topics.clone();
         let transport = self.transport.clone();
         let signing_key = self.signing_key.clone();
+        let stage_stats = Arc::clone(&self.stage_stats);
 
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS));
@@ -1147,7 +1440,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             loop {
                 interval.tick().await;
 
-                Self::flush_ihave_batches(&topics, &transport, &signing_key).await;
+                Self::flush_ihave_batches(&topics, &transport, &signing_key, &stage_stats).await;
             }
         });
     }
@@ -1156,6 +1449,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
         transport: &Arc<T>,
         signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
+        stage_stats: &Arc<PubSubStageStats>,
     ) {
         let work: Vec<(TopicId, Vec<MessageIdType>, Vec<PeerId>)> = {
             let mut topics_guard = topics.write().await;
@@ -1224,12 +1518,46 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
 
-            for peer in lazy_peers {
-                if let Err(e) = transport
-                    .send_to_peer(peer, GossipStreamType::PubSub, bytes.clone())
-                    .await
-                {
-                    warn!(peer_id = %peer, topic = ?topic_id, "IHAVE send failed: {e}");
+            // X0X-0007: parallel send with per-peer timeout. Was a sequential
+            // for-await loop that bounded periodic IHAVE flush latency by the
+            // sum of per-peer send latencies; now bounded by max + the per-
+            // peer timeout. Same JoinSet shape as `parallel_send_to_peers`
+            // (the helper method is on `&self` and this background task does
+            // not have one — keeping the shape inline avoids an Arc<Self>
+            // refactor).
+            if !lazy_peers.is_empty() {
+                let mut set = tokio::task::JoinSet::new();
+                for peer in lazy_peers {
+                    let transport = Arc::clone(transport);
+                    let bytes = bytes.clone();
+                    let stage_stats = Arc::clone(stage_stats);
+                    set.spawn(async move {
+                        match tokio::time::timeout(
+                            PER_PEER_REPUBLISH_TIMEOUT,
+                            transport.send_to_peer(peer, GossipStreamType::PubSub, bytes),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                warn!(peer_id = %peer, topic = ?topic_id, "IHAVE send failed: {e}");
+                            }
+                            Err(_) => {
+                                stage_stats.record_per_peer_timeout();
+                                warn!(
+                                    peer_id = %peer,
+                                    topic = ?topic_id,
+                                    timeout_ms = PER_PEER_REPUBLISH_TIMEOUT.as_millis() as u64,
+                                    "IHAVE per-peer send timed out — peer skipped"
+                                );
+                            }
+                        }
+                    });
+                }
+                while let Some(joined) = set.join_next().await {
+                    if let Err(e) = joined {
+                        warn!(topic = ?topic_id, "IHAVE per-peer send task panicked: {e}");
+                    }
                 }
             }
         }
@@ -1492,8 +1820,11 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
 
     async fn handle_message(&self, from: PeerId, data: Bytes) -> Result<()> {
         // Deserialize the GossipMessage
-        let message: GossipMessage = postcard::from_bytes(&data)
-            .map_err(|e| anyhow!("Failed to deserialize PubSub message: {}", e))?;
+        let decode_started = Instant::now();
+        let decoded: std::result::Result<GossipMessage, _> = postcard::from_bytes(&data);
+        self.record_stage(PubSubStage::Decode, decode_started);
+        let message =
+            decoded.map_err(|e| anyhow!("Failed to deserialize PubSub message: {}", e))?;
 
         let topic_id = message.header.topic;
         let msg_kind = message.header.kind;
@@ -1512,7 +1843,11 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
             MessageKind::IHave => {
                 // IHAVE payload contains Vec<MessageIdType>
                 if let Some(payload) = &message.payload {
-                    let msg_ids: Vec<MessageIdType> = postcard::from_bytes(payload)
+                    let decode_started = Instant::now();
+                    let decoded: std::result::Result<Vec<MessageIdType>, _> =
+                        postcard::from_bytes(payload);
+                    self.record_stage(PubSubStage::Decode, decode_started);
+                    let msg_ids = decoded
                         .map_err(|e| anyhow!("Failed to deserialize IHAVE payload: {}", e))?;
                     self.handle_ihave(from, topic_id, msg_ids).await
                 } else {
@@ -1522,7 +1857,11 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
             MessageKind::IWant => {
                 // IWANT payload contains Vec<MessageIdType>
                 if let Some(payload) = &message.payload {
-                    let msg_ids: Vec<MessageIdType> = postcard::from_bytes(payload)
+                    let decode_started = Instant::now();
+                    let decoded: std::result::Result<Vec<MessageIdType>, _> =
+                        postcard::from_bytes(payload);
+                    self.record_stage(PubSubStage::Decode, decode_started);
+                    let msg_ids = decoded
                         .map_err(|e| anyhow!("Failed to deserialize IWANT payload: {}", e))?;
                     self.handle_iwant(from, topic_id, msg_ids).await
                 } else {
@@ -1594,7 +1933,32 @@ mod tests {
         saorsa_gossip_identity::MlDsaKeyPair::generate().expect("Failed to generate test key pair")
     }
 
+    fn signed_eager_message(
+        signing_key: &saorsa_gossip_identity::MlDsaKeyPair,
+        topic: TopicId,
+        msg_id: MessageIdType,
+        payload: Bytes,
+    ) -> GossipMessage {
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let header_bytes = postcard::to_stdvec(&header).expect("header serializes");
+        let signature = signing_key.sign(&header_bytes).expect("header signs");
+        GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        }
+    }
+
     #[derive(Debug)]
+    #[allow(dead_code)] // data_len kept for forensic dumps in test failures
     struct SendRecord {
         peer: PeerId,
         stream_type: GossipStreamType,
@@ -1725,7 +2089,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_publish_local_backpressures_eager_fanout_and_releases_topic_lock() {
+    async fn test_publish_local_eager_fanout_concurrent_with_per_peer_timeout() {
+        // X0X-0007: EAGER fan-out is concurrent (one task per peer) with a
+        // per-peer `PER_PEER_REPUBLISH_TIMEOUT` budget. A single slow peer
+        // no longer pins the dispatcher; instead the per-peer timeout fires
+        // and `republish_per_peer_timeout` is incremented.
+        //
+        // Predecessor test (`test_publish_local_backpressures_eager_fanout_and_releases_topic_lock`)
+        // asserted the opposite: sequential await and `max_in_flight == 1`.
+        // X0X-0006 telemetry showed that sequential pattern was ~73% of
+        // dispatcher wall-clock under load. The new shape is bounded
+        // (`PER_PEER_REPUBLISH_TIMEOUT` per task, eager_peers tasks per
+        // publish — capped at MAX_EAGER_DEGREE=12) so the 2026-04-25
+        // unbounded-task OOM stays prevented.
         let peer_id = test_peer_id(1);
         let (transport, mut started_rx) = BlockingTransport::new(peer_id);
         let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
@@ -1748,62 +2124,48 @@ mod tests {
                 .expect("publish should complete");
         });
 
-        let first = tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
-            .await
-            .expect("first send should start")
-            .expect("send channel should stay open");
-        assert_eq!(first.stream_type, GossipStreamType::PubSub);
-        assert!(first.data_len > 0);
-        assert!(
-            eager_peers.contains(&first.peer),
-            "send should target one of the eager peers"
-        );
-
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(
-            started_rx.try_recv().is_err(),
-            "publish_local should not start the next peer send while the first send is blocked"
-        );
-        assert_eq!(
-            transport.max_in_flight(),
-            1,
-            "eager fan-out should have at most one blocked send in flight"
-        );
-        assert!(
-            !publish.is_finished(),
-            "publish_local should apply back-pressure instead of returning before sends drain"
-        );
-
-        let topic_ids = tokio::time::timeout(Duration::from_millis(50), pubsub.all_topic_ids())
-            .await
-            .expect("topic lock should not be held while send_to_peer is blocked");
-        assert!(
-            topic_ids.contains(&topic),
-            "topic should be visible while publish is blocked on network I/O"
-        );
-
-        let mut data_ptrs = vec![first.data_ptr];
-        for _ in 1..eager_peers.len() {
-            transport.release_sends(1);
+        // Drain N start-of-send signals — every peer's send task should
+        // start near-simultaneously, not serialized.
+        let mut data_ptrs = Vec::with_capacity(eager_peers.len());
+        let mut started_peers = std::collections::HashSet::new();
+        for _ in 0..eager_peers.len() {
             let record = tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
                 .await
-                .expect("next send should start after releasing prior send")
+                .expect("next send should start (concurrent fan-out)")
                 .expect("send channel should stay open");
             assert_eq!(record.stream_type, GossipStreamType::PubSub);
             assert!(
                 eager_peers.contains(&record.peer),
                 "send should target one of the eager peers"
             );
+            started_peers.insert(record.peer);
             data_ptrs.push(record.data_ptr);
-            assert_eq!(
-                transport.max_in_flight(),
-                1,
-                "fan-out should remain sequential under back-pressure"
-            );
         }
+        assert_eq!(
+            started_peers.len(),
+            eager_peers.len(),
+            "every eager peer should have a send task in flight concurrently"
+        );
+        assert_eq!(
+            transport.max_in_flight(),
+            eager_peers.len(),
+            "X0X-0007 fan-out runs all eager-peer sends concurrently"
+        );
 
-        transport.release_sends(1);
-        tokio::time::timeout(Duration::from_millis(100), publish)
+        // The topic lock is released BEFORE the network I/O — this remains
+        // critical because publishes from this peer's own subscribers must
+        // not block on remote sends.
+        let topic_ids = tokio::time::timeout(Duration::from_millis(50), pubsub.all_topic_ids())
+            .await
+            .expect("topic lock should not be held while send_to_peer is in flight");
+        assert!(
+            topic_ids.contains(&topic),
+            "topic should be visible while publish is in flight on network I/O"
+        );
+
+        // Release every blocked send at once — publish should now complete.
+        transport.release_sends(eager_peers.len());
+        tokio::time::timeout(Duration::from_millis(200), publish)
             .await
             .expect("publish task should finish after all sends are released")
             .expect("publish task should not panic");
@@ -1812,6 +2174,154 @@ mod tests {
         assert!(
             data_ptrs.iter().all(|ptr| *ptr == data_ptrs[0]),
             "all eager sends should share the same serialized Bytes allocation"
+        );
+        let stage_stats = pubsub.stage_stats();
+        assert_eq!(
+            stage_stats.republish_per_peer_timeout, 0,
+            "no peer should have hit the per-peer timeout (sends were released within budget)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_local_eager_fanout_per_peer_timeout_isolates_one_slow_peer() {
+        // X0X-0007 acceptance: a single peer that never accepts the send
+        // hits PER_PEER_REPUBLISH_TIMEOUT and is skipped. The other peers
+        // complete normally, and the per-peer timeout counter records the
+        // isolated slow peer. Publish itself returns within budget bounded
+        // by `PER_PEER_REPUBLISH_TIMEOUT`, not by the slow peer's hang.
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([42u8; 32]);
+        let eager_peers: Vec<PeerId> = (2..6).map(test_peer_id).collect();
+        pubsub
+            .initialize_topic_peers(topic, eager_peers.clone())
+            .await;
+
+        let publish_pubsub = Arc::clone(&pubsub);
+        let publish_started = Instant::now();
+        let publish = tokio::spawn(async move {
+            publish_pubsub
+                .publish_local(topic, Bytes::from_static(b"isolate-slow"))
+                .await
+                .expect("publish should complete");
+        });
+
+        // Drain start-of-send signals so we know all peers' sends are in
+        // flight, then release all-but-one. The remaining peer never gets
+        // released, so its send must hit the per-peer timeout.
+        for _ in 0..eager_peers.len() {
+            tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .expect("send should start")
+                .expect("send channel should stay open");
+        }
+        transport.release_sends(eager_peers.len() - 1);
+
+        // Publish must return within ~PER_PEER_REPUBLISH_TIMEOUT + slack.
+        // The slow peer's task hits its 750 ms budget and is skipped; the
+        // other peers' tasks completed immediately on release.
+        tokio::time::timeout(Duration::from_secs(2), publish)
+            .await
+            .expect("publish must return within the per-peer timeout budget — slow peer should not pin the dispatcher")
+            .expect("publish task should not panic");
+        let publish_elapsed = publish_started.elapsed();
+        assert!(
+            publish_elapsed < Duration::from_millis(1_500),
+            "publish elapsed {publish_elapsed:?} — should be bounded by PER_PEER_REPUBLISH_TIMEOUT (750ms) plus a small slack"
+        );
+
+        let stage_stats = pubsub.stage_stats();
+        assert_eq!(
+            stage_stats.republish_per_peer_timeout, 1,
+            "exactly one peer (the unreleased one) should have hit the per-peer timeout"
+        );
+        // Every peer's send_to_peer was *attempted* (send_count counts
+        // attempts at entry, not completions). The slow peer's send was
+        // cancelled by the per-peer timeout; the other 3 completed normally.
+        assert_eq!(
+            transport.send_count(),
+            eager_peers.len(),
+            "every eager peer should have had send_to_peer attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stage_stats_record_slow_republish_from_handle_message() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([9u8; 32]);
+        let forward_peer = test_peer_id(2);
+        let from_peer = test_peer_id(3);
+        pubsub
+            .initialize_topic_peers(topic, vec![forward_peer])
+            .await;
+
+        let message = signed_eager_message(
+            &test_signing_key(),
+            topic,
+            [42u8; 32],
+            Bytes::from_static(b"stage stats"),
+        );
+        let wire: Bytes = postcard::to_stdvec(&message)
+            .expect("message serializes")
+            .into();
+
+        let handle_pubsub = Arc::clone(&pubsub);
+        let handle = tokio::spawn(async move {
+            handle_pubsub
+                .handle_message(from_peer, wire)
+                .await
+                .expect("handle_message should complete");
+        });
+
+        let record = tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("forward send should start")
+            .expect("send channel should stay open");
+        assert_eq!(record.peer, forward_peer);
+
+        // Never release the send — the per-peer timeout (X0X-0007) must
+        // fire and unblock the dispatcher within `PER_PEER_REPUBLISH_TIMEOUT`
+        // plus slack. Pre-X0X-0007 this test asserted republish > 1 s by
+        // sleeping 1.1 s before releasing the send; under X0X-0007 the slow
+        // peer is isolated and the republish stage is bounded by the
+        // per-peer budget instead.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle task should finish bounded by PER_PEER_REPUBLISH_TIMEOUT — slow peer must not pin the dispatcher")
+            .expect("handle task should not panic");
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(stats.decode.count, 1);
+        assert_eq!(stats.verify.count, 1);
+        assert_eq!(stats.dedupe_lock_acquire.count, 1);
+        assert_eq!(stats.dedupe_check.count, 1);
+        assert_eq!(stats.eager_fanout.count, 1);
+        assert_eq!(stats.republish.count, 1);
+        assert_eq!(
+            stats.republish_per_peer_timeout, 1,
+            "the unreleased peer should have hit the per-peer timeout exactly once"
+        );
+        // Republish stage time bounded by PER_PEER_REPUBLISH_TIMEOUT + tokio
+        // task scheduling slack. Use 1500 ms as the upper bound to absorb CI
+        // jitter while still proving the per-peer budget is being honoured
+        // (was unbounded pre-X0X-0007).
+        assert!(
+            stats.republish.max_ns < 1_500_000_000,
+            "republish max_ns should be bounded by PER_PEER_REPUBLISH_TIMEOUT, got {} ns",
+            stats.republish.max_ns
         );
     }
 
@@ -1834,11 +2344,13 @@ mod tests {
         let flush_topics = Arc::clone(&topics);
         let flush_transport = Arc::clone(&transport);
         let flush_signing_key = Arc::clone(&signing_key);
+        let flush_stage_stats = Arc::new(PubSubStageStats::default());
         let flush = tokio::spawn(async move {
             PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
                 &flush_topics,
                 &flush_transport,
                 &flush_signing_key,
+                &flush_stage_stats,
             )
             .await;
         });

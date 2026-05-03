@@ -1149,11 +1149,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     async fn send_to_peer_bounded(
         &self,
+        topic: TopicId,
         peer: PeerId,
         stream_type: GossipStreamType,
         bytes: Bytes,
         op: &'static str,
     ) -> Result<()> {
+        if self
+            .filter_suppressed_topic_peers(topic, vec![peer], op)
+            .await
+            .is_empty()
+        {
+            return Ok(());
+        }
+
         match Self::send_to_peer_with_timeout(
             Arc::clone(&self.transport),
             Arc::clone(&self.stage_stats),
@@ -1164,7 +1173,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         )
         .await?
         {
-            PeerSendOutcome::Sent | PeerSendOutcome::TimedOut => Ok(()),
+            PeerSendOutcome::Sent => {
+                self.record_topic_send_results(topic, vec![peer], Vec::new())
+                    .await;
+                Ok(())
+            }
+            PeerSendOutcome::TimedOut => {
+                self.record_topic_send_results(topic, Vec::new(), vec![peer])
+                    .await;
+                Ok(())
+            }
         }
     }
 
@@ -1692,7 +1710,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
             let send_result = self
-                .send_to_peer_bounded(from, GossipStreamType::PubSub, bytes.into(), "IWANT")
+                .send_to_peer_bounded(topic, from, GossipStreamType::PubSub, bytes.into(), "IWANT")
                 .await;
             self.record_stage(PubSubStage::Republish, republish_started);
             send_result?;
@@ -1752,7 +1770,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
             let send_result = self
-                .send_to_peer_bounded(from, GossipStreamType::PubSub, bytes.into(), "EAGER")
+                .send_to_peer_bounded(topic, from, GossipStreamType::PubSub, bytes.into(), "EAGER")
                 .await;
             if let Err(e) = send_result {
                 self.record_stage(PubSubStage::Republish, republish_started);
@@ -1849,6 +1867,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     if let Ok(bytes) = postcard::to_stdvec(&eager_msg) {
                         let _ = self
                             .send_to_peer_bounded(
+                                topic,
                                 from,
                                 GossipStreamType::PubSub,
                                 bytes.into(),
@@ -1887,6 +1906,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
                         let _ = self
                             .send_to_peer_bounded(
+                                topic,
                                 from,
                                 GossipStreamType::PubSub,
                                 bytes.into(),
@@ -1960,6 +1980,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
                         let _ = self
                             .send_to_peer_bounded(
+                                topic,
                                 from,
                                 GossipStreamType::PubSub,
                                 bytes.into(),
@@ -2015,8 +2036,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         let bytes =
             postcard::to_stdvec(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
-        self.send_to_peer_bounded(peer, GossipStreamType::PubSub, bytes.into(), "ANTI_ENTROPY")
-            .await?;
+        self.send_to_peer_bounded(
+            topic,
+            peer,
+            GossipStreamType::PubSub,
+            bytes.into(),
+            "ANTI_ENTROPY",
+        )
+        .await?;
 
         debug!(
             peer_id = %peer,
@@ -3204,6 +3231,63 @@ mod tests {
             transport.send_count_to(healthy_peer),
             1,
             "healthy EAGER peer should still receive fanout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_peer_bounded_sends_record_cooling_and_skip_suppressed_peer() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([46u8; 32]);
+        let slow_peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![slow_peer]).await;
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                pubsub.send_to_peer_bounded(
+                    topic,
+                    slow_peer,
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"bounded-single-peer"),
+                    "EAGER",
+                ),
+            )
+            .await
+            .expect("bounded send should return after per-peer timeout")
+            .expect("timeout outcome is recorded, not returned as an error");
+
+            tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .expect("send should have started")
+                .expect("started channel should stay open");
+        }
+
+        let suppressed = pubsub.stage_stats().suppressed_peers;
+        assert_eq!(suppressed.len(), 1, "single-peer sends should cool peers");
+        assert_eq!(suppressed[0].peer_id, slow_peer.to_string());
+
+        let attempts_after_cooling = transport.send_count();
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                slow_peer,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"should-be-skipped"),
+                "EAGER",
+            )
+            .await
+            .expect("suppressed peer should be skipped cleanly");
+        assert_eq!(
+            transport.send_count(),
+            attempts_after_cooling,
+            "suppressed peer should not consume another send slot"
         );
     }
 

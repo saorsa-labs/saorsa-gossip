@@ -271,6 +271,7 @@ struct SuppressedPeerState {
     suppressed_until: Instant,
     recent_timeout_count: usize,
     cooldown: Duration,
+    recovery_probe_in_flight: bool,
 }
 
 /// JSON-friendly diagnostic for peers currently cooled by send-side timeout feedback.
@@ -292,6 +293,11 @@ pub struct SuppressedPeerSnapshot {
     pub affected_topics_count: usize,
     /// Cooldown duration applied to this suppression.
     pub cooldown_ms: u64,
+    /// Current recovery state for this peer/topic (`cooldown`, `recovery_ready`,
+    /// or `recovery_probe`).
+    pub state: String,
+    /// Whether a post-cooldown recovery send has been claimed and is still in flight.
+    pub recovery_probe_in_flight: bool,
 }
 
 /// JSON-friendly snapshot of per-stage PubSub handling timings.
@@ -334,6 +340,192 @@ enum PeerSendOutcome {
     TimedOut,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendAttemptKind {
+    Normal,
+    RecoveryProbe,
+}
+
+type RecoveryProbeId = u64;
+
+static NEXT_RECOVERY_PROBE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerSendAttempt {
+    peer: PeerId,
+    kind: SendAttemptKind,
+    recovery_probe_id: Option<RecoveryProbeId>,
+}
+
+struct SendAttemptClaims {
+    topic: TopicId,
+    attempts: Vec<PeerSendAttempt>,
+    topics: Arc<RwLock<HashMap<TopicId, TopicState>>>,
+    stage_stats: Arc<PubSubStageStats>,
+    armed: bool,
+}
+
+impl SendAttemptClaims {
+    fn new(
+        topic: TopicId,
+        attempts: Vec<PeerSendAttempt>,
+        topics: Arc<RwLock<HashMap<TopicId, TopicState>>>,
+        stage_stats: Arc<PubSubStageStats>,
+    ) -> Self {
+        Self {
+            topic,
+            attempts,
+            topics,
+            stage_stats,
+            armed: true,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.attempts.is_empty()
+    }
+
+    fn attempts(&self) -> &[PeerSendAttempt] {
+        &self.attempts
+    }
+
+    async fn record_results(mut self, sent: Vec<PeerSendAttempt>, timed_out: Vec<PeerSendAttempt>) {
+        record_topic_send_attempt_results_for_state(
+            &self.topics,
+            &self.stage_stats,
+            self.topic,
+            sent,
+            timed_out,
+        )
+        .await;
+        self.armed = false;
+    }
+}
+
+impl Drop for SendAttemptClaims {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let timed_out: Vec<PeerSendAttempt> = self
+            .attempts
+            .iter()
+            .copied()
+            .filter(|attempt| attempt.kind == SendAttemptKind::RecoveryProbe)
+            .collect();
+        if timed_out.is_empty() {
+            return;
+        }
+
+        let topic = self.topic;
+        let topics = Arc::clone(&self.topics);
+        let stage_stats = Arc::clone(&self.stage_stats);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    record_topic_send_attempt_results_for_state(
+                        &topics,
+                        &stage_stats,
+                        topic,
+                        Vec::new(),
+                        timed_out,
+                    )
+                    .await;
+                });
+            }
+            Err(e) => {
+                warn!(
+                    topic = ?topic,
+                    "Unable to release cancelled PubSub recovery probes: {e}"
+                );
+            }
+        }
+    }
+}
+
+struct AbortOnDropSendHandle {
+    handle: tokio::task::JoinHandle<Result<PeerSendOutcome>>,
+    abort_on_drop: bool,
+}
+
+impl AbortOnDropSendHandle {
+    fn new(handle: tokio::task::JoinHandle<Result<PeerSendOutcome>>) -> Self {
+        Self {
+            handle,
+            abort_on_drop: true,
+        }
+    }
+
+    async fn join(
+        mut self,
+    ) -> std::result::Result<Result<PeerSendOutcome>, tokio::task::JoinError> {
+        let result = (&mut self.handle).await;
+        self.abort_on_drop = false;
+        result
+    }
+}
+
+impl Drop for AbortOnDropSendHandle {
+    fn drop(&mut self) {
+        if self.abort_on_drop {
+            self.handle.abort();
+        }
+    }
+}
+
+struct SendTaskSet {
+    op: &'static str,
+    handles: Vec<(PeerSendAttempt, AbortOnDropSendHandle)>,
+}
+
+impl SendTaskSet {
+    fn with_capacity(op: &'static str, capacity: usize) -> Self {
+        Self {
+            op,
+            handles: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(
+        &mut self,
+        attempt: PeerSendAttempt,
+        handle: tokio::task::JoinHandle<Result<PeerSendOutcome>>,
+    ) {
+        self.handles
+            .push((attempt, AbortOnDropSendHandle::new(handle)));
+    }
+
+    async fn collect_results(mut self) -> (Vec<PeerSendAttempt>, Vec<PeerSendAttempt>) {
+        let mut sent = Vec::new();
+        let mut timed_out = Vec::new();
+        while let Some((attempt, handle)) = self.handles.pop() {
+            match handle.join().await {
+                Ok(Ok(PeerSendOutcome::Sent)) => sent.push(attempt),
+                Ok(Ok(PeerSendOutcome::TimedOut)) => timed_out.push(attempt),
+                Ok(Err(_)) => timed_out.extend(recovery_probe_timeout(attempt)),
+                Err(e) => {
+                    timed_out.extend(recovery_probe_timeout(attempt));
+                    warn!(
+                        peer_id = %attempt.peer,
+                        op = self.op,
+                        "{} per-peer send task panicked: {e}",
+                        self.op
+                    );
+                }
+            }
+        }
+        (sent, timed_out)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerRecoveryProbeEvent {
+    suppressed_until: Instant,
+    recent_timeout_count: usize,
+    cooldown: Duration,
+}
+
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -361,8 +553,7 @@ impl PubSubStageStats {
 
     fn suppressed_peer_snapshots(&self) -> Vec<SuppressedPeerSnapshot> {
         let now = Instant::now();
-        let mut guard = self.suppressed_peers_guard();
-        guard.retain(|_, state| state.suppressed_until > now);
+        let guard = self.suppressed_peers_guard();
 
         let mut affected_topics = HashMap::<PeerId, usize>::new();
         for key in guard.keys() {
@@ -383,6 +574,14 @@ impl PubSubStageStats {
                         / PEER_TIMEOUT_WINDOW.as_secs_f64(),
                     affected_topics_count: affected_topics.get(&key.peer).copied().unwrap_or(1),
                     cooldown_ms: duration_millis_u64(state.cooldown),
+                    state: if state.recovery_probe_in_flight {
+                        "recovery_probe".to_string()
+                    } else if state.suppressed_until > now {
+                        "cooldown".to_string()
+                    } else {
+                        "recovery_ready".to_string()
+                    },
+                    recovery_probe_in_flight: state.recovery_probe_in_flight,
                 }
             })
             .collect();
@@ -440,6 +639,27 @@ impl PubSubStageStats {
                 suppressed_until,
                 recent_timeout_count,
                 cooldown,
+                recovery_probe_in_flight: false,
+            },
+        );
+    }
+
+    fn record_peer_recovery_probe(
+        &self,
+        topic: TopicId,
+        peer: PeerId,
+        suppressed_until: Instant,
+        recent_timeout_count: usize,
+        cooldown: Duration,
+    ) {
+        let mut guard = self.suppressed_peers_guard();
+        guard.insert(
+            SuppressedPeerKey { topic, peer },
+            SuppressedPeerState {
+                suppressed_until,
+                recent_timeout_count,
+                cooldown,
+                recovery_probe_in_flight: true,
             },
         );
     }
@@ -447,6 +667,11 @@ impl PubSubStageStats {
     fn clear_peer_suppression(&self, topic: TopicId, peer: PeerId) {
         let mut guard = self.suppressed_peers_guard();
         guard.remove(&SuppressedPeerKey { topic, peer });
+    }
+
+    fn clear_topic_suppressions(&self, topic: TopicId) {
+        let mut guard = self.suppressed_peers_guard();
+        guard.retain(|key, _| key.topic != topic);
     }
 
     fn record_message_kind(&self, kind: MessageKind) {
@@ -615,6 +840,9 @@ struct PeerCoolingState {
     timeout_count: usize,
     suppressed_until: Option<Instant>,
     cooldown: Duration,
+    last_suppression_timeout_count: usize,
+    recovery_probe_in_flight: bool,
+    recovery_probe_id: Option<RecoveryProbeId>,
 }
 
 struct PeerSuppressionEvent {
@@ -631,15 +859,60 @@ impl PeerCoolingState {
             timeout_count: 0,
             suppressed_until: None,
             cooldown: PEER_SUPPRESSION_COOLDOWN,
+            last_suppression_timeout_count: 0,
+            recovery_probe_in_flight: false,
+            recovery_probe_id: None,
         }
     }
 
     fn is_suppressed_at(&self, now: Instant) -> bool {
         self.suppressed_until.is_some_and(|until| until > now)
+            || self.recovery_probe_in_flight
+            || self.suppression_expired_at(now)
     }
 
     fn suppression_expired_at(&self, now: Instant) -> bool {
         self.suppressed_until.is_some_and(|until| until <= now)
+    }
+
+    fn can_graft_at(&self, now: Instant) -> bool {
+        !self.is_suppressed_at(now)
+    }
+
+    fn claim_send_attempt_at(
+        &mut self,
+        now: Instant,
+    ) -> Option<(
+        SendAttemptKind,
+        Option<RecoveryProbeId>,
+        Option<PeerRecoveryProbeEvent>,
+    )> {
+        if self.suppressed_until.is_some_and(|until| until > now) {
+            return None;
+        }
+        if self.suppression_expired_at(now) {
+            if self.recovery_probe_in_flight {
+                return None;
+            }
+            let recovery_probe_id = NEXT_RECOVERY_PROBE_ID.fetch_add(1, Ordering::Relaxed);
+            self.recovery_probe_in_flight = true;
+            self.recovery_probe_id = Some(recovery_probe_id);
+            let suppressed_until = self.suppressed_until.unwrap_or(now);
+            return Some((
+                SendAttemptKind::RecoveryProbe,
+                Some(recovery_probe_id),
+                Some(PeerRecoveryProbeEvent {
+                    suppressed_until,
+                    recent_timeout_count: self.last_suppression_timeout_count.max(1),
+                    cooldown: self.cooldown,
+                }),
+            ));
+        }
+        Some((SendAttemptKind::Normal, None, None))
+    }
+
+    fn matches_recovery_probe(&self, recovery_probe_id: Option<RecoveryProbeId>) -> bool {
+        self.recovery_probe_in_flight && self.recovery_probe_id == recovery_probe_id
     }
 
     fn next_cooldown(&self) -> Duration {
@@ -817,59 +1090,130 @@ impl TopicState {
             .is_some_and(|state| state.is_suppressed_at(now))
     }
 
-    fn record_send_success_at(&mut self, peer: PeerId, now: Instant) -> bool {
-        let recovered = self
-            .peer_cooling
+    fn can_graft_peer_at(&self, peer: PeerId, now: Instant) -> bool {
+        self.peer_cooling
             .get(&peer)
-            .is_some_and(|state| state.suppression_expired_at(now));
-        if recovered {
-            self.peer_cooling.remove(&peer);
+            .is_none_or(|state| state.can_graft_at(now))
+    }
+
+    fn claim_send_attempt_at(
+        &mut self,
+        peer: PeerId,
+        now: Instant,
+    ) -> Option<(PeerSendAttempt, Option<PeerRecoveryProbeEvent>)> {
+        let Some(cooling) = self.peer_cooling.get_mut(&peer) else {
+            return Some((
+                PeerSendAttempt {
+                    peer,
+                    kind: SendAttemptKind::Normal,
+                    recovery_probe_id: None,
+                },
+                None,
+            ));
+        };
+
+        let (kind, recovery_probe_id, recovery_event) = cooling.claim_send_attempt_at(now)?;
+        Some((
+            PeerSendAttempt {
+                peer,
+                kind,
+                recovery_probe_id,
+            },
+            recovery_event,
+        ))
+    }
+
+    fn record_send_success_at(&mut self, attempt: PeerSendAttempt, now: Instant) -> bool {
+        match attempt.kind {
+            SendAttemptKind::RecoveryProbe => {
+                let Some(cooling) = self.peer_cooling.get(&attempt.peer) else {
+                    return false;
+                };
+                if !cooling.matches_recovery_probe(attempt.recovery_probe_id) {
+                    return false;
+                }
+                self.peer_cooling.remove(&attempt.peer).is_some()
+            }
+            SendAttemptKind::Normal => {
+                if let Some(cooling) = self.peer_cooling.get_mut(&attempt.peer) {
+                    if !cooling.is_suppressed_at(now) {
+                        cooling.timeout_count = 0;
+                        cooling.timeout_window_started = now;
+                    }
+                }
+                false
+            }
         }
-        recovered
     }
 
     fn record_send_timeout_at(
         &mut self,
-        peer: PeerId,
+        attempt: PeerSendAttempt,
         now: Instant,
     ) -> Option<PeerSuppressionEvent> {
         let event = {
-            let cooling = self
-                .peer_cooling
-                .entry(peer)
-                .or_insert_with(|| PeerCoolingState::new(now));
-
-            if cooling.is_suppressed_at(now) {
-                return None;
-            }
-
-            if now.saturating_duration_since(cooling.timeout_window_started) > PEER_TIMEOUT_WINDOW {
-                cooling.timeout_window_started = now;
-                cooling.timeout_count = 0;
-            }
-
-            cooling.timeout_count = cooling.timeout_count.saturating_add(1);
-            if cooling.timeout_count < PEER_TIMEOUT_THRESHOLD {
-                None
-            } else {
+            if attempt.kind == SendAttemptKind::RecoveryProbe {
+                let cooling = self.peer_cooling.get_mut(&attempt.peer)?;
+                if !cooling.matches_recovery_probe(attempt.recovery_probe_id) {
+                    return None;
+                }
                 let cooldown = cooling.next_cooldown();
                 let suppressed_until = now + cooldown;
-                let recent_timeout_count = cooling.timeout_count;
                 cooling.cooldown = cooldown;
                 cooling.suppressed_until = Some(suppressed_until);
+                cooling.last_suppression_timeout_count = 1;
+                cooling.recovery_probe_in_flight = false;
+                cooling.recovery_probe_id = None;
                 cooling.timeout_window_started = now;
                 cooling.timeout_count = 0;
                 Some(PeerSuppressionEvent {
                     suppressed_until,
-                    recent_timeout_count,
+                    recent_timeout_count: 1,
                     cooldown,
                     demoted: false,
                 })
+            } else {
+                let cooling = self
+                    .peer_cooling
+                    .entry(attempt.peer)
+                    .or_insert_with(|| PeerCoolingState::new(now));
+                if cooling.is_suppressed_at(now) {
+                    return None;
+                }
+
+                if now.saturating_duration_since(cooling.timeout_window_started)
+                    > PEER_TIMEOUT_WINDOW
+                {
+                    cooling.timeout_window_started = now;
+                    cooling.timeout_count = 0;
+                }
+
+                cooling.timeout_count = cooling.timeout_count.saturating_add(1);
+                if cooling.timeout_count < PEER_TIMEOUT_THRESHOLD {
+                    None
+                } else {
+                    let cooldown = cooling.next_cooldown();
+                    let suppressed_until = now + cooldown;
+                    let recent_timeout_count = cooling.timeout_count;
+                    cooling.cooldown = cooldown;
+                    cooling.suppressed_until = Some(suppressed_until);
+                    cooling.last_suppression_timeout_count = recent_timeout_count;
+                    cooling.recovery_probe_in_flight = false;
+                    cooling.recovery_probe_id = None;
+                    cooling.timeout_window_started = now;
+                    cooling.timeout_count = 0;
+                    Some(PeerSuppressionEvent {
+                        suppressed_until,
+                        recent_timeout_count,
+                        cooldown,
+                        demoted: false,
+                    })
+                }
             }
         };
 
         event.map(|mut event| {
-            event.demoted = self.prune_peer(peer);
+            event.demoted = self.prune_peer(attempt.peer);
             event
         })
     }
@@ -897,14 +1241,13 @@ impl TopicState {
             false
         }
     }
-
     /// Move peer from lazy to eager
     fn graft_peer(&mut self, peer: PeerId) -> bool {
         self.graft_peer_at(peer, Instant::now())
     }
 
     fn graft_peer_at(&mut self, peer: PeerId, now: Instant) -> bool {
-        if self.is_peer_suppressed_at(peer, now) {
+        if !self.can_graft_peer_at(peer, now) {
             debug!(peer_id = %peer, "GRAFT skipped: peer is cooling after send timeouts");
             return false;
         }
@@ -937,7 +1280,7 @@ impl TopicState {
             let mut scored_lazy: Vec<(PeerId, f64)> = self
                 .lazy_peers
                 .iter()
-                .filter(|&&p| !self.is_peer_suppressed_at(p, now))
+                .filter(|&&p| self.can_graft_peer_at(p, now))
                 .map(|&p| {
                     let score = self.peer_scores.get(&p).map_or(0.5, |s| s.score());
                     (p, score)
@@ -981,10 +1324,88 @@ impl TopicState {
     }
 }
 
+async fn record_topic_send_attempt_results_for_state(
+    topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
+    stage_stats: &Arc<PubSubStageStats>,
+    topic: TopicId,
+    sent: Vec<PeerSendAttempt>,
+    timed_out: Vec<PeerSendAttempt>,
+) {
+    let now = Instant::now();
+    let mut topics_guard = topics.write().await;
+    let Some(state) = topics_guard.get_mut(&topic) else {
+        for attempt in sent.iter().chain(timed_out.iter()) {
+            if attempt.kind == SendAttemptKind::RecoveryProbe {
+                stage_stats.clear_peer_suppression(topic, attempt.peer);
+            }
+        }
+        return;
+    };
+
+    for attempt in sent {
+        if state.record_send_success_at(attempt, now) {
+            stage_stats.clear_peer_suppression(topic, attempt.peer);
+            debug!(
+                peer_id = %attempt.peer,
+                topic = ?topic,
+                "Peer cooling cleared after successful post-cooldown send"
+            );
+        }
+    }
+
+    for attempt in timed_out {
+        if let Some(event) = state.record_send_timeout_at(attempt, now) {
+            stage_stats.record_peer_suppressed(
+                topic,
+                attempt.peer,
+                event.suppressed_until,
+                event.recent_timeout_count,
+                event.cooldown,
+            );
+            if event.demoted {
+                stage_stats.record_prune();
+            }
+            warn!(
+                peer_id = %attempt.peer,
+                topic = ?topic,
+                cooldown_ms = duration_millis_u64(event.cooldown),
+                recent_timeout_count = event.recent_timeout_count,
+                demoted = event.demoted,
+                "Peer cooled after repeated PubSub send timeouts"
+            );
+        }
+    }
+}
+
+fn recovery_probe_timeout(attempt: PeerSendAttempt) -> Vec<PeerSendAttempt> {
+    if attempt.kind == SendAttemptKind::RecoveryProbe {
+        vec![attempt]
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+fn normal_send_attempt(peer: PeerId) -> PeerSendAttempt {
+    PeerSendAttempt {
+        peer,
+        kind: SendAttemptKind::Normal,
+        recovery_probe_id: None,
+    }
+}
+
+#[cfg(test)]
 fn clean_and_reap_topics(
     topics: &mut HashMap<TopicId, TopicState>,
     topic_idle_ttl: Duration,
 ) -> usize {
+    clean_and_reap_topic_ids(topics, topic_idle_ttl).len()
+}
+
+fn clean_and_reap_topic_ids(
+    topics: &mut HashMap<TopicId, TopicState>,
+    topic_idle_ttl: Duration,
+) -> Vec<TopicId> {
     for state in topics.values_mut() {
         state.clean_cache();
     }
@@ -994,12 +1415,11 @@ fn clean_and_reap_topics(
         .filter(|(_, s)| s.is_idle(topic_idle_ttl))
         .map(|(id, _)| *id)
         .collect();
-    let idle_count = idle.len();
-    for id in idle {
-        topics.remove(&id);
+    for id in &idle {
+        topics.remove(id);
     }
 
-    idle_count
+    idle
 }
 
 /// Pub/sub trait for message dissemination
@@ -1155,58 +1575,127 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
     ) -> Result<()> {
-        if self
-            .filter_suppressed_topic_peers(topic, vec![peer], op)
-            .await
-            .is_empty()
-        {
+        let claims = self.claim_topic_send_attempts(topic, vec![peer], op).await;
+        let Some(attempt) = claims.attempts().first().copied() else {
             return Ok(());
-        }
+        };
 
-        match Self::send_to_peer_with_timeout(
-            Arc::clone(&self.transport),
-            Arc::clone(&self.stage_stats),
-            peer,
-            stream_type,
-            bytes,
-            op,
-        )
-        .await?
-        {
-            PeerSendOutcome::Sent => {
-                self.record_topic_send_results(topic, vec![peer], Vec::new())
-                    .await;
+        let transport = Arc::clone(&self.transport);
+        let stage_stats = Arc::clone(&self.stage_stats);
+        let handle = AbortOnDropSendHandle::new(tokio::spawn(async move {
+            Self::send_to_peer_with_timeout(
+                transport,
+                stage_stats,
+                attempt.peer,
+                stream_type,
+                bytes,
+                op,
+            )
+            .await
+        }));
+
+        match handle.join().await {
+            Ok(Ok(PeerSendOutcome::Sent)) => {
+                claims.record_results(vec![attempt], Vec::new()).await;
                 Ok(())
             }
-            PeerSendOutcome::TimedOut => {
-                self.record_topic_send_results(topic, Vec::new(), vec![peer])
-                    .await;
+            Ok(Ok(PeerSendOutcome::TimedOut)) => {
+                claims.record_results(Vec::new(), vec![attempt]).await;
                 Ok(())
+            }
+            Ok(Err(e)) => {
+                let timed_out = recovery_probe_timeout(attempt);
+                claims.record_results(Vec::new(), timed_out).await;
+                Err(e)
+            }
+            Err(e) => {
+                let timed_out = recovery_probe_timeout(attempt);
+                claims.record_results(Vec::new(), timed_out).await;
+                warn!(
+                    peer_id = %attempt.peer,
+                    op,
+                    "{op} per-peer send task panicked: {e}"
+                );
+                Err(anyhow!("{op} per-peer send task panicked: {e}"))
             }
         }
     }
 
-    async fn filter_suppressed_topic_peers(
+    async fn claim_topic_send_attempts(
         &self,
         topic: TopicId,
         peers: Vec<PeerId>,
         op: &'static str,
-    ) -> Vec<PeerId> {
+    ) -> SendAttemptClaims {
         if peers.is_empty() {
-            return peers;
+            return SendAttemptClaims::new(
+                topic,
+                Vec::new(),
+                Arc::clone(&self.topics),
+                Arc::clone(&self.stage_stats),
+            );
         }
 
         let now = Instant::now();
-        let topics = self.topics.read().await;
-        let Some(state) = topics.get(&topic) else {
-            return peers;
+        let mut topics = self.topics.write().await;
+        let attempts = if let Some(state) = topics.get_mut(&topic) {
+            Self::claim_topic_send_attempts_for_state(
+                &self.stage_stats,
+                topic,
+                state,
+                peers,
+                now,
+                op,
+            )
+        } else {
+            peers
+                .into_iter()
+                .map(|peer| PeerSendAttempt {
+                    peer,
+                    kind: SendAttemptKind::Normal,
+                    recovery_probe_id: None,
+                })
+                .collect()
         };
 
-        peers
-            .into_iter()
-            .filter(|peer| {
-                let suppressed = state.is_peer_suppressed_at(*peer, now);
-                if suppressed {
+        SendAttemptClaims::new(
+            topic,
+            attempts,
+            Arc::clone(&self.topics),
+            Arc::clone(&self.stage_stats),
+        )
+    }
+
+    fn claim_topic_send_attempts_for_state(
+        stage_stats: &PubSubStageStats,
+        topic: TopicId,
+        state: &mut TopicState,
+        peers: Vec<PeerId>,
+        now: Instant,
+        op: &'static str,
+    ) -> Vec<PeerSendAttempt> {
+        let mut attempts = Vec::with_capacity(peers.len());
+        for peer in peers {
+            match state.claim_send_attempt_at(peer, now) {
+                Some((attempt, recovery_event)) => {
+                    if let Some(event) = recovery_event {
+                        stage_stats.record_peer_recovery_probe(
+                            topic,
+                            peer,
+                            event.suppressed_until,
+                            event.recent_timeout_count,
+                            event.cooldown,
+                        );
+                        debug!(
+                            peer_id = %peer,
+                            topic = ?topic,
+                            op,
+                            "{op} send admitted as peer recovery probe"
+                        );
+                    }
+                    attempts.push(attempt);
+                }
+                None => {
                     trace!(
                         peer_id = %peer,
                         topic = ?topic,
@@ -1214,22 +1703,50 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         "{op} send skipped: peer cooling after repeated timeouts"
                     );
                 }
-                !suppressed
-            })
-            .collect()
+            }
+        }
+        attempts
     }
 
+    #[cfg(test)]
     async fn record_topic_send_results(
         &self,
         topic: TopicId,
         sent: Vec<PeerId>,
         timed_out: Vec<PeerId>,
     ) {
+        let sent = sent
+            .into_iter()
+            .map(|peer| PeerSendAttempt {
+                peer,
+                kind: SendAttemptKind::Normal,
+                recovery_probe_id: None,
+            })
+            .collect();
+        let timed_out = timed_out
+            .into_iter()
+            .map(|peer| PeerSendAttempt {
+                peer,
+                kind: SendAttemptKind::Normal,
+                recovery_probe_id: None,
+            })
+            .collect();
+        self.record_topic_send_attempt_results(topic, sent, timed_out)
+            .await;
+    }
+
+    #[cfg(test)]
+    async fn record_topic_send_attempt_results(
+        &self,
+        topic: TopicId,
+        sent: Vec<PeerSendAttempt>,
+        timed_out: Vec<PeerSendAttempt>,
+    ) {
         if sent.is_empty() && timed_out.is_empty() {
             return;
         }
 
-        Self::record_topic_send_results_for(
+        Self::record_topic_send_attempt_results_for(
             &self.topics,
             &self.stage_stats,
             topic,
@@ -1239,52 +1756,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         .await;
     }
 
-    async fn record_topic_send_results_for(
+    #[cfg(test)]
+    async fn record_topic_send_attempt_results_for(
         topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
         stage_stats: &Arc<PubSubStageStats>,
         topic: TopicId,
-        sent: Vec<PeerId>,
-        timed_out: Vec<PeerId>,
+        sent: Vec<PeerSendAttempt>,
+        timed_out: Vec<PeerSendAttempt>,
     ) {
-        let now = Instant::now();
-        let mut topics_guard = topics.write().await;
-        let Some(state) = topics_guard.get_mut(&topic) else {
-            return;
-        };
-
-        for peer in sent {
-            if state.record_send_success_at(peer, now) {
-                stage_stats.clear_peer_suppression(topic, peer);
-                debug!(
-                    peer_id = %peer,
-                    topic = ?topic,
-                    "Peer cooling cleared after successful post-cooldown send"
-                );
-            }
-        }
-
-        for peer in timed_out {
-            if let Some(event) = state.record_send_timeout_at(peer, now) {
-                stage_stats.record_peer_suppressed(
-                    topic,
-                    peer,
-                    event.suppressed_until,
-                    event.recent_timeout_count,
-                    event.cooldown,
-                );
-                if event.demoted {
-                    stage_stats.record_prune();
-                }
-                warn!(
-                    peer_id = %peer,
-                    topic = ?topic,
-                    cooldown_ms = duration_millis_u64(event.cooldown),
-                    recent_timeout_count = event.recent_timeout_count,
-                    demoted = event.demoted,
-                    "Peer cooled after repeated PubSub send timeouts"
-                );
-            }
-        }
+        record_topic_send_attempt_results_for_state(topics, stage_stats, topic, sent, timed_out)
+            .await;
     }
 
     /// Send `bytes` to every peer in `peers` concurrently with a per-peer
@@ -1307,44 +1788,30 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
     ) {
-        let peers = self.filter_suppressed_topic_peers(topic, peers, op).await;
-        if peers.is_empty() {
+        let claims = self.claim_topic_send_attempts(topic, peers, op).await;
+        if claims.is_empty() {
             return;
         }
-        let mut set = tokio::task::JoinSet::new();
-        for peer in peers {
+        let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
+        for attempt in claims.attempts().iter().copied() {
             let transport = Arc::clone(&self.transport);
             let bytes = bytes.clone();
             let stage_stats = Arc::clone(&self.stage_stats);
-            set.spawn(async move {
-                let outcome = Self::send_to_peer_with_timeout(
+            let handle = tokio::spawn(async move {
+                Self::send_to_peer_with_timeout(
                     transport,
                     stage_stats,
-                    peer,
+                    attempt.peer,
                     stream_type,
                     bytes,
                     op,
                 )
-                .await;
-                (peer, outcome)
+                .await
             });
+            send_tasks.push(attempt, handle);
         }
-        // Drain the JoinSet so the helper actually returns when all sends
-        // have either completed, errored, or hit the per-peer timeout. Each
-        // task swallows its own errors, so JoinError outcomes are logged
-        // (panicked task) but otherwise ignored — we never want one panic to
-        // poison the dispatcher.
-        let mut sent = Vec::new();
-        let mut timed_out = Vec::new();
-        while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok((peer, Ok(PeerSendOutcome::Sent))) => sent.push(peer),
-                Ok((peer, Ok(PeerSendOutcome::TimedOut))) => timed_out.push(peer),
-                Ok((_peer, Err(_))) => {}
-                Err(e) => warn!(op, "{op} per-peer send task panicked: {e}"),
-            }
-        }
-        self.record_topic_send_results(topic, sent, timed_out).await;
+        let (sent, timed_out) = send_tasks.collect_results().await;
+        claims.record_results(sent, timed_out).await;
     }
 
     /// Get current epoch (seconds since UNIX_EPOCH)
@@ -2101,13 +2568,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     .drain(..state.pending_ihave.len().min(MAX_IHAVE_BATCH_SIZE))
                     .collect();
 
-                let now = Instant::now();
-                let lazy_peers: Vec<PeerId> = state
-                    .lazy_peers
-                    .iter()
-                    .filter(|&&peer| !state.is_peer_suppressed_at(peer, now))
-                    .copied()
-                    .collect();
+                let lazy_peers: Vec<PeerId> = state.lazy_peers.iter().copied().collect();
                 work.push((*topic_id, batch, lazy_peers));
             }
 
@@ -2160,46 +2621,55 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
 
+            let attempts = {
+                let now = Instant::now();
+                let mut topics_guard = topics.write().await;
+                let Some(state) = topics_guard.get_mut(&topic_id) else {
+                    continue;
+                };
+                Self::claim_topic_send_attempts_for_state(
+                    stage_stats,
+                    topic_id,
+                    state,
+                    lazy_peers,
+                    now,
+                    "IHAVE",
+                )
+            };
+            let claims = SendAttemptClaims::new(
+                topic_id,
+                attempts,
+                Arc::clone(topics),
+                Arc::clone(stage_stats),
+            );
+
             // X0X-0007: parallel send with per-peer timeout. Was a sequential
             // for-await loop that bounded periodic IHAVE flush latency by the
             // sum of per-peer send latencies; now bounded by max + the per-
-            // peer timeout. Same JoinSet shape as `parallel_send_to_peers`
-            // (the helper method is on `&self` and this background task does
-            // not have one — keeping the shape inline avoids an Arc<Self>
-            // refactor).
-            if !lazy_peers.is_empty() {
-                let mut set = tokio::task::JoinSet::new();
-                for peer in lazy_peers {
+            // peer timeout. Same tracked-JoinHandle shape as
+            // `parallel_send_to_peers` so a panicked recovery-probe task can
+            // still be associated with the peer and re-suppressed.
+            if !claims.is_empty() {
+                let mut send_tasks = SendTaskSet::with_capacity("IHAVE", claims.attempts().len());
+                for attempt in claims.attempts().iter().copied() {
                     let transport = Arc::clone(transport);
                     let bytes = bytes.clone();
                     let stage_stats = Arc::clone(stage_stats);
-                    set.spawn(async move {
-                        let outcome = Self::send_to_peer_with_timeout(
+                    let handle = tokio::spawn(async move {
+                        Self::send_to_peer_with_timeout(
                             transport,
                             stage_stats,
-                            peer,
+                            attempt.peer,
                             GossipStreamType::PubSub,
                             bytes,
                             "IHAVE",
                         )
-                        .await;
-                        (peer, outcome)
+                        .await
                     });
+                    send_tasks.push(attempt, handle);
                 }
-                let mut sent = Vec::new();
-                let mut timed_out = Vec::new();
-                while let Some(joined) = set.join_next().await {
-                    match joined {
-                        Ok((peer, Ok(PeerSendOutcome::Sent))) => sent.push(peer),
-                        Ok((peer, Ok(PeerSendOutcome::TimedOut))) => timed_out.push(peer),
-                        Ok((_peer, Err(_))) => {}
-                        Err(e) => {
-                            warn!(topic = ?topic_id, "IHAVE per-peer send task panicked: {e}")
-                        }
-                    }
-                }
-                Self::record_topic_send_results_for(topics, stage_stats, topic_id, sent, timed_out)
-                    .await;
+                let (sent, timed_out) = send_tasks.collect_results().await;
+                claims.record_results(sent, timed_out).await;
             }
         }
     }
@@ -2216,6 +2686,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ///    forever without silently closing quiet local subscriptions.
     fn spawn_cache_cleaner(&self) {
         let topics = self.topics.clone();
+        let stage_stats = Arc::clone(&self.stage_stats);
         let topic_idle_ttl = Duration::from_secs(TOPIC_IDLE_TTL_SECS);
 
         tokio::spawn(async move {
@@ -2225,12 +2696,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 interval.tick().await;
 
                 let mut topics_guard = topics.write().await;
-                let idle_count = clean_and_reap_topics(&mut topics_guard, topic_idle_ttl);
+                let idle_topics = clean_and_reap_topic_ids(&mut topics_guard, topic_idle_ttl);
+                let idle_count = idle_topics.len();
+                drop(topics_guard);
+                for topic in idle_topics {
+                    stage_stats.clear_topic_suppressions(topic);
+                }
                 if idle_count > 0 {
+                    let remaining = topics.read().await.len();
                     debug!(
                         idle_count = idle_count,
-                        remaining = topics_guard.len(),
-                        "Reaped idle TopicState entries"
+                        remaining, "Reaped idle TopicState entries"
                     );
                 }
             }
@@ -2301,7 +2777,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
                 let topics_guard = topics.read().await;
 
-                // Collect work to do (topic, peer, msg_ids) while holding the read lock
+                // Collect work to do (topic, peer, msg_ids) while holding the read lock.
                 let mut work: Vec<(TopicId, PeerId, Vec<MessageIdType>)> = Vec::new();
 
                 for (topic_id, state) in topics_guard.iter() {
@@ -2372,15 +2848,67 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     };
 
                     if let Ok(bytes) = postcard::to_stdvec(&message) {
-                        let _ = Self::send_to_peer_with_timeout(
-                            Arc::clone(&transport),
+                        let attempts = {
+                            let now = Instant::now();
+                            let mut topics_guard = topics.write().await;
+                            let Some(state) = topics_guard.get_mut(&topic_id) else {
+                                continue;
+                            };
+                            Self::claim_topic_send_attempts_for_state(
+                                &stage_stats,
+                                topic_id,
+                                state,
+                                vec![peer],
+                                now,
+                                "ANTI_ENTROPY",
+                            )
+                        };
+                        let claims = SendAttemptClaims::new(
+                            topic_id,
+                            attempts,
+                            Arc::clone(&topics),
                             Arc::clone(&stage_stats),
-                            peer,
-                            GossipStreamType::PubSub,
-                            bytes.into(),
-                            "ANTI_ENTROPY",
-                        )
-                        .await;
+                        );
+                        let Some(attempt) = claims.attempts().first().copied() else {
+                            continue;
+                        };
+                        let bytes: Bytes = bytes.into();
+                        let send_transport = Arc::clone(&transport);
+                        let send_stage_stats = Arc::clone(&stage_stats);
+                        let handle = AbortOnDropSendHandle::new(tokio::spawn(async move {
+                            Self::send_to_peer_with_timeout(
+                                send_transport,
+                                send_stage_stats,
+                                attempt.peer,
+                                GossipStreamType::PubSub,
+                                bytes,
+                                "ANTI_ENTROPY",
+                            )
+                            .await
+                        }));
+
+                        match handle.join().await {
+                            Ok(Ok(PeerSendOutcome::Sent)) => {
+                                claims.record_results(vec![attempt], Vec::new()).await;
+                            }
+                            Ok(Ok(PeerSendOutcome::TimedOut)) => {
+                                claims.record_results(Vec::new(), vec![attempt]).await;
+                            }
+                            Ok(Err(_)) => {
+                                claims
+                                    .record_results(Vec::new(), recovery_probe_timeout(attempt))
+                                    .await;
+                            }
+                            Err(e) => {
+                                claims
+                                    .record_results(Vec::new(), recovery_probe_timeout(attempt))
+                                    .await;
+                                warn!(
+                                    peer_id = %attempt.peer,
+                                    "ANTI_ENTROPY per-peer send task panicked: {e}"
+                                );
+                            }
+                        }
                     }
 
                     trace!(
@@ -2502,6 +3030,8 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
     async fn unsubscribe(&self, topic: TopicId) -> Result<()> {
         let mut topics = self.topics.write().await;
         topics.remove(&topic);
+        drop(topics);
+        self.stage_stats.clear_topic_suppressions(topic);
         Ok(())
     }
 
@@ -2747,6 +3277,10 @@ mod tests {
         send_counts: Mutex<HashMap<PeerId, usize>>,
     }
 
+    struct PanicTransport {
+        local_peer: PeerId,
+    }
+
     impl RecordingTransport {
         fn new(local_peer: PeerId) -> Arc<Self> {
             Arc::new(Self {
@@ -2762,6 +3296,12 @@ mod tests {
                 .get(&peer)
                 .copied()
                 .unwrap_or(0)
+        }
+    }
+
+    impl PanicTransport {
+        fn new(local_peer: PeerId) -> Arc<Self> {
+            Arc::new(Self { local_peer })
         }
     }
 
@@ -2796,6 +3336,42 @@ mod tests {
 
         async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
             Err(anyhow!("recording test transport does not receive"))
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.local_peer
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for PanicTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(self.local_peer)
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            _peer: PeerId,
+            _stream_type: GossipStreamType,
+            _data: Bytes,
+        ) -> Result<()> {
+            panic!("panic transport send_to_peer");
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+            Err(anyhow!("panic test transport does not receive"))
         }
 
         fn local_peer_id(&self) -> PeerId {
@@ -2863,6 +3439,39 @@ mod tests {
         let transport = test_transport().await;
         let signing_key = test_signing_key();
         let _pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_clears_suppression_diagnostics() {
+        let peer_id = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = test_transport().await;
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(peer_id, transport, test_signing_key(), false);
+        let topic = TopicId::new([8u8; 32]);
+
+        {
+            let mut topics = pubsub.topics.write().await;
+            topics.insert(topic, TopicState::new());
+        }
+        pubsub.stage_stats.record_peer_suppressed(
+            topic,
+            peer,
+            Instant::now() + Duration::from_secs(10),
+            PEER_TIMEOUT_THRESHOLD,
+            PEER_SUPPRESSION_COOLDOWN,
+        );
+        assert_eq!(pubsub.stage_stats().suppressed_peers.len(), 1);
+
+        pubsub
+            .unsubscribe(topic)
+            .await
+            .expect("unsubscribe should succeed");
+
+        assert!(
+            pubsub.stage_stats().suppressed_peers.is_empty(),
+            "unsubscribe should clear per-topic suppression diagnostics"
+        );
     }
 
     #[tokio::test]
@@ -3291,15 +3900,304 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_single_peer_recovery_probe_timeout_resuppresses_immediately() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([47u8; 32]);
+        let slow_peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![slow_peer]).await;
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![slow_peer])
+                .await;
+        }
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.get_mut(&topic).expect("topic exists");
+            let cooling = state
+                .peer_cooling
+                .get_mut(&slow_peer)
+                .expect("peer is cooling");
+            cooling.suppressed_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            pubsub.send_to_peer_bounded(
+                topic,
+                slow_peer,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"recovery-probe"),
+                "EAGER",
+            ),
+        )
+        .await
+        .expect("recovery probe should return after per-peer timeout")
+        .expect("timeout outcome is recorded, not returned as an error");
+
+        tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("recovery probe should have attempted one send")
+            .expect("started channel should stay open");
+
+        let suppressed = pubsub.stage_stats().suppressed_peers;
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(suppressed[0].peer_id, slow_peer.to_string());
+        assert_eq!(suppressed[0].recent_timeout_count, 1);
+        assert_eq!(suppressed[0].state, "cooldown");
+        assert!(!suppressed[0].recovery_probe_in_flight);
+
+        let attempts_after_probe = transport.send_count();
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                slow_peer,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"must-skip"),
+                "EAGER",
+            )
+            .await
+            .expect("active re-suppression should skip cleanly");
+        assert_eq!(
+            transport.send_count(),
+            attempts_after_probe,
+            "failed recovery probe should not permit another immediate send"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_panicked_recovery_probe_send_resuppresses_peer() {
+        let peer_id = test_peer_id(1);
+        let transport = PanicTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([51u8; 32]);
+        let peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![peer]).await;
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![peer])
+                .await;
+        }
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.get_mut(&topic).expect("topic exists");
+            let cooling = state.peer_cooling.get_mut(&peer).expect("peer is cooling");
+            cooling.suppressed_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+
+        pubsub
+            .parallel_send_to_peers(
+                topic,
+                vec![peer],
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"panic-probe"),
+                "EAGER",
+            )
+            .await;
+
+        let suppressed = pubsub.stage_stats().suppressed_peers;
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(suppressed[0].peer_id, peer.to_string());
+        assert_eq!(suppressed[0].recent_timeout_count, 1);
+        assert_eq!(suppressed[0].state, "cooldown");
+    }
+
+    #[tokio::test]
+    async fn test_panicked_single_peer_recovery_probe_resuppresses_peer() {
+        let peer_id = test_peer_id(1);
+        let transport = PanicTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([52u8; 32]);
+        let peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![peer]).await;
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![peer])
+                .await;
+        }
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.get_mut(&topic).expect("topic exists");
+            let cooling = state.peer_cooling.get_mut(&peer).expect("peer is cooling");
+            cooling.suppressed_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+
+        let result = pubsub
+            .send_to_peer_bounded(
+                topic,
+                peer,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"panic-direct-probe"),
+                "EAGER",
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "panicked transport should be returned as an error"
+        );
+
+        let suppressed = pubsub.stage_stats().suppressed_peers;
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(suppressed[0].peer_id, peer.to_string());
+        assert_eq!(suppressed[0].recent_timeout_count, 1);
+        assert_eq!(suppressed[0].state, "cooldown");
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_recovery_probe_resuppresses_peer() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([53u8; 32]);
+        let peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![peer]).await;
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![peer])
+                .await;
+        }
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.get_mut(&topic).expect("topic exists");
+            let cooling = state.peer_cooling.get_mut(&peer).expect("peer is cooling");
+            cooling.suppressed_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+
+        let send_pubsub = Arc::clone(&pubsub);
+        let send_task = tokio::spawn(async move {
+            send_pubsub
+                .send_to_peer_bounded(
+                    topic,
+                    peer,
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"cancelled-probe"),
+                    "EAGER",
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("recovery probe send should start")
+            .expect("send channel should stay open");
+        send_task.abort();
+        let _ = send_task.await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let suppressed = pubsub.stage_stats().suppressed_peers;
+                if suppressed
+                    .first()
+                    .is_some_and(|entry| entry.state == "cooldown")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled recovery probe should be re-suppressed");
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).expect("topic exists");
+        let cooling = state.peer_cooling.get(&peer).expect("peer is cooling");
+        assert!(
+            !cooling.recovery_probe_in_flight,
+            "cancelled probe cleanup must release the in-flight marker"
+        );
+
+        transport.release_sends(1);
+    }
+
     #[test]
-    fn test_peer_cooling_recovers_after_cooldown_without_restart() {
+    fn test_expired_suppression_remains_visible_as_recovery_ready() {
+        let stats = PubSubStageStats::default();
+        let topic = TopicId::new([49u8; 32]);
+        let peer = test_peer_id(2);
+        stats.record_peer_suppressed(
+            topic,
+            peer,
+            Instant::now() - Duration::from_millis(1),
+            PEER_TIMEOUT_THRESHOLD,
+            PEER_SUPPRESSION_COOLDOWN,
+        );
+
+        let suppressed = stats.snapshot().suppressed_peers;
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(suppressed[0].peer_id, peer.to_string());
+        assert_eq!(suppressed[0].topic, topic.to_string());
+        assert_eq!(suppressed[0].state, "recovery_ready");
+        assert!(!suppressed[0].recovery_probe_in_flight);
+    }
+
+    #[tokio::test]
+    async fn test_missing_topic_clears_recovery_probe_diagnostic() {
+        let topics = Arc::new(RwLock::new(HashMap::new()));
+        let stage_stats = Arc::new(PubSubStageStats::default());
+        let topic = TopicId::new([50u8; 32]);
+        let peer = test_peer_id(2);
+        stage_stats.record_peer_recovery_probe(
+            topic,
+            peer,
+            Instant::now() - Duration::from_millis(1),
+            PEER_TIMEOUT_THRESHOLD,
+            PEER_SUPPRESSION_COOLDOWN,
+        );
+
+        PlumtreePubSub::<RecordingTransport>::record_topic_send_attempt_results_for(
+            &topics,
+            &stage_stats,
+            topic,
+            vec![PeerSendAttempt {
+                peer,
+                kind: SendAttemptKind::RecoveryProbe,
+                recovery_probe_id: Some(1),
+            }],
+            Vec::new(),
+        )
+        .await;
+
+        assert!(
+            stage_stats.snapshot().suppressed_peers.is_empty(),
+            "missing topic should not leave stale recovery-probe diagnostics"
+        );
+    }
+
+    #[test]
+    fn test_peer_cooling_requires_successful_probe_after_cooldown() {
         let mut state = TopicState::new();
         let peer = test_peer_id(2);
         state.eager_peers.insert(peer);
 
         let now = Instant::now();
         for _ in 0..PEER_TIMEOUT_THRESHOLD {
-            let _ = state.record_send_timeout_at(peer, now);
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer), now);
         }
 
         assert!(
@@ -3311,12 +4209,126 @@ mod tests {
         let after_cooldown = now + PEER_SUPPRESSION_COOLDOWN + Duration::from_millis(1);
         let (_pruned, grafted) = state.maintain_degree_at(after_cooldown);
 
-        assert_eq!(grafted, 1, "expired cooling should allow re-admission");
-        assert!(
-            state.eager_peers.contains(&peer),
-            "peer should re-enter EAGER without a daemon restart"
+        assert_eq!(
+            grafted, 0,
+            "expired cooling should wait for one recovery probe"
         );
+        assert!(
+            !state.eager_peers.contains(&peer),
+            "peer should not re-enter EAGER before a successful recovery probe"
+        );
+        assert!(state.is_peer_suppressed_at(peer, after_cooldown));
+
+        let (attempt, event) = state
+            .claim_send_attempt_at(peer, after_cooldown)
+            .expect("expired cooling should admit exactly one recovery probe");
+        assert_eq!(attempt.kind, SendAttemptKind::RecoveryProbe);
+        assert!(event.is_some());
+        assert!(
+            state.claim_send_attempt_at(peer, after_cooldown).is_none(),
+            "second recovery probe must be skipped while first is in flight"
+        );
+
+        assert!(
+            state.record_send_success_at(attempt, after_cooldown),
+            "successful recovery probe should clear cooling"
+        );
+        let (_pruned, grafted) = state.maintain_degree_at(after_cooldown);
+        assert_eq!(grafted, 1, "cleared peer can be grafted again");
+        assert!(state.eager_peers.contains(&peer));
         assert!(!state.is_peer_suppressed_at(peer, after_cooldown));
+    }
+
+    #[test]
+    fn test_failed_recovery_probe_immediately_extends_cooldown() {
+        let mut state = TopicState::new();
+        let peer = test_peer_id(2);
+        state.eager_peers.insert(peer);
+
+        let now = Instant::now();
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer), now);
+        }
+
+        let after_cooldown = now + PEER_SUPPRESSION_COOLDOWN + Duration::from_millis(1);
+        let (attempt, _) = state
+            .claim_send_attempt_at(peer, after_cooldown)
+            .expect("expired cooling should admit one recovery probe");
+        assert_eq!(attempt.kind, SendAttemptKind::RecoveryProbe);
+
+        let event = state
+            .record_send_timeout_at(attempt, after_cooldown)
+            .expect("failed recovery probe should immediately re-suppress");
+        assert_eq!(
+            event.recent_timeout_count, 1,
+            "failed probe should not need another full timeout window"
+        );
+        assert_eq!(
+            event.cooldown,
+            PEER_SUPPRESSION_COOLDOWN
+                .checked_mul(2)
+                .expect("cooldown doubles"),
+            "failed probe should apply exponential backoff"
+        );
+        assert!(state.is_peer_suppressed_at(peer, after_cooldown));
+        assert!(state.lazy_peers.contains(&peer));
+        assert!(!state.eager_peers.contains(&peer));
+    }
+
+    #[test]
+    fn test_stale_recovery_probe_result_cannot_recreate_or_clear_cooling() {
+        let mut state = TopicState::new();
+        let peer = test_peer_id(2);
+        state.eager_peers.insert(peer);
+
+        let now = Instant::now();
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer), now);
+        }
+
+        let after_cooldown = now + PEER_SUPPRESSION_COOLDOWN + Duration::from_millis(1);
+        let (old_attempt, _) = state
+            .claim_send_attempt_at(peer, after_cooldown)
+            .expect("expired cooling should admit one recovery probe");
+        assert_eq!(old_attempt.kind, SendAttemptKind::RecoveryProbe);
+
+        state.peer_cooling.remove(&peer);
+        assert!(
+            state
+                .record_send_timeout_at(old_attempt, after_cooldown)
+                .is_none(),
+            "stale recovery timeout must not recreate cooling after peer removal"
+        );
+        assert!(
+            !state.peer_cooling.contains_key(&peer),
+            "stale recovery timeout must leave removed peer absent"
+        );
+
+        let later = after_cooldown + PEER_TIMEOUT_WINDOW + Duration::from_millis(1);
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer), later);
+        }
+        {
+            let cooling = state.peer_cooling.get_mut(&peer).expect("peer is cooling");
+            cooling.suppressed_until = Some(later - Duration::from_millis(1));
+        }
+        let (new_attempt, _) = state
+            .claim_send_attempt_at(peer, later)
+            .expect("new cooling should admit its own recovery probe");
+        assert_ne!(
+            old_attempt.recovery_probe_id, new_attempt.recovery_probe_id,
+            "recovery probes should carry unique ownership tokens"
+        );
+
+        assert!(
+            !state.record_send_success_at(old_attempt, later),
+            "stale recovery success must not clear a newer in-flight probe"
+        );
+        let cooling = state.peer_cooling.get(&peer).expect("peer stays cooling");
+        assert!(
+            cooling.matches_recovery_probe(new_attempt.recovery_probe_id),
+            "new recovery probe ownership should remain intact"
+        );
     }
 
     #[tokio::test]
@@ -3480,6 +4492,65 @@ mod tests {
             .await
             .expect("IHAVE flush should finish after send is released")
             .expect("IHAVE flush task should not panic");
+    }
+
+    #[tokio::test]
+    async fn test_ihave_flush_uses_single_recovery_probe_for_expired_cooling() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let topics = Arc::new(RwLock::new(HashMap::new()));
+        let signing_key = Arc::new(test_signing_key());
+        let stage_stats = Arc::new(PubSubStageStats::default());
+        let topic = TopicId::new([48u8; 32]);
+        let lazy_peer = test_peer_id(2);
+
+        {
+            let mut topics_guard = topics.write().await;
+            let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(lazy_peer);
+            state.pending_ihave.push([8u8; 32]);
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                let _ =
+                    state.record_send_timeout_at(normal_send_attempt(lazy_peer), Instant::now());
+            }
+            let cooling = state
+                .peer_cooling
+                .get_mut(&lazy_peer)
+                .expect("peer is cooling");
+            cooling.suppressed_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+
+        let flush_topics = Arc::clone(&topics);
+        let flush_transport = Arc::clone(&transport);
+        let flush_signing_key = Arc::clone(&signing_key);
+        let flush_stage_stats = Arc::clone(&stage_stats);
+        let flush = tokio::spawn(async move {
+            PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
+                &flush_topics,
+                &flush_transport,
+                &flush_signing_key,
+                &flush_stage_stats,
+            )
+            .await;
+        });
+
+        let record = tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("IHAVE recovery probe should start")
+            .expect("send channel should stay open");
+        assert_eq!(record.peer, lazy_peer);
+
+        tokio::time::timeout(Duration::from_secs(2), flush)
+            .await
+            .expect("IHAVE recovery probe should finish after per-peer timeout")
+            .expect("IHAVE flush task should not panic");
+
+        let suppressed = stage_stats.snapshot().suppressed_peers;
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(suppressed[0].peer_id, lazy_peer.to_string());
+        assert_eq!(suppressed[0].recent_timeout_count, 1);
+        assert_eq!(suppressed[0].state, "cooldown");
+        assert_eq!(transport.send_count(), 1);
     }
 
     #[tokio::test]

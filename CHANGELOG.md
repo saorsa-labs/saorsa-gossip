@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.27] - 2026-05-03
+
+### Fixed
+
+- PubSub slow-peer recovery now uses a single post-cooldown probe per
+  peer/topic. A failed probe immediately re-suppresses the peer with
+  exponential backoff instead of allowing another full timeout window.
+- GRAFT and degree maintenance no longer re-admit peers whose cooldown has
+  expired until a recovery probe succeeds.
+- Recovery-probe diagnostics now distinguish `cooldown`, `recovery_ready`, and
+  `recovery_probe` states, and clear stale probe diagnostics when topics are
+  reaped or disappear before result recording.
+
 ## [0.5.26] - 2026-05-03
 
 ### Fixed

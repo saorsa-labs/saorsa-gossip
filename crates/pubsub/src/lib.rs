@@ -103,6 +103,15 @@ const PEER_SUPPRESSION_COOLDOWN: Duration = Duration::from_secs(120);
 /// Maximum repeated-offender suppression duration.
 const PEER_SUPPRESSION_BACKOFF_MAX: Duration = Duration::from_secs(1_800);
 
+/// Per-peer concurrent EAGER/data sends allowed by the PubSub outbound budget.
+const OUTBOUND_DATA_PERMITS_PER_PEER: usize = 1;
+
+/// Per-peer concurrent control sends allowed beside one data send.
+const OUTBOUND_CONTROL_PERMITS_PER_PEER: usize = 2;
+
+/// Idle outbound budget entries are reaped after this duration.
+const OUTBOUND_BUDGET_REAP_AFTER: Duration = Duration::from_secs(600);
+
 /// Message ID type alias
 type MessageIdType = [u8; 32];
 
@@ -257,6 +266,10 @@ pub struct PubSubStageStats {
     /// healthy but one specific peer is slow" from "the whole pipeline is
     /// degrading".
     republish_per_peer_timeout: AtomicU64,
+    /// Send work skipped because a peer already consumed its outbound PubSub
+    /// permits. This is distinct from a transport timeout: no new task was
+    /// spawned, and the peer/topic receives timeout pressure for cooling.
+    outbound_budget_exhausted: AtomicU64,
     suppressed_peers: Mutex<HashMap<SuppressedPeerKey, SuppressedPeerState>>,
 }
 
@@ -320,6 +333,9 @@ pub struct PubSubStageStatsSnapshot {
     /// Cumulative count of per-peer sends that hit
     /// `PER_PEER_REPUBLISH_TIMEOUT` during EAGER republish or IHAVE flush.
     pub republish_per_peer_timeout: u64,
+    /// Cumulative count of sends skipped before spawning because the peer had
+    /// already consumed its outbound PubSub budget.
+    pub outbound_budget_exhausted: u64,
     /// Peers currently cooled after repeated send-side timeouts.
     pub suppressed_peers: Vec<SuppressedPeerSnapshot>,
 }
@@ -346,6 +362,35 @@ enum SendAttemptKind {
     RecoveryProbe,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundSendClass {
+    Data,
+    Control,
+}
+
+impl OutboundSendClass {
+    fn for_op(op: &'static str) -> Self {
+        match op {
+            "EAGER" => Self::Data,
+            _ => Self::Control,
+        }
+    }
+
+    fn limit(self) -> usize {
+        match self {
+            Self::Data => OUTBOUND_DATA_PERMITS_PER_PEER,
+            Self::Control => OUTBOUND_CONTROL_PERMITS_PER_PEER,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::Control => "control",
+        }
+    }
+}
+
 type RecoveryProbeId = u64;
 
 static NEXT_RECOVERY_PROBE_ID: AtomicU64 = AtomicU64::new(1);
@@ -357,9 +402,127 @@ struct PeerSendAttempt {
     recovery_probe_id: Option<RecoveryProbeId>,
 }
 
+#[derive(Debug)]
+struct PeerOutboundBudgetEntry {
+    data_in_flight: usize,
+    control_in_flight: usize,
+    last_used: Instant,
+}
+
+impl PeerOutboundBudgetEntry {
+    fn new(now: Instant) -> Self {
+        Self {
+            data_in_flight: 0,
+            control_in_flight: 0,
+            last_used: now,
+        }
+    }
+
+    fn is_idle_at(&self, now: Instant) -> bool {
+        self.data_in_flight == 0
+            && self.control_in_flight == 0
+            && now.saturating_duration_since(self.last_used) > OUTBOUND_BUDGET_REAP_AFTER
+    }
+}
+
+#[derive(Debug, Default)]
+struct PeerOutboundBudgets {
+    peers: Mutex<HashMap<PeerId, PeerOutboundBudgetEntry>>,
+}
+
+impl PeerOutboundBudgets {
+    fn peers_guard(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, PeerOutboundBudgetEntry>> {
+        match self.peers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("PubSub outbound-budget lock was poisoned; recovering");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn try_acquire(
+        self: &Arc<Self>,
+        peer: PeerId,
+        class: OutboundSendClass,
+        now: Instant,
+    ) -> Option<OutboundSendPermit> {
+        let mut guard = self.peers_guard();
+        guard.retain(|_, entry| !entry.is_idle_at(now));
+
+        let entry = guard
+            .entry(peer)
+            .or_insert_with(|| PeerOutboundBudgetEntry::new(now));
+        let in_flight = match class {
+            OutboundSendClass::Data => entry.data_in_flight,
+            OutboundSendClass::Control => entry.control_in_flight,
+        };
+        if in_flight >= class.limit() {
+            entry.last_used = now;
+            return None;
+        }
+
+        match class {
+            OutboundSendClass::Data => entry.data_in_flight += 1,
+            OutboundSendClass::Control => entry.control_in_flight += 1,
+        }
+        entry.last_used = now;
+
+        Some(OutboundSendPermit {
+            budgets: Arc::clone(self),
+            peer,
+            class,
+            active: true,
+        })
+    }
+
+    fn release(&self, peer: PeerId, class: OutboundSendClass) {
+        let mut guard = self.peers_guard();
+        let Some(entry) = guard.get_mut(&peer) else {
+            warn!(peer_id = %peer, class = class.label(), "PubSub outbound permit released after peer budget entry was removed");
+            return;
+        };
+
+        match class {
+            OutboundSendClass::Data => {
+                if entry.data_in_flight == 0 {
+                    warn!(peer_id = %peer, class = class.label(), "PubSub outbound data permit released with zero in-flight count");
+                } else {
+                    entry.data_in_flight -= 1;
+                }
+            }
+            OutboundSendClass::Control => {
+                if entry.control_in_flight == 0 {
+                    warn!(peer_id = %peer, class = class.label(), "PubSub outbound control permit released with zero in-flight count");
+                } else {
+                    entry.control_in_flight -= 1;
+                }
+            }
+        }
+        entry.last_used = Instant::now();
+    }
+}
+
+struct OutboundSendPermit {
+    budgets: Arc<PeerOutboundBudgets>,
+    peer: PeerId,
+    class: OutboundSendClass,
+    active: bool,
+}
+
+impl Drop for OutboundSendPermit {
+    fn drop(&mut self) {
+        if self.active {
+            self.budgets.release(self.peer, self.class);
+            self.active = false;
+        }
+    }
+}
+
 struct SendAttemptClaims {
     topic: TopicId,
     attempts: Vec<PeerSendAttempt>,
+    permits: Vec<OutboundSendPermit>,
     topics: Arc<RwLock<HashMap<TopicId, TopicState>>>,
     stage_stats: Arc<PubSubStageStats>,
     armed: bool,
@@ -369,12 +532,14 @@ impl SendAttemptClaims {
     fn new(
         topic: TopicId,
         attempts: Vec<PeerSendAttempt>,
+        permits: Vec<OutboundSendPermit>,
         topics: Arc<RwLock<HashMap<TopicId, TopicState>>>,
         stage_stats: Arc<PubSubStageStats>,
     ) -> Self {
         Self {
             topic,
             attempts,
+            permits,
             topics,
             stage_stats,
             armed: true,
@@ -387,6 +552,10 @@ impl SendAttemptClaims {
 
     fn attempts(&self) -> &[PeerSendAttempt] {
         &self.attempts
+    }
+
+    fn take_permits(&mut self) -> Vec<OutboundSendPermit> {
+        std::mem::take(&mut self.permits)
     }
 
     async fn record_results(mut self, sent: Vec<PeerSendAttempt>, timed_out: Vec<PeerSendAttempt>) {
@@ -615,12 +784,18 @@ impl PubSubStageStats {
             eager_fanout: self.eager_fanout.snapshot(),
             republish: self.republish.snapshot(),
             republish_per_peer_timeout: self.republish_per_peer_timeout.load(Ordering::Relaxed),
+            outbound_budget_exhausted: self.outbound_budget_exhausted.load(Ordering::Relaxed),
             suppressed_peers: self.suppressed_peer_snapshots(),
         }
     }
 
     fn record_per_peer_timeout(&self) {
         self.republish_per_peer_timeout
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_outbound_budget_exhausted(&self) {
+        self.outbound_budget_exhausted
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1480,6 +1655,8 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     signing_key: Arc<saorsa_gossip_identity::MlDsaKeyPair>,
     /// Low-overhead timing counters for inbound PubSub processing stages.
     stage_stats: Arc<PubSubStageStats>,
+    /// Global per-peer outbound PubSub budgets shared by all topics and send classes.
+    outbound_budgets: Arc<PeerOutboundBudgets>,
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
@@ -1510,6 +1687,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             transport,
             signing_key: Arc::new(signing_key),
             stage_stats: Arc::new(PubSubStageStats::default()),
+            outbound_budgets: Arc::new(PeerOutboundBudgets::default()),
         };
 
         if start_background_tasks {
@@ -1575,14 +1753,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
     ) -> Result<()> {
-        let claims = self.claim_topic_send_attempts(topic, vec![peer], op).await;
+        let mut claims = self.claim_topic_send_attempts(topic, vec![peer], op).await;
         let Some(attempt) = claims.attempts().first().copied() else {
+            return Ok(());
+        };
+        let Some(permit) = claims.take_permits().into_iter().next() else {
             return Ok(());
         };
 
         let transport = Arc::clone(&self.transport);
         let stage_stats = Arc::clone(&self.stage_stats);
         let handle = AbortOnDropSendHandle::new(tokio::spawn(async move {
+            let _permit = permit;
             Self::send_to_peer_with_timeout(
                 transport,
                 stage_stats,
@@ -1631,16 +1813,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             return SendAttemptClaims::new(
                 topic,
                 Vec::new(),
+                Vec::new(),
                 Arc::clone(&self.topics),
                 Arc::clone(&self.stage_stats),
             );
         }
 
         let now = Instant::now();
+        let send_class = OutboundSendClass::for_op(op);
         let mut topics = self.topics.write().await;
-        let attempts = if let Some(state) = topics.get_mut(&topic) {
+        let (attempts, permits) = if let Some(state) = topics.get_mut(&topic) {
             Self::claim_topic_send_attempts_for_state(
                 &self.stage_stats,
+                &self.outbound_budgets,
                 topic,
                 state,
                 peers,
@@ -1648,19 +1833,34 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 op,
             )
         } else {
-            peers
-                .into_iter()
-                .map(|peer| PeerSendAttempt {
-                    peer,
-                    kind: SendAttemptKind::Normal,
-                    recovery_probe_id: None,
-                })
-                .collect()
+            let mut attempts = Vec::with_capacity(peers.len());
+            let mut permits = Vec::with_capacity(peers.len());
+            for peer in peers {
+                if let Some(permit) = self.outbound_budgets.try_acquire(peer, send_class, now) {
+                    attempts.push(PeerSendAttempt {
+                        peer,
+                        kind: SendAttemptKind::Normal,
+                        recovery_probe_id: None,
+                    });
+                    permits.push(permit);
+                } else {
+                    self.stage_stats.record_outbound_budget_exhausted();
+                    trace!(
+                        peer_id = %peer,
+                        topic = ?topic,
+                        op,
+                        class = send_class.label(),
+                        "{op} send skipped: peer outbound PubSub budget exhausted"
+                    );
+                }
+            }
+            (attempts, permits)
         };
 
         SendAttemptClaims::new(
             topic,
             attempts,
+            permits,
             Arc::clone(&self.topics),
             Arc::clone(&self.stage_stats),
         )
@@ -1668,13 +1868,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     fn claim_topic_send_attempts_for_state(
         stage_stats: &PubSubStageStats,
+        outbound_budgets: &Arc<PeerOutboundBudgets>,
         topic: TopicId,
         state: &mut TopicState,
         peers: Vec<PeerId>,
         now: Instant,
         op: &'static str,
-    ) -> Vec<PeerSendAttempt> {
+    ) -> (Vec<PeerSendAttempt>, Vec<OutboundSendPermit>) {
         let mut attempts = Vec::with_capacity(peers.len());
+        let mut permits = Vec::with_capacity(peers.len());
+        let send_class = OutboundSendClass::for_op(op);
         for peer in peers {
             match state.claim_send_attempt_at(peer, now) {
                 Some((attempt, recovery_event)) => {
@@ -1693,7 +1896,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             "{op} send admitted as peer recovery probe"
                         );
                     }
+                    let Some(permit) = outbound_budgets.try_acquire(peer, send_class, now) else {
+                        Self::record_outbound_budget_pressure_for_state(
+                            stage_stats,
+                            topic,
+                            state,
+                            attempt,
+                            now,
+                            op,
+                            send_class,
+                        );
+                        continue;
+                    };
                     attempts.push(attempt);
+                    permits.push(permit);
                 }
                 None => {
                     trace!(
@@ -1705,7 +1921,48 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
         }
-        attempts
+        (attempts, permits)
+    }
+
+    fn record_outbound_budget_pressure_for_state(
+        stage_stats: &PubSubStageStats,
+        topic: TopicId,
+        state: &mut TopicState,
+        attempt: PeerSendAttempt,
+        now: Instant,
+        op: &'static str,
+        send_class: OutboundSendClass,
+    ) {
+        stage_stats.record_outbound_budget_exhausted();
+        if let Some(event) = state.record_send_timeout_at(attempt, now) {
+            stage_stats.record_peer_suppressed(
+                topic,
+                attempt.peer,
+                event.suppressed_until,
+                event.recent_timeout_count,
+                event.cooldown,
+            );
+            if event.demoted {
+                stage_stats.record_prune();
+            }
+            warn!(
+                peer_id = %attempt.peer,
+                topic = ?topic,
+                op,
+                class = send_class.label(),
+                cooldown_ms = duration_millis_u64(event.cooldown),
+                recent_timeout_count = event.recent_timeout_count,
+                demoted = event.demoted,
+                "Peer cooled after repeated PubSub outbound budget pressure"
+            );
+        }
+        trace!(
+            peer_id = %attempt.peer,
+            topic = ?topic,
+            op,
+            class = send_class.label(),
+            "{op} send skipped: peer outbound PubSub budget exhausted"
+        );
     }
 
     #[cfg(test)]
@@ -1788,16 +2045,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
     ) {
-        let claims = self.claim_topic_send_attempts(topic, peers, op).await;
+        let mut claims = self.claim_topic_send_attempts(topic, peers, op).await;
         if claims.is_empty() {
             return;
         }
         let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
-        for attempt in claims.attempts().iter().copied() {
+        let attempts = claims.attempts().to_vec();
+        let permits = claims.take_permits();
+        for (attempt, permit) in attempts.into_iter().zip(permits) {
             let transport = Arc::clone(&self.transport);
             let bytes = bytes.clone();
             let stage_stats = Arc::clone(&self.stage_stats);
             let handle = tokio::spawn(async move {
+                let _permit = permit;
                 Self::send_to_peer_with_timeout(
                     transport,
                     stage_stats,
@@ -2527,6 +2787,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let transport = self.transport.clone();
         let signing_key = self.signing_key.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
+        let outbound_budgets = Arc::clone(&self.outbound_budgets);
         let initial_jitter = deterministic_jitter(
             self.peer_id,
             b"pubsub-ihave-flush",
@@ -2543,7 +2804,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             loop {
                 interval.tick().await;
 
-                Self::flush_ihave_batches(&topics, &transport, &signing_key, &stage_stats).await;
+                Self::flush_ihave_batches(
+                    &topics,
+                    &transport,
+                    &signing_key,
+                    &stage_stats,
+                    &outbound_budgets,
+                )
+                .await;
             }
         });
     }
@@ -2553,6 +2821,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         transport: &Arc<T>,
         signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
         stage_stats: &Arc<PubSubStageStats>,
+        outbound_budgets: &Arc<PeerOutboundBudgets>,
     ) {
         let work: Vec<(TopicId, Vec<MessageIdType>, Vec<PeerId>)> = {
             let mut topics_guard = topics.write().await;
@@ -2621,7 +2890,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
 
-            let attempts = {
+            let (attempts, permits) = {
                 let now = Instant::now();
                 let mut topics_guard = topics.write().await;
                 let Some(state) = topics_guard.get_mut(&topic_id) else {
@@ -2629,6 +2898,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 };
                 Self::claim_topic_send_attempts_for_state(
                     stage_stats,
+                    outbound_budgets,
                     topic_id,
                     state,
                     lazy_peers,
@@ -2636,9 +2906,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     "IHAVE",
                 )
             };
-            let claims = SendAttemptClaims::new(
+            let mut claims = SendAttemptClaims::new(
                 topic_id,
                 attempts,
+                permits,
                 Arc::clone(topics),
                 Arc::clone(stage_stats),
             );
@@ -2651,11 +2922,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // still be associated with the peer and re-suppressed.
             if !claims.is_empty() {
                 let mut send_tasks = SendTaskSet::with_capacity("IHAVE", claims.attempts().len());
-                for attempt in claims.attempts().iter().copied() {
+                let attempts = claims.attempts().to_vec();
+                let permits = claims.take_permits();
+                for (attempt, permit) in attempts.into_iter().zip(permits) {
                     let transport = Arc::clone(transport);
                     let bytes = bytes.clone();
                     let stage_stats = Arc::clone(stage_stats);
                     let handle = tokio::spawn(async move {
+                        let _permit = permit;
                         Self::send_to_peer_with_timeout(
                             transport,
                             stage_stats,
@@ -2759,6 +3033,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let transport = self.transport.clone();
         let signing_key = self.signing_key.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
+        let outbound_budgets = Arc::clone(&self.outbound_budgets);
         let initial_jitter = deterministic_jitter(
             self.peer_id,
             b"pubsub-anti-entropy",
@@ -2848,7 +3123,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     };
 
                     if let Ok(bytes) = postcard::to_stdvec(&message) {
-                        let attempts = {
+                        let (attempts, permits) = {
                             let now = Instant::now();
                             let mut topics_guard = topics.write().await;
                             let Some(state) = topics_guard.get_mut(&topic_id) else {
@@ -2856,6 +3131,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             };
                             Self::claim_topic_send_attempts_for_state(
                                 &stage_stats,
+                                &outbound_budgets,
                                 topic_id,
                                 state,
                                 vec![peer],
@@ -2863,19 +3139,24 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 "ANTI_ENTROPY",
                             )
                         };
-                        let claims = SendAttemptClaims::new(
+                        let mut claims = SendAttemptClaims::new(
                             topic_id,
                             attempts,
+                            permits,
                             Arc::clone(&topics),
                             Arc::clone(&stage_stats),
                         );
                         let Some(attempt) = claims.attempts().first().copied() else {
                             continue;
                         };
+                        let Some(permit) = claims.take_permits().into_iter().next() else {
+                            continue;
+                        };
                         let bytes: Bytes = bytes.into();
                         let send_transport = Arc::clone(&transport);
                         let send_stage_stats = Arc::clone(&stage_stats);
                         let handle = AbortOnDropSendHandle::new(tokio::spawn(async move {
+                            let _permit = permit;
                             Self::send_to_peer_with_timeout(
                                 send_transport,
                                 send_stage_stats,
@@ -3780,6 +4061,363 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_outbound_budget_limits_duplicate_eager_sends_to_one_in_flight_per_peer() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([54u8; 32]);
+        let slow_peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![slow_peer]).await;
+
+        let send_pubsub = Arc::clone(&pubsub);
+        let repeated_slow_peer_work = vec![slow_peer; PEER_TIMEOUT_THRESHOLD + 1];
+        let send = tokio::spawn(async move {
+            send_pubsub
+                .parallel_send_to_peers(
+                    topic,
+                    repeated_slow_peer_work,
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"budgeted-eager"),
+                    "EAGER",
+                )
+                .await;
+        });
+
+        let record = tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("one eager send should start")
+            .expect("send channel should stay open");
+        assert_eq!(record.peer, slow_peer);
+
+        let extra_start = tokio::time::timeout(Duration::from_millis(100), started_rx.recv()).await;
+        assert!(
+            extra_start.is_err(),
+            "duplicate work for one peer should be skipped by the outbound budget, not spawned"
+        );
+
+        transport.release_sends(1);
+        tokio::time::timeout(Duration::from_millis(200), send)
+            .await
+            .expect("budgeted send should finish after the only permit is released")
+            .expect("send task should not panic");
+
+        assert_eq!(
+            transport.send_count(),
+            1,
+            "only one data send may enter transport for a peer at a time"
+        );
+        assert_eq!(
+            transport.max_in_flight(),
+            1,
+            "per-peer data budget should cap duplicate fanout work at one in-flight send"
+        );
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(
+            stats.outbound_budget_exhausted, PEER_TIMEOUT_THRESHOLD as u64,
+            "budget skips should be visible in diagnostics"
+        );
+        assert_eq!(
+            stats.suppressed_peers.len(),
+            1,
+            "repeated budget pressure should feed slow-peer cooling"
+        );
+        assert_eq!(stats.suppressed_peers[0].peer_id, slow_peer.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_one_budget_exhausted_peer_does_not_block_healthy_peer_send() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([55u8; 32]);
+        let slow_peer = test_peer_id(2);
+        let healthy_peer = test_peer_id(3);
+        pubsub
+            .initialize_topic_peers(topic, vec![slow_peer, healthy_peer])
+            .await;
+
+        let mut peers = vec![slow_peer; PEER_TIMEOUT_THRESHOLD + 1];
+        peers.push(healthy_peer);
+        let send_pubsub = Arc::clone(&pubsub);
+        let send = tokio::spawn(async move {
+            send_pubsub
+                .parallel_send_to_peers(
+                    topic,
+                    peers,
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"mixed-budgeted-eager"),
+                    "EAGER",
+                )
+                .await;
+        });
+
+        let mut started = HashSet::new();
+        for _ in 0..2 {
+            let record = tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .expect("slow and healthy peer sends should both start")
+                .expect("send channel should stay open");
+            started.insert(record.peer);
+        }
+        assert!(
+            started.contains(&slow_peer),
+            "first slow-peer send should consume its one data permit"
+        );
+        assert!(
+            started.contains(&healthy_peer),
+            "healthy peer should still get its own permit while slow peer is over budget"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .is_err(),
+            "no extra slow-peer sends should be spawned"
+        );
+
+        transport.release_sends(2);
+        tokio::time::timeout(Duration::from_millis(200), send)
+            .await
+            .expect("mixed send should finish after both real sends are released")
+            .expect("send task should not panic");
+        assert_eq!(
+            transport.send_count(),
+            2,
+            "only one slow-peer send and one healthy-peer send should enter transport"
+        );
+        assert_eq!(
+            pubsub.stage_stats().outbound_budget_exhausted,
+            PEER_TIMEOUT_THRESHOLD as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_outbound_control_budget_limits_duplicate_iwant_sends() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([56u8; 32]);
+        let peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![peer]).await;
+
+        let first_pubsub = Arc::clone(&pubsub);
+        let first = tokio::spawn(async move {
+            first_pubsub
+                .send_to_peer_bounded(
+                    topic,
+                    peer,
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"iwant-1"),
+                    "IWANT",
+                )
+                .await
+        });
+        let second_pubsub = Arc::clone(&pubsub);
+        let second = tokio::spawn(async move {
+            second_pubsub
+                .send_to_peer_bounded(
+                    topic,
+                    peer,
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"iwant-2"),
+                    "IWANT",
+                )
+                .await
+        });
+
+        for _ in 0..OUTBOUND_CONTROL_PERMITS_PER_PEER {
+            let record = tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .expect("control sends up to the peer budget should start")
+                .expect("send channel should stay open");
+            assert_eq!(record.peer, peer);
+        }
+        assert_eq!(
+            transport.send_count(),
+            OUTBOUND_CONTROL_PERMITS_PER_PEER,
+            "two control sends should consume the small per-peer control budget"
+        );
+
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                peer,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"iwant-3"),
+                "IWANT",
+            )
+            .await
+            .expect("budget exhaustion should skip, not return a send error");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .is_err(),
+            "third control send should be skipped while the control budget is full"
+        );
+        assert_eq!(
+            pubsub.stage_stats().outbound_budget_exhausted,
+            1,
+            "control budget exhaustion should be visible in diagnostics"
+        );
+
+        transport.release_sends(OUTBOUND_CONTROL_PERMITS_PER_PEER);
+        for task in [first, second] {
+            tokio::time::timeout(Duration::from_millis(200), task)
+                .await
+                .expect("control send should finish after release")
+                .expect("send task should not panic")
+                .expect("send should succeed");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ihave_flush_respects_existing_control_budget() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let topics = Arc::new(RwLock::new(HashMap::new()));
+        let signing_key = Arc::new(test_signing_key());
+        let stage_stats = Arc::new(PubSubStageStats::default());
+        let outbound_budgets = Arc::new(PeerOutboundBudgets::default());
+        let topic = TopicId::new([57u8; 32]);
+        let lazy_peer = test_peer_id(2);
+
+        {
+            let mut topics_guard = topics.write().await;
+            let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(lazy_peer);
+            state.pending_ihave.push([9u8; 32]);
+        }
+
+        let now = Instant::now();
+        let first_permit = outbound_budgets
+            .try_acquire(lazy_peer, OutboundSendClass::Control, now)
+            .expect("first control permit should be available");
+        let second_permit = outbound_budgets
+            .try_acquire(lazy_peer, OutboundSendClass::Control, now)
+            .expect("second control permit should be available");
+
+        PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
+            &topics,
+            &transport,
+            &signing_key,
+            &stage_stats,
+            &outbound_budgets,
+        )
+        .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .is_err(),
+            "IHAVE should not spawn transport work when the peer control budget is full"
+        );
+        assert_eq!(
+            stage_stats.snapshot().outbound_budget_exhausted,
+            1,
+            "IHAVE budget skip should be visible in diagnostics"
+        );
+
+        drop(first_permit);
+        drop(second_permit);
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_outbound_send_releases_peer_budget() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([58u8; 32]);
+        let peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![peer]).await;
+
+        let first_pubsub = Arc::clone(&pubsub);
+        let first = tokio::spawn(async move {
+            first_pubsub
+                .send_to_peer_bounded(
+                    topic,
+                    peer,
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"cancel-first"),
+                    "EAGER",
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("first send should start")
+            .expect("send channel should stay open");
+        first.abort();
+        let _ = first.await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let in_flight = {
+                    let guard = pubsub.outbound_budgets.peers_guard();
+                    guard
+                        .get(&peer)
+                        .map(|entry| entry.data_in_flight)
+                        .unwrap_or(0)
+                };
+                if in_flight == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborting the send should release its outbound data permit");
+
+        let second_pubsub = Arc::clone(&pubsub);
+        let second = tokio::spawn(async move {
+            second_pubsub
+                .send_to_peer_bounded(
+                    topic,
+                    peer,
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"after-cancel"),
+                    "EAGER",
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("second send should start after the aborted permit is released")
+            .expect("send channel should stay open");
+        transport.release_sends(1);
+        tokio::time::timeout(Duration::from_millis(200), second)
+            .await
+            .expect("second send should finish after release")
+            .expect("second send task should not panic")
+            .expect("second send should succeed");
+
+        assert_eq!(
+            transport.send_count(),
+            2,
+            "the second send should enter transport instead of being blocked by a leaked permit"
+        );
+    }
+
+    #[tokio::test]
     async fn test_peer_timeout_cooling_demotes_and_skips_future_eager_sends() {
         let peer_id = test_peer_id(1);
         let transport = RecordingTransport::new(peer_id);
@@ -4464,12 +5102,14 @@ mod tests {
         let flush_transport = Arc::clone(&transport);
         let flush_signing_key = Arc::clone(&signing_key);
         let flush_stage_stats = Arc::new(PubSubStageStats::default());
+        let flush_outbound_budgets = Arc::new(PeerOutboundBudgets::default());
         let flush = tokio::spawn(async move {
             PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
                 &flush_topics,
                 &flush_transport,
                 &flush_signing_key,
                 &flush_stage_stats,
+                &flush_outbound_budgets,
             )
             .await;
         });
@@ -4524,12 +5164,14 @@ mod tests {
         let flush_transport = Arc::clone(&transport);
         let flush_signing_key = Arc::clone(&signing_key);
         let flush_stage_stats = Arc::clone(&stage_stats);
+        let flush_outbound_budgets = Arc::new(PeerOutboundBudgets::default());
         let flush = tokio::spawn(async move {
             PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
                 &flush_topics,
                 &flush_transport,
                 &flush_signing_key,
                 &flush_stage_stats,
+                &flush_outbound_budgets,
             )
             .await;
         });

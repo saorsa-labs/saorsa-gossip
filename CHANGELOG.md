@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.28] - 2026-05-03
+
+### Added
+
+- PubSub outbound sends now enforce a per-peer concurrency budget: one EAGER/data
+  send plus a small control-plane budget for IHAVE, IWANT, and anti-entropy.
+- `PubSubStageStatsSnapshot::outbound_budget_exhausted` exposes skipped sends
+  caused by a peer already consuming its outbound PubSub permits.
+
+### Fixed
+
+- Repeated outbound budget pressure now feeds the existing slow-peer cooling
+  path, so one overloaded peer cannot keep spawning fresh send tasks while
+  waiting for timeout-based suppression.
+- Outbound send permits are released on completion, timeout, panic, and caller
+  cancellation, preventing leaked peer budget after aborted sends.
+
 ## [0.5.27] - 2026-05-03
 
 ### Fixed

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.30] - 2026-05-03
+
+### Changed
+
+- PlumTree topic-peer refresh now admits newly connected peers as LAZY first,
+  then uses score-aware mesh maintenance to fill only the bounded EAGER degree.
+- IWANT repair and first-contact EAGER senders now go through the same bounded
+  score-aware maintenance path instead of directly expanding EAGER membership.
+- Added rate-limited opportunistic grafting so a substantially better LAZY peer
+  can replace one low-score EAGER peer while the mesh remains within degree
+  bounds.
+- ADR-009 now documents how PlumTree `MIN_EAGER_DEGREE`, `MAX_EAGER_DEGREE`,
+  LAZY peers, and opportunistic grafting map to Gossipsub-style mesh parameters.
+
 ## [0.5.29] - 2026-05-03
 
 ### Added

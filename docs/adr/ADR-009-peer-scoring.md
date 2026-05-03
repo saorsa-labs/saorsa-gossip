@@ -200,6 +200,24 @@ impl PeerScorer {
 
 ### Protocol Integration
 
+#### 0. PlumTree PubSub Mesh Maintenance
+
+The PubSub layer maps PlumTree's EAGER/LAZY split onto the same bounded-mesh
+shape used by Gossipsub heartbeats:
+
+| Gossipsub concept | PlumTree mapping | Local constant |
+|-------------------|------------------|----------------|
+| `D_low` | Minimum EAGER peers before grafting from LAZY repair candidates | `MIN_EAGER_DEGREE` |
+| `D_high` | Maximum EAGER peers before pruning the lowest-score EAGER peers | `MAX_EAGER_DEGREE` |
+| `D_lazy` | Connected peers retained in LAZY for IHAVE/IWANT repair and future grafting | `lazy_peers` |
+| Opportunistic graft | Periodic replacement of a low-score EAGER peer with a substantially better LAZY peer | `OPPORTUNISTIC_GRAFT_INTERVAL` |
+
+Topic-peer refresh must not bulk-promote every connected peer. Disconnected
+peers are removed, newly connected peers enter LAZY, and the maintenance pass
+chooses the bounded EAGER subset by score. This preserves PlumTree's repair
+model while avoiding the production failure mode where a periodic membership
+refresh undoes sender-side PRUNE/cooling decisions.
+
 #### 1. HyParView Neighbor Selection
 
 ```rust

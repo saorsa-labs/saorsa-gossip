@@ -115,6 +115,15 @@ const PEER_SCORE_SEND_MIN_FACTOR: f64 = 0.35;
 /// Retain score evidence long enough to cover maximum cooling backoff plus decay.
 const PEER_SCORE_RETENTION: Duration = Duration::from_secs(2_400);
 
+/// Minimum interval between score-driven eager-peer replacement passes.
+const OPPORTUNISTIC_GRAFT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Maximum low-score eager peers replaced by one opportunistic maintenance pass.
+const OPPORTUNISTIC_GRAFT_MAX_REPLACEMENTS: usize = 1;
+
+/// Score advantage required before replacing an eager peer with a lazy peer.
+const OPPORTUNISTIC_GRAFT_MIN_SCORE_DELTA: f64 = 0.20;
+
 /// Per-peer concurrent EAGER/data sends allowed by the PubSub outbound budget.
 const OUTBOUND_DATA_PERMITS_PER_PEER: usize = 1;
 
@@ -178,10 +187,6 @@ impl PubSubMessageKindStats {
 
     fn record_prune(&self) {
         self.prune.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_graft(&self) {
-        self.graft.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_prunes(&self, count: usize) {
@@ -908,10 +913,6 @@ impl PubSubStageStats {
         self.message_kinds.record_prune();
     }
 
-    fn record_graft(&self) {
-        self.message_kinds.record_graft();
-    }
-
     fn record_prunes(&self, count: usize) {
         self.message_kinds.record_prunes(count);
     }
@@ -1326,6 +1327,8 @@ struct TopicState {
     last_activity: Instant,
     /// Send-side timeout/cooldown state keyed by peer for this topic.
     peer_cooling: HashMap<PeerId, PeerCoolingState>,
+    /// Last score-driven eager replacement pass.
+    last_opportunistic_graft: Option<Instant>,
 }
 
 impl TopicState {
@@ -1342,6 +1345,7 @@ impl TopicState {
             replay_ttl: Duration::from_secs(REPLAY_CACHE_TTL_SECS),
             last_activity: Instant::now(),
             peer_cooling: HashMap::new(),
+            last_opportunistic_graft: None,
         }
     }
 
@@ -1444,6 +1448,7 @@ impl TopicState {
         self.subscribers.retain(|tx| !tx.is_closed());
     }
 
+    #[cfg(test)]
     fn is_peer_suppressed_at(&self, peer: PeerId, now: Instant) -> bool {
         self.peer_cooling
             .get(&peer)
@@ -1465,6 +1470,27 @@ impl TopicState {
 
     fn is_score_eligible_for_eager_at(&self, peer: PeerId, now: Instant) -> bool {
         self.can_graft_peer_at(peer, now) && self.peer_score_at(peer, now) >= PEER_SCORE_EAGER_MIN
+    }
+
+    fn scored_lazy_peers_at(&self, now: Instant) -> Vec<(PeerId, f64)> {
+        let mut scored: Vec<(PeerId, f64)> = self
+            .lazy_peers
+            .iter()
+            .filter(|&&p| self.can_graft_peer_at(p, now))
+            .map(|&p| (p, self.peer_score_at(p, now)))
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scored
+    }
+
+    fn scored_eager_peers_at(&self, now: Instant) -> Vec<(PeerId, f64)> {
+        let mut scored: Vec<(PeerId, f64)> = self
+            .eager_peers
+            .iter()
+            .map(|&p| (p, self.peer_score_at(p, now)))
+            .collect();
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+        scored
     }
 
     fn role_for_peer_at(&self, peer: PeerId, now: Instant) -> &'static str {
@@ -1695,11 +1721,6 @@ impl TopicState {
             false
         }
     }
-    /// Move peer from lazy to eager
-    fn graft_peer(&mut self, peer: PeerId) -> bool {
-        self.graft_peer_at(peer, Instant::now())
-    }
-
     fn graft_peer_at(&mut self, peer: PeerId, now: Instant) -> bool {
         if !self.can_graft_peer_at(peer, now) {
             debug!(peer_id = %peer, "GRAFT skipped: peer is cooling after send timeouts");
@@ -1715,10 +1736,20 @@ impl TopicState {
         }
     }
 
+    fn add_new_peer_lazy(&mut self, peer: PeerId) -> bool {
+        if self.eager_peers.contains(&peer) || self.lazy_peers.contains(&peer) {
+            return false;
+        }
+        self.lazy_peers.insert(peer);
+        true
+    }
+
     /// Maintain eager peer degree (6-12) using score-based selection
     ///
     /// Promotes the highest-scoring lazy peers when below minimum degree,
     /// and demotes the lowest-scoring eager peers when above maximum degree.
+    /// When the mesh is within degree bounds, periodically replaces one
+    /// low-score eager peer with a substantially better lazy peer.
     fn maintain_degree(&mut self) -> (usize, usize) {
         self.maintain_degree_at(Instant::now())
     }
@@ -1726,21 +1757,27 @@ impl TopicState {
     fn maintain_degree_at(&mut self, now: Instant) -> (usize, usize) {
         let mut pruned = 0;
         let mut grafted = 0;
-        let eager_count = self.eager_peers.len();
 
-        if eager_count < MIN_EAGER_DEGREE && !self.lazy_peers.is_empty() {
-            // Promote highest-scoring lazy peers
-            let to_promote = MIN_EAGER_DEGREE - eager_count;
-            let mut scored_lazy: Vec<(PeerId, f64)> = self
-                .lazy_peers
+        if self.eager_peers.len() > MAX_EAGER_DEGREE {
+            // Demote lowest-scoring eager peers.
+            let to_demote = self.eager_peers.len() - MAX_EAGER_DEGREE;
+            let peers: Vec<PeerId> = self
+                .scored_eager_peers_at(now)
                 .iter()
-                .filter(|&&p| self.can_graft_peer_at(p, now))
-                .map(|&p| {
-                    let score = self.peer_score_at(p, now);
-                    (p, score)
-                })
+                .take(to_demote)
+                .map(|(p, _)| *p)
                 .collect();
-            scored_lazy.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for peer in peers {
+                if self.prune_peer(peer) {
+                    pruned += 1;
+                }
+            }
+        }
+
+        if self.eager_peers.len() < MIN_EAGER_DEGREE && !self.lazy_peers.is_empty() {
+            // Promote highest-scoring lazy peers.
+            let to_promote = MIN_EAGER_DEGREE - self.eager_peers.len();
+            let scored_lazy = self.scored_lazy_peers_at(now);
             let mut peers: Vec<PeerId> = scored_lazy
                 .iter()
                 .filter(|(_, score)| *score >= PEER_SCORE_EAGER_MIN)
@@ -1763,29 +1800,62 @@ impl TopicState {
                     grafted += 1;
                 }
             }
-        } else if eager_count > MAX_EAGER_DEGREE {
-            // Demote lowest-scoring eager peers
-            let to_demote = eager_count - MAX_EAGER_DEGREE;
-            let mut scored_eager: Vec<(PeerId, f64)> = self
-                .eager_peers
-                .iter()
-                .map(|&p| {
-                    let score = self.peer_score_at(p, now);
-                    (p, score)
-                })
-                .collect();
-            scored_eager.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            let peers: Vec<PeerId> = scored_eager
-                .iter()
-                .take(to_demote)
-                .map(|(p, _)| *p)
-                .collect();
-            for peer in peers {
-                if self.prune_peer(peer) {
-                    pruned += 1;
+        }
+
+        let (opportunistic_pruned, opportunistic_grafted) = self.opportunistic_graft_at(now);
+        pruned += opportunistic_pruned;
+        grafted += opportunistic_grafted;
+
+        (pruned, grafted)
+    }
+
+    fn opportunistic_graft_at(&mut self, now: Instant) -> (usize, usize) {
+        if self.eager_peers.len() < MIN_EAGER_DEGREE
+            || self.eager_peers.len() > MAX_EAGER_DEGREE
+            || self.lazy_peers.is_empty()
+        {
+            return (0, 0);
+        }
+
+        if self
+            .last_opportunistic_graft
+            .is_some_and(|last| now.saturating_duration_since(last) < OPPORTUNISTIC_GRAFT_INTERVAL)
+        {
+            return (0, 0);
+        }
+        self.last_opportunistic_graft = Some(now);
+
+        let mut scored_eager = self.scored_eager_peers_at(now).into_iter();
+        let mut scored_lazy = self
+            .scored_lazy_peers_at(now)
+            .into_iter()
+            .filter(|(_, score)| *score >= PEER_SCORE_EAGER_MIN);
+
+        let mut pruned = 0;
+        let mut grafted = 0;
+
+        while grafted < OPPORTUNISTIC_GRAFT_MAX_REPLACEMENTS {
+            let Some((eager_peer, eager_score)) = scored_eager.next() else {
+                break;
+            };
+            let Some((lazy_peer, lazy_score)) = scored_lazy.next() else {
+                break;
+            };
+
+            if eager_score >= PEER_SCORE_EAGER_MIN
+                || lazy_score < eager_score + OPPORTUNISTIC_GRAFT_MIN_SCORE_DELTA
+            {
+                break;
+            }
+
+            if self.prune_peer(eager_peer) {
+                pruned += 1;
+                if self.graft_peer_at(lazy_peer, now) {
+                    grafted += 1;
                 }
             }
         }
+
         (pruned, grafted)
     }
 }
@@ -2610,20 +2680,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             return Ok(());
         }
 
-        // Add sender to eager_peers if not already present
-        // This ensures bidirectional message flow - if a peer sends us messages
-        // on a topic, they've subscribed and should receive our messages too.
-        if !state.eager_peers.contains(&from) && !state.lazy_peers.contains(&from) {
-            if state.is_peer_suppressed_at(from, Instant::now()) {
-                state.lazy_peers.insert(from);
-                debug!(
-                    peer_id = %from,
-                    topic = ?topic,
-                    "Added cooled sender to lazy_peers"
-                );
-            } else {
-                state.eager_peers.insert(from);
-                debug!(peer_id = %from, topic = ?topic, "Added sender to eager_peers");
+        // Unknown senders enter LAZY first. Score-aware maintenance decides
+        // whether they are needed in the bounded EAGER mesh.
+        let now = Instant::now();
+        if state.add_new_peer_lazy(from) {
+            debug!(peer_id = %from, topic = ?topic, "Added sender to lazy_peers");
+            let (pruned, grafted) = state.maintain_degree_at(now);
+            if pruned > 0 {
+                self.stage_stats.record_prunes(pruned);
+            }
+            if grafted > 0 {
+                self.stage_stats.record_grafts(grafted);
             }
         }
 
@@ -2779,16 +2846,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         state.touch();
 
         let mut to_send = Vec::new();
+        let mut requester_has_cached_message = false;
 
         for msg_id in msg_ids {
             if let Some(cached) = state.get_message(&msg_id) {
                 to_send.push((msg_id, cached));
-                // GRAFT: move peer from lazy to eager
-                if state.graft_peer(from) {
-                    self.stage_stats.record_graft();
-                }
+                requester_has_cached_message = true;
             } else {
                 warn!(msg_id = ?msg_id, "IWANT for unknown message");
+            }
+        }
+
+        if requester_has_cached_message {
+            // GRAFT only when bounded score-aware maintenance chooses the
+            // requester; an IWANT burst must not bypass mesh degree caps.
+            state.add_new_peer_lazy(from);
+            let (pruned, grafted) = state.maintain_degree_at(Instant::now());
+            if pruned > 0 {
+                self.stage_stats.record_prunes(pruned);
+            }
+            if grafted > 0 {
+                self.stage_stats.record_grafts(grafted);
             }
         }
         self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
@@ -3525,14 +3603,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let mut topics = self.topics.write().await;
         let state = topics.entry(topic).or_insert_with(TopicState::new);
 
-        // Start with all peers as eager (tree will optimize via PRUNE)
         let now = Instant::now();
         for peer in peers {
-            if state.is_peer_suppressed_at(peer, now) {
-                state.lazy_peers.insert(peer);
-            } else {
-                state.eager_peers.insert(peer);
-            }
+            // New peers enter LAZY first; score-aware maintenance chooses the
+            // bounded EAGER subset instead of bulk-promoting the full view.
+            state.add_new_peer_lazy(peer);
+        }
+
+        let (pruned, grafted) = state.maintain_degree_at(now);
+        if pruned > 0 {
+            self.stage_stats.record_prunes(pruned);
+        }
+        if grafted > 0 {
+            self.stage_stats.record_grafts(grafted);
         }
 
         debug!(topic = ?topic, peer_count = state.eager_peers.len(), "Initialized topic peers");
@@ -3557,24 +3640,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             self.stage_stats.clear_peer_suppression(topic, peer);
         }
 
-        // Add new connected peers conservatively, then let score-aware degree
-        // maintenance decide which LAZY peers are worth promoting. This avoids
-        // undoing send-side demotion/cooling on every membership refresh.
+        // Add new connected peers conservatively as LAZY, then let score-aware
+        // degree maintenance decide which peers are worth promoting. This
+        // avoids undoing send-side demotion/cooling on every membership refresh.
         let now = Instant::now();
-        for peer in connected {
-            if state.eager_peers.contains(&peer) || state.lazy_peers.contains(&peer) {
-                continue;
-            }
-
-            if state.is_peer_suppressed_at(peer, now) {
-                state.lazy_peers.insert(peer);
-            } else if state.is_score_eligible_for_eager_at(peer, now)
-                && state.eager_peers.len() < MAX_EAGER_DEGREE
-            {
-                state.eager_peers.insert(peer);
-            } else {
-                state.lazy_peers.insert(peer);
-            }
+        for peer in connected_set.iter().copied() {
+            state.add_new_peer_lazy(peer);
         }
 
         let (pruned, grafted) = state.maintain_degree_at(now);
@@ -4174,7 +4245,7 @@ mod tests {
         assert_eq!(stats.iwant, 1);
         assert_eq!(stats.anti_entropy, 1);
         assert_eq!(stats.prune, 1);
-        assert_eq!(stats.graft, 1);
+        assert_eq!(stats.graft, 2);
         assert_eq!(stats.decode_failed, 0);
     }
 
@@ -5711,6 +5782,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_iwant_graft_respects_max_eager_degree() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([10u8; 32]);
+        let from_peer = test_peer_id(240);
+        let mut connected = Vec::new();
+
+        {
+            let now = Instant::now();
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            for i in 0..MAX_EAGER_DEGREE {
+                let peer = test_peer_id(i as u8 + 30);
+                connected.push(peer);
+                state.eager_peers.insert(peer);
+                let mut score = PeerScore::new_at(now);
+                score.record_delivery();
+                state.peer_scores.insert(peer, score);
+            }
+            state.lazy_peers.insert(from_peer);
+        }
+
+        let payload = Bytes::from("test");
+        pubsub.publish(topic, payload).await.ok();
+        let msg_id = {
+            let topics = pubsub.topics.read().await;
+            let state = topics.get(&topic).unwrap();
+            state
+                .message_cache
+                .peek_lru()
+                .map(|(id, _)| *id)
+                .expect("message should be cached")
+        };
+
+        pubsub
+            .handle_iwant(from_peer, topic, vec![msg_id])
+            .await
+            .ok();
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert_eq!(
+            state.eager_peers.len(),
+            MAX_EAGER_DEGREE,
+            "IWANT repair should not inflate EAGER above MAX_EAGER_DEGREE"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_eager_sender_enters_lazy_when_mesh_is_full_enough() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([11u8; 32]);
+        let unknown_sender = test_peer_id(250);
+
+        {
+            let now = Instant::now();
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            for i in 0..MIN_EAGER_DEGREE {
+                let peer = test_peer_id(i as u8 + 50);
+                state.eager_peers.insert(peer);
+                let mut score = PeerScore::new_at(now);
+                score.record_delivery();
+                state.peer_scores.insert(peer, score);
+            }
+        }
+
+        let payload = Bytes::from("hello from an unknown sender");
+        let msg_id = [99u8; 32];
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize");
+        let signature = signing_key.sign(&header_bytes).expect("sign");
+        let message = GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        pubsub
+            .handle_eager(unknown_sender, topic, message)
+            .await
+            .expect("unknown sender eager should be accepted");
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert_eq!(state.eager_peers.len(), MIN_EAGER_DEGREE);
+        assert!(
+            state.lazy_peers.contains(&unknown_sender),
+            "unknown EAGER sender should not bypass LAZY-first admission"
+        );
+        assert!(!state.eager_peers.contains(&unknown_sender));
+    }
+
+    #[tokio::test]
     async fn test_degree_maintenance() {
         let peer_id = test_peer_id(1);
         let transport = test_transport().await;
@@ -7019,6 +7196,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_initialize_topic_peers_limits_initial_eager_degree() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([7u8; 32]);
+        let peers: Vec<PeerId> = (10..(10 + MAX_EAGER_DEGREE + 4))
+            .map(|i| test_peer_id(i as u8))
+            .collect();
+
+        pubsub.initialize_topic_peers(topic, peers.clone()).await;
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert_eq!(
+            state.eager_peers.len(),
+            MIN_EAGER_DEGREE,
+            "initial peer seeding should build a bounded mesh instead of bulk-promoting the full view"
+        );
+        assert_eq!(
+            state.lazy_peers.len(),
+            peers.len() - MIN_EAGER_DEGREE,
+            "remaining connected peers should stay LAZY for repair/opportunistic grafting"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_topic_peers_adds_new_peers_as_lazy_when_mesh_is_full_enough() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([8u8; 32]);
+
+        let mut connected = Vec::new();
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            for i in 0..MIN_EAGER_DEGREE {
+                let peer = test_peer_id(i as u8 + 20);
+                connected.push(peer);
+                state.eager_peers.insert(peer);
+            }
+        }
+
+        let new_peer_a = test_peer_id(80);
+        let new_peer_b = test_peer_id(81);
+        connected.extend([new_peer_a, new_peer_b]);
+
+        pubsub.set_topic_peers(topic, connected).await;
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert_eq!(
+            state.eager_peers.len(),
+            MIN_EAGER_DEGREE,
+            "refresh should not expand EAGER just because new connected peers appeared"
+        );
+        assert!(state.lazy_peers.contains(&new_peer_a));
+        assert!(state.lazy_peers.contains(&new_peer_b));
+    }
+
+    #[tokio::test]
     async fn test_set_topic_peers_retains_lazy_if_connected() {
         let peer_id = test_peer_id(1);
         let transport = test_transport().await;
@@ -7037,9 +7277,8 @@ mod tests {
             state.lazy_peers.insert(peer_b);
         }
 
-        // Both still connected — peer_b should be promoted back to eager
-        // during the periodic refresh so that PRUNE optimizations don't
-        // permanently break gossip routing.
+        // Both still connected and the mesh is below MIN_EAGER_DEGREE, so
+        // score-aware maintenance may promote peer_b to keep routing viable.
         pubsub.set_topic_peers(topic, vec![peer_a, peer_b]).await;
 
         let topics = pubsub.topics.read().await;
@@ -7047,7 +7286,7 @@ mod tests {
         assert!(state.eager_peers.contains(&peer_a));
         assert!(
             state.eager_peers.contains(&peer_b),
-            "Lazy peer should be promoted to eager during refresh"
+            "Lazy peer should be promoted when needed to reach the minimum eager degree"
         );
         assert!(
             !state.lazy_peers.contains(&peer_b),
@@ -7135,7 +7374,7 @@ mod tests {
         );
         assert!(
             state.eager_peers.contains(&peer_b),
-            "Connected lazy peer should be promoted to eager"
+            "Connected lazy peer should be promoted because the mesh is below minimum degree"
         );
         assert!(
             !state.lazy_peers.contains(&peer_b),
@@ -7143,8 +7382,152 @@ mod tests {
         );
         assert!(
             state.eager_peers.contains(&peer_c),
-            "New peer should be added as eager"
+            "New peer should be promoted when needed to reach the minimum eager degree"
         );
+    }
+
+    #[test]
+    fn test_opportunistic_graft_replaces_low_score_eager_with_better_lazy() {
+        let mut state = TopicState::new();
+        let now = Instant::now();
+
+        let low_eager = test_peer_id(31);
+        for i in 0..MIN_EAGER_DEGREE {
+            let peer = test_peer_id(i as u8 + 30);
+            state.eager_peers.insert(peer);
+            let mut score = PeerScore::new_at(now);
+            score.record_delivery();
+            state.peer_scores.insert(peer, score);
+        }
+
+        let mut low_score = PeerScore::new_at(now);
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            low_score.record_outbound_send_timeout_at(now);
+        }
+        low_score.record_cooling_event_at(now);
+        state.peer_scores.insert(low_eager, low_score);
+
+        let better_lazy = test_peer_id(90);
+        state.lazy_peers.insert(better_lazy);
+        let mut better_score = PeerScore::new_at(now);
+        better_score.record_delivery();
+        for _ in 0..6 {
+            better_score.record_outbound_send_success_at(now, SendAttemptKind::Normal);
+        }
+        state.peer_scores.insert(better_lazy, better_score);
+
+        let (pruned, grafted) = state.maintain_degree_at(now);
+
+        assert_eq!(pruned, 1);
+        assert_eq!(grafted, 1);
+        assert!(
+            state.lazy_peers.contains(&low_eager),
+            "low-score eager peer should be demoted during opportunistic maintenance"
+        );
+        assert!(
+            state.eager_peers.contains(&better_lazy),
+            "higher-score lazy peer should replace the low-score eager peer"
+        );
+        assert_eq!(state.eager_peers.len(), MIN_EAGER_DEGREE);
+    }
+
+    #[test]
+    fn test_opportunistic_graft_is_rate_limited() {
+        let mut state = TopicState::new();
+        let now = Instant::now();
+
+        let low_eager_a = test_peer_id(101);
+        let low_eager_b = test_peer_id(102);
+        for peer in [low_eager_a, low_eager_b] {
+            state.eager_peers.insert(peer);
+            let mut score = PeerScore::new_at(now);
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                score.record_outbound_send_timeout_at(now);
+            }
+            score.record_cooling_event_at(now);
+            state.peer_scores.insert(peer, score);
+        }
+        for i in 0..(MIN_EAGER_DEGREE - 2) {
+            let peer = test_peer_id(i as u8 + 110);
+            state.eager_peers.insert(peer);
+            let mut score = PeerScore::new_at(now);
+            score.record_delivery();
+            state.peer_scores.insert(peer, score);
+        }
+
+        let better_lazy_a = test_peer_id(121);
+        let better_lazy_b = test_peer_id(122);
+        for peer in [better_lazy_a, better_lazy_b] {
+            state.lazy_peers.insert(peer);
+            let mut score = PeerScore::new_at(now);
+            score.record_delivery();
+            for _ in 0..6 {
+                score.record_outbound_send_success_at(now, SendAttemptKind::Normal);
+            }
+            state.peer_scores.insert(peer, score);
+        }
+
+        let first = state.maintain_degree_at(now);
+        let second = state.maintain_degree_at(now + Duration::from_secs(1));
+
+        assert_eq!(first, (1, 1));
+        assert_eq!(
+            second,
+            (0, 0),
+            "opportunistic replacement should not run on every membership refresh"
+        );
+        let replaced = [better_lazy_a, better_lazy_b]
+            .iter()
+            .filter(|peer| state.eager_peers.contains(peer))
+            .count();
+        assert_eq!(replaced, 1);
+    }
+
+    #[tokio::test]
+    async fn test_repeated_refresh_keeps_duplicate_pruned_peer_lazy_when_mesh_is_healthy() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([9u8; 32]);
+        let pruned_peer = test_peer_id(140);
+        let mut connected = Vec::new();
+
+        {
+            let now = Instant::now();
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            for i in 0..MIN_EAGER_DEGREE {
+                let peer = test_peer_id(i as u8 + 130);
+                connected.push(peer);
+                state.eager_peers.insert(peer);
+                let mut score = PeerScore::new_at(now);
+                score.record_delivery();
+                state.peer_scores.insert(peer, score);
+            }
+
+            connected.push(pruned_peer);
+            state.lazy_peers.insert(pruned_peer);
+            let mut score = PeerScore::new_at(now);
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                score.record_outbound_send_timeout_at(now);
+            }
+            score.record_cooling_event_at(now);
+            state.peer_scores.insert(pruned_peer, score);
+        }
+
+        for _ in 0..5 {
+            pubsub.set_topic_peers(topic, connected.clone()).await;
+        }
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert_eq!(state.eager_peers.len(), MIN_EAGER_DEGREE);
+        assert!(
+            state.lazy_peers.contains(&pruned_peer),
+            "refresh ticks should preserve LAZY state for a low-score duplicate-driven PRUNE"
+        );
+        assert!(!state.eager_peers.contains(&pruned_peer));
     }
 
     // -----------------------------------------------------------------------

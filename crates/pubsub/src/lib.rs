@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time;
 use tracing::{debug, error, trace, warn};
@@ -90,6 +90,18 @@ const MAX_EAGER_DEGREE: usize = 12;
 /// and `republish_per_peer_timeout` is incremented so the operator can see
 /// which peer is the slow one without a hung dispatcher.
 const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// Rolling window for send-side slow-peer detection.
+const PEER_TIMEOUT_WINDOW: Duration = Duration::from_secs(30);
+
+/// Timeouts inside `PEER_TIMEOUT_WINDOW` before a peer is cooled.
+const PEER_TIMEOUT_THRESHOLD: usize = 5;
+
+/// Initial sender-side suppression duration for a cooled peer.
+const PEER_SUPPRESSION_COOLDOWN: Duration = Duration::from_secs(120);
+
+/// Maximum repeated-offender suppression duration.
+const PEER_SUPPRESSION_BACKOFF_MAX: Duration = Duration::from_secs(1_800);
 
 /// Message ID type alias
 type MessageIdType = [u8; 32];
@@ -245,6 +257,41 @@ pub struct PubSubStageStats {
     /// healthy but one specific peer is slow" from "the whole pipeline is
     /// degrading".
     republish_per_peer_timeout: AtomicU64,
+    suppressed_peers: Mutex<HashMap<SuppressedPeerKey, SuppressedPeerState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SuppressedPeerKey {
+    topic: TopicId,
+    peer: PeerId,
+}
+
+#[derive(Debug, Clone)]
+struct SuppressedPeerState {
+    suppressed_until: Instant,
+    recent_timeout_count: usize,
+    cooldown: Duration,
+}
+
+/// JSON-friendly diagnostic for peers currently cooled by send-side timeout feedback.
+#[derive(Debug, Clone, Serialize)]
+pub struct SuppressedPeerSnapshot {
+    /// Peer identifier, formatted the same way as logs.
+    pub peer_id: String,
+    /// Topic identifier, formatted the same way as logs.
+    pub topic: String,
+    /// Approximate wall-clock Unix millisecond when this cooldown expires.
+    pub suppressed_until_unix_ms: u64,
+    /// Remaining cooldown duration.
+    pub suppressed_for_ms: u64,
+    /// Number of recent timeouts that triggered the current cooldown.
+    pub recent_timeout_count: usize,
+    /// Timeout rate implied by the trigger window.
+    pub recent_timeout_rate_per_sec: f64,
+    /// Active topic suppressions for this peer in this snapshot.
+    pub affected_topics_count: usize,
+    /// Cooldown duration applied to this suppression.
+    pub cooldown_ms: u64,
 }
 
 /// JSON-friendly snapshot of per-stage PubSub handling timings.
@@ -267,6 +314,8 @@ pub struct PubSubStageStatsSnapshot {
     /// Cumulative count of per-peer sends that hit
     /// `PER_PEER_REPUBLISH_TIMEOUT` during EAGER republish or IHAVE flush.
     pub republish_per_peer_timeout: u64,
+    /// Peers currently cooled after repeated send-side timeouts.
+    pub suppressed_peers: Vec<SuppressedPeerSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -279,7 +328,73 @@ enum PubSubStage {
     Republish,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerSendOutcome {
+    Sent,
+    TimedOut,
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn unix_millis_after(remaining: Duration) -> u64 {
+    let now_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration_millis_u64(duration),
+        Err(_) => 0,
+    };
+    now_ms.saturating_add(duration_millis_u64(remaining))
+}
+
 impl PubSubStageStats {
+    fn suppressed_peers_guard(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<SuppressedPeerKey, SuppressedPeerState>> {
+        match self.suppressed_peers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("PubSub suppressed-peers diagnostics lock was poisoned; recovering");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn suppressed_peer_snapshots(&self) -> Vec<SuppressedPeerSnapshot> {
+        let now = Instant::now();
+        let mut guard = self.suppressed_peers_guard();
+        guard.retain(|_, state| state.suppressed_until > now);
+
+        let mut affected_topics = HashMap::<PeerId, usize>::new();
+        for key in guard.keys() {
+            *affected_topics.entry(key.peer).or_default() += 1;
+        }
+
+        let mut snapshots: Vec<SuppressedPeerSnapshot> = guard
+            .iter()
+            .map(|(key, state)| {
+                let remaining = state.suppressed_until.saturating_duration_since(now);
+                SuppressedPeerSnapshot {
+                    peer_id: key.peer.to_string(),
+                    topic: key.topic.to_string(),
+                    suppressed_until_unix_ms: unix_millis_after(remaining),
+                    suppressed_for_ms: duration_millis_u64(remaining),
+                    recent_timeout_count: state.recent_timeout_count,
+                    recent_timeout_rate_per_sec: state.recent_timeout_count as f64
+                        / PEER_TIMEOUT_WINDOW.as_secs_f64(),
+                    affected_topics_count: affected_topics.get(&key.peer).copied().unwrap_or(1),
+                    cooldown_ms: duration_millis_u64(state.cooldown),
+                }
+            })
+            .collect();
+
+        snapshots.sort_by(|a, b| {
+            a.peer_id
+                .cmp(&b.peer_id)
+                .then_with(|| a.topic.cmp(&b.topic))
+        });
+        snapshots
+    }
+
     fn record(&self, stage: PubSubStage, duration: Duration) {
         match stage {
             PubSubStage::Decode => self.decode.record(duration),
@@ -301,12 +416,37 @@ impl PubSubStageStats {
             eager_fanout: self.eager_fanout.snapshot(),
             republish: self.republish.snapshot(),
             republish_per_peer_timeout: self.republish_per_peer_timeout.load(Ordering::Relaxed),
+            suppressed_peers: self.suppressed_peer_snapshots(),
         }
     }
 
     fn record_per_peer_timeout(&self) {
         self.republish_per_peer_timeout
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_peer_suppressed(
+        &self,
+        topic: TopicId,
+        peer: PeerId,
+        suppressed_until: Instant,
+        recent_timeout_count: usize,
+        cooldown: Duration,
+    ) {
+        let mut guard = self.suppressed_peers_guard();
+        guard.insert(
+            SuppressedPeerKey { topic, peer },
+            SuppressedPeerState {
+                suppressed_until,
+                recent_timeout_count,
+                cooldown,
+            },
+        );
+    }
+
+    fn clear_peer_suppression(&self, topic: TopicId, peer: PeerId) {
+        let mut guard = self.suppressed_peers_guard();
+        guard.remove(&SuppressedPeerKey { topic, peer });
     }
 
     fn record_message_kind(&self, kind: MessageKind) {
@@ -470,6 +610,50 @@ impl PeerScore {
     }
 }
 
+struct PeerCoolingState {
+    timeout_window_started: Instant,
+    timeout_count: usize,
+    suppressed_until: Option<Instant>,
+    cooldown: Duration,
+}
+
+struct PeerSuppressionEvent {
+    suppressed_until: Instant,
+    recent_timeout_count: usize,
+    cooldown: Duration,
+    demoted: bool,
+}
+
+impl PeerCoolingState {
+    fn new(now: Instant) -> Self {
+        Self {
+            timeout_window_started: now,
+            timeout_count: 0,
+            suppressed_until: None,
+            cooldown: PEER_SUPPRESSION_COOLDOWN,
+        }
+    }
+
+    fn is_suppressed_at(&self, now: Instant) -> bool {
+        self.suppressed_until.is_some_and(|until| until > now)
+    }
+
+    fn suppression_expired_at(&self, now: Instant) -> bool {
+        self.suppressed_until.is_some_and(|until| until <= now)
+    }
+
+    fn next_cooldown(&self) -> Duration {
+        if self.suppressed_until.is_some() {
+            match self.cooldown.checked_mul(2) {
+                Some(duration) => duration.min(PEER_SUPPRESSION_BACKOFF_MAX),
+                None => PEER_SUPPRESSION_BACKOFF_MAX,
+            }
+        } else {
+            PEER_SUPPRESSION_COOLDOWN
+        }
+    }
+}
+
 /// Cached message entry
 #[derive(Clone)]
 struct CachedMessage {
@@ -508,6 +692,8 @@ struct TopicState {
     /// When this exceeds TOPIC_IDLE_TTL_SECS, the entire entry is dropped
     /// from the parent `topics` HashMap.
     last_activity: Instant,
+    /// Send-side timeout/cooldown state keyed by peer for this topic.
+    peer_cooling: HashMap<PeerId, PeerCoolingState>,
 }
 
 impl TopicState {
@@ -523,6 +709,7 @@ impl TopicState {
             replay_cache: LruCache::new(replay_cache_capacity()),
             replay_ttl: Duration::from_secs(REPLAY_CACHE_TTL_SECS),
             last_activity: Instant::now(),
+            peer_cooling: HashMap::new(),
         }
     }
 
@@ -624,6 +811,82 @@ impl TopicState {
         self.subscribers.retain(|tx| !tx.is_closed());
     }
 
+    fn is_peer_suppressed_at(&self, peer: PeerId, now: Instant) -> bool {
+        self.peer_cooling
+            .get(&peer)
+            .is_some_and(|state| state.is_suppressed_at(now))
+    }
+
+    fn record_send_success_at(&mut self, peer: PeerId, now: Instant) -> bool {
+        let recovered = self
+            .peer_cooling
+            .get(&peer)
+            .is_some_and(|state| state.suppression_expired_at(now));
+        if recovered {
+            self.peer_cooling.remove(&peer);
+        }
+        recovered
+    }
+
+    fn record_send_timeout_at(
+        &mut self,
+        peer: PeerId,
+        now: Instant,
+    ) -> Option<PeerSuppressionEvent> {
+        let event = {
+            let cooling = self
+                .peer_cooling
+                .entry(peer)
+                .or_insert_with(|| PeerCoolingState::new(now));
+
+            if cooling.is_suppressed_at(now) {
+                return None;
+            }
+
+            if now.saturating_duration_since(cooling.timeout_window_started) > PEER_TIMEOUT_WINDOW {
+                cooling.timeout_window_started = now;
+                cooling.timeout_count = 0;
+            }
+
+            cooling.timeout_count = cooling.timeout_count.saturating_add(1);
+            if cooling.timeout_count < PEER_TIMEOUT_THRESHOLD {
+                None
+            } else {
+                let cooldown = cooling.next_cooldown();
+                let suppressed_until = now + cooldown;
+                let recent_timeout_count = cooling.timeout_count;
+                cooling.cooldown = cooldown;
+                cooling.suppressed_until = Some(suppressed_until);
+                cooling.timeout_window_started = now;
+                cooling.timeout_count = 0;
+                Some(PeerSuppressionEvent {
+                    suppressed_until,
+                    recent_timeout_count,
+                    cooldown,
+                    demoted: false,
+                })
+            }
+        };
+
+        event.map(|mut event| {
+            event.demoted = self.prune_peer(peer);
+            event
+        })
+    }
+
+    fn clear_disconnected_peer_cooling(&mut self, connected_set: &HashSet<PeerId>) -> Vec<PeerId> {
+        let removed: Vec<PeerId> = self
+            .peer_cooling
+            .keys()
+            .filter(|peer| !connected_set.contains(peer))
+            .copied()
+            .collect();
+        for peer in &removed {
+            self.peer_cooling.remove(peer);
+        }
+        removed
+    }
+
     /// Move peer from eager to lazy
     fn prune_peer(&mut self, peer: PeerId) -> bool {
         if self.eager_peers.remove(&peer) {
@@ -637,6 +900,15 @@ impl TopicState {
 
     /// Move peer from lazy to eager
     fn graft_peer(&mut self, peer: PeerId) -> bool {
+        self.graft_peer_at(peer, Instant::now())
+    }
+
+    fn graft_peer_at(&mut self, peer: PeerId, now: Instant) -> bool {
+        if self.is_peer_suppressed_at(peer, now) {
+            debug!(peer_id = %peer, "GRAFT skipped: peer is cooling after send timeouts");
+            return false;
+        }
+
         if self.lazy_peers.remove(&peer) {
             self.eager_peers.insert(peer);
             debug!(peer_id = %peer, "GRAFT: moved peer from lazy to eager");
@@ -651,6 +923,10 @@ impl TopicState {
     /// Promotes the highest-scoring lazy peers when below minimum degree,
     /// and demotes the lowest-scoring eager peers when above maximum degree.
     fn maintain_degree(&mut self) -> (usize, usize) {
+        self.maintain_degree_at(Instant::now())
+    }
+
+    fn maintain_degree_at(&mut self, now: Instant) -> (usize, usize) {
         let mut pruned = 0;
         let mut grafted = 0;
         let eager_count = self.eager_peers.len();
@@ -661,6 +937,7 @@ impl TopicState {
             let mut scored_lazy: Vec<(PeerId, f64)> = self
                 .lazy_peers
                 .iter()
+                .filter(|&&p| !self.is_peer_suppressed_at(p, now))
                 .map(|&p| {
                     let score = self.peer_scores.get(&p).map_or(0.5, |s| s.score());
                     (p, score)
@@ -673,7 +950,7 @@ impl TopicState {
                 .map(|(p, _)| *p)
                 .collect();
             for peer in peers {
-                if self.graft_peer(peer) {
+                if self.graft_peer_at(peer, now) {
                     grafted += 1;
                 }
             }
@@ -841,14 +1118,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         stream_type: GossipStreamType,
         bytes: Bytes,
         op: &'static str,
-    ) -> Result<()> {
+    ) -> Result<PeerSendOutcome> {
         match tokio::time::timeout(
             PER_PEER_REPUBLISH_TIMEOUT,
             transport.send_to_peer(peer, stream_type, bytes),
         )
         .await
         {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => Ok(PeerSendOutcome::Sent),
             Ok(Err(e)) => {
                 warn!(
                     peer_id = %peer,
@@ -865,7 +1142,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     timeout_ms = PER_PEER_REPUBLISH_TIMEOUT.as_millis() as u64,
                     "{op} per-peer send timed out — peer skipped, recorded in republish_per_peer_timeout"
                 );
-                Ok(())
+                Ok(PeerSendOutcome::TimedOut)
             }
         }
     }
@@ -877,7 +1154,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
     ) -> Result<()> {
-        Self::send_to_peer_with_timeout(
+        match Self::send_to_peer_with_timeout(
             Arc::clone(&self.transport),
             Arc::clone(&self.stage_stats),
             peer,
@@ -885,7 +1162,111 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             bytes,
             op,
         )
-        .await
+        .await?
+        {
+            PeerSendOutcome::Sent | PeerSendOutcome::TimedOut => Ok(()),
+        }
+    }
+
+    async fn filter_suppressed_topic_peers(
+        &self,
+        topic: TopicId,
+        peers: Vec<PeerId>,
+        op: &'static str,
+    ) -> Vec<PeerId> {
+        if peers.is_empty() {
+            return peers;
+        }
+
+        let now = Instant::now();
+        let topics = self.topics.read().await;
+        let Some(state) = topics.get(&topic) else {
+            return peers;
+        };
+
+        peers
+            .into_iter()
+            .filter(|peer| {
+                let suppressed = state.is_peer_suppressed_at(*peer, now);
+                if suppressed {
+                    trace!(
+                        peer_id = %peer,
+                        topic = ?topic,
+                        op,
+                        "{op} send skipped: peer cooling after repeated timeouts"
+                    );
+                }
+                !suppressed
+            })
+            .collect()
+    }
+
+    async fn record_topic_send_results(
+        &self,
+        topic: TopicId,
+        sent: Vec<PeerId>,
+        timed_out: Vec<PeerId>,
+    ) {
+        if sent.is_empty() && timed_out.is_empty() {
+            return;
+        }
+
+        Self::record_topic_send_results_for(
+            &self.topics,
+            &self.stage_stats,
+            topic,
+            sent,
+            timed_out,
+        )
+        .await;
+    }
+
+    async fn record_topic_send_results_for(
+        topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
+        stage_stats: &Arc<PubSubStageStats>,
+        topic: TopicId,
+        sent: Vec<PeerId>,
+        timed_out: Vec<PeerId>,
+    ) {
+        let now = Instant::now();
+        let mut topics_guard = topics.write().await;
+        let Some(state) = topics_guard.get_mut(&topic) else {
+            return;
+        };
+
+        for peer in sent {
+            if state.record_send_success_at(peer, now) {
+                stage_stats.clear_peer_suppression(topic, peer);
+                debug!(
+                    peer_id = %peer,
+                    topic = ?topic,
+                    "Peer cooling cleared after successful post-cooldown send"
+                );
+            }
+        }
+
+        for peer in timed_out {
+            if let Some(event) = state.record_send_timeout_at(peer, now) {
+                stage_stats.record_peer_suppressed(
+                    topic,
+                    peer,
+                    event.suppressed_until,
+                    event.recent_timeout_count,
+                    event.cooldown,
+                );
+                if event.demoted {
+                    stage_stats.record_prune();
+                }
+                warn!(
+                    peer_id = %peer,
+                    topic = ?topic,
+                    cooldown_ms = duration_millis_u64(event.cooldown),
+                    recent_timeout_count = event.recent_timeout_count,
+                    demoted = event.demoted,
+                    "Peer cooled after repeated PubSub send timeouts"
+                );
+            }
+        }
     }
 
     /// Send `bytes` to every peer in `peers` concurrently with a per-peer
@@ -902,11 +1283,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// `op` is the short label that appears in WARN logs ("EAGER", "IHAVE").
     async fn parallel_send_to_peers(
         &self,
+        topic: TopicId,
         peers: Vec<PeerId>,
         stream_type: GossipStreamType,
         bytes: Bytes,
         op: &'static str,
     ) {
+        let peers = self.filter_suppressed_topic_peers(topic, peers, op).await;
         if peers.is_empty() {
             return;
         }
@@ -915,26 +1298,35 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let transport = Arc::clone(&self.transport);
             let bytes = bytes.clone();
             let stage_stats = Arc::clone(&self.stage_stats);
-            set.spawn(Self::send_to_peer_with_timeout(
-                transport,
-                stage_stats,
-                peer,
-                stream_type,
-                bytes,
-                op,
-            ));
+            set.spawn(async move {
+                let outcome = Self::send_to_peer_with_timeout(
+                    transport,
+                    stage_stats,
+                    peer,
+                    stream_type,
+                    bytes,
+                    op,
+                )
+                .await;
+                (peer, outcome)
+            });
         }
         // Drain the JoinSet so the helper actually returns when all sends
         // have either completed, errored, or hit the per-peer timeout. Each
         // task swallows its own errors, so JoinError outcomes are logged
         // (panicked task) but otherwise ignored — we never want one panic to
         // poison the dispatcher.
+        let mut sent = Vec::new();
+        let mut timed_out = Vec::new();
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok(Ok(())) | Ok(Err(_)) => {}
+                Ok((peer, Ok(PeerSendOutcome::Sent))) => sent.push(peer),
+                Ok((peer, Ok(PeerSendOutcome::TimedOut))) => timed_out.push(peer),
+                Ok((_peer, Err(_))) => {}
                 Err(e) => warn!(op, "{op} per-peer send task panicked: {e}"),
             }
         }
+        self.record_topic_send_results(topic, sent, timed_out).await;
     }
 
     /// Get current epoch (seconds since UNIX_EPOCH)
@@ -1063,7 +1455,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         };
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Sending EAGER fan-out");
-        self.parallel_send_to_peers(eager_peers, GossipStreamType::PubSub, bytes, "EAGER")
+        self.parallel_send_to_peers(topic, eager_peers, GossipStreamType::PubSub, bytes, "EAGER")
             .await;
 
         // Batch msg_id to pending_ihave
@@ -1159,8 +1551,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // This ensures bidirectional message flow - if a peer sends us messages
         // on a topic, they've subscribed and should receive our messages too.
         if !state.eager_peers.contains(&from) && !state.lazy_peers.contains(&from) {
-            state.eager_peers.insert(from);
-            debug!(peer_id = %from, topic = ?topic, "Added sender to eager_peers");
+            if state.is_peer_suppressed_at(from, Instant::now()) {
+                state.lazy_peers.insert(from);
+                debug!(
+                    peer_id = %from,
+                    topic = ?topic,
+                    "Added cooled sender to lazy_peers"
+                );
+            } else {
+                state.eager_peers.insert(from);
+                debug!(peer_id = %from, topic = ?topic, "Added sender to eager_peers");
+            }
         }
 
         // Forward to eager_peers (except sender)
@@ -1206,7 +1607,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // `for peer { send.await }` which made one slow peer pin the entire
         // dispatcher (X0X-0006: 73% of dispatcher wall-clock).
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Forwarding EAGER");
-        self.parallel_send_to_peers(eager_peers, GossipStreamType::PubSub, bytes, "EAGER")
+        self.parallel_send_to_peers(topic, eager_peers, GossipStreamType::PubSub, bytes, "EAGER")
             .await;
         self.record_stage(PubSubStage::Republish, republish_started);
 
@@ -1673,7 +2074,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     .drain(..state.pending_ihave.len().min(MAX_IHAVE_BATCH_SIZE))
                     .collect();
 
-                let lazy_peers: Vec<PeerId> = state.lazy_peers.iter().copied().collect();
+                let now = Instant::now();
+                let lazy_peers: Vec<PeerId> = state
+                    .lazy_peers
+                    .iter()
+                    .filter(|&&peer| !state.is_peer_suppressed_at(peer, now))
+                    .copied()
+                    .collect();
                 work.push((*topic_id, batch, lazy_peers));
             }
 
@@ -1739,23 +2146,33 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     let transport = Arc::clone(transport);
                     let bytes = bytes.clone();
                     let stage_stats = Arc::clone(stage_stats);
-                    set.spawn(Self::send_to_peer_with_timeout(
-                        transport,
-                        stage_stats,
-                        peer,
-                        GossipStreamType::PubSub,
-                        bytes,
-                        "IHAVE",
-                    ));
+                    set.spawn(async move {
+                        let outcome = Self::send_to_peer_with_timeout(
+                            transport,
+                            stage_stats,
+                            peer,
+                            GossipStreamType::PubSub,
+                            bytes,
+                            "IHAVE",
+                        )
+                        .await;
+                        (peer, outcome)
+                    });
                 }
+                let mut sent = Vec::new();
+                let mut timed_out = Vec::new();
                 while let Some(joined) = set.join_next().await {
                     match joined {
-                        Ok(Ok(())) | Ok(Err(_)) => {}
+                        Ok((peer, Ok(PeerSendOutcome::Sent))) => sent.push(peer),
+                        Ok((peer, Ok(PeerSendOutcome::TimedOut))) => timed_out.push(peer),
+                        Ok((_peer, Err(_))) => {}
                         Err(e) => {
                             warn!(topic = ?topic_id, "IHAVE per-peer send task panicked: {e}")
                         }
                     }
                 }
+                Self::record_topic_send_results_for(topics, stage_stats, topic_id, sent, timed_out)
+                    .await;
             }
         }
     }
@@ -1955,8 +2372,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let state = topics.entry(topic).or_insert_with(TopicState::new);
 
         // Start with all peers as eager (tree will optimize via PRUNE)
+        let now = Instant::now();
         for peer in peers {
-            state.eager_peers.insert(peer);
+            if state.is_peer_suppressed_at(peer, now) {
+                state.lazy_peers.insert(peer);
+            } else {
+                state.eager_peers.insert(peer);
+            }
         }
 
         debug!(topic = ?topic, peer_count = state.eager_peers.len(), "Initialized topic peers");
@@ -1976,22 +2398,37 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Remove stale peers (no longer connected) from both sets.
         state.eager_peers.retain(|p| connected_set.contains(p));
         state.lazy_peers.retain(|p| connected_set.contains(p));
+        let removed_cooling = state.clear_disconnected_peer_cooling(&connected_set);
+        for peer in removed_cooling {
+            self.stage_stats.clear_peer_suppression(topic, peer);
+        }
 
         // Promote all connected lazy peers back to eager. PlumTree's PRUNE
         // optimization moves peers to lazy when duplicate messages are detected,
         // but the periodic peer refresh should restore them. Without this,
         // peers pruned during a message burst stay lazy permanently, breaking
         // gossip routing after the burst ends.
-        let to_promote: Vec<PeerId> = state.lazy_peers.iter().copied().collect();
+        let now = Instant::now();
+        let to_promote: Vec<PeerId> = state
+            .lazy_peers
+            .iter()
+            .filter(|&&peer| !state.is_peer_suppressed_at(peer, now))
+            .copied()
+            .collect();
         for peer in to_promote {
             state.lazy_peers.remove(&peer);
             state.eager_peers.insert(peer);
+            self.stage_stats.clear_peer_suppression(topic, peer);
         }
 
         // Add any remaining connected peers not in either set as eager.
         for peer in connected {
             if !state.eager_peers.contains(&peer) {
-                state.eager_peers.insert(peer);
+                if state.is_peer_suppressed_at(peer, now) {
+                    state.lazy_peers.insert(peer);
+                } else {
+                    state.eager_peers.insert(peer);
+                }
             }
         }
 
@@ -2275,6 +2712,67 @@ mod tests {
 
         fn send_count(&self) -> usize {
             self.send_count.load(Ordering::SeqCst)
+        }
+    }
+
+    struct RecordingTransport {
+        local_peer: PeerId,
+        send_counts: Mutex<HashMap<PeerId, usize>>,
+    }
+
+    impl RecordingTransport {
+        fn new(local_peer: PeerId) -> Arc<Self> {
+            Arc::new(Self {
+                local_peer,
+                send_counts: Mutex::new(HashMap::new()),
+            })
+        }
+
+        fn send_count_to(&self, peer: PeerId) -> usize {
+            self.send_counts
+                .lock()
+                .expect("send counts lock")
+                .get(&peer)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for RecordingTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(self.local_peer)
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            peer: PeerId,
+            _stream_type: GossipStreamType,
+            _data: Bytes,
+        ) -> Result<()> {
+            let mut counts = self.send_counts.lock().expect("send counts lock");
+            *counts.entry(peer).or_default() += 1;
+            Ok(())
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+            Err(anyhow!("recording test transport does not receive"))
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.local_peer
         }
     }
 
@@ -2642,6 +3140,137 @@ mod tests {
             transport.send_count(),
             eager_peers.len(),
             "every eager peer should have had send_to_peer attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_peer_timeout_cooling_demotes_and_skips_future_eager_sends() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([43u8; 32]);
+        let slow_peer = test_peer_id(2);
+        let healthy_peer = test_peer_id(3);
+        pubsub
+            .initialize_topic_peers(topic, vec![slow_peer, healthy_peer])
+            .await;
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![slow_peer])
+                .await;
+        }
+
+        {
+            let topics = pubsub.topics.read().await;
+            let state = topics.get(&topic).expect("topic exists");
+            assert!(
+                !state.eager_peers.contains(&slow_peer),
+                "cooled peer should be removed from EAGER fanout"
+            );
+            assert!(
+                state.lazy_peers.contains(&slow_peer),
+                "cooled peer should remain in LAZY for later recovery"
+            );
+            assert!(
+                state.eager_peers.contains(&healthy_peer),
+                "healthy peers should stay EAGER"
+            );
+        }
+
+        let suppressed = pubsub.stage_stats().suppressed_peers;
+        assert_eq!(suppressed.len(), 1, "one peer/topic should be cooled");
+        assert_eq!(suppressed[0].peer_id, slow_peer.to_string());
+        assert_eq!(suppressed[0].topic, topic.to_string());
+        assert_eq!(suppressed[0].recent_timeout_count, PEER_TIMEOUT_THRESHOLD);
+        assert_eq!(suppressed[0].affected_topics_count, 1);
+
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"after-cooling"))
+            .await
+            .expect("publish should complete");
+
+        assert_eq!(
+            transport.send_count_to(slow_peer),
+            0,
+            "cooled peer should not consume a send slot on later EAGER fanout"
+        );
+        assert_eq!(
+            transport.send_count_to(healthy_peer),
+            1,
+            "healthy EAGER peer should still receive fanout"
+        );
+    }
+
+    #[test]
+    fn test_peer_cooling_recovers_after_cooldown_without_restart() {
+        let mut state = TopicState::new();
+        let peer = test_peer_id(2);
+        state.eager_peers.insert(peer);
+
+        let now = Instant::now();
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(peer, now);
+        }
+
+        assert!(
+            state.is_peer_suppressed_at(peer, now),
+            "peer should be suppressed after threshold timeouts"
+        );
+        assert!(state.lazy_peers.contains(&peer));
+
+        let after_cooldown = now + PEER_SUPPRESSION_COOLDOWN + Duration::from_millis(1);
+        let (_pruned, grafted) = state.maintain_degree_at(after_cooldown);
+
+        assert_eq!(grafted, 1, "expired cooling should allow re-admission");
+        assert!(
+            state.eager_peers.contains(&peer),
+            "peer should re-enter EAGER without a daemon restart"
+        );
+        assert!(!state.is_peer_suppressed_at(peer, after_cooldown));
+    }
+
+    #[tokio::test]
+    async fn test_peer_cooling_is_per_topic_and_refresh_respects_active_cooldown() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(peer_id, transport, test_signing_key(), false);
+        let topic_a = TopicId::new([44u8; 32]);
+        let topic_b = TopicId::new([45u8; 32]);
+        let peer = test_peer_id(2);
+
+        pubsub.initialize_topic_peers(topic_a, vec![peer]).await;
+        pubsub.initialize_topic_peers(topic_b, vec![peer]).await;
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic_a, Vec::new(), vec![peer])
+                .await;
+        }
+
+        pubsub.set_topic_peers(topic_a, vec![peer]).await;
+
+        let topics = pubsub.topics.read().await;
+        let state_a = topics.get(&topic_a).expect("topic A exists");
+        let state_b = topics.get(&topic_b).expect("topic B exists");
+
+        assert!(
+            state_a.lazy_peers.contains(&peer),
+            "active cooling should keep peer lazy on affected topic"
+        );
+        assert!(
+            !state_a.eager_peers.contains(&peer),
+            "refresh must not immediately re-promote cooled peer"
+        );
+        assert!(
+            state_b.eager_peers.contains(&peer),
+            "same peer should stay EAGER on unaffected topic"
         );
     }
 

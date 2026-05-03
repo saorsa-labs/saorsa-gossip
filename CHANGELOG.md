@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.25] - 2026-05-03
+
+### Added
+
+- PubSub sender-side slow-peer cooling for PlumTree fanout. Peers that repeatedly
+  hit the per-peer send timeout on a topic are temporarily demoted from EAGER to
+  LAZY and skipped during the cooldown, freeing dispatcher capacity without a
+  daemon restart.
+- `PubSubStageStatsSnapshot::suppressed_peers` diagnostics showing cooled
+  peer/topic entries, cooldown expiry, recent timeout rate, and affected topic
+  count.
+
+### Fixed
+
+- Periodic topic peer refresh no longer immediately re-promotes a peer that is
+  actively cooling after send-side timeouts.
+- Cooled peers are re-admitted after cooldown expiry through the normal PlumTree
+  maintenance/refresh path instead of requiring operator restart.
+
 ## [0.5.23] - 2026-04-27
 
 ### Fixed

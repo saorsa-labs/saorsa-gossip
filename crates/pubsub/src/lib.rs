@@ -103,6 +103,18 @@ const PEER_SUPPRESSION_COOLDOWN: Duration = Duration::from_secs(120);
 /// Maximum repeated-offender suppression duration.
 const PEER_SUPPRESSION_BACKOFF_MAX: Duration = Duration::from_secs(1_800);
 
+/// Half-life for decayed peer-score send-health evidence.
+const PEER_SCORE_DECAY_HALF_LIFE: Duration = Duration::from_secs(300);
+
+/// Lowest score accepted for EAGER promotion when healthier alternatives exist.
+const PEER_SCORE_EAGER_MIN: f64 = 0.45;
+
+/// Minimum multiplier applied by send-health to the inbound/recency base score.
+const PEER_SCORE_SEND_MIN_FACTOR: f64 = 0.35;
+
+/// Retain score evidence long enough to cover maximum cooling backoff plus decay.
+const PEER_SCORE_RETENTION: Duration = Duration::from_secs(2_400);
+
 /// Per-peer concurrent EAGER/data sends allowed by the PubSub outbound budget.
 const OUTBOUND_DATA_PERMITS_PER_PEER: usize = 1;
 
@@ -313,6 +325,38 @@ pub struct SuppressedPeerSnapshot {
     pub recovery_probe_in_flight: bool,
 }
 
+/// JSON-friendly diagnostic for score-driven PlumTree mesh selection.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerScoreSnapshot {
+    /// Peer identifier, formatted the same way as logs.
+    pub peer_id: String,
+    /// Topic identifier, formatted the same way as logs.
+    pub topic: String,
+    /// Current mesh role for this peer (`eager`, `lazy`, `cooled`,
+    /// `recovery_ready`, `recovery_probe`, or `excluded`).
+    pub role: String,
+    /// Current composite mesh-selection score in the range 0.0..=1.0.
+    pub score: f64,
+    /// IWANT response-rate component in the range 0.0..=1.0.
+    pub iwant_response_rate: f64,
+    /// Recency component in the range 0.0..=1.0.
+    pub recency: f64,
+    /// Send-side health component in the range 0.0..=1.0.
+    pub send_health: f64,
+    /// Decayed successful outbound send evidence.
+    pub outbound_send_successes: f64,
+    /// Decayed outbound send-timeout evidence.
+    pub outbound_send_timeouts: f64,
+    /// Decayed cooling-event evidence.
+    pub cooling_events: f64,
+    /// Decayed recovery-probe attempt evidence.
+    pub recovery_probes: f64,
+    /// Decayed successful recovery-probe evidence.
+    pub recovery_successes: f64,
+    /// Whether this peer is currently eligible for score-driven EAGER promotion.
+    pub eager_eligible: bool,
+}
+
 /// JSON-friendly snapshot of per-stage PubSub handling timings.
 #[derive(Debug, Clone, Serialize)]
 pub struct PubSubStageStatsSnapshot {
@@ -338,6 +382,8 @@ pub struct PubSubStageStatsSnapshot {
     pub outbound_budget_exhausted: u64,
     /// Peers currently cooled after repeated send-side timeouts.
     pub suppressed_peers: Vec<SuppressedPeerSnapshot>,
+    /// Per-topic peer-score components used for PlumTree mesh selection.
+    pub peer_scores: Vec<PeerScoreSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -786,6 +832,7 @@ impl PubSubStageStats {
             republish_per_peer_timeout: self.republish_per_peer_timeout.load(Ordering::Relaxed),
             outbound_budget_exhausted: self.outbound_budget_exhausted.load(Ordering::Relaxed),
             suppressed_peers: self.suppressed_peer_snapshots(),
+            peer_scores: Vec::new(),
         }
     }
 
@@ -942,10 +989,63 @@ enum AntiEntropyPayload {
     },
 }
 
-/// Per-peer quality score for tree optimization
+#[derive(Clone, Debug)]
+struct DecayedCounter {
+    value: f64,
+    updated_at: Instant,
+}
+
+impl DecayedCounter {
+    fn new(now: Instant) -> Self {
+        Self {
+            value: 0.0,
+            updated_at: now,
+        }
+    }
+
+    fn value_at(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.updated_at).as_secs_f64();
+        if elapsed <= 0.0 || self.value <= 0.0 {
+            return self.value;
+        }
+
+        let half_life = PEER_SCORE_DECAY_HALF_LIFE.as_secs_f64();
+        let decay = 0.5_f64.powf(elapsed / half_life);
+        self.value * decay
+    }
+
+    fn add_at(&mut self, now: Instant, amount: f64) {
+        self.value = self.value_at(now) + amount;
+        self.updated_at = now;
+    }
+
+    fn last_activity(&self) -> Option<Instant> {
+        if self.value > 0.0 {
+            Some(self.updated_at)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PeerScoreComponents {
+    score: f64,
+    iwant_response_rate: f64,
+    recency: f64,
+    send_health: f64,
+    outbound_send_successes: f64,
+    outbound_send_timeouts: f64,
+    cooling_events: f64,
+    recovery_probes: f64,
+    recovery_successes: f64,
+}
+
+/// Per-peer quality score for tree optimization.
 ///
-/// Tracks delivery metrics to enable score-based promotion/demotion
-/// decisions in the Plumtree spanning tree.
+/// Tracks IWANT response quality, recency, and decayed send-side health so
+/// slow outbound edges influence later PlumTree EAGER/LAZY selection.
+#[derive(Clone, Debug)]
 struct PeerScore {
     /// Count of EAGER messages received from this peer
     messages_delivered: u64,
@@ -955,23 +1055,48 @@ struct PeerScore {
     iwant_responses: u64,
     /// Last time we received any message from this peer
     last_seen: Instant,
+    outbound_send_successes: DecayedCounter,
+    outbound_send_timeouts: DecayedCounter,
+    cooling_events: DecayedCounter,
+    recovery_probes: DecayedCounter,
+    recovery_successes: DecayedCounter,
 }
 
 impl PeerScore {
     /// Create a new peer score with default values
     fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(now: Instant) -> Self {
         Self {
             messages_delivered: 0,
             iwant_requests: 0,
             iwant_responses: 0,
-            last_seen: Instant::now(),
+            last_seen: now,
+            outbound_send_successes: DecayedCounter::new(now),
+            outbound_send_timeouts: DecayedCounter::new(now),
+            cooling_events: DecayedCounter::new(now),
+            recovery_probes: DecayedCounter::new(now),
+            recovery_successes: DecayedCounter::new(now),
         }
     }
 
     /// Calculate peer quality score (0.0 to 1.0)
     ///
-    /// Score = (iwant_response_rate * 0.6) + (recency_factor * 0.4)
+    /// Base score = `(iwant_response_rate * 0.6) + (recency_factor * 0.4)`.
+    /// Decayed send-health evidence then scales that base down for peers
+    /// causing outbound timeouts, cooling, or repeated recovery probes.
+    #[cfg(test)]
     fn score(&self) -> f64 {
+        self.score_at(Instant::now())
+    }
+
+    fn score_at(&self, now: Instant) -> f64 {
+        self.components_at(now).score
+    }
+
+    fn components_at(&self, now: Instant) -> PeerScoreComponents {
         let response_rate = if self.iwant_requests > 0 {
             self.iwant_responses as f64 / self.iwant_requests as f64
         } else {
@@ -984,12 +1109,39 @@ impl PeerScore {
             }
         };
 
-        let secs_since_seen = Instant::now()
-            .saturating_duration_since(self.last_seen)
-            .as_secs_f64();
+        let secs_since_seen = now.saturating_duration_since(self.last_seen).as_secs_f64();
         let recency = (1.0 - (secs_since_seen / 300.0)).max(0.0);
 
-        (response_rate.min(1.0) * 0.6) + (recency * 0.4)
+        let outbound_send_successes = self.outbound_send_successes.value_at(now);
+        let outbound_send_timeouts = self.outbound_send_timeouts.value_at(now);
+        let cooling_events = self.cooling_events.value_at(now);
+        let recovery_probes = self.recovery_probes.value_at(now);
+        let recovery_successes = self.recovery_successes.value_at(now);
+
+        let good = outbound_send_successes + (recovery_successes * 2.0);
+        let bad = outbound_send_timeouts + (cooling_events * 3.0) + (recovery_probes * 0.5);
+        let send_health = if good <= 0.0 && bad <= 0.0 {
+            1.0
+        } else {
+            ((good + 1.0) / (good + bad + 1.0)).clamp(0.0, 1.0)
+        };
+
+        let base = (response_rate.min(1.0) * 0.6) + (recency * 0.4);
+        let send_factor =
+            PEER_SCORE_SEND_MIN_FACTOR + ((1.0 - PEER_SCORE_SEND_MIN_FACTOR) * send_health);
+        let score = (base * send_factor).clamp(0.0, 1.0);
+
+        PeerScoreComponents {
+            score,
+            iwant_response_rate: response_rate.min(1.0),
+            recency,
+            send_health,
+            outbound_send_successes,
+            outbound_send_timeouts,
+            cooling_events,
+            recovery_probes,
+            recovery_successes,
+        }
     }
 
     /// Record a message delivery from this peer
@@ -1007,6 +1159,38 @@ impl PeerScore {
     fn record_iwant_response(&mut self) {
         self.iwant_responses += 1;
         self.last_seen = Instant::now();
+    }
+
+    fn record_recovery_probe_at(&mut self, now: Instant) {
+        self.recovery_probes.add_at(now, 1.0);
+    }
+
+    fn record_outbound_send_success_at(&mut self, now: Instant, kind: SendAttemptKind) {
+        self.outbound_send_successes.add_at(now, 1.0);
+        if kind == SendAttemptKind::RecoveryProbe {
+            self.recovery_successes.add_at(now, 1.0);
+        }
+    }
+
+    fn record_outbound_send_timeout_at(&mut self, now: Instant) {
+        self.outbound_send_timeouts.add_at(now, 1.0);
+    }
+
+    fn record_cooling_event_at(&mut self, now: Instant) {
+        self.cooling_events.add_at(now, 1.0);
+    }
+
+    fn last_activity(&self) -> Instant {
+        [
+            self.outbound_send_successes.last_activity(),
+            self.outbound_send_timeouts.last_activity(),
+            self.cooling_events.last_activity(),
+            self.recovery_probes.last_activity(),
+            self.recovery_successes.last_activity(),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(self.last_seen, |latest, instant| latest.max(instant))
     }
 }
 
@@ -1247,12 +1431,13 @@ impl TopicState {
             self.replay_cache.pop(&hash);
         }
 
-        // Clean stale peer scores (10 minute expiry)
+        // Clean stale peer scores after send-side evidence has outlived the
+        // maximum cooling backoff plus one decay half-life.
         // Use saturating_duration_since to avoid panic on Windows (coarse timer)
-        let score_expiry = Duration::from_secs(600);
         let now = Instant::now();
-        self.peer_scores
-            .retain(|_, score| now.saturating_duration_since(score.last_seen) < score_expiry);
+        self.peer_scores.retain(|_, score| {
+            now.saturating_duration_since(score.last_activity()) < PEER_SCORE_RETENTION
+        });
 
         // Quiet topics do not send through the subscriber list, so closed
         // receivers would otherwise keep an idle topic alive forever.
@@ -1269,6 +1454,78 @@ impl TopicState {
         self.peer_cooling
             .get(&peer)
             .is_none_or(|state| state.can_graft_at(now))
+    }
+
+    fn peer_score_at(&self, peer: PeerId, now: Instant) -> f64 {
+        self.peer_scores.get(&peer).map_or_else(
+            || PeerScore::new_at(now).score_at(now),
+            |score| score.score_at(now),
+        )
+    }
+
+    fn is_score_eligible_for_eager_at(&self, peer: PeerId, now: Instant) -> bool {
+        self.can_graft_peer_at(peer, now) && self.peer_score_at(peer, now) >= PEER_SCORE_EAGER_MIN
+    }
+
+    fn role_for_peer_at(&self, peer: PeerId, now: Instant) -> &'static str {
+        if let Some(cooling) = self.peer_cooling.get(&peer) {
+            if cooling.recovery_probe_in_flight {
+                return "recovery_probe";
+            }
+            if cooling.suppressed_until.is_some_and(|until| until > now) {
+                return "cooled";
+            }
+            if cooling.suppression_expired_at(now) {
+                return "recovery_ready";
+            }
+        }
+
+        if self.eager_peers.contains(&peer) {
+            "eager"
+        } else if self.lazy_peers.contains(&peer) {
+            "lazy"
+        } else {
+            "excluded"
+        }
+    }
+
+    fn peer_score_snapshots(&self, topic: TopicId, now: Instant) -> Vec<PeerScoreSnapshot> {
+        let mut peers: HashSet<PeerId> = self.peer_scores.keys().copied().collect();
+        peers.extend(self.eager_peers.iter().copied());
+        peers.extend(self.lazy_peers.iter().copied());
+        peers.extend(self.peer_cooling.keys().copied());
+
+        let mut snapshots: Vec<PeerScoreSnapshot> = peers
+            .into_iter()
+            .map(|peer| {
+                let components = self.peer_scores.get(&peer).map_or_else(
+                    || PeerScore::new_at(now).components_at(now),
+                    |score| score.components_at(now),
+                );
+                PeerScoreSnapshot {
+                    peer_id: peer.to_string(),
+                    topic: topic.to_string(),
+                    role: self.role_for_peer_at(peer, now).to_string(),
+                    score: components.score,
+                    iwant_response_rate: components.iwant_response_rate,
+                    recency: components.recency,
+                    send_health: components.send_health,
+                    outbound_send_successes: components.outbound_send_successes,
+                    outbound_send_timeouts: components.outbound_send_timeouts,
+                    cooling_events: components.cooling_events,
+                    recovery_probes: components.recovery_probes,
+                    recovery_successes: components.recovery_successes,
+                    eager_eligible: self.is_score_eligible_for_eager_at(peer, now),
+                }
+            })
+            .collect();
+
+        snapshots.sort_by(|a, b| {
+            a.peer_id
+                .cmp(&b.peer_id)
+                .then_with(|| a.topic.cmp(&b.topic))
+        });
+        snapshots
     }
 
     fn claim_send_attempt_at(
@@ -1299,6 +1556,11 @@ impl TopicState {
     }
 
     fn record_send_success_at(&mut self, attempt: PeerSendAttempt, now: Instant) -> bool {
+        self.peer_scores
+            .entry(attempt.peer)
+            .or_insert_with(|| PeerScore::new_at(now))
+            .record_outbound_send_success_at(now, attempt.kind);
+
         match attempt.kind {
             SendAttemptKind::RecoveryProbe => {
                 let Some(cooling) = self.peer_cooling.get(&attempt.peer) else {
@@ -1326,6 +1588,13 @@ impl TopicState {
         attempt: PeerSendAttempt,
         now: Instant,
     ) -> Option<PeerSuppressionEvent> {
+        if attempt.kind == SendAttemptKind::Normal {
+            self.peer_scores
+                .entry(attempt.peer)
+                .or_insert_with(|| PeerScore::new_at(now))
+                .record_outbound_send_timeout_at(now);
+        }
+
         let event = {
             if attempt.kind == SendAttemptKind::RecoveryProbe {
                 let cooling = self.peer_cooling.get_mut(&attempt.peer)?;
@@ -1388,6 +1657,16 @@ impl TopicState {
         };
 
         event.map(|mut event| {
+            if attempt.kind == SendAttemptKind::RecoveryProbe {
+                self.peer_scores
+                    .entry(attempt.peer)
+                    .or_insert_with(|| PeerScore::new_at(now))
+                    .record_outbound_send_timeout_at(now);
+            }
+            self.peer_scores
+                .entry(attempt.peer)
+                .or_insert_with(|| PeerScore::new_at(now))
+                .record_cooling_event_at(now);
             event.demoted = self.prune_peer(attempt.peer);
             event
         })
@@ -1457,16 +1736,28 @@ impl TopicState {
                 .iter()
                 .filter(|&&p| self.can_graft_peer_at(p, now))
                 .map(|&p| {
-                    let score = self.peer_scores.get(&p).map_or(0.5, |s| s.score());
+                    let score = self.peer_score_at(p, now);
                     (p, score)
                 })
                 .collect();
             scored_lazy.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let peers: Vec<PeerId> = scored_lazy
+            let mut peers: Vec<PeerId> = scored_lazy
                 .iter()
+                .filter(|(_, score)| *score >= PEER_SCORE_EAGER_MIN)
                 .take(to_promote)
                 .map(|(p, _)| *p)
                 .collect();
+            if peers.len() < to_promote {
+                for (peer, _) in scored_lazy
+                    .iter()
+                    .filter(|(_, score)| *score < PEER_SCORE_EAGER_MIN)
+                {
+                    peers.push(*peer);
+                    if peers.len() >= to_promote {
+                        break;
+                    }
+                }
+            }
             for peer in peers {
                 if self.graft_peer_at(peer, now) {
                     grafted += 1;
@@ -1479,7 +1770,7 @@ impl TopicState {
                 .eager_peers
                 .iter()
                 .map(|&p| {
-                    let score = self.peer_scores.get(&p).map_or(0.5, |s| s.score());
+                    let score = self.peer_score_at(p, now);
                     (p, score)
                 })
                 .collect();
@@ -1702,7 +1993,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     /// Snapshot per-stage timings for inbound PubSub message handling.
     pub fn stage_stats(&self) -> PubSubStageStatsSnapshot {
-        self.stage_stats.snapshot()
+        let mut snapshot = self.stage_stats.snapshot();
+        snapshot.peer_scores = self.peer_score_snapshots();
+        snapshot
+    }
+
+    fn peer_score_snapshots(&self) -> Vec<PeerScoreSnapshot> {
+        let Ok(topics) = self.topics.try_read() else {
+            return Vec::new();
+        };
+
+        let now = Instant::now();
+        let mut snapshots = Vec::new();
+        for (topic, state) in topics.iter() {
+            snapshots.extend(state.peer_score_snapshots(*topic, now));
+        }
+        snapshots.sort_by(|a, b| {
+            a.peer_id
+                .cmp(&b.peer_id)
+                .then_with(|| a.topic.cmp(&b.topic))
+        });
+        snapshots
     }
 
     fn record_stage(&self, stage: PubSubStage, started: Instant) {
@@ -1881,6 +2192,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         for peer in peers {
             match state.claim_send_attempt_at(peer, now) {
                 Some((attempt, recovery_event)) => {
+                    if attempt.kind == SendAttemptKind::RecoveryProbe {
+                        state
+                            .peer_scores
+                            .entry(peer)
+                            .or_insert_with(|| PeerScore::new_at(now))
+                            .record_recovery_probe_at(now);
+                    }
                     if let Some(event) = recovery_event {
                         stage_stats.record_peer_recovery_probe(
                             topic,
@@ -3239,33 +3557,32 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             self.stage_stats.clear_peer_suppression(topic, peer);
         }
 
-        // Promote all connected lazy peers back to eager. PlumTree's PRUNE
-        // optimization moves peers to lazy when duplicate messages are detected,
-        // but the periodic peer refresh should restore them. Without this,
-        // peers pruned during a message burst stay lazy permanently, breaking
-        // gossip routing after the burst ends.
+        // Add new connected peers conservatively, then let score-aware degree
+        // maintenance decide which LAZY peers are worth promoting. This avoids
+        // undoing send-side demotion/cooling on every membership refresh.
         let now = Instant::now();
-        let to_promote: Vec<PeerId> = state
-            .lazy_peers
-            .iter()
-            .filter(|&&peer| !state.is_peer_suppressed_at(peer, now))
-            .copied()
-            .collect();
-        for peer in to_promote {
-            state.lazy_peers.remove(&peer);
-            state.eager_peers.insert(peer);
-            self.stage_stats.clear_peer_suppression(topic, peer);
+        for peer in connected {
+            if state.eager_peers.contains(&peer) || state.lazy_peers.contains(&peer) {
+                continue;
+            }
+
+            if state.is_peer_suppressed_at(peer, now) {
+                state.lazy_peers.insert(peer);
+            } else if state.is_score_eligible_for_eager_at(peer, now)
+                && state.eager_peers.len() < MAX_EAGER_DEGREE
+            {
+                state.eager_peers.insert(peer);
+            } else {
+                state.lazy_peers.insert(peer);
+            }
         }
 
-        // Add any remaining connected peers not in either set as eager.
-        for peer in connected {
-            if !state.eager_peers.contains(&peer) {
-                if state.is_peer_suppressed_at(peer, now) {
-                    state.lazy_peers.insert(peer);
-                } else {
-                    state.eager_peers.insert(peer);
-                }
-            }
+        let (pruned, grafted) = state.maintain_degree_at(now);
+        if pruned > 0 {
+            self.stage_stats.record_prunes(pruned);
+        }
+        if grafted > 0 {
+            self.stage_stats.record_grafts(grafted);
         }
 
         debug!(
@@ -4482,6 +4799,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stage_stats_include_peer_score_components_for_cooled_peer() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([59u8; 32]);
+        let slow_peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![slow_peer]).await;
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![slow_peer])
+                .await;
+        }
+
+        let stats = pubsub.stage_stats();
+        let score = stats
+            .peer_scores
+            .iter()
+            .find(|score| {
+                score.peer_id == slow_peer.to_string() && score.topic == topic.to_string()
+            })
+            .expect("cooled peer should have peer-score diagnostics");
+
+        assert_eq!(score.role, "cooled");
+        assert!(
+            score.outbound_send_timeouts >= (PEER_TIMEOUT_THRESHOLD as f64 - 0.01),
+            "timeout component should explain low score: {score:?}"
+        );
+        assert!(
+            score.cooling_events >= 0.99,
+            "cooling component should explain low score: {score:?}"
+        );
+        assert!(
+            score.score < PEER_SCORE_EAGER_MIN,
+            "cooled peer should be below eager eligibility threshold: {score:?}"
+        );
+        assert!(
+            !score.eager_eligible,
+            "cooled peer should not be marked eager eligible"
+        );
+    }
+
+    #[tokio::test]
     async fn test_single_peer_bounded_sends_record_cooling_and_skip_suppressed_peer() {
         let peer_id = test_peer_id(1);
         let (transport, mut started_rx) = BlockingTransport::new(peer_id);
@@ -4929,6 +5294,12 @@ mod tests {
             .claim_send_attempt_at(peer, after_cooldown)
             .expect("expired cooling should admit one recovery probe");
         assert_eq!(old_attempt.kind, SendAttemptKind::RecoveryProbe);
+        let score_before_stale = state
+            .peer_scores
+            .get(&peer)
+            .expect("peer score exists")
+            .components_at(after_cooldown)
+            .outbound_send_timeouts;
 
         state.peer_cooling.remove(&peer);
         assert!(
@@ -4940,6 +5311,16 @@ mod tests {
         assert!(
             !state.peer_cooling.contains_key(&peer),
             "stale recovery timeout must leave removed peer absent"
+        );
+        let score_after_stale = state
+            .peer_scores
+            .get(&peer)
+            .expect("peer score remains")
+            .components_at(after_cooldown)
+            .outbound_send_timeouts;
+        assert_eq!(
+            score_after_stale, score_before_stale,
+            "stale recovery timeout must not add score penalties"
         );
 
         let later = after_cooldown + PEER_TIMEOUT_WINDOW + Duration::from_millis(1);
@@ -6113,6 +6494,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_peer_score_outbound_timeouts_and_cooling_lower_score() {
+        let now = Instant::now();
+        let mut score = PeerScore::new_at(now);
+        let base = score.score_at(now);
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            score.record_outbound_send_timeout_at(now);
+        }
+        score.record_cooling_event_at(now);
+
+        let degraded = score.score_at(now);
+        assert!(
+            degraded < PEER_SCORE_EAGER_MIN,
+            "send-side timeout pressure should make peer ineligible for EAGER promotion, got {degraded}"
+        );
+        assert!(
+            degraded < base * 0.7,
+            "send-side timeout pressure should materially lower score: base={base}, degraded={degraded}"
+        );
+    }
+
+    #[test]
+    fn test_peer_score_recovery_success_recovers_gradually() {
+        let now = Instant::now();
+        let mut score = PeerScore::new_at(now);
+        let base = score.score_at(now);
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            score.record_outbound_send_timeout_at(now);
+        }
+        score.record_cooling_event_at(now);
+        let degraded = score.score_at(now);
+
+        score.record_recovery_probe_at(now);
+        score.record_outbound_send_success_at(now, SendAttemptKind::RecoveryProbe);
+
+        let recovered = score.score_at(now);
+        assert!(
+            recovered > degraded,
+            "successful recovery probe should improve score: degraded={degraded}, recovered={recovered}"
+        );
+        assert!(
+            recovered < base,
+            "recovery should be gradual while timeout evidence remains: base={base}, recovered={recovered}"
+        );
+    }
+
+    #[test]
+    fn test_peer_score_send_health_evidence_decays() {
+        let now = Instant::now();
+        let mut score = PeerScore::new_at(now);
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            score.record_outbound_send_timeout_at(now);
+        }
+        score.record_cooling_event_at(now);
+
+        let degraded = score.components_at(now).send_health;
+        let future = now + Duration::from_secs(PEER_SCORE_DECAY_HALF_LIFE.as_secs() * 6);
+        let decayed = score.components_at(future).send_health;
+        assert!(
+            decayed > degraded,
+            "old send-health penalties should decay: degraded_health={degraded}, decayed_health={decayed}"
+        );
+    }
+
+    #[test]
+    fn test_peer_score_cleanup_retains_active_send_side_evidence() {
+        let mut state = TopicState::new();
+        let now = Instant::now();
+        let peer = test_peer_id(22);
+
+        let Some(stale_seen) = now.checked_sub(PEER_SCORE_RETENTION + Duration::from_secs(1))
+        else {
+            return;
+        };
+        let mut score = PeerScore::new_at(stale_seen);
+        score.last_seen = stale_seen;
+        score.record_outbound_send_timeout_at(now);
+        state.peer_scores.insert(peer, score);
+
+        state.clean_cache();
+        assert!(
+            state.peer_scores.contains_key(&peer),
+            "fresh send-side health evidence should keep a stale inbound score alive"
+        );
+    }
+
     #[tokio::test]
     async fn test_eager_records_delivery_score() {
         let peer_id = test_peer_id(1);
@@ -6291,6 +6760,101 @@ mod tests {
     }
 
     #[test]
+    fn test_score_based_promotion_avoids_low_score_when_alternatives_exist() {
+        let mut state = TopicState::new();
+        let now = Instant::now();
+
+        let mut healthy_peers = Vec::new();
+        for i in 0..MIN_EAGER_DEGREE {
+            let peer = test_peer_id(i as u8 + 30);
+            healthy_peers.push(peer);
+            state.lazy_peers.insert(peer);
+
+            let mut score = PeerScore::new_at(now);
+            score.record_delivery();
+            state.peer_scores.insert(peer, score);
+        }
+
+        let slow_a = test_peer_id(90);
+        let slow_b = test_peer_id(91);
+        for peer in [slow_a, slow_b] {
+            state.lazy_peers.insert(peer);
+            let mut score = PeerScore::new_at(now);
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                score.record_outbound_send_timeout_at(now);
+            }
+            score.record_cooling_event_at(now);
+            state.peer_scores.insert(peer, score);
+        }
+
+        let (pruned, grafted) = state.maintain_degree_at(now);
+        assert_eq!(pruned, 0);
+        assert_eq!(grafted, MIN_EAGER_DEGREE);
+        for peer in healthy_peers {
+            assert!(
+                state.eager_peers.contains(&peer),
+                "healthy peer should be promoted"
+            );
+        }
+        assert!(
+            state.lazy_peers.contains(&slow_a) && state.lazy_peers.contains(&slow_b),
+            "low-score peers should remain LAZY while healthy alternatives exist"
+        );
+    }
+
+    #[test]
+    fn test_score_based_promotion_backfills_low_score_when_healthy_insufficient() {
+        let mut state = TopicState::new();
+        let now = Instant::now();
+
+        let mut healthy_peers = Vec::new();
+        for i in 0..(MIN_EAGER_DEGREE - 2) {
+            let peer = test_peer_id(i as u8 + 40);
+            healthy_peers.push(peer);
+            state.lazy_peers.insert(peer);
+
+            let mut score = PeerScore::new_at(now);
+            score.record_delivery();
+            state.peer_scores.insert(peer, score);
+        }
+
+        let mut slow_peers = Vec::new();
+        for i in 0..10 {
+            let peer = test_peer_id(i as u8 + 70);
+            slow_peers.push(peer);
+            state.lazy_peers.insert(peer);
+
+            let mut score = PeerScore::new_at(now);
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                score.record_outbound_send_timeout_at(now);
+            }
+            score.record_cooling_event_at(now);
+            state.peer_scores.insert(peer, score);
+        }
+
+        let (pruned, grafted) = state.maintain_degree_at(now);
+        assert_eq!(pruned, 0);
+        assert_eq!(
+            grafted, MIN_EAGER_DEGREE,
+            "mesh should still fill to the minimum degree when healthy candidates are insufficient"
+        );
+        for peer in healthy_peers {
+            assert!(
+                state.eager_peers.contains(&peer),
+                "healthy peer should be promoted first"
+            );
+        }
+        let slow_promoted = slow_peers
+            .iter()
+            .filter(|peer| state.eager_peers.contains(peer))
+            .count();
+        assert_eq!(
+            slow_promoted, 2,
+            "only the low-score peers required to fill MIN_EAGER_DEGREE should be backfilled"
+        );
+    }
+
+    #[test]
     fn test_score_based_demotion_lowest_first() {
         // Create too many eager peers with different scores using IWANT response rates
         // which create a continuous gradient (unlike messages_delivered which is binary).
@@ -6357,7 +6921,8 @@ mod tests {
         // Use checked_sub because on some platforms (Windows CI) the
         // monotonic clock epoch may be too recent for a 700s subtraction.
         let mut stale_score = PeerScore::new();
-        let Some(past) = Instant::now().checked_sub(Duration::from_secs(700)) else {
+        let Some(past) = Instant::now().checked_sub(PEER_SCORE_RETENTION + Duration::from_secs(1))
+        else {
             // Platform doesn't have enough headroom — skip test gracefully
             return;
         };
@@ -6487,6 +7052,55 @@ mod tests {
         assert!(
             !state.lazy_peers.contains(&peer_b),
             "Promoted peer should no longer be in lazy set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_topic_peers_does_not_bulk_promote_low_score_lazy_peer() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([1u8; 32]);
+        let slow_peer = test_peer_id(90);
+
+        let mut connected = Vec::new();
+        {
+            let now = Instant::now();
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+
+            for i in 0..MIN_EAGER_DEGREE {
+                let peer = test_peer_id(i as u8 + 20);
+                connected.push(peer);
+                state.eager_peers.insert(peer);
+
+                let mut score = PeerScore::new_at(now);
+                score.record_delivery();
+                state.peer_scores.insert(peer, score);
+            }
+
+            connected.push(slow_peer);
+            state.lazy_peers.insert(slow_peer);
+            let mut slow_score = PeerScore::new_at(now);
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                slow_score.record_outbound_send_timeout_at(now);
+            }
+            slow_score.record_cooling_event_at(now);
+            state.peer_scores.insert(slow_peer, slow_score);
+        }
+
+        pubsub.set_topic_peers(topic, connected).await;
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert!(
+            state.lazy_peers.contains(&slow_peer),
+            "membership refresh should not bypass score-aware EAGER selection"
+        );
+        assert!(
+            !state.eager_peers.contains(&slow_peer),
+            "low-score lazy peer should not be bulk-promoted by refresh"
         );
     }
 

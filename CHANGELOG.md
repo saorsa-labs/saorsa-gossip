@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.29] - 2026-05-03
+
+### Added
+
+- PubSub peer-score diagnostics now include per-topic score components for
+  EAGER/LAZY/cooled peers, including decayed send successes, timeouts, cooling
+  events, recovery probes, and recovery successes.
+
+### Changed
+
+- PlumTree mesh selection now folds send-side health into peer scores so
+  outbound timeouts and cooling events reduce future EAGER eligibility, while
+  successful recovery sends rebuild trust gradually.
+- Topic peer refresh now uses the same score-aware degree maintenance as the
+  background maintainer instead of bulk-promoting connected LAZY peers.
+
+### Fixed
+
+- Score cleanup now retains fresh send-side evidence for the full cooling/backoff
+  horizon, preventing long-backoff peers from looking freshly healthy too early.
+
+### Compatibility
+
+- `PubSubStageStatsSnapshot` has a new public `peer_scores` field. Consumers
+  that construct this diagnostic snapshot directly with a struct literal may
+  need to add the field; serde/JSON consumers remain additive-compatible.
+
 ## [0.5.28] - 2026-05-03
 
 ### Added

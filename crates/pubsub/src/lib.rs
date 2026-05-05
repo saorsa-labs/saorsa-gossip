@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time;
@@ -114,6 +114,15 @@ const PEER_SCORE_SEND_MIN_FACTOR: f64 = 0.35;
 
 /// Retain score evidence long enough to cover maximum cooling backoff plus decay.
 const PEER_SCORE_RETENTION: Duration = Duration::from_secs(2_400);
+
+/// Fastest adaptive cleanup pass for expired suppression diagnostics/state.
+const SUPPRESSION_CLEANUP_MIN_INTERVAL_MS: u64 = 10_000;
+
+/// Normal adaptive cleanup pass for stable suppression state.
+const SUPPRESSION_CLEANUP_NORMAL_INTERVAL_MS: u64 = 60_000;
+
+/// Slowest adaptive cleanup pass when suppression state is empty or shrinking.
+const SUPPRESSION_CLEANUP_MAX_INTERVAL_MS: u64 = 120_000;
 
 /// Minimum interval between score-driven eager-peer replacement passes.
 const OPPORTUNISTIC_GRAFT_INTERVAL: Duration = Duration::from_secs(60);
@@ -288,6 +297,26 @@ pub struct PubSubStageStats {
     /// spawned, and the peer/topic receives timeout pressure for cooling.
     outbound_budget_exhausted: AtomicU64,
     suppressed_peers: Mutex<HashMap<SuppressedPeerKey, SuppressedPeerState>>,
+    suppression_cleanup: SuppressionCleanupStats,
+}
+
+#[derive(Debug)]
+struct SuppressionCleanupStats {
+    current_interval_ms: AtomicU64,
+    growth_rate_bits: AtomicU64,
+    current_entries: AtomicU64,
+    last_removed: AtomicU64,
+}
+
+impl Default for SuppressionCleanupStats {
+    fn default() -> Self {
+        Self {
+            current_interval_ms: AtomicU64::new(SUPPRESSION_CLEANUP_NORMAL_INTERVAL_MS),
+            growth_rate_bits: AtomicU64::new(0),
+            current_entries: AtomicU64::new(0),
+            last_removed: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -387,6 +416,14 @@ pub struct PubSubStageStatsSnapshot {
     pub outbound_budget_exhausted: u64,
     /// Peers currently cooled after repeated send-side timeouts.
     pub suppressed_peers: Vec<SuppressedPeerSnapshot>,
+    /// Current adaptive cleanup interval for expired suppression state.
+    pub suppression_cleanup_interval_ms: u64,
+    /// Latest observed suppression-entry growth rate.
+    pub suppression_cleanup_growth_rate_per_sec: f64,
+    /// Current total suppression entries observed by the cleanup supervisor.
+    pub suppression_cleanup_entries: u64,
+    /// Number of expired suppression entries removed in the last cleanup pass.
+    pub suppression_cleanup_last_removed: u64,
     /// Per-topic peer-score components used for PlumTree mesh selection.
     pub peer_scores: Vec<PeerScoreSnapshot>,
 }
@@ -837,8 +874,46 @@ impl PubSubStageStats {
             republish_per_peer_timeout: self.republish_per_peer_timeout.load(Ordering::Relaxed),
             outbound_budget_exhausted: self.outbound_budget_exhausted.load(Ordering::Relaxed),
             suppressed_peers: self.suppressed_peer_snapshots(),
+            suppression_cleanup_interval_ms: self
+                .suppression_cleanup
+                .current_interval_ms
+                .load(Ordering::Relaxed),
+            suppression_cleanup_growth_rate_per_sec: f64::from_bits(
+                self.suppression_cleanup
+                    .growth_rate_bits
+                    .load(Ordering::Relaxed),
+            ),
+            suppression_cleanup_entries: self
+                .suppression_cleanup
+                .current_entries
+                .load(Ordering::Relaxed),
+            suppression_cleanup_last_removed: self
+                .suppression_cleanup
+                .last_removed
+                .load(Ordering::Relaxed),
             peer_scores: Vec::new(),
         }
+    }
+
+    fn record_suppression_cleanup(
+        &self,
+        interval: Duration,
+        growth_rate_per_sec: f64,
+        current_entries: usize,
+        removed: usize,
+    ) {
+        self.suppression_cleanup
+            .current_interval_ms
+            .store(duration_millis_u64(interval), Ordering::Relaxed);
+        self.suppression_cleanup
+            .growth_rate_bits
+            .store(growth_rate_per_sec.to_bits(), Ordering::Relaxed);
+        self.suppression_cleanup
+            .current_entries
+            .store(current_entries as u64, Ordering::Relaxed);
+        self.suppression_cleanup
+            .last_removed
+            .store(removed as u64, Ordering::Relaxed);
     }
 
     fn record_per_peer_timeout(&self) {
@@ -891,14 +966,18 @@ impl PubSubStageStats {
         );
     }
 
-    fn clear_peer_suppression(&self, topic: TopicId, peer: PeerId) {
+    fn clear_peer_suppression(&self, topic: TopicId, peer: PeerId) -> bool {
         let mut guard = self.suppressed_peers_guard();
-        guard.remove(&SuppressedPeerKey { topic, peer });
+        guard.remove(&SuppressedPeerKey { topic, peer }).is_some()
     }
 
     fn clear_topic_suppressions(&self, topic: TopicId) {
         let mut guard = self.suppressed_peers_guard();
         guard.retain(|key, _| key.topic != topic);
+    }
+
+    fn suppressed_peer_count(&self) -> usize {
+        self.suppressed_peers_guard().len()
     }
 
     fn record_message_kind(&self, kind: MessageKind) {
@@ -1958,6 +2037,59 @@ fn clean_and_reap_topic_ids(
     idle
 }
 
+#[cfg(test)]
+fn count_peer_cooling_entries(topics: &HashMap<TopicId, TopicState>) -> usize {
+    topics.values().map(|state| state.peer_cooling.len()).sum()
+}
+
+fn clean_expired_peer_cooling(
+    topics: &mut HashMap<TopicId, TopicState>,
+    stage_stats: &PubSubStageStats,
+    now: Instant,
+) -> usize {
+    let mut removed = 0;
+    for (topic, state) in topics.iter_mut() {
+        let topic = *topic;
+        let expired: Vec<PeerId> = state
+            .peer_cooling
+            .iter()
+            .filter_map(|(peer, cooling)| {
+                let expired =
+                    cooling.suppression_expired_at(now) && !cooling.recovery_probe_in_flight;
+                expired.then_some(*peer)
+            })
+            .collect();
+        for peer in expired {
+            if stage_stats.clear_peer_suppression(topic, peer) {
+                removed += 1;
+            }
+            if !state.eager_peers.contains(&peer) && !state.lazy_peers.contains(&peer) {
+                state.peer_cooling.remove(&peer);
+            }
+        }
+    }
+    removed
+}
+
+fn next_suppression_cleanup_interval(
+    previous_len: usize,
+    current_len: usize,
+    previous_interval: Duration,
+) -> Duration {
+    let previous_ms = duration_millis_u64(previous_interval);
+    let next_ms = if current_len == 0 || current_len < previous_len {
+        previous_ms.saturating_mul(2)
+    } else if current_len > previous_len {
+        previous_ms / 2
+    } else {
+        previous_ms
+    };
+    Duration::from_millis(next_ms.clamp(
+        SUPPRESSION_CLEANUP_MIN_INTERVAL_MS,
+        SUPPRESSION_CLEANUP_MAX_INTERVAL_MS,
+    ))
+}
+
 /// Pub/sub trait for message dissemination
 #[async_trait::async_trait]
 pub trait PubSub: Send + Sync {
@@ -2016,6 +2148,13 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     signing_key: Arc<saorsa_gossip_identity::MlDsaKeyPair>,
     /// Low-overhead timing counters for inbound PubSub processing stages.
     stage_stats: Arc<PubSubStageStats>,
+    /// Last complete peer-score diagnostics snapshot.
+    ///
+    /// Diagnostics readers use `topics.try_read()` so they never block the
+    /// PubSub hot path. If a membership refresh or cache cleanup currently
+    /// holds the topic write lock, readers fall back to this copy-on-write
+    /// snapshot instead of observing an empty peer-score table.
+    peer_score_snapshot: Arc<StdRwLock<Arc<Vec<PeerScoreSnapshot>>>>,
     /// Global per-peer outbound PubSub budgets shared by all topics and send classes.
     outbound_budgets: Arc<PeerOutboundBudgets>,
 }
@@ -2048,6 +2187,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             transport,
             signing_key: Arc::new(signing_key),
             stage_stats: Arc::new(PubSubStageStats::default()),
+            peer_score_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
             outbound_budgets: Arc::new(PeerOutboundBudgets::default()),
         };
 
@@ -2070,10 +2210,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     fn peer_score_snapshots(&self) -> Vec<PeerScoreSnapshot> {
         let Ok(topics) = self.topics.try_read() else {
-            return Vec::new();
+            return self.cached_peer_score_snapshots();
         };
 
-        let now = Instant::now();
+        let snapshots = Self::build_peer_score_snapshots(&topics, Instant::now());
+        self.store_peer_score_snapshots(snapshots)
+    }
+
+    fn build_peer_score_snapshots(
+        topics: &HashMap<TopicId, TopicState>,
+        now: Instant,
+    ) -> Vec<PeerScoreSnapshot> {
         let mut snapshots = Vec::new();
         for (topic, state) in topics.iter() {
             snapshots.extend(state.peer_score_snapshots(*topic, now));
@@ -2084,6 +2231,32 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 .then_with(|| a.topic.cmp(&b.topic))
         });
         snapshots
+    }
+
+    fn cached_peer_score_snapshots(&self) -> Vec<PeerScoreSnapshot> {
+        match self.peer_score_snapshot.read() {
+            Ok(snapshot) => snapshot.as_ref().clone(),
+            Err(e) => {
+                error!("peer-score diagnostics snapshot cache poisoned: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    fn store_peer_score_snapshots(
+        &self,
+        snapshots: Vec<PeerScoreSnapshot>,
+    ) -> Vec<PeerScoreSnapshot> {
+        let shared = Arc::new(snapshots);
+        match self.peer_score_snapshot.write() {
+            Ok(mut cached) => {
+                *cached = Arc::clone(&shared);
+            }
+            Err(e) => {
+                error!("peer-score diagnostics snapshot cache poisoned: {e}");
+            }
+        }
+        shared.as_ref().clone()
     }
 
     fn record_stage(&self, stage: PubSubStage, started: Instant) {
@@ -3360,18 +3533,53 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let topic_idle_ttl = Duration::from_secs(TOPIC_IDLE_TTL_SECS);
 
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(60));
+            let mut cleanup_interval =
+                Duration::from_millis(SUPPRESSION_CLEANUP_NORMAL_INTERVAL_MS);
+            let mut previous_suppression_len = 0_usize;
+            let mut previous_cleanup = Instant::now();
 
             loop {
-                interval.tick().await;
+                time::sleep(cleanup_interval).await;
 
                 let mut topics_guard = topics.write().await;
+                let before_suppression_len = stage_stats.suppressed_peer_count();
+                let removed_suppressions =
+                    clean_expired_peer_cooling(&mut topics_guard, &stage_stats, Instant::now());
                 let idle_topics = clean_and_reap_topic_ids(&mut topics_guard, topic_idle_ttl);
                 let idle_count = idle_topics.len();
+                let after_suppression_len = stage_stats.suppressed_peer_count();
                 drop(topics_guard);
+
                 for topic in idle_topics {
                     stage_stats.clear_topic_suppressions(topic);
                 }
+                let now = Instant::now();
+                let elapsed = now
+                    .saturating_duration_since(previous_cleanup)
+                    .max(Duration::from_millis(1));
+                let growth_rate = (after_suppression_len as f64 - previous_suppression_len as f64)
+                    / elapsed.as_secs_f64();
+                cleanup_interval = next_suppression_cleanup_interval(
+                    previous_suppression_len,
+                    after_suppression_len,
+                    cleanup_interval,
+                );
+                previous_cleanup = now;
+                previous_suppression_len = after_suppression_len;
+                stage_stats.record_suppression_cleanup(
+                    cleanup_interval,
+                    growth_rate,
+                    after_suppression_len,
+                    removed_suppressions,
+                );
+                debug!(
+                    before = before_suppression_len,
+                    after = after_suppression_len,
+                    removed = removed_suppressions,
+                    growth_rate_per_sec = growth_rate,
+                    next_interval_ms = duration_millis_u64(cleanup_interval),
+                    "Adaptive PubSub suppression cleanup pass"
+                );
                 if idle_count > 0 {
                     let remaining = topics.read().await.len();
                     debug!(
@@ -3627,6 +3835,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// Peers that were previously moved to `lazy_peers` via PRUNE are left
     /// in lazy if they are still connected; otherwise they are removed.
     pub async fn set_topic_peers(&self, topic: TopicId, connected: Vec<PeerId>) {
+        let rebuild_started = Instant::now();
+        debug!(
+            topic = ?topic,
+            connected = connected.len(),
+            "PubSub peer score rebuild start"
+        );
         let mut topics = self.topics.write().await;
         let state = topics.entry(topic).or_insert_with(TopicState::new);
 
@@ -3658,8 +3872,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         debug!(
             topic = ?topic,
+            duration_ms = rebuild_started.elapsed().as_millis() as u64,
             eager = state.eager_peers.len(),
             lazy = state.lazy_peers.len(),
+            peer_scores = state.peer_scores.len(),
+            pruned,
+            grafted,
             "Set topic peers"
         );
     }
@@ -7117,6 +7335,120 @@ mod tests {
             !state.peer_scores.contains_key(&stale_peer),
             "Stale peer score should be cleaned up"
         );
+    }
+
+    #[tokio::test]
+    async fn peer_scores_rebuild_atomicity_uses_cached_snapshot_while_topics_locked() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            transport,
+            signing_key,
+            false,
+        ));
+        let topic = TopicId::new([42u8; 32]);
+        let scored_peer = test_peer_id(42);
+
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(scored_peer);
+            let mut score = PeerScore::new_at(Instant::now());
+            score.record_delivery();
+            state.peer_scores.insert(scored_peer, score);
+        }
+
+        let warm_snapshot = pubsub.stage_stats();
+        assert!(
+            !warm_snapshot.peer_scores.is_empty(),
+            "warm diagnostics snapshot should contain the seeded peer"
+        );
+
+        let topics_write_guard = pubsub.topics.write().await;
+        let mut readers = Vec::new();
+        for _ in 0..16 {
+            let pubsub = Arc::clone(&pubsub);
+            readers.push(tokio::spawn(async move {
+                pubsub.stage_stats().peer_scores.len()
+            }));
+        }
+
+        for reader in readers {
+            assert!(
+                reader.await.unwrap() > 0,
+                "readers should fall back to cached peer_scores while topics are locked"
+            );
+        }
+        drop(topics_write_guard);
+
+        pubsub.set_topic_peers(topic, vec![scored_peer]).await;
+        assert!(
+            !pubsub.stage_stats().peer_scores.is_empty(),
+            "peer_scores should remain populated after membership refresh"
+        );
+    }
+
+    #[test]
+    fn cooling_cleanup_adaptive_interval_shortens_and_lengthens() {
+        let normal = Duration::from_millis(SUPPRESSION_CLEANUP_NORMAL_INTERVAL_MS);
+        let fast = next_suppression_cleanup_interval(0, 10, normal);
+        assert_eq!(fast, Duration::from_millis(30_000));
+
+        let min = next_suppression_cleanup_interval(
+            10,
+            20,
+            Duration::from_millis(SUPPRESSION_CLEANUP_MIN_INTERVAL_MS),
+        );
+        assert_eq!(
+            min,
+            Duration::from_millis(SUPPRESSION_CLEANUP_MIN_INTERVAL_MS)
+        );
+
+        let slow = next_suppression_cleanup_interval(20, 10, normal);
+        assert_eq!(
+            slow,
+            Duration::from_millis(SUPPRESSION_CLEANUP_MAX_INTERVAL_MS)
+        );
+    }
+
+    #[test]
+    fn cooling_cleanup_adaptive_removes_expired_excluded_suppression() {
+        let topic = TopicId::new([55u8; 32]);
+        let peer = test_peer_id(55);
+        let now = Instant::now();
+        let mut topics = HashMap::new();
+        let mut state = TopicState::new();
+        state.peer_cooling.insert(
+            peer,
+            PeerCoolingState {
+                timeout_window_started: now,
+                timeout_count: 0,
+                suppressed_until: Some(now),
+                cooldown: PEER_SUPPRESSION_COOLDOWN,
+                last_suppression_timeout_count: PEER_TIMEOUT_THRESHOLD,
+                recovery_probe_in_flight: false,
+                recovery_probe_id: None,
+            },
+        );
+        topics.insert(topic, state);
+
+        let stats = PubSubStageStats::default();
+        stats.record_peer_suppressed(
+            topic,
+            peer,
+            now,
+            PEER_TIMEOUT_THRESHOLD,
+            PEER_SUPPRESSION_COOLDOWN,
+        );
+        assert_eq!(stats.suppressed_peer_snapshots().len(), 1);
+
+        let removed = clean_expired_peer_cooling(&mut topics, &stats, now);
+
+        assert_eq!(removed, 1);
+        assert_eq!(count_peer_cooling_entries(&topics), 0);
+        assert!(stats.suppressed_peer_snapshots().is_empty());
     }
 
     #[tokio::test]

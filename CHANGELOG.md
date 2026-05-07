@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.35] - 2026-05-07
+
+Workspace lockstep bump consuming ant-quic 0.27.11 (X0X-0036 part 2 —
+ACK-v2 priority + per-stage diagnostics + 500 ms receiver-side bounded
+response write timeout). No source changes in saorsa-gossip itself.
+
+### Changed
+
+- **`Cargo.toml`** workspace dependency: `ant-quic = "0.27.10"` → `"0.27.11"`.
+- **Workspace version**: 0.5.34 → 0.5.35 across every crate.
+
+### Verified
+
+- `cargo fmt --all -- --check` clean.
+- `cargo clippy --all-features --all-targets -- -D warnings` clean.
+- `cargo test --all-features --workspace --lib` — full workspace passes.
+
 ## [0.5.34] - 2026-05-07
 
 Workspace lockstep bump consuming ant-quic 0.27.10 (X0X-0036 part 1 —

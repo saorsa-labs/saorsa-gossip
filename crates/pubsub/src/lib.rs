@@ -1230,10 +1230,6 @@ impl PeerScore {
         self.last_seen = Instant::now();
     }
 
-    fn record_seen_at(&mut self, now: Instant) {
-        self.last_seen = self.last_seen.max(now);
-    }
-
     /// Record that we sent an IWANT request to this peer
     fn record_iwant_request(&mut self) {
         self.iwant_requests += 1;
@@ -1542,14 +1538,6 @@ impl TopicState {
         self.peer_cooling
             .get(&peer)
             .is_none_or(|state| state.can_graft_at(now))
-    }
-
-    fn record_inbound_peer_activity_at(&mut self, peer: PeerId, now: Instant) -> bool {
-        self.peer_scores
-            .entry(peer)
-            .or_insert_with(|| PeerScore::new_at(now))
-            .record_seen_at(now);
-        self.peer_cooling.remove(&peer).is_some()
     }
 
     fn peer_score_at(&self, peer: PeerId, now: Instant) -> f64 {
@@ -2275,51 +2263,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         self.stage_stats.record(stage, started.elapsed());
     }
 
-    fn record_inbound_peer_activity_for_state(
-        stage_stats: &PubSubStageStats,
-        topic: TopicId,
-        peer: PeerId,
-        state: &mut TopicState,
-        now: Instant,
-        kind: MessageKind,
-    ) {
-        if state.record_inbound_peer_activity_at(peer, now) {
-            stage_stats.clear_peer_suppression(topic, peer);
-            debug!(
-                peer_id = %peer,
-                topic = ?topic,
-                msg_kind = ?kind,
-                "Peer cooling cleared after inbound PubSub activity"
-            );
-        }
-    }
-
-    /// Reset per-topic cooling state for `peer` on receipt of any inbound
-    /// frame, regardless of pubsub message kind.
-    ///
-    /// This mirrors the iroh relay-actor pattern (X0X-0040): the cooling
-    /// counter resets on the first inbound frame from a peer, not on a
-    /// recovery probe outcome. Already-routed pubsub kinds
-    /// (`Eager`/`IHave`/`IWant`/`AntiEntropy`) reset cooling inside their
-    /// dedicated handlers; this helper exists to cover non-pubsub frames
-    /// (e.g. presence beacons, SWIM `Ping`/`Ack`, FOAF `Find`,
-    /// HyParView `Shuffle`) that the dispatcher otherwise drops without
-    /// observing peer liveness. The operation is idempotent: re-recording
-    /// for an already-cleared peer is a no-op against `peer_cooling`.
-    async fn record_inbound_from_peer(&self, topic: TopicId, peer: PeerId, kind: MessageKind) {
-        let mut topics = self.topics.write().await;
-        let state = topics.entry(topic).or_insert_with(TopicState::new);
-        state.touch();
-        Self::record_inbound_peer_activity_for_state(
-            self.stage_stats.as_ref(),
-            topic,
-            peer,
-            state,
-            Instant::now(),
-            kind,
-        );
-    }
-
     async fn send_to_peer_with_timeout(
         transport: Arc<T>,
         stage_stats: Arc<PubSubStageStats>,
@@ -2859,14 +2802,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let dedupe_started = Instant::now();
         let state = topics.entry(topic).or_insert_with(TopicState::new);
         state.touch();
-        Self::record_inbound_peer_activity_for_state(
-            self.stage_stats.as_ref(),
-            topic,
-            from,
-            state,
-            Instant::now(),
-            message.header.kind,
-        );
 
         // Check for duplicate
         if state.has_message(&msg_id) {
@@ -2995,14 +2930,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let dedupe_started = Instant::now();
         let state = topics.entry(topic).or_insert_with(TopicState::new);
         state.touch();
-        Self::record_inbound_peer_activity_for_state(
-            self.stage_stats.as_ref(),
-            topic,
-            from,
-            state,
-            Instant::now(),
-            MessageKind::IHave,
-        );
 
         let mut requested = Vec::new();
 
@@ -3090,14 +3017,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let dedupe_started = Instant::now();
         let state = topics.entry(topic).or_insert_with(TopicState::new);
         state.touch();
-        Self::record_inbound_peer_activity_for_state(
-            self.stage_stats.as_ref(),
-            topic,
-            from,
-            state,
-            Instant::now(),
-            MessageKind::IWant,
-        );
 
         let mut to_send = Vec::new();
         let mut requester_has_cached_message = false;
@@ -3213,14 +3132,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let dedupe_started = Instant::now();
                 let state = topics.entry(topic).or_insert_with(TopicState::new);
                 state.touch();
-                Self::record_inbound_peer_activity_for_state(
-                    self.stage_stats.as_ref(),
-                    topic,
-                    from,
-                    state,
-                    Instant::now(),
-                    MessageKind::AntiEntropy,
-                );
 
                 let our_ids: HashSet<MessageIdType> =
                     state.cached_message_ids().into_iter().collect();
@@ -3325,14 +3236,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let ids_to_request: Vec<MessageIdType> = if let Some(state) = topics.get_mut(&topic)
                 {
                     state.touch();
-                    Self::record_inbound_peer_activity_for_state(
-                        self.stage_stats.as_ref(),
-                        topic,
-                        from,
-                        state,
-                        Instant::now(),
-                        MessageKind::AntiEntropy,
-                    );
                     missing_ids
                         .into_iter()
                         .filter(|id| !state.has_message(id))
@@ -4096,21 +3999,11 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
                 }
             }
             MessageKind::AntiEntropy => self.handle_anti_entropy(from, topic_id, message).await,
-            // Other message kinds (Ping, Ack, Find, Presence, Shuffle) are not
-            // routed by PubSub, but X0X-0040 requires per-peer cooling state
-            // to reset on the first inbound frame regardless of kind. Record
-            // inbound activity for the (topic, peer) pair before ignoring the
-            // payload — this covers presence beacons in particular, which
-            // arrive on the bulk gossip stream and otherwise bypass cooling
-            // resets.
+            // Other message kinds (Ping, Ack, Find, Presence, Shuffle) are not handled by PubSub
             _ => {
-                self.record_inbound_from_peer(topic_id, from, msg_kind)
-                    .await;
-                debug!(
-                    msg_kind = ?msg_kind,
-                    peer_id = %from,
-                    topic = ?topic_id,
-                    "PubSub received non-pubsub message kind; cooling reset, payload ignored"
+                warn!(
+                    "PubSub received non-pubsub message kind {:?}, ignoring",
+                    msg_kind
                 );
                 Ok(())
             }
@@ -5636,166 +5529,6 @@ mod tests {
         assert_eq!(grafted, 1, "cleared peer can be grafted again");
         assert!(state.eager_peers.contains(&peer));
         assert!(!state.is_peer_suppressed_at(peer, after_cooldown));
-    }
-
-    #[test]
-    fn test_inbound_activity_clears_peer_cooling_without_immediate_graft() {
-        let mut state = TopicState::new();
-        let peer = test_peer_id(2);
-        state.eager_peers.insert(peer);
-
-        let now = Instant::now();
-        for _ in 0..PEER_TIMEOUT_THRESHOLD {
-            let _ = state.record_send_timeout_at(normal_send_attempt(peer), now);
-        }
-
-        assert!(state.is_peer_suppressed_at(peer, now));
-        assert!(state.lazy_peers.contains(&peer));
-        assert!(!state.eager_peers.contains(&peer));
-
-        let inbound_at = now + Duration::from_millis(1);
-        assert!(
-            state.record_inbound_peer_activity_at(peer, inbound_at),
-            "valid inbound activity should clear cooling immediately"
-        );
-
-        assert!(!state.is_peer_suppressed_at(peer, inbound_at));
-        assert!(
-            state.lazy_peers.contains(&peer),
-            "clearing cooling should leave mesh promotion to degree maintenance"
-        );
-        assert!(
-            !state.eager_peers.contains(&peer),
-            "inbound activity should not bypass EAGER degree policy"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_ihave_inbound_activity_clears_peer_cooling_diagnostic() {
-        let peer_id = test_peer_id(1);
-        let transport = RecordingTransport::new(peer_id);
-        let pubsub = PlumtreePubSub::new_with_task_control(
-            peer_id,
-            Arc::clone(&transport),
-            test_signing_key(),
-            false,
-        );
-        let topic = TopicId::new([60u8; 32]);
-        let cooled_peer = test_peer_id(2);
-        pubsub
-            .initialize_topic_peers(topic, vec![cooled_peer])
-            .await;
-
-        for _ in 0..PEER_TIMEOUT_THRESHOLD {
-            pubsub
-                .record_topic_send_results(topic, Vec::new(), vec![cooled_peer])
-                .await;
-        }
-
-        assert_eq!(
-            pubsub.stage_stats().suppressed_peers.len(),
-            1,
-            "peer should start cooled"
-        );
-
-        let payload: Bytes = postcard::to_stdvec(&vec![[7u8; 32]])
-            .expect("IHAVE IDs serialize")
-            .into();
-        let message = signed_control_message(
-            &test_signing_key(),
-            topic,
-            [8u8; 32],
-            MessageKind::IHave,
-            payload,
-        );
-        let wire: Bytes = postcard::to_stdvec(&message)
-            .expect("IHAVE message serializes")
-            .into();
-
-        pubsub
-            .handle_message(cooled_peer, wire)
-            .await
-            .expect("valid IHAVE should be handled");
-
-        assert!(
-            pubsub.stage_stats().suppressed_peers.is_empty(),
-            "inbound activity should clear suppression diagnostics"
-        );
-
-        let topics = pubsub.topics.read().await;
-        let state = topics.get(&topic).expect("topic exists");
-        assert!(!state.is_peer_suppressed_at(cooled_peer, Instant::now()));
-        assert!(
-            state.lazy_peers.contains(&cooled_peer),
-            "inbound clearing should keep the peer lazy until maintenance promotes it"
-        );
-    }
-
-    /// X0X-0040 — sub-threshold timeouts followed by an inbound frame must
-    /// reset the per-peer cooling counter, so the next round of timeouts
-    /// must not trip suppression prematurely.
-    #[test]
-    fn test_inbound_frame_resets_subthreshold_timeout_counter() {
-        let mut state = TopicState::new();
-        let peer = test_peer_id(2);
-        state.eager_peers.insert(peer);
-
-        let now = Instant::now();
-        // Accumulate 4 timeouts (one short of the threshold of 5).
-        let pre_inbound = PEER_TIMEOUT_THRESHOLD - 1;
-        for _ in 0..pre_inbound {
-            assert!(
-                state
-                    .record_send_timeout_at(normal_send_attempt(peer), now)
-                    .is_none(),
-                "sub-threshold timeouts must not produce a suppression event"
-            );
-        }
-        assert!(
-            !state.is_peer_suppressed_at(peer, now),
-            "peer must not be suppressed below threshold"
-        );
-        let cooling = state
-            .peer_cooling
-            .get(&peer)
-            .expect("peer accumulated cooling state");
-        assert_eq!(cooling.timeout_count, pre_inbound);
-
-        // First inbound frame after sub-threshold timeouts — counter resets.
-        let inbound_at = now + Duration::from_millis(1);
-        assert!(
-            state.record_inbound_peer_activity_at(peer, inbound_at),
-            "inbound activity should clear cooling entry"
-        );
-        assert!(
-            !state.peer_cooling.contains_key(&peer),
-            "cooling entry should be removed after inbound reset"
-        );
-
-        // Now accumulate another (PEER_TIMEOUT_THRESHOLD - 1) timeouts within
-        // the same window. Without the reset, peer would already have hit
-        // threshold (4 + 4 = 8 ≥ 5). With the reset, none of these alone
-        // crosses threshold.
-        for i in 0..pre_inbound {
-            assert!(
-                state
-                    .record_send_timeout_at(normal_send_attempt(peer), inbound_at)
-                    .is_none(),
-                "timeout {i} after reset must remain sub-threshold"
-            );
-        }
-        assert!(
-            !state.is_peer_suppressed_at(peer, inbound_at),
-            "after inbound reset, sub-threshold timeouts must not trip suppression"
-        );
-        let cooling = state
-            .peer_cooling
-            .get(&peer)
-            .expect("post-reset cooling entry should exist after fresh timeouts");
-        assert_eq!(
-            cooling.timeout_count, pre_inbound,
-            "post-reset counter must equal new timeout count, not pre-reset+post-reset sum"
-        );
     }
 
     #[test]

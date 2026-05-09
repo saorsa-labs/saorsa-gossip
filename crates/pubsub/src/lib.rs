@@ -1230,6 +1230,10 @@ impl PeerScore {
         self.last_seen = Instant::now();
     }
 
+    fn record_seen_at(&mut self, now: Instant) {
+        self.last_seen = self.last_seen.max(now);
+    }
+
     /// Record that we sent an IWANT request to this peer
     fn record_iwant_request(&mut self) {
         self.iwant_requests += 1;
@@ -1538,6 +1542,14 @@ impl TopicState {
         self.peer_cooling
             .get(&peer)
             .is_none_or(|state| state.can_graft_at(now))
+    }
+
+    fn record_inbound_peer_activity_at(&mut self, peer: PeerId, now: Instant) -> bool {
+        self.peer_scores
+            .entry(peer)
+            .or_insert_with(|| PeerScore::new_at(now))
+            .record_seen_at(now);
+        self.peer_cooling.remove(&peer).is_some()
     }
 
     fn peer_score_at(&self, peer: PeerId, now: Instant) -> f64 {
@@ -2263,6 +2275,52 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         self.stage_stats.record(stage, started.elapsed());
     }
 
+    fn verify_message_signature(&self, message: &GossipMessage) -> bool {
+        let verify_started = Instant::now();
+        let verified =
+            self.verify_signature(&message.header, &message.signature, &message.public_key);
+        self.record_stage(PubSubStage::Verify, verify_started);
+        verified
+    }
+
+    fn record_inbound_peer_activity_for_state(
+        stage_stats: &PubSubStageStats,
+        topic: TopicId,
+        peer: PeerId,
+        state: &mut TopicState,
+        now: Instant,
+        kind: MessageKind,
+    ) {
+        if state.record_inbound_peer_activity_at(peer, now) {
+            stage_stats.clear_peer_suppression(topic, peer);
+            debug!(
+                peer_id = %peer,
+                topic = ?topic,
+                msg_kind = ?kind,
+                "Peer cooling cleared after verified inbound PubSub activity"
+            );
+        }
+    }
+
+    async fn record_verified_inbound_from_peer(
+        &self,
+        topic: TopicId,
+        peer: PeerId,
+        kind: MessageKind,
+    ) {
+        let mut topics = self.topics.write().await;
+        let state = topics.entry(topic).or_insert_with(TopicState::new);
+        state.touch();
+        Self::record_inbound_peer_activity_for_state(
+            self.stage_stats.as_ref(),
+            topic,
+            peer,
+            state,
+            Instant::now(),
+            kind,
+        );
+    }
+
     async fn send_to_peer_with_timeout(
         transport: Arc<T>,
         stage_stats: Arc<PubSubStageStats>,
@@ -2786,12 +2844,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ) -> Result<()> {
         let msg_id = message.header.msg_id;
 
-        // Verify signature
-        let verify_started = Instant::now();
-        let verified =
-            self.verify_signature(&message.header, &message.signature, &message.public_key);
-        self.record_stage(PubSubStage::Verify, verify_started);
-        if !verified {
+        if !self.verify_message_signature(&message) {
             warn!(peer_id = %from, msg_id = ?msg_id, "Invalid signature, dropping");
             return Err(anyhow!("Invalid signature"));
         }
@@ -2802,6 +2855,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let dedupe_started = Instant::now();
         let state = topics.entry(topic).or_insert_with(TopicState::new);
         state.touch();
+        Self::record_inbound_peer_activity_for_state(
+            self.stage_stats.as_ref(),
+            topic,
+            from,
+            state,
+            Instant::now(),
+            message.header.kind,
+        );
 
         // Check for duplicate
         if state.has_message(&msg_id) {
@@ -3088,15 +3149,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         message: GossipMessage,
     ) -> Result<()> {
-        // Verify signature
-        let verify_started = Instant::now();
-        let verified =
-            self.verify_signature(&message.header, &message.signature, &message.public_key);
-        self.record_stage(PubSubStage::Verify, verify_started);
-        if !verified {
+        if !self.verify_message_signature(&message) {
             warn!(peer_id = %from, "Anti-entropy: invalid signature, dropping");
             return Err(anyhow!("Invalid signature on anti-entropy message"));
         }
+        self.record_verified_inbound_from_peer(topic, from, message.header.kind)
+            .await;
 
         let payload_bytes = message.payload.ok_or_else(|| {
             self.stage_stats.record_decode_failed();
@@ -3959,6 +4017,12 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
         match msg_kind {
             MessageKind::Eager => self.handle_eager(from, topic_id, message).await,
             MessageKind::IHave => {
+                if !self.verify_message_signature(&message) {
+                    warn!(peer_id = %from, "IHAVE: invalid signature, dropping");
+                    return Err(anyhow!("Invalid signature on IHAVE message"));
+                }
+                self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
+                    .await;
                 // IHAVE payload contains Vec<MessageIdType>
                 if let Some(payload) = &message.payload {
                     let decode_started = Instant::now();
@@ -3979,6 +4043,12 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
                 }
             }
             MessageKind::IWant => {
+                if !self.verify_message_signature(&message) {
+                    warn!(peer_id = %from, "IWANT: invalid signature, dropping");
+                    return Err(anyhow!("Invalid signature on IWANT message"));
+                }
+                self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
+                    .await;
                 // IWANT payload contains Vec<MessageIdType>
                 if let Some(payload) = &message.payload {
                     let decode_started = Instant::now();
@@ -4001,6 +4071,16 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
             MessageKind::AntiEntropy => self.handle_anti_entropy(from, topic_id, message).await,
             // Other message kinds (Ping, Ack, Find, Presence, Shuffle) are not handled by PubSub
             _ => {
+                if self.verify_message_signature(&message) {
+                    self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
+                        .await;
+                } else {
+                    warn!(
+                        peer_id = %from,
+                        msg_kind = ?msg_kind,
+                        "PubSub received non-pubsub message kind with invalid signature; cooling not reset"
+                    );
+                }
                 warn!(
                     "PubSub received non-pubsub message kind {:?}, ignoring",
                     msg_kind
@@ -4109,6 +4189,39 @@ mod tests {
             payload: Some(payload),
             signature,
             public_key: signing_key.public_key().to_vec(),
+        }
+    }
+
+    fn unsigned_control_message(
+        topic: TopicId,
+        msg_id: MessageIdType,
+        kind: MessageKind,
+        payload: Bytes,
+    ) -> GossipMessage {
+        GossipMessage {
+            header: MessageHeader {
+                version: 1,
+                topic,
+                msg_id,
+                kind,
+                hop: 0,
+                ttl: 10,
+            },
+            payload: Some(payload),
+            signature: Vec::new(),
+            public_key: Vec::new(),
+        }
+    }
+
+    fn seed_subthreshold_cooling(state: &mut TopicState, peer: PeerId, now: Instant) {
+        state.eager_peers.insert(peer);
+        for _ in 0..(PEER_TIMEOUT_THRESHOLD - 1) {
+            assert!(
+                state
+                    .record_send_timeout_at(normal_send_attempt(peer), now)
+                    .is_none(),
+                "sub-threshold timeouts must not produce a suppression event"
+            );
         }
     }
 
@@ -5446,6 +5559,168 @@ mod tests {
         assert_eq!(suppressed[0].topic, topic.to_string());
         assert_eq!(suppressed[0].state, "recovery_ready");
         assert!(!suppressed[0].recovery_probe_in_flight);
+    }
+
+    #[tokio::test]
+    async fn test_unsigned_ihave_does_not_reset_subthreshold_timeout_counter() {
+        let peer_id = test_peer_id(1);
+        let from_peer = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(peer_id, transport, test_signing_key(), false);
+        let topic = TopicId::new([54u8; 32]);
+        let now = Instant::now();
+        let pre_inbound = PEER_TIMEOUT_THRESHOLD - 1;
+
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            seed_subthreshold_cooling(state, from_peer, now);
+            let cooling = state
+                .peer_cooling
+                .get(&from_peer)
+                .expect("peer accumulated cooling state");
+            assert_eq!(cooling.timeout_count, pre_inbound);
+        }
+
+        let missing_id = [7u8; 32];
+        let payload: Bytes = postcard::to_stdvec(&vec![missing_id])
+            .expect("IHAVE IDs serialize")
+            .into();
+        let message = unsigned_control_message(topic, missing_id, MessageKind::IHave, payload);
+        let wire: Bytes = postcard::to_stdvec(&message)
+            .expect("unsigned IHAVE message serializes")
+            .into();
+
+        assert!(
+            pubsub.handle_message(from_peer, wire).await.is_err(),
+            "unsigned IHAVE should be rejected"
+        );
+
+        let mut topics = pubsub.topics.write().await;
+        let state = topics.get_mut(&topic).expect("topic exists");
+        let cooling = state
+            .peer_cooling
+            .get(&from_peer)
+            .expect("unsigned IHAVE must not clear cooling");
+        assert_eq!(cooling.timeout_count, pre_inbound);
+
+        let event = state.record_send_timeout_at(
+            normal_send_attempt(from_peer),
+            now + Duration::from_millis(1),
+        );
+        assert!(
+            event.is_some(),
+            "next timeout should trip suppression when unsigned IHAVE did not reset"
+        );
+        assert!(state.is_peer_suppressed_at(from_peer, now + Duration::from_millis(1)));
+    }
+
+    /// X0X-0056/X0X-0040 — sub-threshold timeouts followed by a signed inbound
+    /// frame must reset the per-peer cooling counter, so the next round of
+    /// timeouts must not trip suppression prematurely.
+    #[tokio::test]
+    async fn test_inbound_frame_resets_subthreshold_timeout_counter() {
+        let peer_id = test_peer_id(1);
+        let from_peer = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let sender_key = test_signing_key();
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(peer_id, transport, test_signing_key(), false);
+        let topic = TopicId::new([55u8; 32]);
+        let now = Instant::now();
+        let pre_inbound = PEER_TIMEOUT_THRESHOLD - 1;
+
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            seed_subthreshold_cooling(state, from_peer, now);
+        }
+
+        let missing_id = [8u8; 32];
+        let payload: Bytes = postcard::to_stdvec(&vec![missing_id])
+            .expect("IHAVE IDs serialize")
+            .into();
+        let message =
+            signed_control_message(&sender_key, topic, missing_id, MessageKind::IHave, payload);
+        let wire: Bytes = postcard::to_stdvec(&message)
+            .expect("signed IHAVE message serializes")
+            .into();
+
+        pubsub
+            .handle_message(from_peer, wire)
+            .await
+            .expect("signed IHAVE should be handled");
+
+        let inbound_at = now + Duration::from_millis(1);
+        let mut topics = pubsub.topics.write().await;
+        let state = topics.get_mut(&topic).expect("topic exists");
+        assert!(
+            !state.peer_cooling.contains_key(&from_peer),
+            "signed IHAVE should clear cooling entry"
+        );
+
+        for i in 0..pre_inbound {
+            assert!(
+                state
+                    .record_send_timeout_at(normal_send_attempt(from_peer), inbound_at)
+                    .is_none(),
+                "timeout {i} after signed reset must remain sub-threshold"
+            );
+        }
+        assert!(
+            !state.is_peer_suppressed_at(from_peer, inbound_at),
+            "after signed inbound reset, sub-threshold timeouts must not trip suppression"
+        );
+        let cooling = state
+            .peer_cooling
+            .get(&from_peer)
+            .expect("fresh post-reset cooling entry should exist");
+        assert_eq!(
+            cooling.timeout_count, pre_inbound,
+            "post-reset counter must equal new timeout count"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_signed_non_pubsub_frame_resets_subthreshold_timeout_counter() {
+        let peer_id = test_peer_id(1);
+        let from_peer = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let sender_key = test_signing_key();
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(peer_id, transport, test_signing_key(), false);
+        let topic = TopicId::new([56u8; 32]);
+        let now = Instant::now();
+
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            seed_subthreshold_cooling(state, from_peer, now);
+        }
+
+        let message = signed_control_message(
+            &sender_key,
+            topic,
+            [9u8; 32],
+            MessageKind::Presence,
+            Bytes::from_static(b"presence-beacon"),
+        );
+        let wire: Bytes = postcard::to_stdvec(&message)
+            .expect("signed presence message serializes")
+            .into();
+
+        pubsub
+            .handle_message(from_peer, wire)
+            .await
+            .expect("signed non-pubsub frame should be ignored after reset");
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).expect("topic exists");
+        assert!(
+            !state.peer_cooling.contains_key(&from_peer),
+            "signed non-pubsub frame should clear cooling"
+        );
     }
 
     #[tokio::test]

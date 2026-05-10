@@ -89,7 +89,21 @@ const MAX_EAGER_DEGREE: usize = 12;
 /// each per-peer send this bounded budget; on timeout the peer is skipped
 /// and `republish_per_peer_timeout` is incremented so the operator can see
 /// which peer is the slow one without a hung dispatcher.
-const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(750);
+///
+/// X0X-0061 bumped this from 750 ms → 2500 ms. The 750 ms budget was tuned
+/// for low-RTT meshes; on the SOTA-Borrow VPS mesh under sustained 4 h
+/// load, helsinki's outbound to sydney (~560 ms RTT) and singapore
+/// (~330 ms RTT) — Hetzner→DigitalOcean over public internet, no private
+/// regional peering — routinely exceeded 750 ms when a single packet loss
+/// occurred. That accumulated cooling at `PEER_TIMEOUT_THRESHOLD` per
+/// `PEER_TIMEOUT_WINDOW`, suppressing peers for the 120 s
+/// `PEER_SUPPRESSION_COOLDOWN`, oscillating helsinki's
+/// suppressed_peers/known_peer_topic_pairs ratio around 0.121–0.177 — over
+/// the 0.120 broad-launch gate every window of the 16-window 4 h soak.
+/// 2500 ms gives ~4 RTTs of headroom on sydney and 7+ on singapore;
+/// `PEER_TIMEOUT_THRESHOLD` is unchanged (5 timeouts in 30 s is still a
+/// real signal at 2500 ms each).
+const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// Rolling window for send-side slow-peer detection.
 const PEER_TIMEOUT_WINDOW: Duration = Duration::from_secs(30);
@@ -4752,16 +4766,16 @@ mod tests {
         transport.release_sends(eager_peers.len() - 1);
 
         // Publish must return within ~PER_PEER_REPUBLISH_TIMEOUT + slack.
-        // The slow peer's task hits its 750 ms budget and is skipped; the
-        // other peers' tasks completed immediately on release.
-        tokio::time::timeout(Duration::from_secs(2), publish)
+        // The slow peer's task hits its 2500 ms budget (X0X-0061) and is
+        // skipped; the other peers' tasks completed immediately on release.
+        tokio::time::timeout(Duration::from_secs(5), publish)
             .await
             .expect("publish must return within the per-peer timeout budget — slow peer should not pin the dispatcher")
             .expect("publish task should not panic");
         let publish_elapsed = publish_started.elapsed();
         assert!(
-            publish_elapsed < Duration::from_millis(1_500),
-            "publish elapsed {publish_elapsed:?} — should be bounded by PER_PEER_REPUBLISH_TIMEOUT (750ms) plus a small slack"
+            publish_elapsed < PER_PEER_REPUBLISH_TIMEOUT + Duration::from_millis(1_000),
+            "publish elapsed {publish_elapsed:?} — should be bounded by PER_PEER_REPUBLISH_TIMEOUT plus a small slack"
         );
 
         let stage_stats = pubsub.stage_stats();
@@ -5264,7 +5278,7 @@ mod tests {
 
         for _ in 0..PEER_TIMEOUT_THRESHOLD {
             tokio::time::timeout(
-                Duration::from_secs(2),
+                PER_PEER_REPUBLISH_TIMEOUT + Duration::from_secs(2),
                 pubsub.send_to_peer_bounded(
                     topic,
                     slow_peer,
@@ -5335,7 +5349,7 @@ mod tests {
         }
 
         tokio::time::timeout(
-            Duration::from_secs(2),
+            PER_PEER_REPUBLISH_TIMEOUT + Duration::from_secs(2),
             pubsub.send_to_peer_bounded(
                 topic,
                 slow_peer,
@@ -5723,6 +5737,29 @@ mod tests {
         );
     }
 
+    /// X0X-0061: the per-peer republish budget must accommodate WAN-class
+    /// tail latency, otherwise nodes on cross-region public-internet paths
+    /// (e.g. Hetzner Helsinki → DigitalOcean Singapore/Sydney) accumulate
+    /// systematic per-peer timeouts that trip cooling at the
+    /// `PEER_TIMEOUT_THRESHOLD` × `PEER_TIMEOUT_WINDOW` rate, suppressing
+    /// peers for `PEER_SUPPRESSION_COOLDOWN` and pushing the
+    /// `suppressed_peers/known_peer_topic_pairs` ratio over the 0.120
+    /// broad-launch gate.
+    ///
+    /// The 750 ms predecessor caused the 4 h NO-GO 0/16 soak documented in
+    /// `proofs/launch-readiness-soak-20260510T073944Z-4h-v0_19_34-x0x-0060-patched`.
+    /// 1500 ms is the minimum needed for sydney-class paths (560 ms RTT)
+    /// to absorb a single packet loss + retransmit (~1100 ms).
+    #[test]
+    fn per_peer_republish_timeout_accommodates_wan_tail_latency() {
+        assert!(
+            PER_PEER_REPUBLISH_TIMEOUT >= Duration::from_millis(1_500),
+            "PER_PEER_REPUBLISH_TIMEOUT must accommodate WAN-class tail latency \
+             (≥ 1500 ms — see X0X-0061); current is {:?}",
+            PER_PEER_REPUBLISH_TIMEOUT
+        );
+    }
+
     #[tokio::test]
     async fn test_missing_topic_clears_recovery_probe_diagnostic() {
         let topics = Arc::new(RwLock::new(HashMap::new()));
@@ -6000,7 +6037,7 @@ mod tests {
         // sleeping 1.1 s before releasing the send; under X0X-0007 the slow
         // peer is isolated and the republish stage is bounded by the
         // per-peer budget instead.
-        tokio::time::timeout(Duration::from_secs(2), handle)
+        tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("handle task should finish bounded by PER_PEER_REPUBLISH_TIMEOUT — slow peer must not pin the dispatcher")
             .expect("handle task should not panic");
@@ -6017,13 +6054,16 @@ mod tests {
             "the unreleased peer should have hit the per-peer timeout exactly once"
         );
         // Republish stage time bounded by PER_PEER_REPUBLISH_TIMEOUT + tokio
-        // task scheduling slack. Use 1500 ms as the upper bound to absorb CI
-        // jitter while still proving the per-peer budget is being honoured
-        // (was unbounded pre-X0X-0007).
+        // task scheduling slack. The bound uses the constant directly so it
+        // tracks future tuning automatically (X0X-0061 bumped this from
+        // 750 ms → 2500 ms).
+        let max_bound_ns =
+            (PER_PEER_REPUBLISH_TIMEOUT + Duration::from_millis(1_000)).as_nanos() as u64;
         assert!(
-            stats.republish.max_ns < 1_500_000_000,
-            "republish max_ns should be bounded by PER_PEER_REPUBLISH_TIMEOUT, got {} ns",
-            stats.republish.max_ns
+            stats.republish.max_ns < max_bound_ns,
+            "republish max_ns should be bounded by PER_PEER_REPUBLISH_TIMEOUT + 1s slack, got {} ns vs bound {} ns",
+            stats.republish.max_ns,
+            max_bound_ns
         );
     }
 
@@ -6127,7 +6167,7 @@ mod tests {
             .expect("send channel should stay open");
         assert_eq!(record.peer, lazy_peer);
 
-        tokio::time::timeout(Duration::from_secs(2), flush)
+        tokio::time::timeout(Duration::from_secs(5), flush)
             .await
             .expect("IHAVE recovery probe should finish after per-peer timeout")
             .expect("IHAVE flush task should not panic");

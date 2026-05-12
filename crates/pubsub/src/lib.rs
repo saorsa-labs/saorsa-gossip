@@ -2545,28 +2545,26 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
     }
 
-    /// X0X-0069: install a SWIM-derived `PeerHealthOracle` so per-topic
-    /// cooling decisions can consult global membership state before
-    /// committing to a cooldown. Builder method — call right after
+    /// X0X-0069 (MVP bridge surface): install a SWIM-derived
+    /// `PeerHealthOracle`. Builder method — call right after
     /// construction.
     ///
-    /// When the oracle is set:
-    /// - A peer membership flags `Alive` follows the legacy
-    ///   timeout-count threshold path.
-    /// - A peer flagged `Suspect` is given one grace cycle
-    ///   (`record_send_timeout_at` returns no suppression event even
-    ///   when crossing `PEER_TIMEOUT_THRESHOLD`) so the SWIM indirect-
-    ///   probe round can clear or confirm it.
-    /// - A peer flagged `Dead` is cooled immediately with a fresh
-    ///   cooldown (skips the count-threshold wait).
-    /// - `None` (oracle has no record yet) follows legacy behaviour.
+    /// Current behaviour (0.5.42–0.5.44): wires the oracle so
+    /// `peer_health(peer)` and `request_indirect_probe(target)` can
+    /// consult / nudge it. **The cooling-decision path
+    /// (`record_send_timeout_at`) does NOT yet consult the oracle.**
+    /// That integration ships as X0X-0069b once the per-topic
+    /// suppression diagnostics (X0X-0075) land — at which point the
+    /// hot path will read from a local snapshot rather than awaiting
+    /// the oracle directly.
     ///
-    /// The implementation is non-blocking on the hot path: pub-sub
-    /// snapshots oracle state via a periodic background refresh and
-    /// reads from a local cache during `record_send_timeout_at`. The
-    /// `request_indirect_probe` nudge fires asynchronously when a
-    /// peer first crosses the threshold, so SWIM has fresh signal in
-    /// time for the next decision.
+    /// Downstream tickets that will consume the oracle:
+    /// - X0X-0069b — cooling-decision integration (Suspect grace,
+    ///   Dead escalation).
+    /// - X0X-0071 — P1-P7 peer scoring uses the verdict in the
+    ///   behaviour penalty path.
+    /// - X0X-0074 — admission control uses the verdict to drop Bulk
+    ///   admissions when the peer is Suspect or Dead.
     pub fn with_health_oracle(mut self, oracle: Arc<dyn PeerHealthOracle>) -> Self {
         self.peer_health_oracle = Some(oracle);
         self

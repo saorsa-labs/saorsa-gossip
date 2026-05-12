@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.44] - 2026-05-12
+
+X0X-0073 (MVP, v2) — reviewer-driven corrections to the 0.5.43
+adaptive cooling primitives. Same scope (primitives only;
+cooling-decision integration still ships as X0X-0073b), but the
+semantics now match the X0X-0073 ticket text.
+
+### Why
+
+0.5.43 shipped a mean EWMA where the ticket asks for "p95 via EWMA
+(N=32 samples)", and was missing the libp2p-style 0.97/sec success
+decay. External review (2026-05-12) flagged five P1/P2 issues; 0.5.44
+addresses all of them before any downstream consumer wires the
+primitives up.
+
+### Fixed (reviewer findings)
+
+- **p95 vs mean EWMA**: `PerPeerRttTracker` now keeps a 32-sample
+  ring buffer per peer and computes p95 on demand. The EWMA is
+  retained as a separate diagnostic (`ewma_ms`); the timeout
+  calculation reads p95 (`p95_ms`) only. This matches the ticket's
+  stated semantics and captures the tail behaviour the multiplier
+  is intended to absorb.
+- **`adaptive_timeout` ceiling-after-floor**: a `legacy_floor`
+  larger than `PER_PEER_TIMEOUT_CEILING` is now capped at the
+  ceiling instead of being returned verbatim. The advertised 10 s
+  upper bound is now enforced on every code path.
+- **Cooldown success decay**: new
+  `AdaptiveCoolingConfig::decay_on_success(current, elapsed)` applies
+  libp2p's 0.97/sec exponential decay toward `self.initial`. Exposes
+  `ADAPTIVE_COOLDOWN_DECAY_PER_SEC = 0.97`.
+- **Escalation factor clamp**: `escalation_factor` is now private;
+  `with_escalation_factor(0)` is clamped to 1 so a misconfiguration
+  cannot produce a zero cooldown after the first event.
+- **`PlumtreePubSub::with_health_oracle` doc**: trimmed to describe
+  the bridge surface actually wired in 0.5.42–0.5.44 (oracle
+  installed, `peer_health` + `request_indirect_probe` consult it;
+  cooling-decision path does NOT yet read the oracle). The
+  Suspect-grace / Dead-escalation behaviour the prior doc claimed
+  ships as X0X-0069b.
+
+### Added
+
+- `PerPeerRttTracker::p95_ms(peer)` — sliding-window p95 in ms.
+- `AdaptiveCoolingConfig::decay_on_success(current, elapsed)` —
+  0.97/sec decay toward `self.initial`.
+- `AdaptiveCoolingConfig::escalate_on_dead(current)` — immediate 2×
+  cooldown escalation when SWIM returns `Dead` (used by X0X-0069b).
+- `AdaptiveCoolingConfig::with_escalation_factor(factor)` — builder
+  that clamps to ≥ 1.
+- `ADAPTIVE_COOLDOWN_DECAY_PER_SEC` constant.
+- 8 new unit tests covering p95 vs mean, ring eviction of stale
+  outliers, ceiling-vs-oversize-floor, decay-on-success at floor /
+  proportional / long-elapsed / never-below-floor, Dead escalation
+  doubling / zero-base / cap, escalation-factor zero-clamp.
+
+### Notes
+
+- API-only changes; no behavioural integration yet. Downstream
+  X0X-0069b will wire the new helpers into
+  `record_send_timeout_at`'s threshold-crossing path under
+  background snapshot of the SWIM oracle (no async-under-hot-lock).
+- The X0X-0073 ticket's behaviour + 4 h soak acceptance criteria
+  remain unmet by this MVP — they belong to X0X-0073b/0069b which
+  integrate these primitives into the cooling path. The X0X-0073
+  ticket state reflects MVP-shipped, not done-against-original-
+  acceptance.
+
 ## [0.5.43] - 2026-05-12
 
 X0X-0073 (MVP) — adaptive cooling primitives. Layer 2 of x0x's

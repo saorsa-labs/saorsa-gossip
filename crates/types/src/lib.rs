@@ -424,6 +424,48 @@ pub fn unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// SWIM-derived health classification consumed by the pub-sub layer to
+/// adjust per-peer cooling decisions.
+///
+/// Bridges the membership crate's `SwimDetector` state into the pub-sub
+/// crate's `PlumtreePubSub` so a peer that membership has flagged as
+/// `Suspect` is given a brief grace period before pub-sub commits to a
+/// 2-minute cooldown, and a peer membership has confirmed `Dead` is
+/// cooled immediately rather than via the per-topic timeout-count
+/// threshold. Aligns x0x's pub-sub send-path with the SWIM Suspicion
+/// mechanism from the Lifeguard paper.
+///
+/// Reference: x0x ticket X0X-0069, SWIM (Das/Gupta/Motivala 2002) and
+/// Lifeguard refinements (Dadgar/Hendrickson 2018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PeerHealth {
+    /// Peer is responding to direct probes.
+    Alive,
+    /// Peer is suspected of failure; SWIM indirect probes are pending.
+    Suspect,
+    /// Peer is confirmed unreachable.
+    Dead,
+}
+
+/// Read-only oracle that exposes per-peer SWIM health to consumers.
+///
+/// The membership crate implements this on `SwimDetector` so pub-sub
+/// can consult it before deciding to cool a peer for a per-topic
+/// send-path timeout (X0X-0069). The trait is intentionally minimal
+/// to keep the cross-crate boundary stable.
+#[async_trait::async_trait]
+pub trait PeerHealthOracle: Send + Sync {
+    /// Snapshot of the peer's current SWIM health. `None` when the
+    /// oracle has no record of the peer (e.g. just joined, never
+    /// probed).
+    async fn health_of(&self, peer: &PeerId) -> Option<PeerHealth>;
+
+    /// Nudge the oracle to issue indirect probes for `target`.
+    /// Best-effort; the oracle may decline (rate-limited, no candidates,
+    /// already in flight).
+    async fn request_indirect_probe(&self, target: PeerId);
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

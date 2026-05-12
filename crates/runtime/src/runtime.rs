@@ -6,6 +6,7 @@ use saorsa_gossip_membership::{HyParViewMembership, Membership, MembershipConfig
 use saorsa_gossip_presence::PresenceManager;
 use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub, PubSubCacheConfig};
 use saorsa_gossip_transport::{GossipTransport, UdpTransportAdapter, UdpTransportAdapterConfig};
+use saorsa_gossip_types::PeerHealthOracle;
 use saorsa_gossip_types::{PeerId, TopicId};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -43,6 +44,10 @@ pub struct GossipRuntimeBuilder {
     identity: Option<MlDsaKeyPair>,
     /// Optional pre-configured transport.
     transport: Option<Arc<UdpTransportAdapter>>,
+    /// X0X-0069: optional SWIM-derived peer-health oracle. When set, the
+    /// runtime wires it into `PlumtreePubSub::with_health_oracle` so per-
+    /// topic cooling decisions can consult global membership state.
+    peer_health_oracle: Option<Arc<dyn PeerHealthOracle>>,
 }
 
 impl GossipRuntimeBuilder {
@@ -67,6 +72,17 @@ impl GossipRuntimeBuilder {
     /// Configure PubSub per-topic message-cache bounds.
     pub fn pubsub_cache(mut self, cache: PubSubCacheConfig) -> Self {
         self.config.pubsub_cache = cache;
+        self
+    }
+
+    /// X0X-0069: install a SWIM-derived peer-health oracle. The runtime
+    /// wires this into `PlumtreePubSub::with_health_oracle` at build
+    /// time so per-topic cooling decisions can consult global membership
+    /// state. Typically callers pass the runtime's own SWIM detector
+    /// here (the membership crate's `SwimDetector` implements
+    /// `PeerHealthOracle` via the bridge in 0.5.42+).
+    pub fn peer_health_oracle(mut self, oracle: Arc<dyn PeerHealthOracle>) -> Self {
+        self.peer_health_oracle = Some(oracle);
         self
     }
 
@@ -130,12 +146,19 @@ impl GossipRuntimeBuilder {
         let membership: Arc<RwLock<Box<dyn Membership>>> =
             Arc::new(RwLock::new(Box::new(membership_impl)));
 
-        let pubsub_impl = PlumtreePubSub::new_with_cache_config(
-            peer_id,
-            transport.clone(),
-            identity.clone(),
-            self.config.pubsub_cache,
-        );
+        let pubsub_impl = {
+            let base = PlumtreePubSub::new_with_cache_config(
+                peer_id,
+                transport.clone(),
+                identity.clone(),
+                self.config.pubsub_cache,
+            );
+            if let Some(oracle) = self.peer_health_oracle.clone() {
+                base.with_health_oracle(oracle)
+            } else {
+                base
+            }
+        };
         let pubsub: Arc<RwLock<Box<dyn PubSub>>> = Arc::new(RwLock::new(Box::new(pubsub_impl)));
 
         let groups = Arc::new(RwLock::new(HashMap::<String, GroupContext>::new()));

@@ -12,7 +12,7 @@
 use anyhow::{anyhow, Result};
 use rand::SeedableRng;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
-use saorsa_gossip_types::PeerId;
+use saorsa_gossip_types::{PeerHealth, PeerHealthOracle, PeerId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -685,6 +685,37 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                 }
             }
         });
+    }
+}
+
+/// X0X-0069: bridge SWIM peer-state into the pub-sub layer via the
+/// `PeerHealthOracle` trait so per-topic send-path cooling can consult
+/// global SWIM health before committing to a 2-minute cooldown.
+///
+/// `health_of` maps the membership crate's `PeerState` (Alive / Suspect
+/// / Dead) onto the types crate's `PeerHealth` enum without exposing
+/// the membership-internal `SwimPeerEntry` shape. `request_indirect_probe`
+/// delegates to the existing `request_indirect_probes` async path; we
+/// swallow errors because the oracle contract is best-effort (pub-sub
+/// has its own fallback path if SWIM declines to probe).
+#[async_trait::async_trait]
+impl<T: GossipTransport + 'static> PeerHealthOracle for SwimDetector<T> {
+    async fn health_of(&self, peer: &PeerId) -> Option<PeerHealth> {
+        self.get_state(peer).await.map(|state| match state {
+            PeerState::Alive => PeerHealth::Alive,
+            PeerState::Suspect => PeerHealth::Suspect,
+            PeerState::Dead => PeerHealth::Dead,
+        })
+    }
+
+    async fn request_indirect_probe(&self, target: PeerId) {
+        if let Err(err) = self.request_indirect_probes(target).await {
+            debug!(
+                target = %target,
+                error = %err,
+                "SWIM: indirect-probe request failed; pub-sub falls back to local cooling"
+            );
+        }
     }
 }
 

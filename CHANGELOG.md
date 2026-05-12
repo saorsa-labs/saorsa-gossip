@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.42] - 2026-05-12
+
+X0X-0069 (MVP) — SWIM peer-health oracle bridge between the membership
+crate's `SwimDetector` and the pub-sub crate's per-topic cooling
+decisions. Layer 3 of x0x's SOTA-Borrow Phase 2 fleet-survival
+portfolio.
+
+### Why
+
+Pub-sub's per-topic cooling (saorsa-gossip-pubsub 0.5.36+'s
+`PeerCoolingState`) currently treats every per-peer timeout as evidence
+the peer is failing, with no awareness of global SWIM membership state.
+A cross-region peer transiently slow under load gets cooled for the full
+`PEER_SUPPRESSION_COOLDOWN` (2 minutes), even when the membership
+crate's `SwimDetector` already knows the peer is responsive on other
+paths. Lifeguard (Dadgar/Hendrickson 2018) reference: SWIM Suspicion
+prevents false-positive failure marks under sustained packet loss
+(12 vs 2 stable members in their experiments).
+
+This release ships the **bridge surface** so downstream cooling
+decisions can consult SWIM. The actual threshold-decision integration
+(use the bridge to hold cooling on Suspect peers, escalate on Dead
+peers) is filed as X0X-0069b follow-up, intentionally scoped out so
+this release does not change cooling behaviour for callers that don't
+opt in.
+
+### Added
+
+- `saorsa_gossip_types::PeerHealth` enum (`Alive` / `Suspect` / `Dead`)
+  maps SWIM states onto pub-sub's vocabulary without exposing the
+  membership crate's internal `SwimPeerEntry`.
+- `saorsa_gossip_types::PeerHealthOracle` async trait — minimal
+  read-only surface (`health_of`, `request_indirect_probe`) for the
+  cross-crate bridge.
+- `impl<T: GossipTransport + 'static> PeerHealthOracle for SwimDetector<T>`
+  in `saorsa-gossip-membership` — maps `PeerState` →`PeerHealth`,
+  delegates indirect-probe requests to the existing
+  `SwimDetector::request_indirect_probes` async path.
+- `PlumtreePubSub::with_health_oracle(oracle)` builder method that
+  installs the oracle on the pub-sub instance.
+- `PlumtreePubSub::peer_health(peer)` — async accessor exposing the
+  oracle verdict per peer; downstream tickets (X0X-0073 adaptive
+  cooling, X0X-0071 P1-P7 scoring, X0X-0074 admission control) read
+  via this single bridge surface.
+- `PlumtreePubSub::request_indirect_probe(target)` — best-effort
+  nudge for SWIM to issue indirect probes, called by accumulating-
+  timeout paths to keep oracle signal fresh.
+- `GossipRuntimeBuilder::peer_health_oracle(oracle)` wires the oracle
+  through the runtime so the pub-sub instance picks it up
+  automatically; if the runtime owns its own `SwimDetector`, wiring
+  is one builder call.
+- New tests in `crates/pubsub`:
+  - `peer_health_oracle_unwired_returns_none`
+  - `peer_health_oracle_returns_swim_state_when_wired`
+  - `request_indirect_probe_forwards_to_oracle`
+
+### Scope notes
+
+This is the **MVP** for X0X-0069. The bridge plumbing ships now so
+downstream tickets unblock immediately. The actual cooling-decision
+integration (consult oracle in `record_send_timeout_at` threshold-
+crossing, hold cooling for `Suspect`, escalate for `Dead`) lands as
+X0X-0069b once a downstream consumer needs it.
+
+### Reference
+
+- Reference: x0x ticket X0X-0069
+- SOTA reference: SWIM paper (Das/Gupta/Motivala 2002), Lifeguard
+  extensions (Dadgar/Hendrickson 2018)
+- See x0x `docs/design/sota-borrow-phase-2-fleet-survival.md` for
+  the portfolio context
+
 ## [0.5.41] - 2026-05-12
 
 X0X-0068 — Bounded discovery cache by age + bytes, with per-topic telemetry.

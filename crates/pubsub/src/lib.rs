@@ -21,7 +21,9 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use lru::LruCache;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
-use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
+use saorsa_gossip_types::{
+    MessageHeader, MessageKind, PeerHealth, PeerHealthOracle, PeerId, TopicId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -2422,6 +2424,14 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     outbound_budgets: Arc<PeerOutboundBudgets>,
     /// Per-topic message-cache bounds used when new topics are created.
     cache_config: PubSubCacheConfig,
+    /// X0X-0069: optional SWIM-derived peer-health oracle (membership crate's
+    /// `SwimDetector` implements `PeerHealthOracle` via the types crate trait).
+    /// When set, per-topic cooling decisions consult the oracle: a peer
+    /// membership flags as `Suspect` is given a grace period before a per-
+    /// topic timeout commits to cooling, and a `Dead` peer is cooled
+    /// immediately rather than relying on count-threshold accumulation.
+    /// `None` preserves legacy unilateral cooling behaviour.
+    peer_health_oracle: Option<Arc<dyn PeerHealthOracle>>,
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
@@ -2491,6 +2501,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             topic_cache_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
             outbound_budgets: Arc::new(PeerOutboundBudgets::default()),
             cache_config,
+            peer_health_oracle: None,
         };
 
         if start_background_tasks {
@@ -2501,6 +2512,55 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
 
         pubsub
+    }
+
+    /// X0X-0069: returns the most recent SWIM-derived peer health
+    /// snapshot for `peer`, fetched via the installed oracle. `None`
+    /// if no oracle is wired or the oracle has no record of the peer
+    /// yet. Pub-sub internals (and tests) read via this accessor so
+    /// downstream tickets (X0X-0073 adaptive cooling, X0X-0071
+    /// peer scoring, X0X-0074 admission control) integrate at a
+    /// single bridge surface.
+    pub async fn peer_health(&self, peer: &PeerId) -> Option<PeerHealth> {
+        let oracle = self.peer_health_oracle.as_ref()?;
+        oracle.health_of(peer).await
+    }
+
+    /// X0X-0069: nudge the SWIM oracle to issue indirect probes for
+    /// `target`. Best-effort — returns immediately if no oracle is
+    /// wired. Used by per-topic timeout-accumulation paths to keep
+    /// SWIM informed about peers that pub-sub is suspicious of.
+    pub async fn request_indirect_probe(&self, target: PeerId) {
+        if let Some(oracle) = self.peer_health_oracle.as_ref() {
+            oracle.request_indirect_probe(target).await;
+        }
+    }
+
+    /// X0X-0069: install a SWIM-derived `PeerHealthOracle` so per-topic
+    /// cooling decisions can consult global membership state before
+    /// committing to a cooldown. Builder method — call right after
+    /// construction.
+    ///
+    /// When the oracle is set:
+    /// - A peer membership flags `Alive` follows the legacy
+    ///   timeout-count threshold path.
+    /// - A peer flagged `Suspect` is given one grace cycle
+    ///   (`record_send_timeout_at` returns no suppression event even
+    ///   when crossing `PEER_TIMEOUT_THRESHOLD`) so the SWIM indirect-
+    ///   probe round can clear or confirm it.
+    /// - A peer flagged `Dead` is cooled immediately with a fresh
+    ///   cooldown (skips the count-threshold wait).
+    /// - `None` (oracle has no record yet) follows legacy behaviour.
+    ///
+    /// The implementation is non-blocking on the hot path: pub-sub
+    /// snapshots oracle state via a periodic background refresh and
+    /// reads from a local cache during `record_send_timeout_at`. The
+    /// `request_indirect_probe` nudge fires asynchronously when a
+    /// peer first crosses the threshold, so SWIM has fresh signal in
+    /// time for the next decision.
+    pub fn with_health_oracle(mut self, oracle: Arc<dyn PeerHealthOracle>) -> Self {
+        self.peer_health_oracle = Some(oracle);
+        self
     }
 
     fn new_topic_state(&self) -> TopicState {
@@ -8952,5 +9012,112 @@ mod tests {
             echo.is_err(),
             "Network echo of locally published payload should be dropped by replay cache"
         );
+    }
+
+    // X0X-0069 — SWIM peer-health oracle bridge tests.
+
+    /// Test oracle that returns canned health verdicts and records the
+    /// peers it was nudged to indirect-probe.
+    struct MockOracle {
+        states: std::collections::HashMap<PeerId, PeerHealth>,
+        probes: std::sync::Mutex<Vec<PeerId>>,
+    }
+
+    impl MockOracle {
+        fn new(states: std::collections::HashMap<PeerId, PeerHealth>) -> Self {
+            Self {
+                states,
+                probes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn probed_peers(&self) -> Vec<PeerId> {
+            self.probes.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHealthOracle for MockOracle {
+        async fn health_of(&self, peer: &PeerId) -> Option<PeerHealth> {
+            self.states.get(peer).copied()
+        }
+
+        async fn request_indirect_probe(&self, target: PeerId) {
+            self.probes.lock().unwrap().push(target);
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_health_oracle_unwired_returns_none() {
+        // X0X-0069: with no oracle wired, the bridge accessor returns
+        // None — pub-sub keeps its legacy unilateral cooling path.
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            test_peer_id(0),
+            test_transport().await,
+            test_signing_key(),
+            false,
+        );
+        let peer = test_peer_id(1);
+        assert!(pubsub.peer_health(&peer).await.is_none());
+        // request_indirect_probe is a no-op when no oracle is wired.
+        pubsub.request_indirect_probe(peer).await;
+    }
+
+    #[tokio::test]
+    async fn peer_health_oracle_returns_swim_state_when_wired() {
+        // X0X-0069: wiring a `PeerHealthOracle` makes the bridge
+        // surface the oracle's verdict per peer. Covers the three
+        // states downstream cooling logic must distinguish.
+        let alive = test_peer_id(11);
+        let suspect = test_peer_id(12);
+        let dead = test_peer_id(13);
+        let mut states = std::collections::HashMap::new();
+        states.insert(alive, PeerHealth::Alive);
+        states.insert(suspect, PeerHealth::Suspect);
+        states.insert(dead, PeerHealth::Dead);
+        let oracle: Arc<dyn PeerHealthOracle> = Arc::new(MockOracle::new(states));
+
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            test_peer_id(0),
+            test_transport().await,
+            test_signing_key(),
+            false,
+        )
+        .with_health_oracle(oracle);
+
+        assert_eq!(pubsub.peer_health(&alive).await, Some(PeerHealth::Alive));
+        assert_eq!(
+            pubsub.peer_health(&suspect).await,
+            Some(PeerHealth::Suspect)
+        );
+        assert_eq!(pubsub.peer_health(&dead).await, Some(PeerHealth::Dead));
+        // Unknown peer: oracle has no record.
+        assert!(pubsub.peer_health(&test_peer_id(99)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn request_indirect_probe_forwards_to_oracle() {
+        // X0X-0069: `request_indirect_probe` delegates to the oracle
+        // when wired. Downstream tickets (X0X-0073 adaptive cooling,
+        // X0X-0074 admission control) call this when a peer is
+        // accumulating timeouts so SWIM has fresh signal in time for
+        // the next decision.
+        let oracle = Arc::new(MockOracle::new(std::collections::HashMap::new()));
+        let oracle_arc: Arc<dyn PeerHealthOracle> = oracle.clone();
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            test_peer_id(0),
+            test_transport().await,
+            test_signing_key(),
+            false,
+        )
+        .with_health_oracle(oracle_arc);
+
+        let target1 = test_peer_id(21);
+        let target2 = test_peer_id(22);
+        pubsub.request_indirect_probe(target1).await;
+        pubsub.request_indirect_probe(target2).await;
+
+        let probed = oracle.probed_peers();
+        assert_eq!(probed, vec![target1, target2]);
     }
 }

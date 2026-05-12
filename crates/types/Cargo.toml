@@ -16,6 +16,7 @@ serde = { workspace = true }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 hex = "0.4"
 postcard = { workspace = true }
 

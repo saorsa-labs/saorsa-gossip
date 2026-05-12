@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.41] - 2026-05-12
+
+X0X-0068 — Bounded discovery cache by age + bytes, with per-topic telemetry.
+Layer 1 of the SOTA-Borrow Phase 2 fleet-survival portfolio (see x0x
+`docs/design/sota-borrow-phase-2-fleet-survival.md`).
+
+### Why
+
+The 2026-05-12 4h cert soak on x0x's 6-node bootstrap mesh showed the
+classic "load grows with state" pattern: `continuous_max_pp_to` climbed
+0→1835 across 6 windows, and `recv_pump.dropped_full` ticked > 0 at
+window 11. saorsa-gossip's per-topic message cache was bounded by count
+(`MAX_CACHE_SIZE = 2_048`) but not by bytes or age. With 11-16 KB group
+cards on `x0x.discovery.groups`, worst-case per-topic state is ≈32 MB
+before signature overhead; multiplied across active topics, ≈100 MB+
+state per anti-entropy reconciliation cycle. Cross-Pacific paths
+(helsinki↔singapore, helsinki↔sydney) can't sustain that bandwidth and
+cool repeatedly.
+
+### Added
+
+- `BoundedMessageCache` replaces the bare `LruCache` for per-topic
+  message storage. Bounds applied in priority order:
+  1. **Age cap** — `MAX_CACHE_AGE_SECS = 60`. Entries older than this
+     are evicted on every cache touch.
+  2. **Bytes cap** — `MAX_CACHE_BYTES_PER_TOPIC = 16 MB`. LRU eviction
+     when the per-topic byte total would exceed the cap (with
+     `MESSAGE_CRYPTO_OVERHEAD_BYTES = 5_500` + `MESSAGE_HEADER_OVERHEAD_BYTES
+     = 256` factored into the byte estimate).
+  3. **Count cap** — existing `MAX_CACHE_SIZE = 2_048` retained as the
+     hard upper bound.
+- `CacheStatsSnapshot { msg_count, total_bytes, oldest_age_secs,
+  evicted_by_age, evicted_by_bytes, evicted_by_count }` exposed per
+  topic via `TopicCacheStatsSnapshot { topic, cache }`.
+- `PubSubStats.topic_caches: Vec<TopicCacheStatsSnapshot>` lets
+  consumers see the caps engaging in production.
+- `PubSubCacheConfig { max_messages_per_topic, max_bytes_per_topic,
+  max_age }` — operator-tunable. `GossipRuntimeConfig::pubsub_cache`
+  + `GossipRuntimeConfig::pubsub_cache(...)` builder method wire it
+  through.
+- `PlumtreePubSub::new_with_cache_config` /
+  `::new_with_task_control_and_cache_config` constructors that take
+  `PubSubCacheConfig`. The existing zero-argument constructor remains
+  backwards compatible (uses `PubSubCacheConfig::default()`).
+- New tests in `crates/pubsub`:
+  - `bounded_cache_evicts_by_age`
+  - `bounded_cache_evicts_by_bytes_under_pressure`
+  - `bounded_cache_evicts_by_count_hard_cap`
+  - `bounded_cache_age_takes_precedence_over_bytes`
+  - `bounded_cache_eviction_counters_track_correctly`
+  - `bounded_cache_get_prunes_expired`
+  - `bounded_cache_simulated_load_stays_within_caps`
+
+### Reference
+
+- Reference: x0x ticket X0X-0068
+- SOTA reference: High-Scalability gossip protocol guide
+- Hunt 12f forecast (§147 in x0x `docs/design/hunt-12f-stale-release-fast-drop.md`)
+
 ## [0.5.36] - 2026-05-07
 
 Workspace lockstep bump consuming ant-quic 0.27.12 (X0X-0037 — duplicate-safe

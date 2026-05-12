@@ -4,7 +4,7 @@ use saorsa_gossip_groups::GroupContext;
 use saorsa_gossip_identity::MlDsaKeyPair;
 use saorsa_gossip_membership::{HyParViewMembership, Membership, MembershipConfig};
 use saorsa_gossip_presence::PresenceManager;
-use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
+use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub, PubSubCacheConfig};
 use saorsa_gossip_transport::{GossipTransport, UdpTransportAdapter, UdpTransportAdapterConfig};
 use saorsa_gossip_types::{PeerId, TopicId};
 use std::collections::HashMap;
@@ -22,6 +22,8 @@ pub struct GossipRuntimeConfig {
     pub bind_addr: SocketAddr,
     /// Optional known peers to dial on startup.
     pub known_peers: Vec<SocketAddr>,
+    /// PubSub per-topic message-cache bounds.
+    pub pubsub_cache: PubSubCacheConfig,
 }
 
 impl Default for GossipRuntimeConfig {
@@ -29,6 +31,7 @@ impl Default for GossipRuntimeConfig {
         Self {
             bind_addr: DEFAULT_BIND_ADDR,
             known_peers: Vec::new(),
+            pubsub_cache: PubSubCacheConfig::default(),
         }
     }
 }
@@ -58,6 +61,12 @@ impl GossipRuntimeBuilder {
     /// Seed the runtime with known peers to connect to on startup.
     pub fn known_peers(mut self, peers: Vec<SocketAddr>) -> Self {
         self.config.known_peers = peers;
+        self
+    }
+
+    /// Configure PubSub per-topic message-cache bounds.
+    pub fn pubsub_cache(mut self, cache: PubSubCacheConfig) -> Self {
+        self.config.pubsub_cache = cache;
         self
     }
 
@@ -121,7 +130,12 @@ impl GossipRuntimeBuilder {
         let membership: Arc<RwLock<Box<dyn Membership>>> =
             Arc::new(RwLock::new(Box::new(membership_impl)));
 
-        let pubsub_impl = PlumtreePubSub::new(peer_id, transport.clone(), identity.clone());
+        let pubsub_impl = PlumtreePubSub::new_with_cache_config(
+            peer_id,
+            transport.clone(),
+            identity.clone(),
+            self.config.pubsub_cache,
+        );
         let pubsub: Arc<RwLock<Box<dyn PubSub>>> = Arc::new(RwLock::new(Box::new(pubsub_impl)));
 
         let groups = Arc::new(RwLock::new(HashMap::<String, GroupContext>::new()));

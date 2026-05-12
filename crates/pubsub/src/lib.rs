@@ -41,13 +41,36 @@ use tracing::{debug, error, trace, warn};
 /// 9 KB/payload).
 const MAX_CACHE_SIZE: usize = 2_048;
 
-/// Message cache TTL (60 s).
+/// Maximum age of a cached pubsub message before forced eviction.
 ///
 /// PlumTree IWANT recovery typically resolves within RTTs (sub-second).
 /// 60 s is generous for partition recovery while bounding steady-state
 /// retention to (msg_rate × 60) × payload_size per topic. Was 300 s —
-/// 5× more retention than required for the recovery window.
-const CACHE_TTL_SECS: u64 = 60;
+/// 5× more retention than required for the recovery window. X0X-0068 keeps
+/// this existing strict age cap while adding byte accounting so large
+/// discovery-card topics cannot fill the whole count window.
+const MAX_CACHE_AGE_SECS: u64 = 60;
+
+/// Maximum total estimated wire bytes retained in the message cache per topic.
+///
+/// The cap is calibrated for the broad-launch cross-region mesh: anti-entropy
+/// should never need to reconcile more than a bounded 16 MiB topic window,
+/// even when discovery group cards are 11-16 KiB each.
+const MAX_CACHE_BYTES_PER_TOPIC: usize = 16 * 1024 * 1024;
+
+/// Estimated non-payload wire overhead for a cached EAGER message.
+///
+/// This includes the postcard header envelope plus conservative room for
+/// framing. The byte cap intentionally over-estimates instead of allowing
+/// under-accounted anti-entropy payloads.
+const MESSAGE_HEADER_OVERHEAD_BYTES: usize = 256;
+
+/// Estimated ML-DSA-65 signature plus public-key bytes on replayed EAGER data.
+///
+/// Cached messages store the payload and header; IWANT/anti-entropy replay
+/// re-signs them, so the cache byte budget includes the eventual wire crypto
+/// overhead rather than only heap bytes.
+const MESSAGE_CRYPTO_OVERHEAD_BYTES: usize = 5_500;
 
 /// Maximum payload replay cache size per topic.
 const REPLAY_CACHE_MAX_ENTRIES: usize = 10_000;
@@ -158,6 +181,27 @@ const OUTBOUND_BUDGET_REAP_AFTER: Duration = Duration::from_secs(600);
 
 /// Message ID type alias
 type MessageIdType = [u8; 32];
+
+/// Tunable bounds for each topic's PubSub message cache.
+#[derive(Debug, Clone, Copy)]
+pub struct PubSubCacheConfig {
+    /// Maximum cached message count per topic.
+    pub max_messages_per_topic: NonZeroUsize,
+    /// Maximum estimated cached message bytes per topic.
+    pub max_bytes_per_topic: usize,
+    /// Maximum cached message age before eviction.
+    pub max_age: Duration,
+}
+
+impl Default for PubSubCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_messages_per_topic: message_cache_capacity(),
+            max_bytes_per_topic: MAX_CACHE_BYTES_PER_TOPIC,
+            max_age: Duration::from_secs(MAX_CACHE_AGE_SECS),
+        }
+    }
+}
 
 /// Counters for inbound PubSub wire classes plus local PlumTree tree changes.
 #[derive(Debug, Default)]
@@ -405,6 +449,32 @@ pub struct PeerScoreSnapshot {
     pub eager_eligible: bool,
 }
 
+/// JSON-friendly snapshot of one topic's bounded message-cache state.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TopicCacheStatsSnapshot {
+    /// Topic identifier, formatted the same way as logs.
+    pub topic: String,
+    /// Per-topic cache counters and resource usage.
+    pub cache: CacheStatsSnapshot,
+}
+
+/// JSON-friendly snapshot of a bounded message cache.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CacheStatsSnapshot {
+    /// Number of cached messages currently retained for the topic.
+    pub msg_count: usize,
+    /// Estimated total wire bytes retained for the topic.
+    pub total_bytes: usize,
+    /// Age in seconds of the oldest retained message.
+    pub oldest_age_secs: u64,
+    /// Cumulative messages evicted because they exceeded the age cap.
+    pub evicted_by_age: u64,
+    /// Cumulative messages evicted to keep the topic under the byte cap.
+    pub evicted_by_bytes: u64,
+    /// Cumulative messages evicted to keep the topic under the count cap.
+    pub evicted_by_count: u64,
+}
+
 /// JSON-friendly snapshot of per-stage PubSub handling timings.
 #[derive(Debug, Clone, Serialize)]
 pub struct PubSubStageStatsSnapshot {
@@ -440,6 +510,8 @@ pub struct PubSubStageStatsSnapshot {
     pub suppression_cleanup_last_removed: u64,
     /// Per-topic peer-score components used for PlumTree mesh selection.
     pub peer_scores: Vec<PeerScoreSnapshot>,
+    /// Per-topic bounded message-cache usage and eviction counters.
+    pub topic_caches: Vec<TopicCacheStatsSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -906,6 +978,7 @@ impl PubSubStageStats {
                 .last_removed
                 .load(Ordering::Relaxed),
             peer_scores: Vec::new(),
+            topic_caches: Vec::new(),
         }
     }
 
@@ -1389,10 +1462,180 @@ impl PeerCoolingState {
 struct CachedMessage {
     /// Message payload
     payload: Bytes,
-    /// Timestamp when cached
-    timestamp: Instant,
     /// Message header
     header: MessageHeader,
+}
+
+#[derive(Clone)]
+struct CachedEntry {
+    message: CachedMessage,
+    bytes: usize,
+    inserted_at: Instant,
+}
+
+/// Per-topic message cache with age, byte, and count bounds.
+///
+/// Eviction priority is age first, then bytes, then count. Age protects
+/// freshness independent of load, bytes protect anti-entropy bandwidth, and
+/// count remains a final hard cap for pathological tiny-message streams.
+struct BoundedMessageCache {
+    lru: LruCache<MessageIdType, CachedEntry>,
+    total_bytes: usize,
+    max_count: NonZeroUsize,
+    max_bytes: usize,
+    max_age: Duration,
+    evicted_by_age: u64,
+    evicted_by_bytes: u64,
+    evicted_by_count: u64,
+}
+
+impl BoundedMessageCache {
+    fn new(max_count: NonZeroUsize, max_bytes: usize, max_age: Duration) -> Self {
+        Self {
+            lru: LruCache::new(max_count),
+            total_bytes: 0,
+            max_count,
+            max_bytes,
+            max_age,
+            evicted_by_age: 0,
+            evicted_by_bytes: 0,
+            evicted_by_count: 0,
+        }
+    }
+
+    fn insert(&mut self, msg_id: MessageIdType, message: CachedMessage) -> bool {
+        self.insert_at(msg_id, message, Instant::now())
+    }
+
+    fn insert_at(&mut self, msg_id: MessageIdType, message: CachedMessage, now: Instant) -> bool {
+        let bytes = estimate_message_bytes(&message);
+        self.prune_expired_at(now);
+
+        if let Some(existing) = self.lru.pop(&msg_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(existing.bytes);
+        }
+
+        if bytes > self.max_bytes {
+            return false;
+        }
+
+        self.ensure_bytes_capacity(bytes);
+        self.ensure_count_capacity_for_insert();
+
+        let entry = CachedEntry {
+            message,
+            bytes,
+            inserted_at: now,
+        };
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        if let Some((_, evicted)) = self.lru.push(msg_id, entry) {
+            self.total_bytes = self.total_bytes.saturating_sub(evicted.bytes);
+            self.evicted_by_count = self.evicted_by_count.saturating_add(1);
+        }
+        true
+    }
+
+    fn get(&mut self, msg_id: &MessageIdType) -> Option<&CachedMessage> {
+        self.get_at(msg_id, Instant::now())
+    }
+
+    fn get_at(&mut self, msg_id: &MessageIdType, now: Instant) -> Option<&CachedMessage> {
+        self.prune_expired_at(now);
+        self.lru.get(msg_id).map(|entry| &entry.message)
+    }
+
+    fn contains(&self, msg_id: &MessageIdType) -> bool {
+        self.lru.contains(msg_id)
+    }
+
+    fn ids(&self) -> Vec<MessageIdType> {
+        self.lru.iter().map(|(id, _)| *id).collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lru.len()
+    }
+
+    #[cfg(test)]
+    fn peek_lru_message_id(&self) -> Option<MessageIdType> {
+        self.lru.peek_lru().map(|(id, _)| *id)
+    }
+
+    fn prune_expired(&mut self) {
+        self.prune_expired_at(Instant::now());
+    }
+
+    fn prune_expired_at(&mut self, now: Instant) {
+        let expired: Vec<MessageIdType> = self
+            .lru
+            .iter()
+            .filter_map(|(msg_id, entry)| {
+                (now.saturating_duration_since(entry.inserted_at) >= self.max_age)
+                    .then_some(*msg_id)
+            })
+            .collect();
+
+        for msg_id in expired {
+            if let Some(entry) = self.lru.pop(&msg_id) {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+                self.evicted_by_age = self.evicted_by_age.saturating_add(1);
+            }
+        }
+    }
+
+    fn ensure_bytes_capacity(&mut self, incoming_bytes: usize) {
+        while self.total_bytes.saturating_add(incoming_bytes) > self.max_bytes {
+            let Some((_, entry)) = self.lru.pop_lru() else {
+                break;
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+            self.evicted_by_bytes = self.evicted_by_bytes.saturating_add(1);
+        }
+    }
+
+    fn ensure_count_capacity_for_insert(&mut self) {
+        while self.lru.len().saturating_add(1) > self.max_count.get() {
+            let Some((_, entry)) = self.lru.pop_lru() else {
+                break;
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+            self.evicted_by_count = self.evicted_by_count.saturating_add(1);
+        }
+    }
+
+    fn stats_at(&self, now: Instant) -> CacheStatsSnapshot {
+        let oldest_age_secs = self
+            .lru
+            .iter()
+            .map(|(_, entry)| now.saturating_duration_since(entry.inserted_at).as_secs())
+            .max()
+            .unwrap_or(0);
+
+        CacheStatsSnapshot {
+            msg_count: self.lru.len(),
+            total_bytes: self.total_bytes,
+            oldest_age_secs,
+            evicted_by_age: self.evicted_by_age,
+            evicted_by_bytes: self.evicted_by_bytes,
+            evicted_by_count: self.evicted_by_count,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_all_inserted_at_for_test(&mut self, inserted_at: Instant) {
+        for (_, entry) in self.lru.iter_mut() {
+            entry.inserted_at = inserted_at;
+        }
+    }
+}
+
+fn estimate_message_bytes(message: &CachedMessage) -> usize {
+    message
+        .payload
+        .len()
+        .saturating_add(MESSAGE_HEADER_OVERHEAD_BYTES)
+        .saturating_add(MESSAGE_CRYPTO_OVERHEAD_BYTES)
 }
 
 /// Per-topic state
@@ -1402,7 +1645,7 @@ struct TopicState {
     /// Non-tree peers (send IHAVE only)
     lazy_peers: HashSet<PeerId>,
     /// Message cache: msg_id -> cached message
-    message_cache: LruCache<MessageIdType, CachedMessage>,
+    message_cache: BoundedMessageCache,
     /// Pending IHAVE batch (≤1024 message IDs)
     pending_ihave: Vec<MessageIdType>,
     /// Outstanding IWANT requests: msg_id -> (peer, timestamp)
@@ -1429,11 +1672,20 @@ struct TopicState {
 }
 
 impl TopicState {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_cache_config(PubSubCacheConfig::default())
+    }
+
+    fn with_cache_config(cache_config: PubSubCacheConfig) -> Self {
         Self {
             eager_peers: HashSet::new(),
             lazy_peers: HashSet::new(),
-            message_cache: LruCache::new(message_cache_capacity()),
+            message_cache: BoundedMessageCache::new(
+                cache_config.max_messages_per_topic,
+                cache_config.max_bytes_per_topic,
+                cache_config.max_age,
+            ),
             pending_ihave: Vec::new(),
             outstanding_iwants: HashMap::new(),
             peer_scores: HashMap::new(),
@@ -1478,7 +1730,7 @@ impl TopicState {
 
     /// Get all cached message IDs for anti-entropy digest
     fn cached_message_ids(&self) -> Vec<MessageIdType> {
-        self.message_cache.iter().map(|(id, _)| *id).collect()
+        self.message_cache.ids()
     }
 
     /// Check if message is in cache
@@ -1488,12 +1740,8 @@ impl TopicState {
 
     /// Add message to cache
     fn cache_message(&mut self, msg_id: MessageIdType, payload: Bytes, header: MessageHeader) {
-        let cached = CachedMessage {
-            payload,
-            timestamp: Instant::now(),
-            header,
-        };
-        self.message_cache.put(msg_id, cached);
+        let cached = CachedMessage { payload, header };
+        self.message_cache.insert(msg_id, cached);
         self.touch();
     }
 
@@ -1504,24 +1752,11 @@ impl TopicState {
 
     /// Clean expired cache entries
     fn clean_cache(&mut self) {
-        let now = Instant::now();
-        let ttl = Duration::from_secs(CACHE_TTL_SECS);
-
-        // Collect expired keys
-        let mut expired = Vec::new();
-        for (msg_id, cached) in self.message_cache.iter() {
-            if now.duration_since(cached.timestamp) > ttl {
-                expired.push(*msg_id);
-            }
-        }
-
-        // Remove expired entries
-        for msg_id in expired {
-            self.message_cache.pop(&msg_id);
-        }
+        self.message_cache.prune_expired();
 
         // Clean expired replay cache entries
         let replay_ttl = self.replay_ttl;
+        let now = Instant::now();
         let mut expired_replay = Vec::new();
         for (hash, ts) in self.replay_cache.iter() {
             if now.saturating_duration_since(*ts) > replay_ttl {
@@ -2181,8 +2416,12 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// holds the topic write lock, readers fall back to this copy-on-write
     /// snapshot instead of observing an empty peer-score table.
     peer_score_snapshot: Arc<StdRwLock<Arc<Vec<PeerScoreSnapshot>>>>,
+    /// Last complete per-topic cache diagnostics snapshot.
+    topic_cache_snapshot: Arc<StdRwLock<Arc<Vec<TopicCacheStatsSnapshot>>>>,
     /// Global per-peer outbound PubSub budgets shared by all topics and send classes.
     outbound_budgets: Arc<PeerOutboundBudgets>,
+    /// Per-topic message-cache bounds used when new topics are created.
+    cache_config: PubSubCacheConfig,
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
@@ -2200,11 +2439,46 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         Self::new_with_task_control(peer_id, transport, signing_key, true)
     }
 
+    /// Create a new Plumtree pub/sub instance with custom message-cache bounds.
+    ///
+    /// Existing topics retain the bounds they were created with; the provided
+    /// config applies to topics created after construction.
+    pub fn new_with_cache_config(
+        peer_id: PeerId,
+        transport: Arc<T>,
+        signing_key: saorsa_gossip_identity::MlDsaKeyPair,
+        cache_config: PubSubCacheConfig,
+    ) -> Self {
+        Self::new_with_task_control_and_cache_config(
+            peer_id,
+            transport,
+            signing_key,
+            true,
+            cache_config,
+        )
+    }
+
     fn new_with_task_control(
         peer_id: PeerId,
         transport: Arc<T>,
         signing_key: saorsa_gossip_identity::MlDsaKeyPair,
         start_background_tasks: bool,
+    ) -> Self {
+        Self::new_with_task_control_and_cache_config(
+            peer_id,
+            transport,
+            signing_key,
+            start_background_tasks,
+            PubSubCacheConfig::default(),
+        )
+    }
+
+    fn new_with_task_control_and_cache_config(
+        peer_id: PeerId,
+        transport: Arc<T>,
+        signing_key: saorsa_gossip_identity::MlDsaKeyPair,
+        start_background_tasks: bool,
+        cache_config: PubSubCacheConfig,
     ) -> Self {
         let pubsub = Self {
             topics: Arc::new(RwLock::new(HashMap::new())),
@@ -2214,7 +2488,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             signing_key: Arc::new(signing_key),
             stage_stats: Arc::new(PubSubStageStats::default()),
             peer_score_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
+            topic_cache_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
             outbound_budgets: Arc::new(PeerOutboundBudgets::default()),
+            cache_config,
         };
 
         if start_background_tasks {
@@ -2227,10 +2503,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         pubsub
     }
 
+    fn new_topic_state(&self) -> TopicState {
+        TopicState::with_cache_config(self.cache_config)
+    }
+
     /// Snapshot per-stage timings for inbound PubSub message handling.
     pub fn stage_stats(&self) -> PubSubStageStatsSnapshot {
         let mut snapshot = self.stage_stats.snapshot();
         snapshot.peer_scores = self.peer_score_snapshots();
+        snapshot.topic_caches = self.topic_cache_snapshots();
         snapshot
     }
 
@@ -2285,6 +2566,56 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         shared.as_ref().clone()
     }
 
+    fn topic_cache_snapshots(&self) -> Vec<TopicCacheStatsSnapshot> {
+        let Ok(topics) = self.topics.try_read() else {
+            return self.cached_topic_cache_snapshots();
+        };
+
+        let snapshots = Self::build_topic_cache_snapshots(&topics, Instant::now());
+        self.store_topic_cache_snapshots(snapshots)
+    }
+
+    fn build_topic_cache_snapshots(
+        topics: &HashMap<TopicId, TopicState>,
+        now: Instant,
+    ) -> Vec<TopicCacheStatsSnapshot> {
+        let mut snapshots: Vec<TopicCacheStatsSnapshot> = topics
+            .iter()
+            .map(|(topic, state)| TopicCacheStatsSnapshot {
+                topic: topic.to_string(),
+                cache: state.message_cache.stats_at(now),
+            })
+            .collect();
+        snapshots.sort_by(|a, b| a.topic.cmp(&b.topic));
+        snapshots
+    }
+
+    fn cached_topic_cache_snapshots(&self) -> Vec<TopicCacheStatsSnapshot> {
+        match self.topic_cache_snapshot.read() {
+            Ok(snapshot) => snapshot.as_ref().clone(),
+            Err(e) => {
+                error!("topic-cache diagnostics snapshot cache poisoned: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    fn store_topic_cache_snapshots(
+        &self,
+        snapshots: Vec<TopicCacheStatsSnapshot>,
+    ) -> Vec<TopicCacheStatsSnapshot> {
+        let shared = Arc::new(snapshots);
+        match self.topic_cache_snapshot.write() {
+            Ok(mut cached) => {
+                *cached = Arc::clone(&shared);
+            }
+            Err(e) => {
+                error!("topic-cache diagnostics snapshot cache poisoned: {e}");
+            }
+        }
+        shared.as_ref().clone()
+    }
+
     fn record_stage(&self, stage: PubSubStage, started: Instant) {
         self.stage_stats.record(stage, started.elapsed());
     }
@@ -2323,7 +2654,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         kind: MessageKind,
     ) {
         let mut topics = self.topics.write().await;
-        let state = topics.entry(topic).or_insert_with(TopicState::new);
+        let state = topics
+            .entry(topic)
+            .or_insert_with(|| self.new_topic_state());
         state.touch();
         Self::record_inbound_peer_activity_for_state(
             self.stage_stats.as_ref(),
@@ -2803,7 +3136,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         };
 
         let mut topics = self.topics.write().await;
-        let state = topics.entry(topic).or_insert_with(TopicState::new);
+        let state = topics
+            .entry(topic)
+            .or_insert_with(|| self.new_topic_state());
 
         // Add to cache
         state.cache_message(msg_id, payload.clone(), header);
@@ -2867,7 +3202,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let mut topics = self.topics.write().await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
-        let state = topics.entry(topic).or_insert_with(TopicState::new);
+        let state = topics
+            .entry(topic)
+            .or_insert_with(|| self.new_topic_state());
         state.touch();
         Self::record_inbound_peer_activity_for_state(
             self.stage_stats.as_ref(),
@@ -3003,7 +3340,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let mut topics = self.topics.write().await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
-        let state = topics.entry(topic).or_insert_with(TopicState::new);
+        let state = topics
+            .entry(topic)
+            .or_insert_with(|| self.new_topic_state());
         state.touch();
 
         let mut requested = Vec::new();
@@ -3090,7 +3429,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let mut topics = self.topics.write().await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
-        let state = topics.entry(topic).or_insert_with(TopicState::new);
+        let state = topics
+            .entry(topic)
+            .or_insert_with(|| self.new_topic_state());
         state.touch();
 
         let mut to_send = Vec::new();
@@ -3202,7 +3543,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let mut topics = self.topics.write().await;
                 self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
                 let dedupe_started = Instant::now();
-                let state = topics.entry(topic).or_insert_with(TopicState::new);
+                let state = topics
+                    .entry(topic)
+                    .or_insert_with(|| self.new_topic_state());
                 state.touch();
 
                 let our_ids: HashSet<MessageIdType> =
@@ -3881,7 +4224,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// Initialize peers for a topic from membership layer
     pub async fn initialize_topic_peers(&self, topic: TopicId, peers: Vec<PeerId>) {
         let mut topics = self.topics.write().await;
-        let state = topics.entry(topic).or_insert_with(TopicState::new);
+        let state = topics
+            .entry(topic)
+            .or_insert_with(|| self.new_topic_state());
 
         let now = Instant::now();
         for peer in peers {
@@ -3914,7 +4259,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             "PubSub peer score rebuild start"
         );
         let mut topics = self.topics.write().await;
-        let state = topics.entry(topic).or_insert_with(TopicState::new);
+        let state = topics
+            .entry(topic)
+            .or_insert_with(|| self.new_topic_state());
 
         let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
 
@@ -3975,10 +4322,13 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
     fn subscribe(&self, topic: TopicId) -> mpsc::UnboundedReceiver<(PeerId, Bytes)> {
         let (tx, rx) = mpsc::unbounded_channel();
         let topics = self.topics.clone();
+        let cache_config = self.cache_config;
 
         tokio::spawn(async move {
             let mut topics_guard = topics.write().await;
-            let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
+            let state = topics_guard
+                .entry(topic)
+                .or_insert_with(|| TopicState::with_cache_config(cache_config));
             state.touch();
             state.subscribers.push(tx);
         });
@@ -4224,6 +4574,38 @@ mod tests {
             payload: Some(payload),
             signature: Vec::new(),
             public_key: Vec::new(),
+        }
+    }
+
+    fn test_msg_id(id: u64) -> MessageIdType {
+        let mut msg_id = [0u8; 32];
+        msg_id[..8].copy_from_slice(&id.to_le_bytes());
+        msg_id
+    }
+
+    fn nonzero(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).expect("test cache cap must be non-zero")
+    }
+
+    fn test_header(topic: TopicId, msg_id: MessageIdType) -> MessageHeader {
+        MessageHeader {
+            version: 1,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        }
+    }
+
+    fn test_cached_message(
+        topic: TopicId,
+        msg_id: MessageIdType,
+        payload_len: usize,
+    ) -> CachedMessage {
+        CachedMessage {
+            payload: Bytes::from(vec![0u8; payload_len]),
+            header: test_header(topic, msg_id),
         }
     }
 
@@ -6296,8 +6678,7 @@ mod tests {
             // Get the first (and only) cached message ID
             state
                 .message_cache
-                .peek_lru()
-                .map(|(id, _)| *id)
+                .peek_lru_message_id()
                 .expect("message should be cached")
         };
 
@@ -6345,8 +6726,7 @@ mod tests {
             let state = topics.get(&topic).unwrap();
             state
                 .message_cache
-                .peek_lru()
-                .map(|(id, _)| *id)
+                .peek_lru_message_id()
                 .expect("message should be cached")
         };
 
@@ -6447,6 +6827,180 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_cache_evicts_by_age() {
+        let topic = TopicId::new([1u8; 32]);
+        let now = Instant::now();
+        let old_id = test_msg_id(1);
+        let fresh_id = test_msg_id(2);
+        let mut cache = BoundedMessageCache::new(
+            nonzero(10),
+            usize::MAX,
+            Duration::from_secs(MAX_CACHE_AGE_SECS),
+        );
+
+        assert!(cache.insert_at(
+            old_id,
+            test_cached_message(topic, old_id, 128),
+            now - Duration::from_secs(MAX_CACHE_AGE_SECS + 1),
+        ));
+        assert!(cache.insert_at(fresh_id, test_cached_message(topic, fresh_id, 128), now));
+
+        let stats = cache.stats_at(now);
+        assert_eq!(stats.msg_count, 1);
+        assert_eq!(stats.evicted_by_age, 1);
+        assert!(!cache.contains(&old_id));
+        assert!(cache.contains(&fresh_id));
+    }
+
+    #[test]
+    fn bounded_cache_evicts_by_bytes_under_pressure() {
+        let topic = TopicId::new([2u8; 32]);
+        let now = Instant::now();
+        let sample = test_cached_message(topic, test_msg_id(0), 1024);
+        let entry_bytes = estimate_message_bytes(&sample);
+        let mut cache =
+            BoundedMessageCache::new(nonzero(10), entry_bytes * 2, Duration::from_secs(300));
+
+        for id in 1..=3 {
+            let msg_id = test_msg_id(id);
+            assert!(cache.insert_at(msg_id, test_cached_message(topic, msg_id, 1024), now));
+        }
+
+        let stats = cache.stats_at(now);
+        assert_eq!(stats.msg_count, 2);
+        assert!(stats.total_bytes <= entry_bytes * 2);
+        assert_eq!(stats.evicted_by_bytes, 1);
+        assert!(!cache.contains(&test_msg_id(1)));
+    }
+
+    #[test]
+    fn bounded_cache_evicts_by_count_hard_cap() {
+        let topic = TopicId::new([3u8; 32]);
+        let now = Instant::now();
+        let mut cache = BoundedMessageCache::new(nonzero(2), usize::MAX, Duration::from_secs(300));
+
+        for id in 1..=3 {
+            let msg_id = test_msg_id(id);
+            assert!(cache.insert_at(msg_id, test_cached_message(topic, msg_id, 64), now));
+        }
+
+        let stats = cache.stats_at(now);
+        assert_eq!(stats.msg_count, 2);
+        assert_eq!(stats.evicted_by_count, 1);
+        assert!(!cache.contains(&test_msg_id(1)));
+    }
+
+    #[test]
+    fn bounded_cache_age_takes_precedence_over_bytes() {
+        let topic = TopicId::new([4u8; 32]);
+        let now = Instant::now();
+        let sample = test_cached_message(topic, test_msg_id(0), 512);
+        let entry_bytes = estimate_message_bytes(&sample);
+        let mut cache =
+            BoundedMessageCache::new(nonzero(10), entry_bytes * 2, Duration::from_secs(60));
+        let old_id = test_msg_id(1);
+        let fresh_id = test_msg_id(2);
+        let incoming_id = test_msg_id(3);
+
+        assert!(cache.insert_at(
+            old_id,
+            test_cached_message(topic, old_id, 512),
+            now - Duration::from_secs(61),
+        ));
+        assert!(cache.insert_at(fresh_id, test_cached_message(topic, fresh_id, 512), now));
+        assert!(cache.insert_at(
+            incoming_id,
+            test_cached_message(topic, incoming_id, 512),
+            now,
+        ));
+
+        let stats = cache.stats_at(now);
+        assert_eq!(stats.msg_count, 2);
+        assert_eq!(stats.evicted_by_age, 1);
+        assert_eq!(stats.evicted_by_bytes, 0);
+        assert!(!cache.contains(&old_id));
+    }
+
+    #[test]
+    fn bounded_cache_eviction_counters_track_correctly() {
+        let topic = TopicId::new([5u8; 32]);
+        let now = Instant::now();
+        let sample = test_cached_message(topic, test_msg_id(0), 256);
+        let entry_bytes = estimate_message_bytes(&sample);
+
+        let mut age_cache =
+            BoundedMessageCache::new(nonzero(4), usize::MAX, Duration::from_secs(10));
+        let old_id = test_msg_id(1);
+        let new_id = test_msg_id(2);
+        assert!(age_cache.insert_at(
+            old_id,
+            test_cached_message(topic, old_id, 256),
+            now - Duration::from_secs(11),
+        ));
+        assert!(age_cache.insert_at(new_id, test_cached_message(topic, new_id, 256), now));
+        assert_eq!(age_cache.stats_at(now).evicted_by_age, 1);
+
+        let mut bytes_cache =
+            BoundedMessageCache::new(nonzero(4), entry_bytes, Duration::from_secs(300));
+        let msg_id = test_msg_id(3);
+        assert!(bytes_cache.insert_at(msg_id, test_cached_message(topic, msg_id, 256), now));
+        let msg_id = test_msg_id(4);
+        assert!(bytes_cache.insert_at(msg_id, test_cached_message(topic, msg_id, 256), now));
+        assert_eq!(bytes_cache.stats_at(now).evicted_by_bytes, 1);
+
+        let mut count_cache =
+            BoundedMessageCache::new(nonzero(1), usize::MAX, Duration::from_secs(300));
+        let msg_id = test_msg_id(5);
+        assert!(count_cache.insert_at(msg_id, test_cached_message(topic, msg_id, 256), now));
+        let msg_id = test_msg_id(6);
+        assert!(count_cache.insert_at(msg_id, test_cached_message(topic, msg_id, 256), now));
+        assert_eq!(count_cache.stats_at(now).evicted_by_count, 1);
+    }
+
+    #[test]
+    fn bounded_cache_get_prunes_expired() {
+        let topic = TopicId::new([6u8; 32]);
+        let now = Instant::now();
+        let msg_id = test_msg_id(1);
+        let mut cache = BoundedMessageCache::new(nonzero(4), usize::MAX, Duration::from_secs(10));
+
+        assert!(cache.insert_at(
+            msg_id,
+            test_cached_message(topic, msg_id, 128),
+            now - Duration::from_secs(11),
+        ));
+
+        assert!(cache.get_at(&msg_id, now).is_none());
+        let stats = cache.stats_at(now);
+        assert_eq!(stats.msg_count, 0);
+        assert_eq!(stats.evicted_by_age, 1);
+    }
+
+    #[test]
+    fn bounded_cache_simulated_load_stays_within_caps() {
+        let topic = TopicId::new([7u8; 32]);
+        let start = Instant::now();
+        let sample = test_cached_message(topic, test_msg_id(0), 5 * 1024);
+        let entry_bytes = estimate_message_bytes(&sample);
+        let max_bytes = entry_bytes * 64;
+        let mut cache = BoundedMessageCache::new(nonzero(128), max_bytes, Duration::from_secs(90));
+
+        for i in 0..5_000_u64 {
+            let msg_id = test_msg_id(i);
+            let now = start + Duration::from_millis(i * 300);
+            assert!(cache.insert_at(msg_id, test_cached_message(topic, msg_id, 5 * 1024), now,));
+            let stats = cache.stats_at(now);
+            assert!(stats.msg_count <= 128);
+            assert!(stats.total_bytes <= max_bytes);
+        }
+
+        let stats = cache.stats_at(start + Duration::from_secs(1_500));
+        assert!(
+            stats.evicted_by_age > 0 || stats.evicted_by_bytes > 0 || stats.evicted_by_count > 0
+        );
+    }
+
     #[tokio::test]
     async fn test_cache_expiration() {
         let peer_id = test_peer_id(1);
@@ -6462,10 +7016,10 @@ mod tests {
             let mut topics = pubsub.topics.write().await;
             let state = topics.get_mut(&topic).unwrap();
 
-            // Modify timestamp to simulate expiry
-            for (_, cached) in state.message_cache.iter_mut() {
-                cached.timestamp = Instant::now() - Duration::from_secs(CACHE_TTL_SECS + 10);
-            }
+            // Modify insertion time to simulate expiry
+            state.message_cache.set_all_inserted_at_for_test(
+                Instant::now() - Duration::from_secs(MAX_CACHE_AGE_SECS + 10),
+            );
 
             state.clean_cache();
 

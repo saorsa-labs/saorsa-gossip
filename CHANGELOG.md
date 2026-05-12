@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.43] - 2026-05-12
+
+X0X-0073 (MVP) — adaptive cooling primitives. Layer 2 of x0x's
+SOTA-Borrow Phase 2 fleet-survival portfolio.
+
+### Why
+
+The legacy cooling values (`PER_PEER_REPUBLISH_TIMEOUT = 2500ms`,
+`PEER_SUPPRESSION_COOLDOWN = 120000ms`, `PEER_SUPPRESSION_BACKOFF_MAX
+= 1800000ms`) were calibrated for intra-region paths. Cross-Pacific
+paths (helsinki ↔ singapore/sydney, ~280 ms one-way) routinely exceed
+2.5 s under fanout_burst load. The 120 s initial cooldown is too
+long for transient WAN slowness, and 30 min escalation max is
+draconian for what's often a passing congestion bump.
+
+X0X-0073 ships **per-peer adaptive primitives** so downstream
+consumers (X0X-0069b cooling-decision integration, X0X-0071 P1-P7
+scoring) can read calibrated per-peer values instead of fleet-wide
+constants. This release ships the primitives + thresholds; the actual
+consumption in pub-sub's cooling decision path lands as X0X-0073b
+follow-up (same MVP pattern as X0X-0069 → X0X-0069b).
+
+### Added
+
+- New `saorsa_gossip_pubsub::timing` module:
+  - `PerPeerRttTracker` — per-peer EWMA of observed send durations
+    (alpha 0.20, ~5-sample convergence). `record(peer, observed)`
+    adds a sample, `ewma_ms(peer)` reads the current EWMA,
+    `adaptive_timeout(peer, legacy_floor)` returns `max(2.5 × ewma,
+    PER_PEER_TIMEOUT_FLOOR)` capped at `PER_PEER_TIMEOUT_CEILING`.
+  - `AdaptiveCoolingConfig` — replaces fixed cooldown constants.
+    Defaults: initial = 30 s (was 120 s), max = 300 s (was 1800 s),
+    escalation factor = 2× per consecutive cool. `with_initial` /
+    `with_max` builder for tests + tuning.
+  - Constants: `ADAPTIVE_COOLDOWN_INITIAL = 30s`,
+    `ADAPTIVE_COOLDOWN_MAX = 300s`, `PER_PEER_TIMEOUT_FLOOR = 1500ms`,
+    `PER_PEER_TIMEOUT_CEILING = 10s`, `PER_PEER_TIMEOUT_MULTIPLIER
+    = 2.5`, `PER_PEER_RTT_EWMA_ALPHA = 0.20`,
+    `PER_PEER_RTT_SAMPLE_CAP = 32`.
+- 12 new unit tests in `timing::tests` covering EWMA convergence,
+  sample-count cap, adaptive-timeout floor / ceiling / cold-start,
+  cooldown escalation + cap + overflow safety.
+
+### Scope notes
+
+This is the **MVP** for X0X-0073. The primitives ship now so X0X-0069b
+(cooling-decision integration) and X0X-0071 (P1-P7 scoring) unblock
+immediately. The actual consumption of these primitives inside
+`PeerCoolingState::next_cooldown` and the `record_send_timeout_at`
+path lands as X0X-0073b once a downstream ticket needs the integrated
+behaviour. Cooling behaviour for callers that don't opt in is
+unchanged.
+
+### Reference
+
+- Reference: x0x ticket X0X-0073
+- SOTA reference: libp2p gossipsub v1.1 (1-minute recommended
+  backoff, 0.97/sec decay)
+- See x0x `docs/design/sota-borrow-phase-2-fleet-survival.md` for the
+  portfolio context
+
 ## [0.5.42] - 2026-05-12
 
 X0X-0069 (MVP) — SWIM peer-health oracle bridge between the membership

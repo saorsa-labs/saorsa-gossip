@@ -16,6 +16,15 @@
 //! - **Lazy peers** (gossip): Send only message IDs (IHAVE)
 //!
 //! The tree self-optimizes via duplicate detection (PRUNE) and pull requests (GRAFT).
+//!
+//! # X0X-0073 — adaptive cooling primitives
+//!
+//! See the [`timing`] module for the per-peer EWMA RTT tracker and
+//! adaptive cooldown configuration. Downstream integration into the
+//! cooling-decision path lands as X0X-0073b once a downstream consumer
+//! (X0X-0069b cooling integration, X0X-0071 P1-P7 scoring) needs it.
+
+pub mod timing;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;

@@ -34,7 +34,7 @@ use saorsa_gossip_types::{
     MessageHeader, MessageKind, PeerHealth, PeerHealthOracle, PeerId, TopicId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
@@ -399,6 +399,7 @@ struct SuppressedPeerState {
     suppressed_until: Instant,
     recent_timeout_count: usize,
     cooldown: Duration,
+    last_suppressed_unix_ms: u64,
     recovery_probe_in_flight: bool,
 }
 
@@ -421,6 +422,9 @@ pub struct SuppressedPeerSnapshot {
     pub affected_topics_count: usize,
     /// Cooldown duration applied to this suppression.
     pub cooldown_ms: u64,
+    /// Approximate wall-clock Unix millisecond when the peer/topic last entered
+    /// suppression or recovery-probe state.
+    pub last_suppressed_unix_ms: u64,
     /// Current recovery state for this peer/topic (`cooldown`, `recovery_ready`,
     /// or `recovery_probe`).
     pub state: String,
@@ -458,6 +462,53 @@ pub struct PeerScoreSnapshot {
     pub recovery_successes: f64,
     /// Whether this peer is currently eligible for score-driven EAGER promotion.
     pub eager_eligible: bool,
+}
+
+/// Topic-indexed peer-score and cooling breakdown used by admission-control
+/// tuning. This intentionally mirrors the existing flat [`PeerScoreSnapshot`]
+/// fields while adding the active cooling state for that peer/topic.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerScoreBreakdownSnapshot {
+    /// Current mesh role for this peer.
+    pub role: String,
+    /// Current composite mesh-selection score in the range 0.0..=1.0.
+    pub score: f64,
+    /// Send-side health component in the range 0.0..=1.0.
+    pub send_health: f64,
+    /// Decayed outbound send-timeout evidence.
+    pub outbound_send_timeouts: f64,
+    /// Decayed cooling-event evidence.
+    pub cooling_events: f64,
+    /// Whether this peer is currently eligible for score-driven EAGER promotion.
+    pub eager_eligible: bool,
+    /// Current cooling/recovery state for this peer/topic, when present.
+    pub suppression_state: Option<String>,
+    /// Number of recent timeout events that triggered the current suppression.
+    pub recent_timeout_count: Option<usize>,
+    /// Cooldown duration applied to this suppression.
+    pub cooldown_ms: Option<u64>,
+    /// Approximate wall-clock Unix millisecond when this peer/topic last entered
+    /// suppression or recovery-probe state.
+    pub last_cool_at_unix_ms: Option<u64>,
+}
+
+/// Placeholder admission-control state by peer. X0X-0074 will populate
+/// priority queue depths; X0X-0075 exposes the peer health/suppression state
+/// now so operators can tune topic priorities from real pressure evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdmissionStateSnapshot {
+    /// Current admission state inferred from active PubSub cooling.
+    pub state: String,
+    /// Number of topics currently suppressing this peer.
+    pub suppressed_topics_count: usize,
+    /// Number of suppressed topics still in cooldown.
+    pub cooled_topics_count: usize,
+    /// Number of suppressed topics with a recovery probe in flight.
+    pub recovery_probe_topics_count: usize,
+    /// Number of suppressed topics whose cooldown has expired.
+    pub recovery_ready_topics_count: usize,
+    /// Per-priority queue depths. Empty until X0X-0074 admission queues land.
+    pub priority_queue_depths: BTreeMap<String, usize>,
 }
 
 /// JSON-friendly snapshot of one topic's bounded message-cache state.
@@ -511,6 +562,10 @@ pub struct PubSubStageStatsSnapshot {
     pub outbound_budget_exhausted: u64,
     /// Peers currently cooled after repeated send-side timeouts.
     pub suppressed_peers: Vec<SuppressedPeerSnapshot>,
+    /// Topic-indexed view of currently suppressed peers. Kept alongside the
+    /// flat list so dashboards can identify pressure by topic without
+    /// re-grouping client side.
+    pub suppressed_peers_by_topic: BTreeMap<String, Vec<String>>,
     /// Current adaptive cleanup interval for expired suppression state.
     pub suppression_cleanup_interval_ms: u64,
     /// Latest observed suppression-entry growth rate.
@@ -521,6 +576,11 @@ pub struct PubSubStageStatsSnapshot {
     pub suppression_cleanup_last_removed: u64,
     /// Per-topic peer-score components used for PlumTree mesh selection.
     pub peer_scores: Vec<PeerScoreSnapshot>,
+    /// Topic-indexed peer score breakdown. Values are keyed by
+    /// `topic -> peer_id` and include active cooling state when present.
+    pub peer_scores_by_topic: BTreeMap<String, BTreeMap<String, PeerScoreBreakdownSnapshot>>,
+    /// Peer-indexed admission state placeholder for X0X-0074.
+    pub admission_state_by_peer: BTreeMap<String, AdmissionStateSnapshot>,
     /// Per-topic bounded message-cache usage and eviction counters.
     pub topic_caches: Vec<TopicCacheStatsSnapshot>,
 }
@@ -884,12 +944,15 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn unix_millis_after(remaining: Duration) -> u64 {
-    let now_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+fn unix_millis_now() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration_millis_u64(duration),
         Err(_) => 0,
-    };
-    now_ms.saturating_add(duration_millis_u64(remaining))
+    }
+}
+
+fn unix_millis_after(remaining: Duration) -> u64 {
+    unix_millis_now().saturating_add(duration_millis_u64(remaining))
 }
 
 impl PubSubStageStats {
@@ -928,6 +991,7 @@ impl PubSubStageStats {
                         / PEER_TIMEOUT_WINDOW.as_secs_f64(),
                     affected_topics_count: affected_topics.get(&key.peer).copied().unwrap_or(1),
                     cooldown_ms: duration_millis_u64(state.cooldown),
+                    last_suppressed_unix_ms: state.last_suppressed_unix_ms,
                     state: if state.recovery_probe_in_flight {
                         "recovery_probe".to_string()
                     } else if state.suppressed_until > now {
@@ -971,6 +1035,7 @@ impl PubSubStageStats {
             republish_per_peer_timeout: self.republish_per_peer_timeout.load(Ordering::Relaxed),
             outbound_budget_exhausted: self.outbound_budget_exhausted.load(Ordering::Relaxed),
             suppressed_peers: self.suppressed_peer_snapshots(),
+            suppressed_peers_by_topic: BTreeMap::new(),
             suppression_cleanup_interval_ms: self
                 .suppression_cleanup
                 .current_interval_ms
@@ -989,6 +1054,8 @@ impl PubSubStageStats {
                 .last_removed
                 .load(Ordering::Relaxed),
             peer_scores: Vec::new(),
+            peer_scores_by_topic: BTreeMap::new(),
+            admission_state_by_peer: BTreeMap::new(),
             topic_caches: Vec::new(),
         }
     }
@@ -1033,12 +1100,14 @@ impl PubSubStageStats {
         cooldown: Duration,
     ) {
         let mut guard = self.suppressed_peers_guard();
+        let last_suppressed_unix_ms = unix_millis_now();
         guard.insert(
             SuppressedPeerKey { topic, peer },
             SuppressedPeerState {
                 suppressed_until,
                 recent_timeout_count,
                 cooldown,
+                last_suppressed_unix_ms,
                 recovery_probe_in_flight: false,
             },
         );
@@ -1053,12 +1122,14 @@ impl PubSubStageStats {
         cooldown: Duration,
     ) {
         let mut guard = self.suppressed_peers_guard();
+        let last_suppressed_unix_ms = unix_millis_now();
         guard.insert(
             SuppressedPeerKey { topic, peer },
             SuppressedPeerState {
                 suppressed_until,
                 recent_timeout_count,
                 cooldown,
+                last_suppressed_unix_ms,
                 recovery_probe_in_flight: true,
             },
         );
@@ -2579,7 +2650,105 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let mut snapshot = self.stage_stats.snapshot();
         snapshot.peer_scores = self.peer_score_snapshots();
         snapshot.topic_caches = self.topic_cache_snapshots();
+        snapshot.suppressed_peers_by_topic =
+            Self::build_suppressed_peers_by_topic(&snapshot.suppressed_peers);
+        snapshot.peer_scores_by_topic =
+            Self::build_peer_scores_by_topic(&snapshot.peer_scores, &snapshot.suppressed_peers);
+        snapshot.admission_state_by_peer =
+            Self::build_admission_state_by_peer(&snapshot.suppressed_peers);
         snapshot
+    }
+
+    fn build_suppressed_peers_by_topic(
+        suppressed: &[SuppressedPeerSnapshot],
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut by_topic: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in suppressed {
+            by_topic
+                .entry(row.topic.clone())
+                .or_default()
+                .push(row.peer_id.clone());
+        }
+        for peers in by_topic.values_mut() {
+            peers.sort();
+            peers.dedup();
+        }
+        by_topic
+    }
+
+    fn build_peer_scores_by_topic(
+        scores: &[PeerScoreSnapshot],
+        suppressed: &[SuppressedPeerSnapshot],
+    ) -> BTreeMap<String, BTreeMap<String, PeerScoreBreakdownSnapshot>> {
+        let mut suppression_by_topic_peer: HashMap<(String, String), &SuppressedPeerSnapshot> =
+            HashMap::new();
+        for row in suppressed {
+            suppression_by_topic_peer.insert((row.topic.clone(), row.peer_id.clone()), row);
+        }
+
+        let mut by_topic: BTreeMap<String, BTreeMap<String, PeerScoreBreakdownSnapshot>> =
+            BTreeMap::new();
+        for row in scores {
+            let suppressed = suppression_by_topic_peer
+                .get(&(row.topic.clone(), row.peer_id.clone()))
+                .copied();
+            by_topic.entry(row.topic.clone()).or_default().insert(
+                row.peer_id.clone(),
+                PeerScoreBreakdownSnapshot {
+                    role: row.role.clone(),
+                    score: row.score,
+                    send_health: row.send_health,
+                    outbound_send_timeouts: row.outbound_send_timeouts,
+                    cooling_events: row.cooling_events,
+                    eager_eligible: row.eager_eligible,
+                    suppression_state: suppressed.map(|s| s.state.clone()),
+                    recent_timeout_count: suppressed.map(|s| s.recent_timeout_count),
+                    cooldown_ms: suppressed.map(|s| s.cooldown_ms),
+                    last_cool_at_unix_ms: suppressed.map(|s| s.last_suppressed_unix_ms),
+                },
+            );
+        }
+        by_topic
+    }
+
+    fn build_admission_state_by_peer(
+        suppressed: &[SuppressedPeerSnapshot],
+    ) -> BTreeMap<String, AdmissionStateSnapshot> {
+        let mut by_peer: BTreeMap<String, AdmissionStateSnapshot> = BTreeMap::new();
+        for row in suppressed {
+            let entry =
+                by_peer
+                    .entry(row.peer_id.clone())
+                    .or_insert_with(|| AdmissionStateSnapshot {
+                        state: "alive".to_string(),
+                        suppressed_topics_count: 0,
+                        cooled_topics_count: 0,
+                        recovery_probe_topics_count: 0,
+                        recovery_ready_topics_count: 0,
+                        priority_queue_depths: BTreeMap::new(),
+                    });
+
+            entry.suppressed_topics_count += 1;
+            match row.state.as_str() {
+                "recovery_probe" => entry.recovery_probe_topics_count += 1,
+                "recovery_ready" => entry.recovery_ready_topics_count += 1,
+                _ => entry.cooled_topics_count += 1,
+            }
+        }
+
+        for entry in by_peer.values_mut() {
+            entry.state = if entry.cooled_topics_count > 0 {
+                "cooled".to_string()
+            } else if entry.recovery_probe_topics_count > 0 {
+                "recovery_probe".to_string()
+            } else if entry.recovery_ready_topics_count > 0 {
+                "recovery_ready".to_string()
+            } else {
+                "alive".to_string()
+            };
+        }
+
+        by_peer
     }
 
     fn peer_score_snapshots(&self) -> Vec<PeerScoreSnapshot> {
@@ -4561,6 +4730,22 @@ mod tests {
         PeerId::new(bytes)
     }
 
+    fn suppressed_snapshot(topic: TopicId, peer: PeerId, state: &str) -> SuppressedPeerSnapshot {
+        SuppressedPeerSnapshot {
+            peer_id: peer.to_string(),
+            topic: topic.to_string(),
+            suppressed_until_unix_ms: 1_000,
+            suppressed_for_ms: 30_000,
+            recent_timeout_count: 5,
+            recent_timeout_rate_per_sec: 1.0,
+            affected_topics_count: 1,
+            cooldown_ms: 30_000,
+            last_suppressed_unix_ms: 900,
+            state: state.to_string(),
+            recovery_probe_in_flight: state == "recovery_probe",
+        }
+    }
+
     async fn test_transport() -> Arc<UdpTransportAdapter> {
         let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
         Arc::new(
@@ -5465,6 +5650,73 @@ mod tests {
                 .expect("send task should not panic")
                 .expect("send should succeed");
         }
+    }
+
+    #[test]
+    fn diagnostics_group_suppression_by_topic_and_peer_admission_state() {
+        let topic_a = TopicId::new([1u8; 32]);
+        let topic_b = TopicId::new([2u8; 32]);
+        let peer_a = test_peer_id(10);
+        let peer_b = test_peer_id(11);
+        let suppressed = vec![
+            suppressed_snapshot(topic_b, peer_b, "recovery_probe"),
+            suppressed_snapshot(topic_a, peer_a, "cooldown"),
+            suppressed_snapshot(topic_a, peer_b, "recovery_ready"),
+        ];
+
+        let by_topic =
+            PlumtreePubSub::<RecordingTransport>::build_suppressed_peers_by_topic(&suppressed);
+        assert_eq!(
+            by_topic.get(&topic_a.to_string()).expect("topic a exists"),
+            &vec![peer_a.to_string(), peer_b.to_string()]
+        );
+        assert_eq!(
+            by_topic.get(&topic_b.to_string()).expect("topic b exists"),
+            &vec![peer_b.to_string()]
+        );
+
+        let admission =
+            PlumtreePubSub::<RecordingTransport>::build_admission_state_by_peer(&suppressed);
+        let peer_b_state = admission.get(&peer_b.to_string()).expect("peer b state");
+        assert_eq!(peer_b_state.state, "recovery_probe");
+        assert_eq!(peer_b_state.suppressed_topics_count, 2);
+        assert_eq!(peer_b_state.recovery_probe_topics_count, 1);
+        assert_eq!(peer_b_state.recovery_ready_topics_count, 1);
+    }
+
+    #[test]
+    fn diagnostics_peer_scores_by_topic_include_active_cooling_breakdown() {
+        let topic = TopicId::new([3u8; 32]);
+        let peer = test_peer_id(12);
+        let scores = vec![PeerScoreSnapshot {
+            peer_id: peer.to_string(),
+            topic: topic.to_string(),
+            role: "cooled".to_string(),
+            score: 0.25,
+            iwant_response_rate: 0.5,
+            recency: 0.9,
+            send_health: 0.1,
+            outbound_send_successes: 2.0,
+            outbound_send_timeouts: 8.0,
+            cooling_events: 3.0,
+            recovery_probes: 1.0,
+            recovery_successes: 0.0,
+            eager_eligible: false,
+        }];
+        let suppressed = vec![suppressed_snapshot(topic, peer, "cooldown")];
+
+        let by_topic =
+            PlumtreePubSub::<RecordingTransport>::build_peer_scores_by_topic(&scores, &suppressed);
+        let breakdown = by_topic
+            .get(&topic.to_string())
+            .and_then(|peers| peers.get(&peer.to_string()))
+            .expect("score breakdown");
+
+        assert_eq!(breakdown.role, "cooled");
+        assert_eq!(breakdown.suppression_state.as_deref(), Some("cooldown"));
+        assert_eq!(breakdown.recent_timeout_count, Some(5));
+        assert_eq!(breakdown.cooldown_ms, Some(30_000));
+        assert_eq!(breakdown.last_cool_at_unix_ms, Some(900));
     }
 
     #[tokio::test]

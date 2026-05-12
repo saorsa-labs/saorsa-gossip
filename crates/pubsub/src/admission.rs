@@ -9,19 +9,24 @@
 //! > (x0x/release, discovery anti-entropy, identity anti-entropy),
 //! > preferably before subscriber-channel enqueue."
 //!
-//! ## Decision matrix
+//! ## Decision matrix (as implemented 0.5.48+)
 //!
-//! For peer `P` carrying current SWIM health `H` and per-peer bulk
-//! queue depth `Q_bulk`:
+//! For peer `P` carrying current SWIM health `H`, current cooled state
+//! `C` (from the per-topic cooling map), and per-peer bulk-queue depth
+//! `Q_bulk`:
 //!
-//! - **Critical** → always admit. Bulk admissions are evicted first to
-//!   make room; a dropped Critical is a hard error surfaced on
-//!   `/diagnostics/gossip.admission`.
-//! - **Normal** → admit unless `H = Dead`. `Suspect` and cooled peers
-//!   still receive Normal admissions because dropping them silently
-//!   would starve essential overlay traffic (presence, named-group
-//!   fanout).
-//! - **Bulk** → admit only when `H = Alive` AND
+//! - **Critical** → always admit at the admission layer. A downstream
+//!   `claim_topic_send_attempts` failure (outbound budget exhausted)
+//!   records `dropped_critical_hard_error` and logs a `warn!`; the
+//!   counter must remain zero in production. See "Bulk-evict-before-
+//!   Critical-drop" under Limitations below for the future contract.
+//! - **Normal** → admit unless `H ∈ {Dead, Suspect}`. The Suspect drop
+//!   matches the X0X-0074 ticket text ("admitted unless peer is under
+//!   suspicion or peer score below threshold"); the score check is
+//!   deferred until X0X-0071 lands. Cooled peers still receive Normal
+//!   admissions — dropping Normal there would starve presence and
+//!   named-group fanout.
+//! - **Bulk** → admit only when `H = Alive` AND `C = false` AND
 //!   `Q_bulk < per_peer_bulk_slack_threshold`. Otherwise drop with the
 //!   appropriate `AdmissionDropReason` so the anti-entropy retry path
 //!   re-attempts when capacity returns.
@@ -32,7 +37,8 @@
 //! `PubSubStageStatsSnapshot.admission` block. Per-peer bulk-queue depths
 //! flow into `AdmissionStateSnapshot.priority_queue_depths` so the
 //! X0X-0075 visibility surface attributes pressure to specific peers
-//! under load.
+//! under load. `dropped_critical_hard_error` is treated as a soak-
+//! blocking violation by the broad-launch gate.
 //!
 //! ## Why not just rely on cooling?
 //!
@@ -41,6 +47,22 @@
 //! pipeline so the queue doesn't fill up in the first place. The two
 //! compose: admission relieves pressure, cooling handles peers that
 //! still time out at the reduced load.
+//!
+//! ## Limitations (MVP — future ticket X0X-0074b)
+//!
+//! - **Bulk-evict-before-Critical-drop is not implemented.** The
+//!   original X0X-0074 ticket called for the Critical contract to
+//!   include "drop oldest Bulk before dropping any Critical, bypass
+//!   cooling on Critical claim". This MVP records the
+//!   `dropped_critical_hard_error` counter when a Critical admission
+//!   fails to claim an outbound budget permit, but does not actively
+//!   evict an in-flight Bulk send to make room. Reaching the full
+//!   contract requires either an explicit per-peer queue with
+//!   priority eviction (replacing today's permit/slack model) or
+//!   transport-layer cancellation of Bulk sends. Tracked as
+//!   X0X-0074b; soak interpretation today is "non-zero counter
+//!   means the soak is blocked", not "Critical succeeded under
+//!   pressure".
 
 use saorsa_gossip_types::{
     AdmissionDecision, AdmissionDropReason, PeerHealth, PeerId, TopicId, TopicPriority,

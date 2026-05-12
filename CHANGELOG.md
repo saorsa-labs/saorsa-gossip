@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.48] - 2026-05-12
+
+Documentation-only correction over 0.5.47. No behavioural changes.
+Same admission/cooling semantics as 0.5.47 — this release simply makes
+the source-level docs match what's implemented so downstream readers
+aren't misled.
+
+### Fixed (reviewer round 2 findings 2026-05-12)
+
+- **P3 doc drift in `crates/pubsub/src/admission.rs` module docstring.**
+  The module-level decision matrix still said:
+  - "Critical → always admit. Bulk admissions are evicted first to
+    make room" — but 0.5.47 records a hard-error counter instead;
+    Bulk eviction is not implemented.
+  - "Normal → admit unless H = Dead. Suspect and cooled peers still
+    receive Normal admissions" — but 0.5.47 drops Normal on Suspect
+    too, per the X0X-0074 ticket.
+
+  Updated to accurately describe the as-implemented decision matrix
+  and called out the unimplemented "Bulk-evict-before-Critical-drop"
+  contract as a known MVP limitation tracked by **X0X-0074b**
+  (filed in this cycle).
+
+### Known limitation (logged for X0X-0074b)
+
+The original X0X-0074 ticket text described Critical's contract as
+"always admitted, bounded queue with bounded wait (then drop oldest
+Bulk before dropping any Critical)". As of 0.5.48, the MVP records a
+`dropped_critical_hard_error` counter when a Critical admission fails
+to claim an outbound budget permit, but does not actively evict an
+in-flight Bulk send to make room. Reaching the full contract
+requires either an explicit per-peer priority queue (replacing the
+permit/slack model) or transport-layer cancellation of Bulk sends.
+The soak gate interpretation today is "non-zero counter = soak
+blocked", not "Critical succeeded under pressure". X0X-0074b owns
+the full eviction-before-drop contract.
+
 ## [0.5.47] - 2026-05-12
 
 Reviewer-driven corrections to 0.5.46. **0.5.46 is yanked** — it shipped

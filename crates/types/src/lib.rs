@@ -447,6 +447,120 @@ pub enum PeerHealth {
     Dead,
 }
 
+/// X0X-0074 — substrate-level admission-control priority class for a topic.
+///
+/// Per Hunt 12f (`docs/design/hunt-12f-stale-release-fast-drop.md` §147),
+/// the overlay must reject low-priority anti-entropy work before it
+/// enters the per-peer outbound pipeline so high-priority DM / control
+/// traffic keeps moving under load. Priority is declared at the topic
+/// level by the application (x0x's `gossip/runtime.rs` registers the
+/// production set) and consulted on every publish / republish.
+///
+/// Reference: SOTA-Borrow Phase 2 plan ticket #74; Google SRE
+/// "Handling Overload" (reject low-priority work early, keep queues
+/// bounded, avoid retry amplification).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum TopicPriority {
+    /// **Bulk** — anti-entropy, manifests, group cards. Admitted only
+    /// when the peer is alive (not suspect / not cooled) and the per-peer
+    /// outbound queue has slack. Dropped first on overflow.
+    Bulk,
+    /// **Normal** — presence beacons, named-group fanout. Admitted unless
+    /// the peer is under suspicion or its score is below threshold.
+    Normal,
+    /// **Critical** — DM inbox, control-plane (test-control, test-discover).
+    /// Always admitted; bulk admissions evict to make room before any
+    /// critical message is dropped. A dropped critical message is a
+    /// hard error surfaced on `/diagnostics/gossip`.
+    Critical,
+}
+
+impl TopicPriority {
+    /// Human-readable label for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bulk => "bulk",
+            Self::Normal => "normal",
+            Self::Critical => "critical",
+        }
+    }
+
+    /// All priority classes, lowest first. Useful for iteration in
+    /// telemetry / diagnostics builders.
+    #[must_use]
+    pub const fn all() -> [Self; 3] {
+        [Self::Bulk, Self::Normal, Self::Critical]
+    }
+}
+
+impl Default for TopicPriority {
+    /// Default to `Normal` — topics that are not explicitly classified
+    /// follow Normal admission rules.
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl std::fmt::Display for TopicPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// X0X-0074 — outcome of an admission-control decision.
+///
+/// Returned by [`AdmissionControl::admit`] (in saorsa-gossip-pubsub).
+/// Consumers use the `dropped` variant to update per-priority drop
+/// counters and skip the per-peer send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionDecision {
+    /// Admit the message to the per-peer outbound pipeline.
+    Admit,
+    /// Drop the message before it enters the pipeline. The reason
+    /// label identifies which admission rule fired.
+    Drop {
+        /// Why this admission failed — surfaced in
+        /// `/diagnostics/gossip` so operators can see which rule is
+        /// firing under load.
+        reason: AdmissionDropReason,
+    },
+}
+
+/// Why an admission was dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionDropReason {
+    /// Peer health is `Dead` per the SWIM oracle (any priority drops
+    /// except Critical, which always admits).
+    PeerDead,
+    /// Peer health is `Suspect` — Normal and Bulk admissions defer.
+    PeerSuspect,
+    /// Per-peer bulk queue exceeded the slack threshold.
+    BulkBackpressure,
+    /// Peer is currently in cooling state from prior send-side timeouts.
+    PeerCooled,
+}
+
+impl AdmissionDropReason {
+    /// Human-readable label for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerDead => "peer_dead",
+            Self::PeerSuspect => "peer_suspect",
+            Self::BulkBackpressure => "bulk_backpressure",
+            Self::PeerCooled => "peer_cooled",
+        }
+    }
+}
+
+impl std::fmt::Display for AdmissionDropReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Read-only oracle that exposes per-peer SWIM health to consumers.
 ///
 /// The membership crate implements this on `SwimDetector` so pub-sub
@@ -490,6 +604,37 @@ mod tests {
         assert_eq!(MessageKind::from_u8(0), Some(MessageKind::Eager));
         assert_eq!(MessageKind::from_u8(255), None);
         assert_eq!(MessageKind::Eager.to_u8(), 0);
+    }
+
+    #[test]
+    fn topic_priority_ordering_matches_severity() {
+        // Why: telemetry + admission logic relies on Bulk < Normal < Critical
+        // so a single comparison can answer "is this at least Normal?".
+        assert!(TopicPriority::Bulk < TopicPriority::Normal);
+        assert!(TopicPriority::Normal < TopicPriority::Critical);
+        assert_eq!(TopicPriority::default(), TopicPriority::Normal);
+    }
+
+    #[test]
+    fn topic_priority_string_labels_are_stable() {
+        // Why: diagnostics + CSV exports key off these labels. Changing
+        // them is a downstream-breaking change for tooling.
+        assert_eq!(TopicPriority::Bulk.as_str(), "bulk");
+        assert_eq!(TopicPriority::Normal.as_str(), "normal");
+        assert_eq!(TopicPriority::Critical.as_str(), "critical");
+    }
+
+    #[test]
+    fn admission_drop_reason_labels_match_serde_variants() {
+        // Why: keep snake_case JSON variants aligned with the diagnostic
+        // labels surfaced on /diagnostics/gossip.
+        assert_eq!(AdmissionDropReason::PeerDead.as_str(), "peer_dead");
+        assert_eq!(AdmissionDropReason::PeerSuspect.as_str(), "peer_suspect");
+        assert_eq!(
+            AdmissionDropReason::BulkBackpressure.as_str(),
+            "bulk_backpressure"
+        );
+        assert_eq!(AdmissionDropReason::PeerCooled.as_str(), "peer_cooled");
     }
 
     #[test]

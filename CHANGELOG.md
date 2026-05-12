@@ -5,6 +5,108 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.46] - 2026-05-12
+
+Bundles two pieces of SOTA-Borrow Phase 2 — X0X-0073b (cooling-decision
+integration on top of the X0X-0073 primitives + X0X-0069 oracle bridge)
+and X0X-0074 (substrate-level admission control with topic priority).
+Both pieces compose: admission relieves pressure before it enters the
+per-peer pipeline; cooling handles peers that still time out at the
+reduced load.
+
+### Added (X0X-0074 admission control)
+
+- `saorsa_gossip_types::TopicPriority` — `Bulk` / `Normal` / `Critical`
+  enum. Defaults to `Normal` for unregistered topics.
+- `saorsa_gossip_types::AdmissionDecision` — `Admit` / `Drop { reason }`.
+- `saorsa_gossip_types::AdmissionDropReason` — `PeerDead` / `PeerSuspect` /
+  `BulkBackpressure` / `PeerCooled`.
+- `saorsa_gossip_pubsub::admission` module:
+  - `AdmissionControl` — engine. `admit(topic, peer, health,
+    is_peer_cooled)` returns the decision. Atomic counters update on
+    every call.
+  - `TopicPriorityRegistry` — `register(topic, priority)` +
+    `priority_for(topic)`. Applications seed at startup.
+  - `AdmissionConfig` — defaults `per_peer_bulk_slack_threshold = 64`
+    (calibrated against the 4 h soak window-3 inflection), Critical
+    queue cap 256 (telemetry only).
+  - `AdmissionStats` + `AdmissionStatsSnapshot` — per-(priority, reason)
+    atomic counters. `dropped_critical_hard_error` must remain zero in
+    production; non-zero is a soak-blocking violation.
+- `PlumtreePubSub::admission()` accessor returns the engine for
+  application-side topic priority registration.
+- `PlumtreePubSub::with_admission(admission)` builder for tests / custom
+  configurations.
+- `PubSubStageStatsSnapshot.admission` aggregated counters + per-peer
+  bulk-queue depths populated in
+  `admission_state_by_peer.priority_queue_depths`.
+
+### Added (X0X-0073b cooling-decision integration)
+
+Already landed on main as a276ab4; bundled into this release:
+- 1 s background `spawn_peer_health_snapshot_refresher` populates a
+  local `peer_health_snapshot` from `oracle.health_of(peer).await`.
+  Hot path consumes the snapshot synchronously — no async-under-lock.
+- `record_send_timeout_inner_at` branches on the snapshot:
+  - `PeerHealth::Dead` → `escalate_on_dead` = 2× immediate
+  - `PeerHealth::Suspect` at threshold → hold cooling, spawn indirect
+    probe, no suppression event
+  - `PeerHealth::Alive` / `None` → `next_cooldown` adaptive escalation
+- Success path: `rtt_tracker.record(peer, observed)` on every bundle
+  success; `decay_on_success` decays cooldown while retaining
+  `last_suppressed_at` so the next escalation builds from the decayed
+  value.
+- `with_health_oracle` API change (`self` → `Self`): now consumes self
+  and spawns the refresher task.
+
+### Behaviour summary
+
+| Topic | Health | Cooled | Decision |
+|---|---|---|---|
+| Critical | * | * | Admit (dropping Critical is a hard error) |
+| Normal | Dead | * | Drop / `PeerDead` |
+| Normal | Alive/Suspect/None | * | Admit |
+| Bulk | Dead | * | Drop / `PeerDead` |
+| Bulk | Suspect | * | Drop / `PeerSuspect` |
+| Bulk | Alive | cooled | Drop / `PeerCooled` |
+| Bulk | Alive | not cooled, queue ≥ slack | Drop / `BulkBackpressure` |
+| Bulk | Alive | not cooled, queue < slack | Admit |
+
+### Integration points
+
+- `parallel_send_to_peers` (publish fan-out): filters peers through
+  admission before claiming attempts. Bulk admissions release after
+  per-peer task completion. Single `topics.read()` batches the cooled
+  lookup for the whole peer list.
+- `send_to_peer_bounded` (single-peer sends — IWANT, recovery probes,
+  etc.): admission gate before claiming, release on completion for
+  Bulk.
+- Telemetry surfaces via `PubSubStageStatsSnapshot.admission` and
+  per-peer depths in `admission_state_by_peer.priority_queue_depths`.
+
+### Tests
+
+- `saorsa-gossip-types`: 3 new tests for ordering / labels / drop-reason
+  variants. 29/29 pass.
+- `saorsa-gossip-pubsub::admission`: 7 unit tests covering critical-
+  always-admit / normal-only-drops-on-dead / bulk-rules / backpressure /
+  per-peer-snapshot / registry-overwrite / unregistered-defaults-normal.
+- `saorsa-gossip-pubsub::tests::admission_*`: 2 async integration tests
+  exercising the publish path with seeded health snapshots:
+  `admission_drops_bulk_send_to_suspect_peer_and_records_counter`
+  (Bulk + Suspect → Drop, transport never touched, counter +1) and
+  `admission_admits_critical_send_even_when_peer_dead` (Critical
+  bypasses health, counter zero on hard-error). Both run in <30 ms —
+  the admission gate avoids the 2.5 s per-peer transport timeout.
+- 520/520 workspace tests pass; fmt + clippy `-D warnings` clean.
+
+### Notes
+
+- This is the release that gates the 4 h Phase A soak validating the
+  original X0X-0073 acceptance (≥ 5× cooling event reduction, no peer
+  > 30 s continuously cooled, Phase A ≥ 98 %).
+- X0X-0071 (P1-P7 peer scoring) is now functionally unblocked.
+
 ## [0.5.45] - 2026-05-12
 
 X0X-0075 Part A — per-topic and per-peer suppression diagnostics

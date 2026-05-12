@@ -24,6 +24,7 @@
 //! primitives so per-peer timeouts follow observed p95 send duration and
 //! cooldowns decay after successful sends.
 
+pub mod admission;
 pub mod timing;
 
 use crate::timing::{AdaptiveCoolingConfig, PerPeerRttTracker};
@@ -32,7 +33,8 @@ use bytes::Bytes;
 use lru::LruCache;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::{
-    MessageHeader, MessageKind, PeerHealth, PeerHealthOracle, PeerId, TopicId,
+    AdmissionDecision, MessageHeader, MessageKind, PeerHealth, PeerHealthOracle, PeerId, TopicId,
+    TopicPriority,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -586,6 +588,13 @@ pub struct PubSubStageStatsSnapshot {
     pub peer_scores_by_topic: BTreeMap<String, BTreeMap<String, PeerScoreBreakdownSnapshot>>,
     /// Peer-indexed admission state placeholder for X0X-0074.
     pub admission_state_by_peer: BTreeMap<String, AdmissionStateSnapshot>,
+    /// X0X-0074: aggregate admission counters — admit + drop totals per
+    /// (priority, reason). Operators tune topic priorities by watching
+    /// `dropped_bulk_backpressure` vs `dropped_bulk_peer_suspect` /
+    /// `dropped_bulk_peer_cooled`. `dropped_critical_hard_error` must
+    /// stay zero in production; a non-zero value is a soak-blocking
+    /// violation.
+    pub admission: admission::AdmissionStatsSnapshot,
     /// Per-topic bounded message-cache usage and eviction counters.
     pub topic_caches: Vec<TopicCacheStatsSnapshot>,
 }
@@ -1197,6 +1206,7 @@ impl PubSubStageStats {
             peer_scores: Vec::new(),
             peer_scores_by_topic: BTreeMap::new(),
             admission_state_by_peer: BTreeMap::new(),
+            admission: admission::AdmissionStatsSnapshot::default(),
             topic_caches: Vec::new(),
         }
     }
@@ -2023,7 +2033,6 @@ impl TopicState {
         self.subscribers.retain(|tx| !tx.is_closed());
     }
 
-    #[cfg(test)]
     fn is_peer_suppressed_at(&self, peer: PeerId, now: Instant) -> bool {
         self.peer_cooling
             .get(&peer)
@@ -2802,6 +2811,11 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// construction observe the oracle after [`Self::with_health_oracle`] is
     /// called by the runtime builder.
     peer_health_oracle: Arc<StdRwLock<Option<Arc<dyn PeerHealthOracle>>>>,
+    /// X0X-0074: substrate-level admission control + per-topic priority
+    /// registry. Consulted on every `send_to_peer_bounded` before the
+    /// per-peer outbound pipeline is touched. Bulk admissions release on
+    /// completion (sent or timed out).
+    admission: Arc<admission::AdmissionControl>,
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
@@ -2875,6 +2889,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             cache_config,
             peer_health_snapshot: Arc::new(StdRwLock::new(HashMap::new())),
             peer_health_oracle: Arc::new(StdRwLock::new(None)),
+            admission: Arc::new(admission::AdmissionControl::new()),
         };
 
         if start_background_tasks {
@@ -2983,7 +2998,61 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Self::build_peer_scores_by_topic(&snapshot.peer_scores, &snapshot.suppressed_peers);
         snapshot.admission_state_by_peer =
             Self::build_admission_state_by_peer(&snapshot.suppressed_peers);
+        Self::merge_admission_per_peer_state(
+            &mut snapshot.admission_state_by_peer,
+            &self.admission.per_peer_snapshot(),
+        );
+        snapshot.admission = self.admission.stats().snapshot();
         snapshot
+    }
+
+    /// X0X-0074: registry + telemetry surface for substrate-level
+    /// admission control. Applications register topic priorities on this
+    /// handle at startup; counters and per-peer bulk-queue depths are
+    /// surfaced through [`Self::stage_stats`].
+    #[must_use]
+    pub fn admission(&self) -> &admission::AdmissionControl {
+        &self.admission
+    }
+
+    /// X0X-0074: replace the admission control instance at construction.
+    /// Useful in tests and for runtimes that want to apply a non-default
+    /// [`admission::AdmissionConfig`].
+    #[must_use]
+    pub fn with_admission(mut self, admission: Arc<admission::AdmissionControl>) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    fn merge_admission_per_peer_state(
+        existing: &mut BTreeMap<String, AdmissionStateSnapshot>,
+        per_peer: &HashMap<PeerId, admission::PerPeerAdmissionCounts>,
+    ) {
+        for (peer, counts) in per_peer {
+            let entry =
+                existing
+                    .entry(peer.to_string())
+                    .or_insert_with(|| AdmissionStateSnapshot {
+                        state: "alive".to_string(),
+                        suppressed_topics_count: 0,
+                        cooled_topics_count: 0,
+                        recovery_probe_topics_count: 0,
+                        recovery_ready_topics_count: 0,
+                        priority_queue_depths: BTreeMap::new(),
+                    });
+            entry.priority_queue_depths.insert(
+                TopicPriority::Bulk.as_str().to_string(),
+                counts.bulk_queue_depth,
+            );
+            entry.priority_queue_depths.insert(
+                TopicPriority::Normal.as_str().to_string(),
+                counts.normal_queue_depth,
+            );
+            entry.priority_queue_depths.insert(
+                TopicPriority::Critical.as_str().to_string(),
+                counts.critical_queue_depth,
+            );
+        }
     }
 
     fn build_suppressed_peers_by_topic(
@@ -3276,11 +3345,38 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
     ) -> Result<()> {
+        // X0X-0074: admission control gate. Consults topic priority,
+        // peer health (from the snapshot — sync, no await under lock),
+        // and per-peer cooled state to decide whether the message
+        // should enter the outbound pipeline at all. Bulk admissions
+        // release on completion below.
+        let priority = self.admission.registry().priority_for(&topic);
+        let health = peer_health_from_snapshot(self.peer_health_snapshot.as_ref(), &peer);
+        let is_peer_cooled = self.is_peer_currently_suppressed(&topic, &peer).await;
+        let admission_decision = self.admission.admit(&topic, &peer, health, is_peer_cooled);
+        if let AdmissionDecision::Drop { reason } = admission_decision {
+            debug!(
+                peer_id = %peer,
+                topic = %topic,
+                op,
+                priority = %priority,
+                reason = %reason,
+                "X0X-0074 admission dropped peer send"
+            );
+            return Ok(());
+        }
+
         let mut claims = self.claim_topic_send_attempts(topic, vec![peer], op).await;
         let Some(attempt) = claims.attempts().first().copied() else {
+            if priority == TopicPriority::Bulk {
+                self.admission.release_bulk(&peer);
+            }
             return Ok(());
         };
         let Some(permit) = claims.take_permits().into_iter().next() else {
+            if priority == TopicPriority::Bulk {
+                self.admission.release_bulk(&peer);
+            }
             return Ok(());
         };
 
@@ -3301,7 +3397,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .await
         }));
 
-        match handle.join().await {
+        let result = match handle.join().await {
             Ok(Ok(PeerSendOutcome::Sent { observed })) => {
                 claims
                     .record_results(vec![PeerSendCompletion { attempt, observed }], Vec::new())
@@ -3327,7 +3423,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 );
                 Err(anyhow!("{op} per-peer send task panicked: {e}"))
             }
+        };
+        if priority == TopicPriority::Bulk {
+            self.admission.release_bulk(&peer);
         }
+        result
+    }
+
+    /// Inspect the per-topic cooling state for `peer`. Returns `true` if
+    /// the peer is currently suppressed for this topic. Used by the
+    /// admission gate to drop bulk admissions to cooled peers without
+    /// re-entering the per-topic send pipeline.
+    async fn is_peer_currently_suppressed(&self, topic: &TopicId, peer: &PeerId) -> bool {
+        let topics_guard = self.topics.read().await;
+        let now = Instant::now();
+        topics_guard
+            .get(topic)
+            .is_some_and(|state| state.is_peer_suppressed_at(*peer, now))
     }
 
     async fn claim_topic_send_attempts(
@@ -3624,8 +3736,28 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
     ) {
-        let mut claims = self.claim_topic_send_attempts(topic, peers, op).await;
+        // X0X-0074: admission gate runs once per (topic, peer) before
+        // we claim attempts. Dropped peers never enter the send
+        // pipeline. Bulk admissions are released after the per-peer
+        // task completes (sent or timed out).
+        let priority = self.admission.registry().priority_for(&topic);
+        let admitted = self
+            .filter_peers_through_admission(&topic, peers, priority, op)
+            .await;
+        if admitted.is_empty() {
+            return;
+        }
+
+        let mut claims = self.claim_topic_send_attempts(topic, admitted, op).await;
         if claims.is_empty() {
+            // No claims means we couldn't enter the send pipeline (e.g.
+            // budgets exhausted). Release the Bulk admissions we
+            // optimistically reserved above.
+            if priority == TopicPriority::Bulk {
+                for peer in claims.attempts() {
+                    self.admission.release_bulk(&peer.peer);
+                }
+            }
             return;
         }
         let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
@@ -3652,7 +3784,60 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             send_tasks.push(attempt, handle);
         }
         let (sent, timed_out) = send_tasks.collect_results().await;
+        if priority == TopicPriority::Bulk {
+            for completion in &sent {
+                self.admission.release_bulk(&completion.attempt.peer);
+            }
+            for attempt in &timed_out {
+                self.admission.release_bulk(&attempt.peer);
+            }
+        }
         claims.record_results(sent, timed_out).await;
+    }
+
+    /// X0X-0074: filter a peer list through the admission gate. Returns
+    /// the subset of peers that admit; the rest are accounted for in the
+    /// admission counters. The cooling lookup is batched under a single
+    /// `topics.read()` to avoid N lock acquisitions for N peers.
+    async fn filter_peers_through_admission(
+        &self,
+        topic: &TopicId,
+        peers: Vec<PeerId>,
+        priority: TopicPriority,
+        op: &'static str,
+    ) -> Vec<PeerId> {
+        let cooled_set: HashSet<PeerId> = {
+            let topics_guard = self.topics.read().await;
+            let now = Instant::now();
+            match topics_guard.get(topic) {
+                Some(state) => peers
+                    .iter()
+                    .copied()
+                    .filter(|peer| state.is_peer_suppressed_at(*peer, now))
+                    .collect(),
+                None => HashSet::new(),
+            }
+        };
+
+        let mut admitted = Vec::with_capacity(peers.len());
+        for peer in peers {
+            let health = peer_health_from_snapshot(self.peer_health_snapshot.as_ref(), &peer);
+            let is_peer_cooled = cooled_set.contains(&peer);
+            match self.admission.admit(topic, &peer, health, is_peer_cooled) {
+                AdmissionDecision::Admit => admitted.push(peer),
+                AdmissionDecision::Drop { reason } => {
+                    debug!(
+                        peer_id = %peer,
+                        topic = %topic,
+                        op,
+                        priority = %priority,
+                        reason = %reason,
+                        "X0X-0074 admission dropped peer send"
+                    );
+                }
+            }
+        }
+        admitted
     }
 
     /// Get current epoch (seconds since UNIX_EPOCH)
@@ -5823,6 +6008,95 @@ mod tests {
             transport.send_count(),
             eager_peers.len(),
             "every eager peer should have had send_to_peer attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_drops_bulk_send_to_suspect_peer_and_records_counter() {
+        // Why: X0X-0074 admission must drop Bulk admissions to peers
+        // the SWIM oracle has flagged Suspect — that's the substrate-
+        // level pressure relief mechanism the Hunt 12f forecast called
+        // for. The dropped send must never reach the transport, and the
+        // counter must increment so operators can attribute pressure.
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([74u8; 32]);
+        let suspect_peer = test_peer_id(2);
+        pubsub
+            .initialize_topic_peers(topic, vec![suspect_peer])
+            .await;
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Bulk);
+        // Seed the health snapshot directly — bypasses the oracle so the
+        // test runs without spawning a refresher task.
+        {
+            let mut guard = pubsub.peer_health_snapshot.write().expect("snapshot lock");
+            guard.insert(suspect_peer, PeerHealth::Suspect);
+        }
+
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"bulk-suspect-drop"))
+            .await
+            .expect("publish should complete even when admission drops");
+
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_bulk_peer_suspect, 1,
+            "bulk admission to Suspect peer must drop and increment the counter"
+        );
+        assert_eq!(stats.admitted_bulk, 0);
+        assert_eq!(
+            transport.send_count(),
+            0,
+            "dropped admission must never reach the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_admits_critical_send_even_when_peer_dead() {
+        // Why: the ticket's hardest contract — Critical never drops on
+        // health. DM inbox + control plane must keep flowing even when
+        // SWIM has flagged the peer Dead. A dropped Critical is a
+        // soak-blocking hard error.
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([75u8; 32]);
+        let dead_peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![dead_peer]).await;
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        {
+            let mut guard = pubsub.peer_health_snapshot.write().expect("snapshot lock");
+            guard.insert(dead_peer, PeerHealth::Dead);
+        }
+
+        transport.release_sends(1);
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"critical-dead-admit"))
+            .await
+            .expect("publish should complete");
+
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(stats.admitted_critical, 1);
+        assert_eq!(
+            stats.dropped_critical_hard_error, 0,
+            "Critical must never drop; this counter is a soak violation"
         );
     }
 

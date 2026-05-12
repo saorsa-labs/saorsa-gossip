@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.45] - 2026-05-12
+
+X0X-0075 Part A — per-topic and per-peer suppression diagnostics
+shipped with ant-quic 0.27.22 pin (X0X-0075 Part B's
+`ConnectionTransportStats` becomes consumable by downstream x0x).
+
+### Why
+
+Reviewer (2026-05-12): "the current timeline counts suppression, but
+we need to know whether the suppressed topics are release, identity,
+discovery, DM inbox, group cards, or test discovery." Without that,
+admission-control tuning (X0X-0074) and cooling-decision integration
+(X0X-0073b) cannot be validated — the visibility is the gate.
+
+### Added
+
+- `PubSubStageStatsSnapshot` gains three new fields:
+  - `suppressed_peers_by_topic: BTreeMap<String, Vec<String>>` —
+    which peers cool on which topic, deduplicated + sorted per topic.
+  - `peer_scores_by_topic: BTreeMap<String, BTreeMap<String,
+    PeerScoreBreakdownSnapshot>>` — per-(topic, peer) score components
+    + active cooling state cross-reference.
+  - `admission_state_by_peer: BTreeMap<String, AdmissionStateSnapshot>`
+    — peer-indexed admission state inferred from active cooling.
+    `priority_queue_depths` reserved for X0X-0074.
+- `PeerScoreBreakdownSnapshot` — role, score, send_health,
+  outbound_send_timeouts, cooling_events, eager_eligible, plus
+  optional suppression_state, recent_timeout_count, cooldown_ms,
+  last_cool_at_unix_ms when the peer is currently cooled.
+- `AdmissionStateSnapshot` — state (cooled / recovery_probe /
+  recovery_ready / alive), suppressed_topics_count,
+  cooled_topics_count, recovery_probe_topics_count,
+  recovery_ready_topics_count, priority_queue_depths (empty until
+  X0X-0074).
+- `SuppressedPeerSnapshot.last_suppressed_unix_ms` — wall-clock Unix
+  millisecond when the (peer, topic) entered suppression or
+  recovery-probe state. Persisted in `SuppressedPeerState`; updated
+  by both `record_suppression` and `record_recovery_probe`.
+- Three builder functions on `PlumtreePubSub`:
+  `build_suppressed_peers_by_topic`,
+  `build_peer_scores_by_topic`,
+  `build_admission_state_by_peer`. Called inside
+  `pubsub_stage_stats_snapshot` after the flat snapshots are
+  built so the topic-indexed views are consistent with the legacy
+  fields they derive from.
+- 2 new unit tests:
+  `diagnostics_group_suppression_by_topic_and_peer_admission_state`
+  and `diagnostics_peer_scores_by_topic_include_active_cooling_breakdown`.
+
+### Changed
+
+- Workspace `ant-quic` dependency bumped 0.27.15 → 0.27.22 to bring
+  the X0X-0075 Part B `ConnectionTransportStats` surface and a
+  number of intervening fixes since 0.27.15:
+  - 0.27.16-0.27.20: X0X-0062 cancellation-safe direct-DM ACK loop
+  - 0.27.21: caller-supplied ACK-v2 request id (X0X-0066 enablement)
+  - 0.27.22: X0X-0075 Part B `ConnectionTransportStats`
+- No behavioural change in saorsa-gossip from the ant-quic bump itself
+  — only the new surface (consumable by downstream x0x).
+
+### Notes
+
+- The cooling-decision integration that consumes these diagnostics
+  ships as X0X-0073b / X0X-0069b (next saorsa-gossip release).
+- Admission control (X0X-0074) is now functionally unblocked — its
+  only blocker was the visibility this release provides.
+
 ## [0.5.44] - 2026-05-12
 
 X0X-0073 (MVP, v2) — reviewer-driven corrections to the 0.5.43

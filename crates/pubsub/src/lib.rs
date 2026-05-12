@@ -3348,8 +3348,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // X0X-0074: admission control gate. Consults topic priority,
         // peer health (from the snapshot — sync, no await under lock),
         // and per-peer cooled state to decide whether the message
-        // should enter the outbound pipeline at all. Bulk admissions
-        // release on completion below.
+        // should enter the outbound pipeline at all.
+        //
+        // Bulk admissions reserve depth here and release exactly once
+        // at function exit, covering no-claim, panic, and normal
+        // completion paths uniformly. Critical admissions that fail to
+        // claim an outbound budget record `dropped_critical_hard_error`
+        // — a non-zero value is a soak-blocking violation.
         let priority = self.admission.registry().priority_for(&topic);
         let health = peer_health_from_snapshot(self.peer_health_snapshot.as_ref(), &peer);
         let is_peer_cooled = self.is_peer_currently_suppressed(&topic, &peer).await;
@@ -3366,17 +3371,36 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             return Ok(());
         }
 
+        // Bulk-admitted means we incremented per-peer depth — release
+        // exactly once on the way out.
+        let bulk_admitted = priority == TopicPriority::Bulk;
+        let release_guard = scopeguard_release(bulk_admitted, &peer, &self.admission);
+
         let mut claims = self.claim_topic_send_attempts(topic, vec![peer], op).await;
         let Some(attempt) = claims.attempts().first().copied() else {
-            if priority == TopicPriority::Bulk {
-                self.admission.release_bulk(&peer);
+            if priority == TopicPriority::Critical {
+                self.admission.stats().record_critical_hard_error();
+                warn!(
+                    peer_id = %peer,
+                    topic = %topic,
+                    op,
+                    "X0X-0074 hard error: Critical admission failed to claim outbound budget"
+                );
             }
+            drop(release_guard);
             return Ok(());
         };
         let Some(permit) = claims.take_permits().into_iter().next() else {
-            if priority == TopicPriority::Bulk {
-                self.admission.release_bulk(&peer);
+            if priority == TopicPriority::Critical {
+                self.admission.stats().record_critical_hard_error();
+                warn!(
+                    peer_id = %peer,
+                    topic = %topic,
+                    op,
+                    "X0X-0074 hard error: Critical admission claimed attempt but lost permit"
+                );
             }
+            drop(release_guard);
             return Ok(());
         };
 
@@ -3424,9 +3448,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 Err(anyhow!("{op} per-peer send task panicked: {e}"))
             }
         };
-        if priority == TopicPriority::Bulk {
-            self.admission.release_bulk(&peer);
-        }
+        drop(release_guard);
         result
     }
 
@@ -3738,26 +3760,51 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ) {
         // X0X-0074: admission gate runs once per (topic, peer) before
         // we claim attempts. Dropped peers never enter the send
-        // pipeline. Bulk admissions are released after the per-peer
-        // task completes (sent or timed out).
+        // pipeline. Bulk admissions are reserved here and released
+        // exactly once at the end of this function regardless of which
+        // downstream path (no-claim, partial-claim, send completion)
+        // the message took — the depth counter must never leak.
         let priority = self.admission.registry().priority_for(&topic);
         let admitted = self
             .filter_peers_through_admission(&topic, peers, priority, op)
             .await;
-        if admitted.is_empty() {
+        let bulk_admitted: Vec<PeerId> = if priority == TopicPriority::Bulk {
+            admitted.clone()
+        } else {
+            Vec::new()
+        };
+        let admitted_count = admitted.len();
+        if admitted_count == 0 {
             return;
         }
 
         let mut claims = self.claim_topic_send_attempts(topic, admitted, op).await;
-        if claims.is_empty() {
-            // No claims means we couldn't enter the send pipeline (e.g.
-            // budgets exhausted). Release the Bulk admissions we
-            // optimistically reserved above.
-            if priority == TopicPriority::Bulk {
-                for peer in claims.attempts() {
-                    self.admission.release_bulk(&peer.peer);
-                }
+        let attempts_count = claims.attempts().len();
+
+        // X0X-0074 hard error: a Critical admission must reach the
+        // per-peer pipeline. If `claim_topic_send_attempts` returns
+        // fewer attempts than admitted (e.g. outbound budgets
+        // exhausted), every missing claim is a hard error. Surface as
+        // a counter so the soak gate can fail the run.
+        if priority == TopicPriority::Critical && attempts_count < admitted_count {
+            let lost = admitted_count - attempts_count;
+            for _ in 0..lost {
+                self.admission.stats().record_critical_hard_error();
             }
+            warn!(
+                topic = %topic,
+                op,
+                lost,
+                admitted = admitted_count,
+                attempted = attempts_count,
+                "X0X-0074 hard error: Critical admission(s) failed to claim outbound budget"
+            );
+        }
+
+        if claims.is_empty() {
+            // No peers got attempts. Bulk reservations release at
+            // function exit below.
+            self.release_bulk_admissions(&bulk_admitted);
             return;
         }
         let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
@@ -3784,17 +3831,51 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             send_tasks.push(attempt, handle);
         }
         let (sent, timed_out) = send_tasks.collect_results().await;
-        if priority == TopicPriority::Bulk {
-            for completion in &sent {
-                self.admission.release_bulk(&completion.attempt.peer);
-            }
-            for attempt in &timed_out {
-                self.admission.release_bulk(&attempt.peer);
-            }
-        }
         claims.record_results(sent, timed_out).await;
+        // Release Bulk admissions for the entire admitted set, exactly
+        // once. Covers no-claim, partial-claim, panic, and normal
+        // completion paths uniformly.
+        self.release_bulk_admissions(&bulk_admitted);
     }
 
+    fn release_bulk_admissions(&self, bulk_admitted: &[PeerId]) {
+        for peer in bulk_admitted {
+            self.admission.release_bulk(peer);
+        }
+    }
+}
+
+/// X0X-0074: RAII guard that releases a per-peer Bulk-admission reservation
+/// exactly once on drop. Used by `send_to_peer_bounded` to guarantee the
+/// per-peer Bulk depth never leaks across early-return paths (no-claim,
+/// no-permit, send error, panic).
+struct BulkAdmissionGuard<'a> {
+    armed: bool,
+    peer: PeerId,
+    admission: &'a admission::AdmissionControl,
+}
+
+impl Drop for BulkAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.admission.release_bulk(&self.peer);
+        }
+    }
+}
+
+fn scopeguard_release<'a>(
+    armed: bool,
+    peer: &PeerId,
+    admission: &'a admission::AdmissionControl,
+) -> BulkAdmissionGuard<'a> {
+    BulkAdmissionGuard {
+        armed,
+        peer: *peer,
+        admission,
+    }
+}
+
+impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// X0X-0074: filter a peer list through the admission gate. Returns
     /// the subset of peers that admit; the rest are accounted for in the
     /// admission counters. The cooling lookup is batched under a single
@@ -6098,6 +6179,128 @@ mod tests {
             stats.dropped_critical_hard_error, 0,
             "Critical must never drop; this counter is a soak violation"
         );
+    }
+
+    #[tokio::test]
+    async fn admission_bulk_depth_releases_after_each_publish() {
+        // Why: regression for reviewer P1.3 (2026-05-12). The previous
+        // release path iterated `claims.attempts()` after it had been
+        // checked empty — the loop was a no-op so per-peer Bulk depth
+        // monotonically leaked, eventually starving the peer of all
+        // future Bulk admissions with false `BulkBackpressure`. After
+        // the fix, repeated publishes to the same peer must keep the
+        // per-peer depth at zero between calls.
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([76u8; 32]);
+        let bulk_peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![bulk_peer]).await;
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Bulk);
+        {
+            let mut guard = pubsub.peer_health_snapshot.write().expect("snapshot lock");
+            guard.insert(bulk_peer, PeerHealth::Alive);
+        }
+
+        // Release every send so they all complete (no leaks via the
+        // timed-out path).
+        transport.release_sends(10);
+
+        for _ in 0..5 {
+            pubsub
+                .publish_local(topic, Bytes::from_static(b"bulk-no-leak"))
+                .await
+                .expect("publish should complete");
+        }
+
+        let per_peer = pubsub.admission().per_peer_snapshot();
+        let depth = per_peer
+            .get(&bulk_peer)
+            .map(|c| c.bulk_queue_depth)
+            .unwrap_or(0);
+        assert_eq!(
+            depth, 0,
+            "Bulk depth must drain to zero between publishes; current = {depth}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_records_critical_hard_error_when_outbound_budget_exhausted() {
+        // Why: reviewer P1.1 (2026-05-12) — after admission says Admit,
+        // the shared outbound budget can still refuse a permit. For
+        // Critical traffic that shortcut is the very thing the
+        // X0X-0074 contract forbids, so a non-zero
+        // `dropped_critical_hard_error` is a soak-blocking violation.
+        // This test exhausts the per-peer outbound budget by spamming
+        // a topic and confirms the next Critical publish records the
+        // hard error counter.
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([77u8; 32]);
+        let target_peer = test_peer_id(2);
+        pubsub
+            .initialize_topic_peers(topic, vec![target_peer])
+            .await;
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Critical);
+
+        // Saturate outbound budget — every published bundle holds a
+        // permit, which the blocking transport never releases. The
+        // shared budget runs out and subsequent Critical admissions
+        // claim zero attempts.
+        let saturate_task = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                for _ in 0..32 {
+                    let _ = pubsub
+                        .publish_local(topic, Bytes::from_static(b"saturate"))
+                        .await;
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The saturation publishes may have already started recording
+        // the hard error (Critical + claim fail). Take a baseline.
+        let baseline = pubsub
+            .admission()
+            .stats()
+            .snapshot()
+            .dropped_critical_hard_error;
+
+        // Final probe publish — guaranteed to hit the no-claim branch.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            pubsub.publish_local(topic, Bytes::from_static(b"probe")),
+        )
+        .await;
+
+        let post = pubsub
+            .admission()
+            .stats()
+            .snapshot()
+            .dropped_critical_hard_error;
+        assert!(
+            post > baseline || baseline > 0,
+            "Critical-without-permit must record dropped_critical_hard_error (baseline={baseline}, post={post})"
+        );
+        saturate_task.abort();
     }
 
     #[tokio::test]

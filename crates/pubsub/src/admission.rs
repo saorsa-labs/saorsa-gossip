@@ -91,6 +91,7 @@ pub struct AdmissionStats {
     dropped_bulk_peer_cooled: AtomicU64,
     dropped_bulk_backpressure: AtomicU64,
     dropped_normal_peer_dead: AtomicU64,
+    dropped_normal_peer_suspect: AtomicU64,
     /// Hard error: a Critical message was dropped. Must stay zero in
     /// production; surfaced as a violation on `/diagnostics/gossip`.
     dropped_critical_hard_error: AtomicU64,
@@ -119,6 +120,11 @@ pub struct AdmissionStatsSnapshot {
     pub dropped_bulk_backpressure: u64,
     /// Normal admissions dropped because the peer is `Dead`.
     pub dropped_normal_peer_dead: u64,
+    /// Normal admissions dropped because the peer is `Suspect` (SWIM
+    /// indirect probes pending). Per the X0X-0074 ticket, Normal
+    /// traffic backs off under suspicion so the SWIM round can clear
+    /// or confirm the peer without the application piling on.
+    pub dropped_normal_peer_suspect: u64,
     /// **Hard error**: a Critical admission was dropped. Must remain
     /// zero in production; non-zero is a soak-blocking violation.
     pub dropped_critical_hard_error: u64,
@@ -137,6 +143,7 @@ impl AdmissionStats {
             dropped_bulk_peer_cooled: self.dropped_bulk_peer_cooled.load(Ordering::Relaxed),
             dropped_bulk_backpressure: self.dropped_bulk_backpressure.load(Ordering::Relaxed),
             dropped_normal_peer_dead: self.dropped_normal_peer_dead.load(Ordering::Relaxed),
+            dropped_normal_peer_suspect: self.dropped_normal_peer_suspect.load(Ordering::Relaxed),
             dropped_critical_hard_error: self.dropped_critical_hard_error.load(Ordering::Relaxed),
         }
     }
@@ -150,11 +157,25 @@ impl AdmissionStats {
         .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// X0X-0074 hard error: a Critical admission could not actually
+    /// claim an outbound budget permit. Per the ticket, Critical must
+    /// always reach the per-peer pipeline; a non-zero value here is a
+    /// soak-blocking violation. Call sites (the publish path) must
+    /// emit this whenever they short-circuit a Critical admission
+    /// downstream of [`AdmissionControl::admit`].
+    pub fn record_critical_hard_error(&self) {
+        self.dropped_critical_hard_error
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_drop(&self, priority: TopicPriority, reason: AdmissionDropReason) {
         let counter = match (priority, reason) {
             (TopicPriority::Critical, _) => &self.dropped_critical_hard_error,
             (TopicPriority::Normal, AdmissionDropReason::PeerDead) => {
                 &self.dropped_normal_peer_dead
+            }
+            (TopicPriority::Normal, AdmissionDropReason::PeerSuspect) => {
+                &self.dropped_normal_peer_suspect
             }
             (TopicPriority::Bulk, AdmissionDropReason::PeerDead) => &self.dropped_bulk_peer_dead,
             (TopicPriority::Bulk, AdmissionDropReason::PeerSuspect) => {
@@ -166,9 +187,11 @@ impl AdmissionStats {
             (TopicPriority::Bulk, AdmissionDropReason::BulkBackpressure) => {
                 &self.dropped_bulk_backpressure
             }
-            // Normal traffic doesn't currently drop on Suspect / Cooled /
-            // Backpressure — record as bulk-backpressure for visibility
-            // since that's the closest analogue if the rules ever evolve.
+            // Normal traffic doesn't currently drop on Cooled or
+            // Backpressure — Normal peers continue to receive non-Bulk
+            // traffic so essential overlay flow keeps moving. Record
+            // these unexpected cases against bulk-backpressure for
+            // visibility if the rules evolve.
             (TopicPriority::Normal, _) => &self.dropped_bulk_backpressure,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -314,11 +337,25 @@ impl AdmissionControl {
                 AdmissionDecision::Admit
             }
             TopicPriority::Normal => {
+                // Per X0X-0074 ticket: "admitted unless peer is under
+                // suspicion (X0X-0069) or peer score below threshold
+                // (X0X-0071)". Dead and Suspect both back off so the
+                // SWIM round can clear or confirm the peer without the
+                // application piling on. Score-threshold check is
+                // deferred until X0X-0071 lands and a score is plumbed
+                // through.
                 if matches!(health, Some(PeerHealth::Dead)) {
                     self.stats
                         .record_drop(priority, AdmissionDropReason::PeerDead);
                     return AdmissionDecision::Drop {
                         reason: AdmissionDropReason::PeerDead,
+                    };
+                }
+                if matches!(health, Some(PeerHealth::Suspect)) {
+                    self.stats
+                        .record_drop(priority, AdmissionDropReason::PeerSuspect);
+                    return AdmissionDecision::Drop {
+                        reason: AdmissionDropReason::PeerSuspect,
                     };
                 }
                 self.stats.record_admit(priority);
@@ -460,11 +497,14 @@ mod tests {
     }
 
     #[test]
-    fn normal_drops_only_when_peer_is_dead() {
-        // Why: presence + named-group fanout (Normal) must keep
-        // flowing through Suspect and cooled peers — dropping them
-        // there would starve essential overlay traffic. Only confirmed
-        // Dead peers shed Normal.
+    fn normal_drops_under_suspicion_and_when_dead() {
+        // Why: per the X0X-0074 ticket, Normal traffic is "admitted
+        // unless peer is under suspicion (X0X-0069) or peer score
+        // below threshold (X0X-0071)". Both Dead and Suspect back off;
+        // Alive and cooled-without-health-signal admit (the
+        // score-threshold check arrives with X0X-0071). This replaces
+        // the prior `normal_drops_only_when_peer_is_dead` test that
+        // contradicted the ticket (reviewer P2, 2026-05-12).
         let admission = AdmissionControl::new();
         admission.registry().register(t(1), TopicPriority::Normal);
 
@@ -474,23 +514,26 @@ mod tests {
         );
         assert_eq!(
             admission.admit(&t(1), &p(3), Some(PeerHealth::Suspect), false),
-            AdmissionDecision::Admit
+            AdmissionDecision::Drop {
+                reason: AdmissionDropReason::PeerSuspect
+            },
+            "Suspect must back off Normal traffic per X0X-0074 ticket"
         );
         assert_eq!(
             admission.admit(&t(1), &p(4), None, true),
             AdmissionDecision::Admit,
-            "cooled peer still gets Normal admission"
+            "cooled-without-health-signal still gets Normal admission"
         );
-        let dropped = admission.admit(&t(1), &p(5), Some(PeerHealth::Dead), false);
         assert_eq!(
-            dropped,
+            admission.admit(&t(1), &p(5), Some(PeerHealth::Dead), false),
             AdmissionDecision::Drop {
                 reason: AdmissionDropReason::PeerDead
             }
         );
 
         let snap = admission.stats().snapshot();
-        assert_eq!(snap.admitted_normal, 3);
+        assert_eq!(snap.admitted_normal, 2);
+        assert_eq!(snap.dropped_normal_peer_suspect, 1);
         assert_eq!(snap.dropped_normal_peer_dead, 1);
     }
 

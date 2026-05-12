@@ -5,7 +5,84 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.46] - 2026-05-12
+## [0.5.47] - 2026-05-12
+
+Reviewer-driven corrections to 0.5.46. **0.5.46 is yanked** — it shipped
+with four bugs (3 P1 + 1 P2) that this release fixes. Use 0.5.47 instead.
+
+### Fixed (reviewer findings 2026-05-12)
+
+- **P1.1 — Critical traffic silently skippable after admission.**
+  `AdmissionControl::admit` correctly returned `Admit` for Critical,
+  but the downstream `claim_topic_send_attempts` could still return
+  no permit (outbound budget exhausted). The previous code just
+  short-circuited without recording the hard error. 0.5.47:
+  - `parallel_send_to_peers` and `send_to_peer_bounded` count
+    `admitted - attempts_count` Critical claim failures as
+    `dropped_critical_hard_error` and emit a `warn!` log.
+  - New `AdmissionStats::record_critical_hard_error()` is the public
+    counter accessor.
+  - Regression test:
+    `admission_records_critical_hard_error_when_outbound_budget_exhausted`.
+- **P1.2 — Production topic names did not match the classifier.**
+  DM uses `x0x/dm/v1/bus` (slash style); the prior classifier had
+  `x0x.dm.` (dot style), routing DM to Normal in production. Same
+  for release manifests (`x0x/release`) and DM capability adverts
+  (`x0x/caps/v1`). 0.5.47 adds the slash-style prefixes to the
+  classifier and seeds them in `register_x0x_topic_priorities`.
+  Tests now assert the actual production topic strings from
+  `src/dm_inbox.rs`, `src/upgrade/manifest.rs`, and
+  `src/dm_capability.rs` classify correctly.
+- **P1.3 — Bulk admission reservations could leak.**
+  `filter_peers_through_admission` incremented per-peer Bulk depth,
+  but the release path iterated `claims.attempts()` AFTER it became
+  empty — the loop was a no-op so depth monotonically leaked,
+  eventually starving peers of future Bulk admissions with false
+  `BulkBackpressure`. Partial claim failures also only released
+  sent/timed-out attempts. 0.5.47:
+  - `parallel_send_to_peers` snapshots the Bulk-admitted peer set up
+    front and releases it via `release_bulk_admissions(&bulk_admitted)`
+    exactly once at function exit. Covers no-claim, partial-claim,
+    panic, and normal completion paths uniformly.
+  - `send_to_peer_bounded` uses a `BulkAdmissionGuard` RAII helper
+    so the release happens on drop regardless of early-return path.
+  - Regression test:
+    `admission_bulk_depth_releases_after_each_publish` (5 publishes
+    to same peer; per-peer Bulk depth must remain 0).
+- **P2 — Normal admission contradicted the ticket.**
+  The X0X-0074 ticket says Normal is "admitted unless peer is under
+  suspicion or peer score below threshold". 0.5.46 dropped only on
+  Dead. 0.5.47 drops on Suspect too, recording into the new
+  `dropped_normal_peer_suspect` counter. The score-threshold check
+  is deferred until X0X-0071 lands and a score is plumbed through.
+  The `normal_drops_only_when_peer_is_dead` test was renamed to
+  `normal_drops_under_suspicion_and_when_dead` and updated.
+
+### Updated decision matrix
+
+| Topic | Health | Cooled | Decision |
+|---|---|---|---|
+| Critical | * | * | Admit (drop = hard error in counter) |
+| Normal | Dead | * | Drop / `PeerDead` |
+| Normal | **Suspect** | * | **Drop / `PeerSuspect`** (changed in 0.5.47) |
+| Normal | Alive/None | * | Admit |
+| Bulk | Dead | * | Drop / `PeerDead` |
+| Bulk | Suspect | * | Drop / `PeerSuspect` |
+| Bulk | Alive | cooled | Drop / `PeerCooled` |
+| Bulk | Alive | not cooled, queue ≥ slack | Drop / `BulkBackpressure` |
+| Bulk | Alive | not cooled, queue < slack | Admit |
+
+### Tests
+
+- 522/522 workspace tests pass (10 added since 0.5.45: 2 publish-path
+  integration + 2 admission integration tests landed in 0.5.46, 2
+  Bulk-depth + Critical-hard-error regression tests added in 0.5.47).
+- fmt + clippy `-D warnings` clean.
+
+## [0.5.46] - 2026-05-12 [YANKED]
+
+**Yanked 2026-05-12** — shipped with four bugs (3 P1 + 1 P2) found in
+external review. Use 0.5.47 instead.
 
 Bundles two pieces of SOTA-Borrow Phase 2 — X0X-0073b (cooling-decision
 integration on top of the X0X-0073 primitives + X0X-0069 oracle bridge)

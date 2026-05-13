@@ -790,6 +790,10 @@ struct SendPathContext {
     cooling_config: AdaptiveCoolingConfig,
     peer_health_snapshot: Arc<StdRwLock<HashMap<PeerId, PeerHealth>>>,
     peer_health_oracle: Arc<StdRwLock<Option<Arc<dyn PeerHealthOracle>>>>,
+    /// X0X-0074 admission control engine — shared with the foreground
+    /// publish path so background IHAVE flush + anti-entropy operations
+    /// can filter through the same gate before claiming attempts.
+    admission: Arc<admission::AdmissionControl>,
 }
 
 struct SendClaimContext<'a> {
@@ -1083,6 +1087,67 @@ fn store_peer_health_oracle(
             warn!("PubSub peer-health oracle slot lock was poisoned; recovering");
             *poisoned.into_inner() = Some(oracle);
         }
+    }
+}
+
+/// X0X-0074: free-function variant of `filter_peers_through_admission`
+/// usable from background tasks (IHAVE flush, anti-entropy) that already
+/// hold a `&TopicState` reference under a `topics.write()` guard. Skips
+/// re-acquiring the topics lock — uses the state ref directly.
+///
+/// Returns `(admitted, bulk_admitted)`:
+/// - `admitted` is the peer subset to pass to `claim_topic_send_attempts_for_state`.
+/// - `bulk_admitted` records the peers whose Bulk admission depth was
+///   incremented; callers MUST call
+///   `release_bulk_admissions_free(&admission, &bulk_admitted)` once the
+///   spawned send tasks complete (including on early-return paths).
+fn filter_peers_through_admission_in_state(
+    admission: &Arc<admission::AdmissionControl>,
+    peer_health_snapshot: &Arc<StdRwLock<HashMap<PeerId, PeerHealth>>>,
+    state: &TopicState,
+    topic: &TopicId,
+    peers: Vec<PeerId>,
+    op: &'static str,
+    now: Instant,
+) -> (Vec<PeerId>, Vec<PeerId>) {
+    let priority = admission.registry().priority_for(topic);
+    let mut admitted = Vec::with_capacity(peers.len());
+    let mut bulk_admitted = Vec::new();
+    for peer in peers {
+        let health = peer_health_from_snapshot(peer_health_snapshot.as_ref(), &peer);
+        let is_peer_cooled = state.is_peer_suppressed_at(peer, now);
+        match admission.admit(topic, &peer, health, is_peer_cooled) {
+            AdmissionDecision::Admit => {
+                if priority == TopicPriority::Bulk {
+                    bulk_admitted.push(peer);
+                }
+                admitted.push(peer);
+            }
+            AdmissionDecision::Drop { reason } => {
+                debug!(
+                    peer_id = %peer,
+                    topic = %topic,
+                    op,
+                    priority = %priority,
+                    reason = %reason,
+                    "X0X-0074 admission dropped peer send (background)"
+                );
+            }
+        }
+    }
+    (admitted, bulk_admitted)
+}
+
+/// Companion to `filter_peers_through_admission_in_state` — release any
+/// Bulk depth reserved during the filter. Idempotent on empty inputs;
+/// safe to call multiple times on the same set (each call decrements per
+/// peer, so call exactly once).
+fn release_bulk_admissions_free(
+    admission: &Arc<admission::AdmissionControl>,
+    bulk_admitted: &[PeerId],
+) {
+    for peer in bulk_admitted {
+        admission.release_bulk(peer);
     }
 }
 
@@ -2908,6 +2973,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             cooling_config: self.cooling_config,
             peer_health_snapshot: Arc::clone(&self.peer_health_snapshot),
             peer_health_oracle: Arc::clone(&self.peer_health_oracle),
+            admission: Arc::clone(&self.admission),
         }
     }
 
@@ -3719,6 +3785,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             cooling_config: AdaptiveCoolingConfig::default(),
             peer_health_snapshot,
             peer_health_oracle,
+            admission: Arc::new(admission::AdmissionControl::new()),
         };
         let sent = sent
             .into_iter()
@@ -3777,6 +3844,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if admitted_count == 0 {
             return;
         }
+        // X0X-0074: RAII guard releases Bulk admissions for the entire
+        // admitted set exactly once on drop — covers no-claim, partial-
+        // claim, send-task panic, AND the case where this future is
+        // dropped/cancelled between admission and the explicit release
+        // (reviewer P2.2, 2026-05-13). Previously we relied on an
+        // explicit call at function end which leaked on cancellation.
+        let _bulk_guard = BulkAdmissionSetGuard {
+            armed: true,
+            bulk_admitted,
+            admission: Arc::clone(&self.admission),
+        };
 
         let mut claims = self.claim_topic_send_attempts(topic, admitted, op).await;
         let attempts_count = claims.attempts().len();
@@ -3802,9 +3880,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
 
         if claims.is_empty() {
-            // No peers got attempts. Bulk reservations release at
-            // function exit below.
-            self.release_bulk_admissions(&bulk_admitted);
+            // No peers got attempts. Bulk reservations release when
+            // `_bulk_guard` drops at function exit.
             return;
         }
         let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
@@ -3832,16 +3909,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
         let (sent, timed_out) = send_tasks.collect_results().await;
         claims.record_results(sent, timed_out).await;
-        // Release Bulk admissions for the entire admitted set, exactly
-        // once. Covers no-claim, partial-claim, panic, and normal
-        // completion paths uniformly.
-        self.release_bulk_admissions(&bulk_admitted);
-    }
-
-    fn release_bulk_admissions(&self, bulk_admitted: &[PeerId]) {
-        for peer in bulk_admitted {
-            self.admission.release_bulk(peer);
-        }
+        // _bulk_guard drops here, releasing every Bulk admission exactly
+        // once. No manual release call needed.
     }
 }
 
@@ -3872,6 +3941,29 @@ fn scopeguard_release<'a>(
         armed,
         peer: *peer,
         admission,
+    }
+}
+
+/// X0X-0074: RAII guard for the publish-fanout path. Releases Bulk
+/// admissions for the entire admitted set exactly once on drop —
+/// covering the no-claim, partial-claim, send-task panic, and the
+/// future-cancellation paths uniformly. Replaces the prior pattern of
+/// calling `release_bulk_admissions` explicitly at the function's end,
+/// which leaked the per-peer depth if the future was dropped between
+/// admission increment and the explicit release.
+struct BulkAdmissionSetGuard {
+    armed: bool,
+    bulk_admitted: Vec<PeerId>,
+    admission: Arc<admission::AdmissionControl>,
+}
+
+impl Drop for BulkAdmissionSetGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            for peer in &self.bulk_admitted {
+                self.admission.release_bulk(peer);
+            }
+        }
     }
 }
 
@@ -4758,12 +4850,32 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
 
-            let (attempts, permits) = {
+            // X0X-0074: filter IHAVE recipients through admission before
+            // claiming attempts. Bulk-classified topics (most production
+            // anti-entropy carriers) will have admissions dropped here
+            // instead of entering the per-peer outbound pipeline. Bulk
+            // depths released at end-of-iteration regardless of send
+            // outcome (covers no-claim, partial-claim, panic, normal
+            // completion paths uniformly).
+            let (attempts, permits, bulk_admitted) = {
                 let now = Instant::now();
                 let mut topics_guard = topics.write().await;
                 let Some(state) = topics_guard.get_mut(&topic_id) else {
                     continue;
                 };
+                let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
+                    &send_path.admission,
+                    &send_path.peer_health_snapshot,
+                    state,
+                    &topic_id,
+                    lazy_peers,
+                    "IHAVE",
+                    now,
+                );
+                if admitted.is_empty() {
+                    release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+                    continue;
+                }
                 let claim_context = SendClaimContext {
                     stage_stats: stage_stats.as_ref(),
                     outbound_budgets,
@@ -4772,7 +4884,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     op: "IHAVE",
                     send_class: OutboundSendClass::for_op("IHAVE"),
                 };
-                Self::claim_topic_send_attempts_for_state(&claim_context, state, lazy_peers, now)
+                let (attempts, permits) =
+                    Self::claim_topic_send_attempts_for_state(&claim_context, state, admitted, now);
+                (attempts, permits, bulk_admitted)
             };
             let mut claims = SendAttemptClaims::new(
                 topic_id,
@@ -4816,6 +4930,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let (sent, timed_out) = send_tasks.collect_results().await;
                 claims.record_results(sent, timed_out).await;
             }
+            // X0X-0074: release every Bulk admission reserved above,
+            // exactly once. Covers no-claim, partial-claim, and panic
+            // paths uniformly via the explicit list rather than relying
+            // on per-completion release.
+            release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
         }
     }
 
@@ -5030,12 +5149,30 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     };
 
                     if let Ok(bytes) = postcard::to_stdvec(&message) {
-                        let (attempts, permits) = {
+                        // X0X-0074: anti-entropy is bulk anti-entropy
+                        // protocol traffic — filter through admission
+                        // before claiming attempts. Bulk depth released
+                        // exactly once at the end of this iteration via
+                        // the explicit list captured here.
+                        let (attempts, permits, bulk_admitted) = {
                             let now = Instant::now();
                             let mut topics_guard = topics.write().await;
                             let Some(state) = topics_guard.get_mut(&topic_id) else {
                                 continue;
                             };
+                            let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
+                                &send_path.admission,
+                                &send_path.peer_health_snapshot,
+                                state,
+                                &topic_id,
+                                vec![peer],
+                                "ANTI_ENTROPY",
+                                now,
+                            );
+                            if admitted.is_empty() {
+                                release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+                                continue;
+                            }
                             let claim_context = SendClaimContext {
                                 stage_stats: stage_stats.as_ref(),
                                 outbound_budgets: &outbound_budgets,
@@ -5044,12 +5181,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 op: "ANTI_ENTROPY",
                                 send_class: OutboundSendClass::for_op("ANTI_ENTROPY"),
                             };
-                            Self::claim_topic_send_attempts_for_state(
+                            let (attempts, permits) = Self::claim_topic_send_attempts_for_state(
                                 &claim_context,
                                 state,
-                                vec![peer],
+                                admitted,
                                 now,
-                            )
+                            );
+                            (attempts, permits, bulk_admitted)
                         };
                         let mut claims = SendAttemptClaims::new(
                             topic_id,
@@ -5110,6 +5248,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 );
                             }
                         }
+                        // X0X-0074: release Bulk admission depth reserved
+                        // above, exactly once. Covers panic / early-return
+                        // paths uniformly.
+                        release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
                     }
 
                     trace!(
@@ -6611,6 +6753,7 @@ mod tests {
             cooling_config: AdaptiveCoolingConfig::default(),
             peer_health_snapshot,
             peer_health_oracle,
+            admission: Arc::new(admission::AdmissionControl::new()),
         };
         let topic = TopicId::new([57u8; 32]);
         let lazy_peer = test_peer_id(2);
@@ -7850,6 +7993,7 @@ mod tests {
             cooling_config: AdaptiveCoolingConfig::default(),
             peer_health_snapshot: flush_peer_health_snapshot,
             peer_health_oracle: flush_peer_health_oracle,
+            admission: Arc::new(admission::AdmissionControl::new()),
         };
         let flush = tokio::spawn(async move {
             PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
@@ -7922,6 +8066,7 @@ mod tests {
             cooling_config: AdaptiveCoolingConfig::default(),
             peer_health_snapshot: flush_peer_health_snapshot,
             peer_health_oracle: flush_peer_health_oracle,
+            admission: Arc::new(admission::AdmissionControl::new()),
         };
         let flush = tokio::spawn(async move {
             PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(

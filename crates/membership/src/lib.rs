@@ -816,8 +816,10 @@ pub struct HyParViewMembership<T: GossipTransport + 'static> {
     passive: Arc<RwLock<HashSet<PeerId>>>,
     /// Peer addresses for connection
     peer_addrs: Arc<RwLock<HashMap<PeerId, std::net::SocketAddr>>>,
-    /// SWIM failure detector
-    swim: SwimDetector<T>,
+    /// SWIM failure detector. Wrapped in `Arc` so consumers (notably
+    /// `PlumtreePubSub::with_health_oracle`) can hold a shared reference
+    /// without forcing a redesign of HyParView's ownership.
+    swim: Arc<SwimDetector<T>>,
     /// Membership configuration
     config: MembershipConfig,
     /// Unique peers seen for network size estimation
@@ -834,13 +836,13 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
             active: Arc::new(RwLock::new(HashSet::new())),
             passive: Arc::new(RwLock::new(HashSet::new())),
             peer_addrs: Arc::new(RwLock::new(HashMap::new())),
-            swim: SwimDetector::new(
+            swim: Arc::new(SwimDetector::new(
                 local_peer_id,
                 SWIM_PROBE_INTERVAL_SECS,
                 SWIM_SUSPECT_TIMEOUT_SECS,
                 SWIM_PROBE_FANOUT,
                 transport.clone(),
-            ),
+            )),
             config,
             seen_peers: Arc::new(RwLock::new(HashMap::new())),
             transport,
@@ -996,6 +998,16 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     /// Get the SWIM detector
     pub fn swim(&self) -> &SwimDetector<T> {
         &self.swim
+    }
+
+    /// Clone the shared `Arc<SwimDetector<T>>` for consumers that need to
+    /// hold their own reference — for example
+    /// `PlumtreePubSub::with_health_oracle`, which requires an
+    /// `Arc<dyn PeerHealthOracle>`. The detector keeps a single
+    /// authoritative state regardless of how many shared references exist.
+    #[must_use]
+    pub fn swim_arc(&self) -> Arc<SwimDetector<T>> {
+        Arc::clone(&self.swim)
     }
 
     /// Dispatch an incoming membership message to the appropriate handler.

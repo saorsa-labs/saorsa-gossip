@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.49] - 2026-05-13
+
+Reviewer round 3 corrections to X0X-0074 admission control. Three of
+four findings affected saorsa-gossip; one (topic classifier) belongs to
+the x0x consumer.
+
+### Fixed (reviewer round 3 findings 2026-05-13)
+
+- **P1.2 — IHAVE flush and anti-entropy bypass admission.** Background
+  protocol traffic (`spawn_ihave_flusher`, `spawn_anti_entropy_task`)
+  called `claim_topic_send_attempts_for_state` directly without
+  routing peers through the admission gate. Bulk-classified topics
+  could push anti-entropy into the per-peer pipeline under pressure,
+  undercutting the X0X-0074 mechanism's stated purpose. Now both
+  background paths route through a new free-function helper
+  `filter_peers_through_admission_in_state` that reuses the same
+  decision logic as `parallel_send_to_peers` and tracks the admitted
+  Bulk set for explicit release at end-of-iteration.
+- **P2.2 — Bulk depth leaked on future cancellation in
+  parallel_send_to_peers.** The fanout path released Bulk admissions
+  via an explicit call at function end. If the future was dropped /
+  cancelled between admission increment (in
+  `filter_peers_through_admission`) and the explicit release at
+  function end, per-peer depth leaked permanently, causing false
+  `BulkBackpressure` until the daemon restarted. Replaced the manual
+  release with a `BulkAdmissionSetGuard` RAII that releases on drop —
+  same pattern `send_to_peer_bounded` already used via
+  `BulkAdmissionGuard`. Now uniformly covers no-claim, partial-claim,
+  send-task panic, AND future-cancellation paths.
+
+### Added
+
+- `filter_peers_through_admission_in_state` — free-function admission
+  filter usable from background tasks that already hold a
+  `&TopicState` reference under a `topics.write()` guard. Returns
+  `(admitted, bulk_admitted)`.
+- `release_bulk_admissions_free` — companion that decrements the
+  per-peer Bulk depth for a list of peers.
+- `BulkAdmissionSetGuard` — RAII variant of `BulkAdmissionGuard` for
+  the publish-fanout admitted-set.
+- `HyParViewMembership::swim_arc()` — clones the shared
+  `Arc<SwimDetector<T>>` for downstream consumers that need
+  `Arc<dyn PeerHealthOracle>`. Pairs with the existing `swim() ->
+  &SwimDetector<T>` accessor; the detector keeps a single
+  authoritative state regardless of how many shared references exist.
+  Underlying `swim: SwimDetector<T>` field is now
+  `swim: Arc<SwimDetector<T>>` (private implementation detail).
+
+### Validation
+
+- cargo fmt --all -- --check: clean
+- cargo clippy --all-features --all-targets -- -D warnings: clean
+- cargo nextest run --workspace: 522/522 pass
+
+### Notes (round 3, P2.1 lives in x0x)
+
+x0x's topic classifier omitted `x0x.directory.*` shard topics
+(production constants in `src/groups/discovery.rs:9`, published from
+`src/bin/x0xd.rs:5597`, `:5856`, `:5996`). Those default to Normal
+admission today; the fix lands in x0x 0.19.44 alongside the
+saorsa-gossip 0.5.49 dep bump.
+
+### Notes (round 3, P1.1 lives in x0x)
+
+x0x's `PubSubManager::new` did not wire the SWIM `PeerHealthOracle`
+into `PlumtreePubSub::with_health_oracle`, leaving the peer-health
+snapshot empty so X0X-0073b's Suspect/Dead cooling branches and
+X0X-0074's Suspect/Dead admission drops never engaged in x0x
+production. The Arc-friendly accessor added in this release
+(`swim_arc()`) is the cross-crate piece; the wiring change lands in
+x0x 0.19.44.
+
 ## [0.5.48] - 2026-05-12
 
 Documentation-only correction over 0.5.47. No behavioural changes.

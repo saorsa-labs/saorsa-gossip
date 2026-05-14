@@ -18,3 +18,8 @@ Thumbs.db
 # Testing
 *.profraw
 *.profdata
+.worktrees/
+
+# Coverage
+/coverage/
+/target/llvm-cov-*/

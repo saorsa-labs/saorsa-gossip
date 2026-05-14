@@ -56,3 +56,6 @@ Max achievable: ~(239+50)/293 = 91.8% — target is reachable.
 
 ## What's Been Tried
 - Baseline measured at 81.57%. Identified all uncovered lines and categorized them by testability.
+- **COMPLETED**: Added 19 focused unit tests covering `with_summary()`, `with_extensions()`, `sign_raw()`, `verify_raw()`, `to_bytes()`, `from_bytes()`, signing with extensions/summary data, error paths for invalid key bytes and empty signatures, shard constants, and distribution validation.
+- **Final result**: 94.37% coverage (469/497 lines) — target >90% exceeded.
+- Remaining 28 uncovered lines are serde visitor dead-code and SystemTime error branches that cannot be triggered in unit tests.

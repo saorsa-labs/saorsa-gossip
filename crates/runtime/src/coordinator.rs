@@ -322,3 +322,367 @@ impl CoordinatorClient {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use saorsa_gossip_coordinator::{CoordinatorRoles, NatClass};
+    use saorsa_gossip_membership::Membership as MembershipTrait;
+    use saorsa_gossip_transport::{GossipStreamType, GossipTransport as GossipTransportTrait};
+    use saorsa_gossip_types::PeerId;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::RwLock as TokioRwLock;
+
+    // ─── Mock implementations ──────────────────────────────────────────
+
+    struct MockTransport {
+        send_count: Arc<AtomicUsize>,
+        receive_messages: Arc<TokioRwLock<Vec<Result<(PeerId, GossipStreamType, Bytes)>>>>,
+        fail_send: Arc<AtomicBool>,
+        local_id: PeerId,
+    }
+
+    impl MockTransport {
+        fn new() -> Self {
+            Self {
+                send_count: Arc::new(AtomicUsize::new(0)),
+                receive_messages: Arc::new(TokioRwLock::new(Vec::new())),
+                fail_send: Arc::new(AtomicBool::new(false)),
+                local_id: PeerId::new([1u8; 32]),
+            }
+        }
+
+        fn with_receive(mut self, msgs: Vec<Result<(PeerId, GossipStreamType, Bytes)>>) -> Self {
+            // We can't use RwLock in a non-async context easily, so we use a
+            // separate init field that's checked on first receive.
+            let store = Arc::new(TokioRwLock::new(msgs));
+            self.receive_messages = store;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl GossipTransportTrait for MockTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(PeerId::new([2u8; 32]))
+        }
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn send_to_peer(
+            &self,
+            _peer: PeerId,
+            _stream_type: GossipStreamType,
+            _data: Bytes,
+        ) -> Result<()> {
+            if self.fail_send.load(Ordering::SeqCst) {
+                return Err(anyhow::anyhow!("mock send failure"));
+            }
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+            let mut store = self.receive_messages.write().await;
+            store
+                .pop()
+                .transpose()?
+                .ok_or(anyhow::anyhow!("no more messages"))
+        }
+        fn local_peer_id(&self) -> PeerId {
+            self.local_id
+        }
+    }
+
+    struct MockMembership {
+        active_peers: Vec<PeerId>,
+    }
+
+    impl MockMembership {
+        fn new(peers: Vec<PeerId>) -> Self {
+            Self {
+                active_peers: peers,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MembershipTrait for MockMembership {
+        async fn join(&self, _seeds: Vec<String>) -> Result<()> {
+            Ok(())
+        }
+        fn active_view(&self) -> Vec<PeerId> {
+            self.active_peers.clone()
+        }
+        fn passive_view(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+        async fn add_active(&self, _peer: PeerId) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_active(&self, _peer: PeerId) -> Result<()> {
+            Ok(())
+        }
+        async fn promote(&self, _peer: PeerId) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // ─── Helper to build CoordinatorClient with mocks ──────────────────
+
+    fn make_coordinator_client(
+        peer_id: PeerId,
+        transport: MockTransport,
+        membership: MockMembership,
+    ) -> CoordinatorClient {
+        let t: Arc<TokioRwLock<Box<dyn GossipTransportTrait>>> =
+            Arc::new(TokioRwLock::new(Box::new(transport)));
+        let m: Arc<TokioRwLock<Box<dyn MembershipTrait>>> =
+            Arc::new(TokioRwLock::new(Box::new(membership)));
+        CoordinatorClient::new(peer_id, t, m)
+    }
+
+    // ─── Tests ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_coordinator_client_new() {
+        let peer = PeerId::new([1u8; 32]);
+        let transport = MockTransport::new();
+        let membership = MockMembership::new(Vec::new());
+        let client = make_coordinator_client(peer, transport, membership);
+        assert!(client.get_cached_adverts().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_publish_coordinator_advert_with_peers() {
+        let peer = PeerId::new([1u8; 32]);
+        let peer2 = PeerId::new([2u8; 32]);
+        let peer3 = PeerId::new([3u8; 32]);
+        let transport = MockTransport::new();
+        let send_count = transport.send_count.clone();
+        let membership = MockMembership::new(vec![peer2, peer3]);
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client
+            .publish_coordinator_advert(
+                CoordinatorRoles::default(),
+                vec!["127.0.0.1:9000".parse().unwrap()],
+                NatClass::Eim,
+                3600_000,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(send_count.load(Ordering::SeqCst), 2);
+        let adverts = client.get_cached_adverts().await;
+        assert_eq!(adverts.len(), 1);
+        assert_eq!(adverts[0].peer, peer);
+    }
+
+    #[tokio::test]
+    async fn test_publish_coordinator_advert_no_peers() {
+        let peer = PeerId::new([1u8; 32]);
+        let transport = MockTransport::new();
+        let send_count = transport.send_count.clone();
+        let membership = MockMembership::new(Vec::new());
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client
+            .publish_coordinator_advert(
+                CoordinatorRoles::default(),
+                vec!["127.0.0.1:9000".parse().unwrap()],
+                NatClass::Eim,
+                3600_000,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(send_count.load(Ordering::SeqCst), 0);
+        let adverts = client.get_cached_adverts().await;
+        assert_eq!(adverts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_publish_coordinator_advert_send_failure() {
+        let peer = PeerId::new([1u8; 32]);
+        let peer2 = PeerId::new([2u8; 32]);
+        let transport = MockTransport::new();
+        transport.fail_send.store(true, Ordering::SeqCst);
+        let membership = MockMembership::new(vec![peer2]);
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client
+            .publish_coordinator_advert(
+                CoordinatorRoles::default(),
+                vec!["127.0.0.1:9000".parse().unwrap()],
+                NatClass::Symmetric,
+                60_000,
+            )
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_find_coordinators_via_foaf_cached() {
+        let peer = PeerId::new([1u8; 32]);
+        let transport = MockTransport::new();
+        let membership = MockMembership::new(Vec::new());
+        let client = make_coordinator_client(peer, transport, membership);
+
+        // Populate cache first
+        let _ = client
+            .publish_coordinator_advert(
+                CoordinatorRoles::default(),
+                vec!["127.0.0.1:9000".parse().unwrap()],
+                NatClass::Eim,
+                3600_000,
+            )
+            .await;
+
+        let result = client.find_coordinators_via_foaf(3, 2).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_coordinators_via_foaf_no_peers() {
+        let peer = PeerId::new([1u8; 32]);
+        let transport = MockTransport::new();
+        let membership = MockMembership::new(Vec::new());
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client.find_coordinators_via_foaf(3, 2).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_coordinators_via_foaf_sends_queries() {
+        let peer = PeerId::new([1u8; 32]);
+        let peer2 = PeerId::new([2u8; 32]);
+        let peer3 = PeerId::new([3u8; 32]);
+        let transport = MockTransport::new();
+        let send_count = transport.send_count.clone();
+        let membership = MockMembership::new(vec![peer2, peer3]);
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client.find_coordinators_via_foaf(3, 2).await;
+        assert!(result.is_ok());
+        assert!(send_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_coordinators_via_foaf_all_sends_fail() {
+        let peer = PeerId::new([1u8; 32]);
+        let peer2 = PeerId::new([2u8; 32]);
+        let transport = MockTransport::new();
+        transport.fail_send.store(true, Ordering::SeqCst);
+        let membership = MockMembership::new(vec![peer2]);
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client.find_coordinators_via_foaf(3, 1).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_adverts_empty() {
+        let peer = PeerId::new([1u8; 32]);
+        let transport = MockTransport::new();
+        let membership = MockMembership::new(Vec::new());
+        let client = make_coordinator_client(peer, transport, membership);
+        assert!(client.get_cached_adverts().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_adverts_after_publish() {
+        let peer = PeerId::new([1u8; 32]);
+        let transport = MockTransport::new();
+        let membership = MockMembership::new(Vec::new());
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let _ = client
+            .publish_coordinator_advert(
+                CoordinatorRoles::default(),
+                vec!["127.0.0.1:9000".parse().unwrap()],
+                NatClass::Edm,
+                60_000,
+            )
+            .await;
+
+        let adverts = client.get_cached_adverts().await;
+        assert_eq!(adverts.len(), 1);
+        assert_eq!(adverts[0].nat_class, NatClass::Edm);
+    }
+
+    #[tokio::test]
+    async fn test_request_address_reflection_timeout() {
+        let peer = PeerId::new([1u8; 32]);
+        let coordinator_id = PeerId::new([5u8; 32]);
+        let transport = MockTransport::new();
+        let membership = MockMembership::new(Vec::new());
+        let client = make_coordinator_client(peer, transport, membership);
+
+        // No messages → receive returns error → times out or errors
+        let result = client.request_address_reflection(coordinator_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_request_address_reflection_success() {
+        let peer = PeerId::new([1u8; 32]);
+        let coordinator_id = PeerId::new([5u8; 32]);
+        let resp_data = Bytes::from("ADDR_REFLECT_RESPONSE:192.168.1.100:5000".to_string());
+        let msg = Ok((coordinator_id, GossipStreamType::Membership, resp_data));
+        let transport = MockTransport::new().with_receive(vec![msg]);
+
+        let membership = MockMembership::new(Vec::new());
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client.request_address_reflection(coordinator_id).await;
+        assert!(result.is_ok());
+        let addr = result.unwrap();
+        assert_eq!(addr.to_string(), "192.168.1.100:5000");
+    }
+
+    #[tokio::test]
+    async fn test_request_address_reflection_invalid_response() {
+        let peer = PeerId::new([1u8; 32]);
+        let coordinator_id = PeerId::new([5u8; 32]);
+        let resp_data = Bytes::from("some other message".to_string());
+        let msg = Ok((coordinator_id, GossipStreamType::Membership, resp_data));
+        let transport = MockTransport::new().with_receive(vec![msg]);
+
+        let membership = MockMembership::new(Vec::new());
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client.request_address_reflection(coordinator_id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_request_address_reflection_wrong_peer() {
+        let peer = PeerId::new([1u8; 32]);
+        let coordinator_id = PeerId::new([5u8; 32]);
+        let wrong_peer = PeerId::new([99u8; 32]);
+        let resp_data = Bytes::from("ADDR_REFLECT_RESPONSE:10.0.0.1:80".to_string());
+        let msg = Ok((wrong_peer, GossipStreamType::Membership, resp_data));
+        let transport = MockTransport::new().with_receive(vec![msg]);
+
+        let membership = MockMembership::new(Vec::new());
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client.request_address_reflection(coordinator_id).await;
+        assert!(result.is_err());
+    }
+}

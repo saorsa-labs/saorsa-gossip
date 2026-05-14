@@ -366,4 +366,33 @@ mod tests {
 
         assert_eq!(runtime.peer_id(), expected);
     }
+
+    // ─── PeerHealthOracle mock ──────────────────────────────────────
+
+    struct MockPeerHealthOracle;
+
+    #[async_trait::async_trait]
+    impl saorsa_gossip_types::PeerHealthOracle for MockPeerHealthOracle {
+        async fn health_of(&self, _peer: &PeerId) -> Option<saorsa_gossip_types::PeerHealth> {
+            Some(saorsa_gossip_types::PeerHealth::Alive)
+        }
+        async fn request_indirect_probe(&self, _target: PeerId) {}
+    }
+
+    #[test]
+    fn test_runtime_builder_peer_health_oracle() {
+        let oracle = Arc::new(MockPeerHealthOracle);
+        let _builder = GossipRuntimeBuilder::new().peer_health_oracle(oracle);
+    }
+
+    #[tokio::test]
+    async fn test_build_with_peer_health_oracle() {
+        let oracle = Arc::new(MockPeerHealthOracle);
+        let runtime = GossipRuntimeBuilder::new()
+            .peer_health_oracle(oracle)
+            .build()
+            .await;
+
+        assert!(runtime.is_ok());
+    }
 }

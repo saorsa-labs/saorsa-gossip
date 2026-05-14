@@ -582,6 +582,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_coordinators_via_foaf_bad_cbor_response() {
+        let peer = PeerId::new([1u8; 32]);
+        let responder = PeerId::new([2u8; 32]);
+
+        let transport = MockTransport::new();
+        // Inject bad CBOR data on Membership stream
+        let msg = Ok((
+            responder,
+            GossipStreamType::Membership,
+            Bytes::from(b"not valid cbor".to_vec()),
+        ));
+        let transport = transport.with_receive(vec![msg]);
+
+        let membership = MockMembership::new(vec![responder]);
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client.find_coordinators_via_foaf(3, 1).await;
+        assert!(result.is_ok());
+        // Bad CBOR is silently ignored → empty result
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_coordinators_via_foaf_wrong_stream_type() {
+        let peer = PeerId::new([1u8; 32]);
+        let responder = PeerId::new([2u8; 32]);
+
+        let transport = MockTransport::new();
+        // Response on PubSub stream instead of Membership → ignored
+        let msg = Ok((
+            responder,
+            GossipStreamType::PubSub,
+            Bytes::from(vec![0u8; 10]),
+        ));
+        let transport = transport.with_receive(vec![msg]);
+
+        let membership = MockMembership::new(vec![responder]);
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client.find_coordinators_via_foaf(3, 1).await;
+        assert!(result.is_ok());
+        // Wrong stream type is ignored → empty result (times out)
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_coordinators_via_foaf_with_responses() {
+        let peer = PeerId::new([1u8; 32]);
+        let responder = PeerId::new([2u8; 32]);
+        let coord_peer = PeerId::new([99u8; 32]);
+
+        // Build a CoordinatorAdvert response and encode it
+        let advert = CoordinatorAdvert::new(
+            coord_peer,
+            CoordinatorRoles::default(),
+            vec![AddrHint::new("127.0.0.1:9000".parse().unwrap())],
+            NatClass::Eim,
+            3600_000,
+        );
+        let mut advert_bytes = Vec::new();
+        ciborium::ser::into_writer(&advert, &mut advert_bytes).unwrap();
+
+        let transport = MockTransport::new();
+        let send_count = transport.send_count.clone();
+        // Inject a valid response from the responder peer
+        let msg = Ok((
+            responder,
+            GossipStreamType::Membership,
+            Bytes::from(advert_bytes),
+        ));
+        let transport = transport.with_receive(vec![msg]);
+
+        let membership = MockMembership::new(vec![responder]);
+        let client = make_coordinator_client(peer, transport, membership);
+
+        let result = client.find_coordinators_via_foaf(3, 1).await;
+        assert!(result.is_ok());
+        // Should have sent query + received response
+        assert!(send_count.load(Ordering::SeqCst) >= 1);
+        // Response advert should be cached
+        let cached = client.get_cached_adverts().await;
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].peer, coord_peer);
+    }
+
+    #[tokio::test]
     async fn test_find_coordinators_via_foaf_all_sends_fail() {
         let peer = PeerId::new([1u8; 32]);
         let peer2 = PeerId::new([2u8; 32]);

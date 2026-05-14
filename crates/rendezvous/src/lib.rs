@@ -942,6 +942,46 @@ mod tests {
     }
 
     #[test]
+    fn test_from_cbor_rejects_malformed_wire_byte_fields() {
+        fn replace_field(value: &mut ciborium::Value, field: &str, replacement: ciborium::Value) {
+            let ciborium::Value::Map(entries) = value else {
+                panic!("ProviderSummary encodes as a CBOR map");
+            };
+            let (_, slot) = entries
+                .iter_mut()
+                .find(|(key, _)| matches!(key, ciborium::Value::Text(name) if name == field))
+                .expect("field is present in encoded summary");
+            *slot = replacement;
+        }
+
+        let target = [39u8; 32];
+        let provider = PeerId::new([40u8; 32]);
+        let summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000)
+            .with_extensions(vec![1, 2, 3]);
+
+        let mut value: ciborium::Value =
+            ciborium::from_reader(&summary.to_cbor().expect("summary cbor")[..])
+                .expect("summary decodes to dynamic value");
+        replace_field(&mut value, "sig", ciborium::Value::Text("not bytes".into()));
+        let mut malformed_sig = Vec::new();
+        ciborium::into_writer(&value, &mut malformed_sig).expect("malformed sig encodes");
+        assert!(ProviderSummary::from_cbor(&malformed_sig).is_err());
+
+        let mut value: ciborium::Value =
+            ciborium::from_reader(&summary.to_cbor().expect("summary cbor")[..])
+                .expect("summary decodes to dynamic value");
+        replace_field(
+            &mut value,
+            "extensions",
+            ciborium::Value::Text("not bytes".into()),
+        );
+        let mut malformed_extensions = Vec::new();
+        ciborium::into_writer(&value, &mut malformed_extensions)
+            .expect("malformed extensions encodes");
+        assert!(ProviderSummary::from_cbor(&malformed_extensions).is_err());
+    }
+
+    #[test]
     fn test_to_bytes_returns_non_empty() {
         let target = [42u8; 32];
         let provider = PeerId::new([0u8; 32]);

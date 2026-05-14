@@ -290,7 +290,10 @@ mod tests {
         let identity = MlDsaKeyPair::generate().unwrap();
         let b = GossipRuntimeBuilder::new().identity(identity.clone());
         assert!(b.identity.is_some());
-        assert_eq!(b.identity.as_ref().unwrap().public_key(), identity.public_key());
+        assert_eq!(
+            b.identity.as_ref().unwrap().public_key(),
+            identity.public_key()
+        );
     }
 
     #[test]
@@ -311,5 +314,16 @@ mod tests {
         // GossipRuntime holds peer_id as a public field, peer_id() returns it.
         // This test documents the expected behavior for the runtime struct.
         assert_eq!(expected_peer_id, identity.peer_id());
+    }
+
+    #[tokio::test]
+    async fn build_with_peer_health_oracle_wires_pubsub() {
+        let oracle: Arc<dyn PeerHealthOracle> = Arc::new(NoopHealthOracle);
+        let runtime = GossipRuntimeBuilder::new()
+            .peer_health_oracle(oracle)
+            .build()
+            .await;
+
+        assert!(runtime.is_ok());
     }
 }

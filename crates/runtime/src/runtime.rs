@@ -233,3 +233,80 @@ impl GossipRuntime {
         self.peer_id
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+    use std::time::Duration;
+
+    #[test]
+    fn runtime_config_default_uses_ephemeral_bind_and_empty_peers() {
+        let config = GossipRuntimeConfig::default();
+
+        assert_eq!(config.bind_addr, DEFAULT_BIND_ADDR);
+        assert!(config.known_peers.is_empty());
+        let default_cache = PubSubCacheConfig::default();
+        assert_eq!(
+            config.pubsub_cache.max_messages_per_topic,
+            default_cache.max_messages_per_topic
+        );
+        assert_eq!(
+            config.pubsub_cache.max_bytes_per_topic,
+            default_cache.max_bytes_per_topic
+        );
+        assert_eq!(config.pubsub_cache.max_age, default_cache.max_age);
+    }
+
+    #[test]
+    fn builder_methods_store_configuration() {
+        let bind_addr: SocketAddr = "127.0.0.1:12000".parse().unwrap();
+        let known_peer: SocketAddr = "127.0.0.1:12001".parse().unwrap();
+        let cache = PubSubCacheConfig {
+            max_messages_per_topic: NonZeroUsize::new(17).unwrap(),
+            max_bytes_per_topic: 4_096,
+            max_age: Duration::from_secs(7),
+        };
+        let identity = MlDsaKeyPair::generate().unwrap();
+        let expected_peer = identity.peer_id();
+
+        let builder = GossipRuntimeBuilder::new()
+            .bind_addr(bind_addr)
+            .known_peers(vec![known_peer])
+            .pubsub_cache(cache)
+            .identity(identity);
+
+        assert_eq!(builder.config.bind_addr, bind_addr);
+        assert_eq!(builder.config.known_peers, vec![known_peer]);
+        assert_eq!(
+            builder.config.pubsub_cache.max_messages_per_topic,
+            cache.max_messages_per_topic
+        );
+        assert_eq!(
+            builder.config.pubsub_cache.max_bytes_per_topic,
+            cache.max_bytes_per_topic
+        );
+        assert_eq!(builder.config.pubsub_cache.max_age, cache.max_age);
+        assert_eq!(builder.identity.as_ref().unwrap().peer_id(), expected_peer);
+    }
+
+    #[tokio::test]
+    async fn build_with_explicit_identity_wires_clients_and_empty_group_maps() {
+        let identity = MlDsaKeyPair::generate().unwrap();
+        let expected_peer = identity.peer_id();
+
+        let runtime = GossipRuntimeBuilder::new()
+            .identity(identity)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.peer_id(), expected_peer);
+        assert_eq!(runtime.identity.peer_id(), expected_peer);
+        assert_eq!(runtime.rendezvous.peer_id(), expected_peer);
+        assert!(runtime.coordinator.get_cached_adverts().await.is_empty());
+        assert!(runtime.groups.read().await.is_empty());
+        assert!(runtime.groups_by_topic.read().await.is_empty());
+    }
+}

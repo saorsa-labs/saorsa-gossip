@@ -48,21 +48,26 @@
 //! compose: admission relieves pressure, cooling handles peers that
 //! still time out at the reduced load.
 //!
-//! ## Limitations (MVP — future ticket X0X-0074b)
+//! ## Bulk-evict-before-Critical-drop (X0X-0074b)
 //!
-//! - **Bulk-evict-before-Critical-drop is not implemented.** The
-//!   original X0X-0074 ticket called for the Critical contract to
-//!   include "drop oldest Bulk before dropping any Critical, bypass
-//!   cooling on Critical claim". This MVP records the
-//!   `dropped_critical_hard_error` counter when a Critical admission
-//!   fails to claim an outbound budget permit, but does not actively
-//!   evict an in-flight Bulk send to make room. Reaching the full
-//!   contract requires either an explicit per-peer queue with
-//!   priority eviction (replacing today's permit/slack model) or
-//!   transport-layer cancellation of Bulk sends. Tracked as
-//!   X0X-0074b; soak interpretation today is "non-zero counter
-//!   means the soak is blocked", not "Critical succeeded under
-//!   pressure".
+//! When a Critical admission cannot claim an outbound budget permit,
+//! the publish path calls [`AdmissionControl::evict_bulk_for_critical`]
+//! for the affected peer *before* recording a hard error. That method
+//! releases one in-flight Bulk reservation for the peer (decrementing
+//! the per-peer `bulk_depth`), increments `bulk_evicted_for_critical`,
+//! and returns `true` so the caller can retry the claim. Only if the
+//! retry *still* fails — i.e. there was no Bulk reservation to evict —
+//! is `dropped_critical_hard_error` recorded.
+//!
+//! This changes the meaning of `dropped_critical_hard_error`: it now
+//! means "even after evicting Bulk we could not place a Critical
+//! message", a strictly stronger signal than the X0X-0074 MVP's
+//! "Critical claim failed once".
+//!
+//! The eviction is a per-peer-queue-depth decrement — it frees an
+//! admission *reservation slot*, not a live tokio task. If a future
+//! soak shows the outbound *permit* pool itself needs a cancellation
+//! hook to free real capacity, that is tracked as X0X-0074c.
 
 use saorsa_gossip_types::{
     AdmissionDecision, AdmissionDropReason, PeerHealth, PeerId, TopicId, TopicPriority,
@@ -114,8 +119,14 @@ pub struct AdmissionStats {
     dropped_bulk_backpressure: AtomicU64,
     dropped_normal_peer_dead: AtomicU64,
     dropped_normal_peer_suspect: AtomicU64,
+    /// X0X-0074b: a Bulk reservation was evicted to make room for a
+    /// Critical admission that failed its first claim. Each increment
+    /// is one Critical message rescued by the evict-then-retry path.
+    bulk_evicted_for_critical: AtomicU64,
     /// Hard error: a Critical message was dropped. Must stay zero in
     /// production; surfaced as a violation on `/diagnostics/gossip`.
+    /// As of X0X-0074b this fires only when the evict-then-retry path
+    /// also failed (no Bulk reservation existed to evict).
     dropped_critical_hard_error: AtomicU64,
 }
 
@@ -147,8 +158,15 @@ pub struct AdmissionStatsSnapshot {
     /// traffic backs off under suspicion so the SWIM round can clear
     /// or confirm the peer without the application piling on.
     pub dropped_normal_peer_suspect: u64,
+    /// X0X-0074b: Bulk reservations evicted to make room for a Critical
+    /// admission that failed its first claim. Non-zero is healthy — it
+    /// means the evict-then-retry path is rescuing Critical traffic
+    /// under outbound-budget pressure rather than dropping it.
+    pub bulk_evicted_for_critical: u64,
     /// **Hard error**: a Critical admission was dropped. Must remain
-    /// zero in production; non-zero is a soak-blocking violation.
+    /// zero in production; non-zero is a soak-blocking violation. As of
+    /// X0X-0074b this fires only when the evict-then-retry path also
+    /// failed — there was no Bulk reservation to evict.
     pub dropped_critical_hard_error: u64,
 }
 
@@ -166,6 +184,7 @@ impl AdmissionStats {
             dropped_bulk_backpressure: self.dropped_bulk_backpressure.load(Ordering::Relaxed),
             dropped_normal_peer_dead: self.dropped_normal_peer_dead.load(Ordering::Relaxed),
             dropped_normal_peer_suspect: self.dropped_normal_peer_suspect.load(Ordering::Relaxed),
+            bulk_evicted_for_critical: self.bulk_evicted_for_critical.load(Ordering::Relaxed),
             dropped_critical_hard_error: self.dropped_critical_hard_error.load(Ordering::Relaxed),
         }
     }
@@ -456,6 +475,40 @@ impl AdmissionControl {
         }
     }
 
+    /// X0X-0074b: evict one in-flight Bulk reservation for `peer` to
+    /// make room for a Critical admission that failed its first
+    /// outbound-budget claim.
+    ///
+    /// Returns `true` when a Bulk reservation existed and was released
+    /// (decrementing the per-peer `bulk_depth` and incrementing
+    /// `bulk_evicted_for_critical`); the caller should then retry the
+    /// claim. Returns `false` when there was nothing to evict — the
+    /// caller should record a `dropped_critical_hard_error` and treat
+    /// it as a soak-blocking violation.
+    ///
+    /// The eviction frees an admission *reservation slot*, not a live
+    /// tokio task: it tells the backpressure accounting that the peer
+    /// has capacity for the Critical message. The displaced Bulk
+    /// message is dropped at its own `release_bulk` call site (the
+    /// RAII guard still fires); anti-entropy re-attempts it later.
+    pub fn evict_bulk_for_critical(&self, peer: &PeerId) -> bool {
+        let mut guard = match self.per_peer.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.get_mut(peer) {
+            Some(entry) if entry.bulk_depth > 0 => {
+                entry.bulk_depth -= 1;
+                drop(guard);
+                self.stats
+                    .bulk_evicted_for_critical
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Snapshot per-peer Bulk queue depths (Normal + Critical depths
     /// are reported as zero for now — they don't maintain per-peer
     /// queue state).
@@ -666,5 +719,85 @@ mod tests {
         let snap = admission.per_peer_snapshot();
         assert_eq!(snap.get(&p(2)).map(|c| c.bulk_queue_depth), Some(2));
         assert_eq!(snap.get(&p(3)).map(|c| c.bulk_queue_depth), Some(1));
+    }
+
+    #[test]
+    fn evict_bulk_for_critical_releases_one_reservation_when_present() {
+        // Why X0X-0074b: when a Critical admission can't claim an
+        // outbound permit, the publish path evicts a Bulk reservation
+        // for the peer to free capacity, then retries. This proves the
+        // eviction decrements the per-peer bulk_depth by exactly one
+        // and increments the rescue counter.
+        let admission = AdmissionControl::new();
+        admission.registry().register(t(1), TopicPriority::Bulk);
+        // Seed two Bulk reservations for the peer.
+        admission.admit(&t(1), &p(2), Some(PeerHealth::Alive), false);
+        admission.admit(&t(1), &p(2), Some(PeerHealth::Alive), false);
+        assert_eq!(
+            admission
+                .per_peer_snapshot()
+                .get(&p(2))
+                .map(|c| c.bulk_queue_depth),
+            Some(2)
+        );
+
+        let evicted = admission.evict_bulk_for_critical(&p(2));
+        assert!(
+            evicted,
+            "a Bulk reservation existed — eviction must succeed"
+        );
+        assert_eq!(
+            admission
+                .per_peer_snapshot()
+                .get(&p(2))
+                .map(|c| c.bulk_queue_depth),
+            Some(1),
+            "eviction decrements bulk_depth by exactly one"
+        );
+        assert_eq!(admission.stats().snapshot().bulk_evicted_for_critical, 1);
+    }
+
+    #[test]
+    fn evict_bulk_for_critical_returns_false_when_nothing_to_evict() {
+        // Why X0X-0074b: if there's no Bulk reservation to displace,
+        // the Critical message genuinely cannot be placed — the caller
+        // must fall through to dropped_critical_hard_error. The counter
+        // for evictions must NOT move in that case.
+        let admission = AdmissionControl::new();
+
+        // Peer never seen — no per-peer state at all.
+        assert!(!admission.evict_bulk_for_critical(&p(9)));
+        // Peer seen but bulk_depth already drained to zero.
+        admission.registry().register(t(1), TopicPriority::Bulk);
+        admission.admit(&t(1), &p(2), Some(PeerHealth::Alive), false);
+        admission.release_bulk(&p(2));
+        assert!(
+            !admission.evict_bulk_for_critical(&p(2)),
+            "bulk_depth==0 means nothing to evict"
+        );
+        assert_eq!(admission.stats().snapshot().bulk_evicted_for_critical, 0);
+    }
+
+    #[test]
+    fn snapshot_exposes_bulk_evicted_for_critical_counter() {
+        // Why: the X0X-0075 diagnostics surface + soak harness key off
+        // this snapshot field. Non-zero is healthy (Critical rescued);
+        // it must be readable independently of the hard-error counter.
+        let admission = AdmissionControl::new();
+        admission.registry().register(t(1), TopicPriority::Bulk);
+        admission.admit(&t(1), &p(2), Some(PeerHealth::Alive), false);
+
+        let before = admission.stats().snapshot();
+        assert_eq!(before.bulk_evicted_for_critical, 0);
+        assert_eq!(before.dropped_critical_hard_error, 0);
+
+        assert!(admission.evict_bulk_for_critical(&p(2)));
+
+        let after = admission.stats().snapshot();
+        assert_eq!(after.bulk_evicted_for_critical, 1);
+        assert_eq!(
+            after.dropped_critical_hard_error, 0,
+            "eviction success must not touch the hard-error counter"
+        );
     }
 }

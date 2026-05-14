@@ -3443,6 +3443,22 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let release_guard = scopeguard_release(bulk_admitted, &peer, &self.admission);
 
         let mut claims = self.claim_topic_send_attempts(topic, vec![peer], op).await;
+        // X0X-0074b: a Critical admission that can't claim an outbound
+        // budget permit evicts one in-flight Bulk reservation for the
+        // peer, then retries the claim once. Only if the retry also
+        // fails is `dropped_critical_hard_error` recorded.
+        if priority == TopicPriority::Critical
+            && claims.attempts().is_empty()
+            && self.admission.evict_bulk_for_critical(&peer)
+        {
+            debug!(
+                peer_id = %peer,
+                topic = %topic,
+                op,
+                "X0X-0074b evicted a Bulk reservation to retry Critical claim"
+            );
+            claims = self.claim_topic_send_attempts(topic, vec![peer], op).await;
+        }
         let Some(attempt) = claims.attempts().first().copied() else {
             if priority == TopicPriority::Critical {
                 self.admission.stats().record_critical_hard_error();
@@ -3450,7 +3466,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     peer_id = %peer,
                     topic = %topic,
                     op,
-                    "X0X-0074 hard error: Critical admission failed to claim outbound budget"
+                    "X0X-0074b hard error: Critical admission failed to claim outbound budget even after Bulk eviction"
                 );
             }
             drop(release_guard);
@@ -3463,7 +3479,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     peer_id = %peer,
                     topic = %topic,
                     op,
-                    "X0X-0074 hard error: Critical admission claimed attempt but lost permit"
+                    "X0X-0074b hard error: Critical admission claimed attempt but lost permit"
                 );
             }
             drop(release_guard);
@@ -3856,32 +3872,96 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             admission: Arc::clone(&self.admission),
         };
 
-        let mut claims = self.claim_topic_send_attempts(topic, admitted, op).await;
-        let attempts_count = claims.attempts().len();
+        // X0X-0074b: keep the admitted peer set so a short Critical
+        // claim can compute which peers need a Bulk eviction + retry.
+        let admitted_peers = admitted.clone();
+        let claims = self.claim_topic_send_attempts(topic, admitted, op).await;
 
-        // X0X-0074 hard error: a Critical admission must reach the
-        // per-peer pipeline. If `claim_topic_send_attempts` returns
-        // fewer attempts than admitted (e.g. outbound budgets
-        // exhausted), every missing claim is a hard error. Surface as
-        // a counter so the soak gate can fail the run.
-        if priority == TopicPriority::Critical && attempts_count < admitted_count {
-            let lost = admitted_count - attempts_count;
-            for _ in 0..lost {
-                self.admission.stats().record_critical_hard_error();
+        // X0X-0074b: a Critical fan-out that came back short on claims
+        // evicts one in-flight Bulk reservation per unclaimed peer, then
+        // retries the claim for just those peers. Only peers still
+        // unclaimed after the retry record `dropped_critical_hard_error`
+        // — the counter now means "couldn't place Critical even after
+        // Bulk eviction", a strictly stronger signal than the X0X-0074
+        // MVP's "Critical claim failed once".
+        let mut retry_claims: Option<SendAttemptClaims> = None;
+        if priority == TopicPriority::Critical && claims.attempts().len() < admitted_count {
+            let claimed: HashSet<PeerId> = claims.attempts().iter().map(|a| a.peer).collect();
+            let unclaimed: Vec<PeerId> = admitted_peers
+                .iter()
+                .copied()
+                .filter(|peer| !claimed.contains(peer))
+                .collect();
+            let mut evicted_any = false;
+            for peer in &unclaimed {
+                if self.admission.evict_bulk_for_critical(peer) {
+                    evicted_any = true;
+                }
             }
-            warn!(
-                topic = %topic,
-                op,
-                lost,
-                admitted = admitted_count,
-                attempted = attempts_count,
-                "X0X-0074 hard error: Critical admission(s) failed to claim outbound budget"
-            );
+            if evicted_any {
+                debug!(
+                    topic = %topic,
+                    op,
+                    unclaimed = unclaimed.len(),
+                    "X0X-0074b evicted Bulk reservation(s) to retry Critical claims"
+                );
+                let retry = self
+                    .claim_topic_send_attempts(topic, unclaimed.clone(), op)
+                    .await;
+                let retried: HashSet<PeerId> = retry.attempts().iter().map(|a| a.peer).collect();
+                let still_lost = unclaimed
+                    .iter()
+                    .filter(|peer| !retried.contains(peer))
+                    .count();
+                for _ in 0..still_lost {
+                    self.admission.stats().record_critical_hard_error();
+                }
+                if still_lost > 0 {
+                    warn!(
+                        topic = %topic,
+                        op,
+                        still_lost,
+                        "X0X-0074b hard error: Critical admission(s) failed even after Bulk eviction"
+                    );
+                }
+                retry_claims = Some(retry);
+            } else {
+                // Nothing to evict — the shortfall is a genuine hard
+                // error the soak gate must catch.
+                let lost = admitted_count - claims.attempts().len();
+                for _ in 0..lost {
+                    self.admission.stats().record_critical_hard_error();
+                }
+                warn!(
+                    topic = %topic,
+                    op,
+                    lost,
+                    admitted = admitted_count,
+                    "X0X-0074b hard error: Critical admission(s) failed to claim, no Bulk to evict"
+                );
+            }
         }
 
+        self.drain_claims(claims, stream_type, &bytes, op).await;
+        if let Some(retry) = retry_claims {
+            self.drain_claims(retry, stream_type, &bytes, op).await;
+        }
+        // _bulk_guard drops here, releasing every Bulk admission exactly
+        // once. No manual release call needed.
+    }
+
+    /// Spawn per-peer send tasks for an already-claimed `SendAttemptClaims`
+    /// batch, collect the outcomes, and record them back into the topic
+    /// state. Extracted so the X0X-0074b evict-then-retry path can drive
+    /// a second claim batch without duplicating the send-task loop.
+    async fn drain_claims(
+        &self,
+        mut claims: SendAttemptClaims,
+        stream_type: GossipStreamType,
+        bytes: &Bytes,
+        op: &'static str,
+    ) {
         if claims.is_empty() {
-            // No peers got attempts. Bulk reservations release when
-            // `_bulk_guard` drops at function exit.
             return;
         }
         let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
@@ -3909,8 +3989,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
         let (sent, timed_out) = send_tasks.collect_results().await;
         claims.record_results(sent, timed_out).await;
-        // _bulk_guard drops here, releasing every Bulk admission exactly
-        // once. No manual release call needed.
     }
 }
 
@@ -6441,6 +6519,98 @@ mod tests {
         assert!(
             post > baseline || baseline > 0,
             "Critical-without-permit must record dropped_critical_hard_error (baseline={baseline}, post={post})"
+        );
+        saturate_task.abort();
+    }
+
+    #[tokio::test]
+    async fn admission_critical_evicts_bulk_reservation_before_hard_error() {
+        // Why X0X-0074b: when a Critical fan-out can't claim an outbound
+        // budget permit, the publish path must evict an in-flight Bulk
+        // reservation for the peer and retry the claim *before* falling
+        // through to `dropped_critical_hard_error`. This test seeds a
+        // Bulk reservation for the target peer, saturates the outbound
+        // budget so the Critical claim comes back short, then publishes
+        // Critical and asserts the eviction path fired
+        // (`bulk_evicted_for_critical` moved).
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let critical_topic = TopicId::new([78u8; 32]);
+        let bulk_topic = TopicId::new([79u8; 32]);
+        let target_peer = test_peer_id(2);
+        pubsub
+            .initialize_topic_peers(critical_topic, vec![target_peer])
+            .await;
+        pubsub
+            .admission()
+            .registry()
+            .register(critical_topic, TopicPriority::Critical);
+        pubsub
+            .admission()
+            .registry()
+            .register(bulk_topic, TopicPriority::Bulk);
+
+        // Seed a Bulk reservation for the target peer so there is
+        // something to evict when the Critical claim comes back short.
+        let seeded =
+            pubsub
+                .admission()
+                .admit(&bulk_topic, &target_peer, Some(PeerHealth::Alive), false);
+        assert_eq!(
+            seeded,
+            AdmissionDecision::Admit,
+            "Bulk seed admit should succeed (fresh peer, no backpressure)"
+        );
+        assert_eq!(
+            pubsub
+                .admission()
+                .per_peer_snapshot()
+                .get(&target_peer)
+                .map(|c| c.bulk_queue_depth),
+            Some(1),
+            "target peer should have one Bulk reservation to evict"
+        );
+
+        // Saturate the outbound budget so the next Critical publish's
+        // claim comes back short and the evict-then-retry path runs.
+        let saturate_task = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                for _ in 0..32 {
+                    let _ = pubsub
+                        .publish_local(critical_topic, Bytes::from_static(b"saturate"))
+                        .await;
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let baseline_evicted = pubsub
+            .admission()
+            .stats()
+            .snapshot()
+            .bulk_evicted_for_critical;
+
+        // Probe publish — Critical, budget saturated → evict-then-retry.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            pubsub.publish_local(critical_topic, Bytes::from_static(b"probe")),
+        )
+        .await;
+
+        let snap = pubsub.admission().stats().snapshot();
+        assert!(
+            snap.bulk_evicted_for_critical > baseline_evicted,
+            "X0X-0074b: a short Critical claim with a Bulk reservation present \
+             must evict it before recording a hard error \
+             (baseline={baseline_evicted}, post={})",
+            snap.bulk_evicted_for_critical
         );
         saturate_task.abort();
     }

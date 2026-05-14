@@ -211,7 +211,7 @@ mod tests {
     use saorsa_gossip_rendezvous::Capability;
     use saorsa_gossip_transport::GossipStreamType;
     use std::collections::VecDeque;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::net::SocketAddr;
     use tokio::sync::{mpsc, Mutex};
 
     #[derive(Clone, Default)]
@@ -427,8 +427,8 @@ mod tests {
             exp: 1,
             ..summary_for(target_id, peer(2), 1_000)
         };
-        let short = summary_for(target_id, peer(3), 1_000);
-        let long = summary_for(target_id, peer(4), 5_000);
+        let short = summary_for(target_id, peer(3), 60_000);
+        let long = summary_for(target_id, peer(4), 120_000);
 
         for summary in [&expired, &short, &long] {
             client
@@ -441,6 +441,15 @@ mod tests {
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].provider, peer(4));
         assert_eq!(providers[1].provider, peer(3));
+    }
+
+    #[tokio::test]
+    async fn providers_for_unknown_target_are_empty() {
+        let (client, _) = client();
+        assert!(client
+            .get_providers_for_target(&target(42))
+            .await
+            .is_empty());
     }
 
     #[tokio::test]
@@ -458,17 +467,5 @@ mod tests {
             .read()
             .await
             .contains_key(&target_id));
-    }
-
-    #[test]
-    fn mock_transport_local_peer_and_bootstrap_are_deterministic() {
-        let transport = MockTransport::default();
-        assert_eq!(transport.local_peer_id(), peer(1));
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12_345));
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        assert_eq!(
-            rt.block_on(transport.dial_bootstrap(addr)).unwrap(),
-            peer(9)
-        );
     }
 }

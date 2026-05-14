@@ -238,8 +238,20 @@ impl GossipRuntime {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use saorsa_gossip_types::PeerHealth;
     use std::num::NonZeroUsize;
     use std::time::Duration;
+
+    struct MockOracle;
+
+    #[async_trait::async_trait]
+    impl PeerHealthOracle for MockOracle {
+        async fn health_of(&self, _peer: &PeerId) -> Option<PeerHealth> {
+            None
+        }
+
+        async fn request_indirect_probe(&self, _target: PeerId) {}
+    }
 
     #[test]
     fn runtime_config_default_uses_ephemeral_bind_and_empty_peers() {
@@ -289,6 +301,22 @@ mod tests {
         );
         assert_eq!(builder.config.pubsub_cache.max_age, cache.max_age);
         assert_eq!(builder.identity.as_ref().unwrap().peer_id(), expected_peer);
+    }
+
+    #[test]
+    fn builder_accepts_peer_health_oracle() {
+        let builder = GossipRuntimeBuilder::new().peer_health_oracle(Arc::new(MockOracle));
+        assert!(builder.peer_health_oracle.is_some());
+    }
+
+    #[tokio::test]
+    async fn build_without_explicit_identity_generates_local_identity() {
+        let runtime = GossipRuntimeBuilder::new().build().await.unwrap();
+
+        assert_eq!(runtime.peer_id(), runtime.identity.peer_id());
+        assert_eq!(runtime.rendezvous.peer_id(), runtime.peer_id());
+        assert!(runtime.groups.read().await.is_empty());
+        assert!(runtime.groups_by_topic.read().await.is_empty());
     }
 
     #[tokio::test]

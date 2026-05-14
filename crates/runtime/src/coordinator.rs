@@ -563,6 +563,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_coordinators_ignores_unexpected_invalid_and_duplicate_responses() {
+        let first = CoordinatorAdvert::new(
+            peer(7),
+            CoordinatorRoles::default(),
+            vec![AddrHint::new(endpoint(10_005))],
+            NatClass::Eim,
+            1_000,
+        );
+        let duplicate = CoordinatorAdvert::new(
+            peer(7),
+            CoordinatorRoles::default(),
+            vec![AddrHint::new(endpoint(10_006))],
+            NatClass::Edm,
+            1_000,
+        );
+        let second = CoordinatorAdvert::new(
+            peer(8),
+            CoordinatorRoles::default(),
+            vec![AddrHint::new(endpoint(10_007))],
+            NatClass::Unknown,
+            1_000,
+        );
+        let incoming = vec![
+            (peer(4), GossipStreamType::Membership, encode_advert(&first)),
+            (peer(2), GossipStreamType::PubSub, encode_advert(&first)),
+            (
+                peer(2),
+                GossipStreamType::Membership,
+                Bytes::from_static(b"not-cbor"),
+            ),
+            (peer(2), GossipStreamType::Membership, encode_advert(&first)),
+            (
+                peer(3),
+                GossipStreamType::Membership,
+                encode_advert(&duplicate),
+            ),
+            (
+                peer(3),
+                GossipStreamType::Membership,
+                encode_advert(&second),
+            ),
+        ];
+        let (client, _) = client_with(vec![peer(2), peer(3)], incoming, HashSet::new());
+
+        let found = client.find_coordinators_via_foaf(1, 2).await.unwrap();
+
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|advert| advert.peer == peer(7)));
+        assert!(found.iter().any(|advert| advert.peer == peer(8)));
+        assert_eq!(client.get_cached_adverts().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn find_coordinators_times_out_without_responses() {
+        let (client, transport) = client_with(vec![peer(2)], Vec::new(), HashSet::new());
+
+        let found = client.find_coordinators_via_foaf(0, 1).await.unwrap();
+
+        assert!(found.is_empty());
+        assert_eq!(transport.sent.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn find_coordinators_returns_empty_when_all_queries_fail() {
         let mut fail_peers = HashSet::new();
         fail_peers.insert(peer(2));

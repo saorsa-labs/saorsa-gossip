@@ -25,6 +25,7 @@
 //! cooldowns decay after successful sends.
 
 pub mod admission;
+pub mod peer_scoring;
 pub mod timing;
 
 use crate::timing::{AdaptiveCoolingConfig, PerPeerRttTracker};
@@ -595,6 +596,12 @@ pub struct PubSubStageStatsSnapshot {
     /// stay zero in production; a non-zero value is a soak-blocking
     /// violation.
     pub admission: admission::AdmissionStatsSnapshot,
+    /// X0X-0071: libp2p-style P1-P7 peer scores, sorted lowest-score
+    /// first (worst peers / graylist candidates on top). Sits alongside
+    /// the legacy `peer_scores` mesh-selection score — this is the
+    /// multi-parameter decaying score. MVP: telemetry only; thresholds
+    /// not yet wired into mesh-selection or admission (X0X-0071b).
+    pub peer_scores_v2: Vec<peer_scoring::PeerScoreV2Snapshot>,
     /// Per-topic bounded message-cache usage and eviction counters.
     pub topic_caches: Vec<TopicCacheStatsSnapshot>,
 }
@@ -1272,6 +1279,7 @@ impl PubSubStageStats {
             peer_scores_by_topic: BTreeMap::new(),
             admission_state_by_peer: BTreeMap::new(),
             admission: admission::AdmissionStatsSnapshot::default(),
+            peer_scores_v2: Vec::new(),
             topic_caches: Vec::new(),
         }
     }
@@ -2881,6 +2889,11 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// per-peer outbound pipeline is touched. Bulk admissions release on
     /// completion (sent or timed out).
     admission: Arc<admission::AdmissionControl>,
+    /// X0X-0071: libp2p-style P1-P7 peer scoring. MVP scope — the score
+    /// is computed and exposed on `/diagnostics/gossip` but the
+    /// thresholds are not yet wired into mesh-selection or admission
+    /// decisions (that integration is X0X-0071b).
+    peer_scoring: Arc<peer_scoring::PeerScoring>,
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
@@ -2955,6 +2968,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             peer_health_snapshot: Arc::new(StdRwLock::new(HashMap::new())),
             peer_health_oracle: Arc::new(StdRwLock::new(None)),
             admission: Arc::new(admission::AdmissionControl::new()),
+            peer_scoring: Arc::new(peer_scoring::PeerScoring::new()),
         };
 
         if start_background_tasks {
@@ -3069,6 +3083,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             &self.admission.per_peer_snapshot(),
         );
         snapshot.admission = self.admission.stats().snapshot();
+        snapshot.peer_scores_v2 = self.peer_scoring.snapshot();
         snapshot
     }
 
@@ -3079,6 +3094,25 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     #[must_use]
     pub fn admission(&self) -> &admission::AdmissionControl {
         &self.admission
+    }
+
+    /// X0X-0071: libp2p-style peer scoring engine. Applications and the
+    /// pub-sub internals record P1-P7 events on this handle; the scores
+    /// surface through [`Self::stage_stats`] in
+    /// `PubSubStageStatsSnapshot.peer_scores_v2`. MVP scope — thresholds
+    /// are not yet wired into mesh-selection or admission (X0X-0071b).
+    #[must_use]
+    pub fn peer_scoring(&self) -> &peer_scoring::PeerScoring {
+        &self.peer_scoring
+    }
+
+    /// X0X-0071: replace the peer-scoring instance at construction.
+    /// Useful in tests and for runtimes that want a non-default
+    /// [`peer_scoring::PeerScoringConfig`].
+    #[must_use]
+    pub fn with_peer_scoring(mut self, peer_scoring: Arc<peer_scoring::PeerScoring>) -> Self {
+        self.peer_scoring = peer_scoring;
+        self
     }
 
     /// X0X-0074: replace the admission control instance at construction.
@@ -6443,6 +6477,69 @@ mod tests {
             "Critical-without-permit must record dropped_critical_hard_error (baseline={baseline}, post={post})"
         );
         saturate_task.abort();
+    }
+
+    #[tokio::test]
+    async fn peer_scoring_events_surface_through_stage_stats() {
+        // Why X0X-0071: the libp2p-style peer scores must be reachable
+        // from the `/diagnostics/gossip` snapshot path so operators
+        // (and the future X0X-0071b threshold wiring) can see them.
+        // This drives a few P2/P4 events through the engine and asserts
+        // they appear in `PubSubStageStatsSnapshot.peer_scores_v2`,
+        // sorted worst-first.
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let good_peer = test_peer_id(2);
+        let bad_peer = test_peer_id(3);
+
+        // good_peer delivers novel messages (P2 positive).
+        pubsub.peer_scoring().record_first_delivery(good_peer);
+        pubsub.peer_scoring().record_first_delivery(good_peer);
+        // bad_peer sends invalid messages (P4 heavy negative, squared).
+        pubsub.peer_scoring().record_invalid_message(bad_peer);
+        pubsub.peer_scoring().record_invalid_message(bad_peer);
+
+        let snapshot = pubsub.stage_stats();
+        assert_eq!(
+            snapshot.peer_scores_v2.len(),
+            2,
+            "both scored peers must surface in the stage-stats snapshot"
+        );
+        // Sorted worst-first: bad_peer (negative) before good_peer.
+        assert_eq!(
+            snapshot.peer_scores_v2[0].peer_id,
+            bad_peer.to_string(),
+            "worst peer (invalid messages) sorts first"
+        );
+        assert!(
+            snapshot.peer_scores_v2[0].score < 0.0,
+            "invalid-message peer has a negative score (got {})",
+            snapshot.peer_scores_v2[0].score
+        );
+        assert_eq!(
+            snapshot.peer_scores_v2[1].peer_id,
+            good_peer.to_string(),
+            "best peer (first deliveries) sorts last"
+        );
+        assert!(
+            snapshot.peer_scores_v2[1].score > 0.0,
+            "first-delivery peer has a positive score (got {})",
+            snapshot.peer_scores_v2[1].score
+        );
+        // P2 count is ~2.0 — the running value decays by 0.97^elapsed
+        // between the two record calls and the snapshot, so a couple of
+        // millis of wall-clock drift leaves it a hair under 2.0.
+        assert!(
+            (snapshot.peer_scores_v2[1].p2_first_deliveries - 2.0).abs() < 0.01,
+            "P2 first-delivery count (~2.0, minus tiny decay) is exposed in the snapshot (got {})",
+            snapshot.peer_scores_v2[1].p2_first_deliveries
+        );
     }
 
     #[tokio::test]

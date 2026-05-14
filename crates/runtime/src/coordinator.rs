@@ -341,12 +341,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GossipTransport for MockCoordTransport {
-        async fn dial(&self, _peer: PeerId, _addr: std::net::SocketAddr) -> Result<()> { Ok(()) }
+        async fn dial(&self, _peer: PeerId, _addr: std::net::SocketAddr) -> Result<()> {
+            Ok(())
+        }
         async fn dial_bootstrap(&self, _addr: std::net::SocketAddr) -> Result<PeerId> {
             Ok(PeerId::new([9; 32]))
         }
-        async fn listen(&self, _bind: std::net::SocketAddr) -> Result<()> { Ok(()) }
-        async fn close(&self) -> Result<()> { Ok(()) }
+        async fn listen(&self, _bind: std::net::SocketAddr) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn send_to_peer(
             &self,
@@ -373,7 +379,9 @@ mod tests {
             Err(anyhow::anyhow!("no messages"))
         }
 
-        fn local_peer_id(&self) -> PeerId { PeerId::new([7; 32]) }
+        fn local_peer_id(&self) -> PeerId {
+            PeerId::new([7; 32])
+        }
     }
 
     /// Transport that immediately returns errors.
@@ -381,12 +389,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GossipTransport for ImmediateErrorTransport {
-        async fn dial(&self, _peer: PeerId, _addr: std::net::SocketAddr) -> Result<()> { Ok(()) }
+        async fn dial(&self, _peer: PeerId, _addr: std::net::SocketAddr) -> Result<()> {
+            Ok(())
+        }
         async fn dial_bootstrap(&self, _addr: std::net::SocketAddr) -> Result<PeerId> {
             Ok(PeerId::new([9; 32]))
         }
-        async fn listen(&self, _bind: std::net::SocketAddr) -> Result<()> { Ok(()) }
-        async fn close(&self) -> Result<()> { Ok(()) }
+        async fn listen(&self, _bind: std::net::SocketAddr) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
         async fn send_to_peer(
             &self,
             _peer: PeerId,
@@ -400,7 +414,9 @@ mod tests {
         async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
             Err(anyhow::anyhow!("immediate error"))
         }
-        fn local_peer_id(&self) -> PeerId { PeerId::new([77; 32]) }
+        fn local_peer_id(&self) -> PeerId {
+            PeerId::new([77; 32])
+        }
     }
 
     /// Transport that always fails sends.
@@ -408,12 +424,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GossipTransport for FailingTransport {
-        async fn dial(&self, _peer: PeerId, _addr: std::net::SocketAddr) -> Result<()> { Ok(()) }
+        async fn dial(&self, _peer: PeerId, _addr: std::net::SocketAddr) -> Result<()> {
+            Ok(())
+        }
         async fn dial_bootstrap(&self, _addr: std::net::SocketAddr) -> Result<PeerId> {
             Ok(PeerId::new([9; 32]))
         }
-        async fn listen(&self, _bind: std::net::SocketAddr) -> Result<()> { Ok(()) }
-        async fn close(&self) -> Result<()> { Ok(()) }
+        async fn listen(&self, _bind: std::net::SocketAddr) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
         async fn send_to_peer(
             &self,
             _peer: PeerId,
@@ -426,7 +448,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             Err(anyhow::anyhow!("no messages"))
         }
-        fn local_peer_id(&self) -> PeerId { PeerId::new([77; 32]) }
+        fn local_peer_id(&self) -> PeerId {
+            PeerId::new([77; 32])
+        }
     }
 
     #[derive(Default)]
@@ -436,12 +460,24 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Membership for MockMembership {
-        async fn join(&self, _seeds: Vec<String>) -> Result<()> { Ok(()) }
-        fn active_view(&self) -> Vec<PeerId> { self.active_peers.lock().unwrap().clone() }
-        fn passive_view(&self) -> Vec<PeerId> { Vec::new() }
-        async fn add_active(&self, _peer: PeerId) -> Result<()> { Ok(()) }
-        async fn remove_active(&self, _peer: PeerId) -> Result<()> { Ok(()) }
-        async fn promote(&self, _peer: PeerId) -> Result<()> { Ok(()) }
+        async fn join(&self, _seeds: Vec<String>) -> Result<()> {
+            Ok(())
+        }
+        fn active_view(&self) -> Vec<PeerId> {
+            self.active_peers.lock().unwrap().clone()
+        }
+        fn passive_view(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+        async fn add_active(&self, _peer: PeerId) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_active(&self, _peer: PeerId) -> Result<()> {
+            Ok(())
+        }
+        async fn promote(&self, _peer: PeerId) -> Result<()> {
+            Ok(())
+        }
     }
 
     fn make_roles() -> CoordinatorRoles {
@@ -459,8 +495,12 @@ mod tests {
 
     #[tokio::test]
     async fn constructor_and_empty_cache() {
-        let transport = Arc::new(RwLock::new(Box::new(FailingTransport) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let transport = Arc::new(RwLock::new(
+            Box::new(FailingTransport) as Box<dyn GossipTransport>
+        ));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
         assert!(client.get_cached_adverts().await.is_empty());
@@ -468,21 +508,25 @@ mod tests {
 
     #[tokio::test]
     async fn publish_without_active_peers_caches_locally() {
-        let transport = Arc::new(RwLock::new(Box::new(FailingTransport) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let transport = Arc::new(RwLock::new(
+            Box::new(FailingTransport) as Box<dyn GossipTransport>
+        ));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        client.publish_coordinator_advert(make_roles(), vec![make_addr()], NatClass::Eim, 60_000).await.unwrap();
+        client
+            .publish_coordinator_advert(make_roles(), vec![make_addr()], NatClass::Eim, 60_000)
+            .await
+            .unwrap();
         assert_eq!(client.get_cached_adverts().await.len(), 1);
     }
 
     #[tokio::test]
     async fn publish_with_active_peers_broadcasts_and_caches() {
         let memb = MockMembership::default();
-        *memb.active_peers.lock().unwrap() = vec![
-            PeerId::new([10; 32]),
-            PeerId::new([11; 32]),
-        ];
+        *memb.active_peers.lock().unwrap() = vec![PeerId::new([10; 32]), PeerId::new([11; 32])];
         let sent = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let sent_clone = sent.clone();
         let transport = Arc::new(RwLock::new(Box::new(MockCoordTransport {
@@ -493,11 +537,16 @@ mod tests {
         let membership = Arc::new(RwLock::new(Box::new(memb) as Box<dyn Membership>));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        client.publish_coordinator_advert(make_roles(), vec![make_addr()], NatClass::Eim, 60_000).await.unwrap();
+        client
+            .publish_coordinator_advert(make_roles(), vec![make_addr()], NatClass::Eim, 60_000)
+            .await
+            .unwrap();
         assert_eq!(client.get_cached_adverts().await.len(), 1);
         let recorded = sent.lock().await;
         assert_eq!(recorded.len(), 2);
-        assert!(recorded.iter().all(|(_, ty)| *ty == GossipStreamType::PubSub));
+        assert!(recorded
+            .iter()
+            .all(|(_, ty)| *ty == GossipStreamType::PubSub));
     }
 
     #[tokio::test]
@@ -520,7 +569,10 @@ mod tests {
         let membership = Arc::new(RwLock::new(Box::new(memb) as Box<dyn Membership>));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        client.publish_coordinator_advert(make_roles(), vec![make_addr()], NatClass::Eim, 60_000).await.unwrap();
+        client
+            .publish_coordinator_advert(make_roles(), vec![make_addr()], NatClass::Eim, 60_000)
+            .await
+            .unwrap();
         let recorded = sent.lock().await;
         // Peer 10 and 12 succeed, 11 fails
         assert_eq!(recorded.len(), 2);
@@ -532,19 +584,30 @@ mod tests {
 
     #[tokio::test]
     async fn foaf_with_cached_adverts_returns_cache() {
-        let transport = Arc::new(RwLock::new(Box::new(FailingTransport) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let transport = Arc::new(RwLock::new(
+            Box::new(FailingTransport) as Box<dyn GossipTransport>
+        ));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        client.publish_coordinator_advert(make_roles(), vec![make_addr()], NatClass::Eim, 60_000).await.unwrap();
+        client
+            .publish_coordinator_advert(make_roles(), vec![make_addr()], NatClass::Eim, 60_000)
+            .await
+            .unwrap();
         let adverts = client.find_coordinators_via_foaf(2, 3).await.unwrap();
         assert_eq!(adverts.len(), 1);
     }
 
     #[tokio::test]
     async fn foaf_with_no_active_peers_returns_empty() {
-        let transport = Arc::new(RwLock::new(Box::new(FailingTransport) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let transport = Arc::new(RwLock::new(
+            Box::new(FailingTransport) as Box<dyn GossipTransport>
+        ));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
         let adverts = client.find_coordinators_via_foaf(2, 3).await.unwrap();
@@ -594,13 +657,11 @@ mod tests {
         let mut advert_bytes = Vec::new();
         ciborium::ser::into_writer(&advert, &mut advert_bytes).unwrap();
 
-        let queued = Arc::new(tokio::sync::Mutex::new(vec![
-            (
-                PeerId::new([10; 32]), // from peer 10
-                GossipStreamType::Membership,
-                Bytes::from(advert_bytes),
-            ),
-        ]));
+        let queued = Arc::new(tokio::sync::Mutex::new(vec![(
+            PeerId::new([10; 32]), // from peer 10
+            GossipStreamType::Membership,
+            Bytes::from(advert_bytes),
+        )]));
         let transport = Arc::new(RwLock::new(Box::new(MockCoordTransport {
             sent: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             queued_responses: queued,
@@ -632,22 +693,25 @@ mod tests {
         let mut advert_bytes = Vec::new();
         ciborium::ser::into_writer(&advert, &mut advert_bytes).unwrap();
 
-        let queued = Arc::new(tokio::sync::Mutex::new(vec![
-            (
-                PeerId::new([10; 32]),
-                GossipStreamType::Membership,
-                Bytes::from(advert_bytes),
-            ),
-        ]));
+        let queued = Arc::new(tokio::sync::Mutex::new(vec![(
+            PeerId::new([10; 32]),
+            GossipStreamType::Membership,
+            Bytes::from(advert_bytes),
+        )]));
         let transport = Arc::new(RwLock::new(Box::new(MockCoordTransport {
             sent: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             queued_responses: queued,
             send_fail_for: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        let result = client.collect_coordinator_responses(&[PeerId::new([10; 32])], 5).await.unwrap();
+        let result = client
+            .collect_coordinator_responses(&[PeerId::new([10; 32])], 5)
+            .await
+            .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].peer, PeerId::new([77; 32]));
     }
@@ -683,10 +747,15 @@ mod tests {
             queued_responses: queued,
             send_fail_for: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        let result = client.collect_coordinator_responses(&[PeerId::new([10; 32])], 5).await.unwrap();
+        let result = client
+            .collect_coordinator_responses(&[PeerId::new([10; 32])], 5)
+            .await
+            .unwrap();
         // Skipped PubSub, accepted Membership → still 1 advert
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].peer, PeerId::new([66; 32]));
@@ -706,22 +775,25 @@ mod tests {
         ciborium::ser::into_writer(&advert, &mut advert_bytes).unwrap();
 
         // Wrong peer (not in expected_peers)
-        let queued = Arc::new(tokio::sync::Mutex::new(vec![
-            (
-                PeerId::new([99; 32]), // unexpected peer
-                GossipStreamType::Membership,
-                Bytes::from(advert_bytes),
-            ),
-        ]));
+        let queued = Arc::new(tokio::sync::Mutex::new(vec![(
+            PeerId::new([99; 32]), // unexpected peer
+            GossipStreamType::Membership,
+            Bytes::from(advert_bytes),
+        )]));
         let transport = Arc::new(RwLock::new(Box::new(MockCoordTransport {
             sent: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             queued_responses: queued,
             send_fail_for: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        let result = client.collect_coordinator_responses(&[PeerId::new([10; 32])], 5).await.unwrap();
+        let result = client
+            .collect_coordinator_responses(&[PeerId::new([10; 32])], 5)
+            .await
+            .unwrap();
         // No expected peers responded → empty
         assert!(result.is_empty());
     }
@@ -758,45 +830,58 @@ mod tests {
             queued_responses: queued,
             send_fail_for: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        let result = client.collect_coordinator_responses(&[PeerId::new([10; 32])], 5).await.unwrap();
+        let result = client
+            .collect_coordinator_responses(&[PeerId::new([10; 32])], 5)
+            .await
+            .unwrap();
         // Invalid CBOR skipped, valid advert processed
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].peer, PeerId::new([44; 32]));
     }
 
-
     #[tokio::test]
     async fn request_address_reflection_with_failing_transport_returns_error() {
-        let transport = Arc::new(RwLock::new(Box::new(FailingTransport) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let transport = Arc::new(RwLock::new(
+            Box::new(FailingTransport) as Box<dyn GossipTransport>
+        ));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        let result = client.request_address_reflection(PeerId::new([10; 32])).await;
+        let result = client
+            .request_address_reflection(PeerId::new([10; 32]))
+            .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn request_address_reflection_parses_valid_response() {
         // Transport that sends back a valid ADDR_REFLECT_RESPONSE on receive
-        let queued = Arc::new(tokio::sync::Mutex::new(vec![
-            (
-                PeerId::new([99; 32]),
-                GossipStreamType::Membership,
-                Bytes::from(b"ADDR_REFLECT_RESPONSE:127.0.0.1:12345" as &[u8]),
-            ),
-        ]));
+        let queued = Arc::new(tokio::sync::Mutex::new(vec![(
+            PeerId::new([99; 32]),
+            GossipStreamType::Membership,
+            Bytes::from(b"ADDR_REFLECT_RESPONSE:127.0.0.1:12345" as &[u8]),
+        )]));
         let transport = Arc::new(RwLock::new(Box::new(MockCoordTransport {
             sent: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             queued_responses: queued,
             send_fail_for: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        let addr = client.request_address_reflection(PeerId::new([99; 32])).await.unwrap();
+        let addr = client
+            .request_address_reflection(PeerId::new([99; 32]))
+            .await
+            .unwrap();
         assert_eq!(addr.to_string(), "127.0.0.1:12345");
     }
 
@@ -804,11 +889,18 @@ mod tests {
     async fn collect_responses_with_zero_timeout_returns_empty() {
         // Zero timeout → immediate timeout: response_future never runs,
         // collect returns Ok(Vec::new()) via the timeout branch.
-        let transport = Arc::new(RwLock::new(Box::new(FailingTransport) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let transport = Arc::new(RwLock::new(
+            Box::new(FailingTransport) as Box<dyn GossipTransport>
+        ));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        let result = client.collect_coordinator_responses(&[PeerId::new([10; 32])], 0).await.unwrap();
+        let result = client
+            .collect_coordinator_responses(&[PeerId::new([10; 32])], 0)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -816,11 +908,18 @@ mod tests {
     async fn collect_responses_handles_receive_error_breaks_loop() {
         // Transport whose receive_message returns error immediately.
         // Covers the Err(e) → warn → break path in the collect loop.
-        let transport = Arc::new(RwLock::new(Box::new(ImmediateErrorTransport) as Box<dyn GossipTransport>));
-        let membership = Arc::new(RwLock::new(Box::new(MockMembership::default()) as Box<dyn Membership>));
+        let transport = Arc::new(RwLock::new(
+            Box::new(ImmediateErrorTransport) as Box<dyn GossipTransport>
+        ));
+        let membership = Arc::new(RwLock::new(
+            Box::new(MockMembership::default()) as Box<dyn Membership>
+        ));
         let client = CoordinatorClient::new(PeerId::new([1; 32]), transport, membership);
 
-        let result = client.collect_coordinator_responses(&[PeerId::new([10; 32])], 5).await.unwrap();
+        let result = client
+            .collect_coordinator_responses(&[PeerId::new([10; 32])], 5)
+            .await
+            .unwrap();
         // Receive error causes loop to break, returns whatever was accumulated (none)
         assert!(result.is_empty());
     }

@@ -223,6 +223,7 @@ mod tests {
     struct MockPubSubState {
         published: Mutex<Vec<(TopicId, Bytes)>>,
         subscribed: std::sync::Mutex<Vec<TopicId>>,
+        subscribers: std::sync::Mutex<Vec<mpsc::UnboundedSender<(PeerId, Bytes)>>>,
     }
 
     #[async_trait::async_trait]
@@ -234,12 +235,16 @@ mod tests {
 
         fn subscribe(&self, topic: TopicId) -> mpsc::UnboundedReceiver<(PeerId, Bytes)> {
             let (tx, rx) = mpsc::unbounded_channel();
-            drop(tx);
             self.state
                 .subscribed
                 .lock()
                 .expect("subscription mutex is not poisoned")
                 .push(topic);
+            self.state
+                .subscribers
+                .lock()
+                .expect("subscriber mutex is not poisoned")
+                .push(tx);
             rx
         }
 
@@ -454,7 +459,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_collecting_requires_subscription_then_records_collector() {
-        let (client, _) = client();
+        let (client, pubsub) = client();
         let target_id = target(10);
 
         assert!(client.start_collecting_for_target(target_id).await.is_err());
@@ -467,5 +472,29 @@ mod tests {
             .read()
             .await
             .contains_key(&target_id));
+
+        let sender = pubsub
+            .state
+            .subscribers
+            .lock()
+            .expect("subscriber mutex")
+            .last()
+            .cloned()
+            .expect("collector subscription");
+        sender
+            .send((
+                peer(2),
+                encode_summary(&summary_for(target_id, peer(2), 60_000)),
+            ))
+            .expect("collector accepts valid summary");
+        sender
+            .send((peer(2), Bytes::from_static(b"invalid summary")))
+            .expect("collector accepts invalid summary for error path");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let cached = client.get_cached_summaries(&target_id).await;
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].provider, peer(2));
     }
 }

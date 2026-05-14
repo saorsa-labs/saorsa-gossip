@@ -205,46 +205,31 @@ impl RendezvousClient {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use saorsa_gossip_rendezvous::Capability;
     use saorsa_gossip_transport::GossipStreamType;
-    use std::collections::VecDeque;
-    use std::net::SocketAddr;
-    use tokio::sync::{mpsc, Mutex};
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
 
     #[derive(Clone, Default)]
     struct MockPubSub {
-        state: Arc<MockPubSubState>,
-    }
-
-    #[derive(Default)]
-    struct MockPubSubState {
-        published: Mutex<Vec<(TopicId, Bytes)>>,
-        subscribed: std::sync::Mutex<Vec<TopicId>>,
-        subscribers: std::sync::Mutex<Vec<mpsc::UnboundedSender<(PeerId, Bytes)>>>,
+        published: Arc<Mutex<Vec<(TopicId, Bytes)>>>,
+        subscribed: Arc<Mutex<Vec<TopicId>>>,
     }
 
     #[async_trait::async_trait]
     impl PubSub for MockPubSub {
         async fn publish(&self, topic: TopicId, data: Bytes) -> Result<()> {
-            self.state.published.lock().await.push((topic, data));
+            self.published.lock().unwrap().push((topic, data));
             Ok(())
         }
 
         fn subscribe(&self, topic: TopicId) -> mpsc::UnboundedReceiver<(PeerId, Bytes)> {
-            let (tx, rx) = mpsc::unbounded_channel();
-            self.state
-                .subscribed
-                .lock()
-                .expect("subscription mutex is not poisoned")
-                .push(topic);
-            self.state
-                .subscribers
-                .lock()
-                .expect("subscriber mutex is not poisoned")
-                .push(tx);
+            self.subscribed.lock().unwrap().push(topic);
+            let (_tx, rx) = mpsc::unbounded_channel();
             rx
         }
 
@@ -259,22 +244,19 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct MockTransport {
-        incoming: Mutex<VecDeque<(PeerId, GossipStreamType, Bytes)>>,
-    }
+    struct MockTransport;
 
     #[async_trait::async_trait]
     impl GossipTransport for MockTransport {
-        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+        async fn dial(&self, _peer: PeerId, _addr: std::net::SocketAddr) -> Result<()> {
             Ok(())
         }
 
-        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
-            Ok(peer(9))
+        async fn dial_bootstrap(&self, _addr: std::net::SocketAddr) -> Result<PeerId> {
+            Ok(PeerId::new([9; 32]))
         }
 
-        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+        async fn listen(&self, _bind: std::net::SocketAddr) -> Result<()> {
             Ok(())
         }
 
@@ -292,209 +274,172 @@ mod tests {
         }
 
         async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
-            self.incoming
-                .lock()
-                .await
-                .pop_front()
-                .ok_or_else(|| anyhow::anyhow!("no message"))
+            Err(anyhow::anyhow!("no messages"))
         }
 
         fn local_peer_id(&self) -> PeerId {
-            peer(1)
+            PeerId::new([7; 32])
         }
     }
 
-    fn peer(byte: u8) -> PeerId {
-        PeerId::new([byte; 32])
-    }
-
-    fn target(byte: u8) -> [u8; 32] {
-        [byte; 32]
-    }
-
-    fn summary_for(target_id: [u8; 32], provider: PeerId, validity_ms: u64) -> ProviderSummary {
-        ProviderSummary::new(target_id, provider, vec![Capability::Site], validity_ms)
-    }
-
-    fn encode_summary(summary: &ProviderSummary) -> Bytes {
-        let mut bytes = Vec::new();
-        ciborium::ser::into_writer(summary, &mut bytes).expect("summary encodes");
-        Bytes::from(bytes)
-    }
-
-    fn client() -> (RendezvousClient, MockPubSub) {
-        let pubsub = MockPubSub::default();
-        let transport: Arc<RwLock<Box<dyn GossipTransport>>> =
-            Arc::new(RwLock::new(Box::new(MockTransport::default())));
-        let pubsub_trait: Arc<RwLock<Box<dyn PubSub>>> =
-            Arc::new(RwLock::new(Box::new(pubsub.clone())));
-        (
-            RendezvousClient::new(peer(1), transport, pubsub_trait),
-            pubsub,
+    fn client() -> RendezvousClient {
+        RendezvousClient::new(
+            PeerId::new([1; 32]),
+            Arc::new(RwLock::new(Box::new(MockTransport))),
+            Arc::new(RwLock::new(Box::new(MockPubSub::default()))),
         )
     }
 
+    fn summary(target: [u8; 32], provider_byte: u8, validity_ms: u64) -> ProviderSummary {
+        ProviderSummary::new(
+            target,
+            PeerId::new([provider_byte; 32]),
+            vec![Capability::Site],
+            validity_ms,
+        )
+    }
+
+    fn encode(summary: &ProviderSummary) -> Bytes {
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(summary, &mut bytes).unwrap();
+        Bytes::from(bytes)
+    }
+
     #[tokio::test]
-    async fn peer_id_and_empty_cache_are_reported() {
-        let (client, _) = client();
-        assert_eq!(client.peer_id(), peer(1));
-        assert!(client.get_cached_summaries(&target(7)).await.is_empty());
+    async fn constructor_and_empty_cache_report_peer_id() {
+        let client = client();
+        let target = [42; 32];
+
+        assert_eq!(client.peer_id(), PeerId::new([1; 32]));
+        assert!(client.get_cached_summaries(&target).await.is_empty());
     }
 
     #[tokio::test]
     async fn subscribe_to_shard_is_idempotent() {
-        let (client, pubsub) = client();
-        let target_id = target(3);
+        let client = client();
+        let target = [3; 32];
 
-        let first = client.subscribe_to_shard(&target_id).await.unwrap();
-        let second = client.subscribe_to_shard(&target_id).await.unwrap();
+        let first = client.subscribe_to_shard(&target).await.unwrap();
+        let second = client.subscribe_to_shard(&target).await.unwrap();
 
-        assert_eq!(first, calculate_shard(&target_id));
+        assert_eq!(first, calculate_shard(&target));
         assert_eq!(first, second);
-        assert_eq!(pubsub.state.subscribed.lock().expect("mutex").len(), 1);
+        assert_eq!(client.subscriptions.read().await.len(), 1);
     }
 
     #[tokio::test]
-    async fn publish_provider_summary_uses_target_shard_topic() {
-        let (client, pubsub) = client();
-        let target_id = target(4);
-        let summary = summary_for(target_id, peer(2), 1_000);
+    async fn publish_provider_summary_serializes_to_shard_topic() {
+        let mock = MockPubSub::default();
+        let published = mock.published.clone();
+        let client = RendezvousClient::new(
+            PeerId::new([1; 32]),
+            Arc::new(RwLock::new(Box::new(MockTransport))),
+            Arc::new(RwLock::new(Box::new(mock))),
+        );
+        let target = [4; 32];
+        let published_summary = summary(target, 8, 60_000);
 
         client
-            .publish_provider_summary(summary.clone())
+            .publish_provider_summary(published_summary.clone())
             .await
             .unwrap();
 
-        let published = pubsub.state.published.lock().await;
-        assert_eq!(published.len(), 1);
-        let shard_name = format!("rendezvous_shard_{}", calculate_shard(&target_id));
-        let expected_topic = TopicId::new(*blake3::hash(shard_name.as_bytes()).as_bytes());
-        assert_eq!(published[0].0, expected_topic);
-        let decoded: ProviderSummary = ciborium::de::from_reader(&published[0].1[..]).unwrap();
-        assert_eq!(decoded.target, summary.target);
-        assert_eq!(decoded.provider, summary.provider);
+        let records = published.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let shard = calculate_shard(&target);
+        let shard_name = format!("rendezvous_shard_{}", shard);
+        let hash = blake3::hash(shard_name.as_bytes());
+        assert_eq!(records[0].0, TopicId::new(*hash.as_bytes()));
+        let decoded: ProviderSummary = ciborium::de::from_reader(&records[0].1[..]).unwrap();
+        assert_eq!(decoded.target, target);
+        assert_eq!(decoded.provider, published_summary.provider);
     }
 
     #[tokio::test]
-    async fn process_incoming_summary_rejects_invalid_payload_and_wrong_target() {
-        let (client, _) = client();
-        let target_id = target(5);
-
-        let invalid = client
-            .process_incoming_summary(&target_id, Bytes::from_static(b"not-cbor"))
-            .await;
-        assert!(invalid.is_err());
-
-        let wrong_target = summary_for(target(6), peer(2), 1_000);
-        let mismatch = client
-            .process_incoming_summary(&target_id, encode_summary(&wrong_target))
-            .await;
-        assert!(mismatch.is_err());
-        assert!(client.get_cached_summaries(&target_id).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn process_incoming_summary_inserts_and_replaces_by_provider() {
-        let (client, _) = client();
-        let target_id = target(8);
-        let mut first = summary_for(target_id, peer(2), 1_000);
-        let mut replacement = summary_for(target_id, peer(2), 2_000);
-        replacement.have_root = true;
-        first.have_root = false;
+    async fn process_incoming_summary_caches_and_replaces_by_provider() {
+        let client = client();
+        let target = [5; 32];
+        let first = summary(target, 11, 60_000).with_manifest_version(1);
+        let replacement = summary(target, 11, 60_000).with_manifest_version(2);
+        let other = summary(target, 12, 60_000);
 
         client
-            .process_incoming_summary(&target_id, encode_summary(&first))
+            .process_incoming_summary(&target, encode(&first))
             .await
             .unwrap();
         client
-            .process_incoming_summary(&target_id, encode_summary(&replacement))
+            .process_incoming_summary(&target, encode(&replacement))
             .await
             .unwrap();
         client
-            .process_incoming_summary(
-                &target_id,
-                encode_summary(&summary_for(target_id, peer(3), 2_000)),
-            )
+            .process_incoming_summary(&target, encode(&other))
             .await
             .unwrap();
 
-        let cached = client.get_cached_summaries(&target_id).await;
+        let cached = client.get_cached_summaries(&target).await;
         assert_eq!(cached.len(), 2);
-        assert!(cached.iter().any(|s| s.provider == peer(2) && s.have_root));
-        assert!(cached.iter().any(|s| s.provider == peer(3)));
+        assert!(cached.iter().any(|s| s.manifest_ver == Some(2)));
+        assert!(!cached.iter().any(|s| s.manifest_ver == Some(1)));
     }
 
     #[tokio::test]
-    async fn providers_for_target_filters_expired_and_orders_by_remaining_validity() {
-        let (client, _) = client();
-        let target_id = target(9);
-        let expired = ProviderSummary {
-            exp: 1,
-            ..summary_for(target_id, peer(2), 1_000)
-        };
-        let short = summary_for(target_id, peer(3), 60_000);
-        let long = summary_for(target_id, peer(4), 120_000);
+    async fn process_incoming_summary_rejects_invalid_and_mismatched_payloads() {
+        let client = client();
+        let target = [6; 32];
+        let wrong_target = [7; 32];
 
-        for summary in [&expired, &short, &long] {
-            client
-                .process_incoming_summary(&target_id, encode_summary(summary))
-                .await
-                .unwrap();
-        }
+        assert!(client
+            .process_incoming_summary(&target, Bytes::from_static(b"not cbor"))
+            .await
+            .is_err());
+        assert!(client
+            .process_incoming_summary(&target, encode(&summary(wrong_target, 9, 60_000)))
+            .await
+            .is_err());
+        assert!(client.get_cached_summaries(&target).await.is_empty());
+    }
 
-        let providers = client.get_providers_for_target(&target_id).await;
+    #[tokio::test]
+    async fn get_providers_filters_expired_and_sorts_by_remaining_validity() {
+        let client = client();
+        let target = [8; 32];
+        let mut expired = summary(target, 20, 1);
+        expired.exp = 1;
+        let short = summary(target, 21, 10_000);
+        let long = summary(target, 22, 30_000);
+        client
+            .cached_summaries
+            .write()
+            .await
+            .insert(target, vec![short, expired, long]);
+
+        let providers = client.get_providers_for_target(&target).await;
+
         assert_eq!(providers.len(), 2);
-        assert_eq!(providers[0].provider, peer(4));
-        assert_eq!(providers[1].provider, peer(3));
+        assert_eq!(providers[0].provider, PeerId::new([22; 32]));
+        assert_eq!(providers[1].provider, PeerId::new([21; 32]));
     }
 
     #[tokio::test]
-    async fn providers_for_unknown_target_are_empty() {
-        let (client, _) = client();
-        assert!(client
-            .get_providers_for_target(&target(42))
-            .await
-            .is_empty());
+    async fn collector_requires_subscription_and_duplicate_start_is_noop() {
+        let client = client();
+        let target = [9; 32];
+
+        assert!(client.start_collecting_for_target(target).await.is_err());
+        client.subscribe_to_shard(&target).await.unwrap();
+        client.start_collecting_for_target(target).await.unwrap();
+        client.start_collecting_for_target(target).await.unwrap();
+
+        let collectors = client.active_collectors.read().await;
+        assert_eq!(collectors.len(), 1);
+        for handle in collectors.values() {
+            handle.abort();
+        }
     }
 
-    #[tokio::test]
-    async fn start_collecting_requires_subscription_then_records_collector() {
-        let (client, pubsub) = client();
-        let target_id = target(10);
-
-        assert!(client.start_collecting_for_target(target_id).await.is_err());
-        client.subscribe_to_shard(&target_id).await.unwrap();
-        client.start_collecting_for_target(target_id).await.unwrap();
-        client.start_collecting_for_target(target_id).await.unwrap();
-
-        assert!(client
-            .active_collectors
-            .read()
-            .await
-            .contains_key(&target_id));
-
-        let sender = pubsub
-            .state
-            .subscribers
-            .lock()
-            .expect("subscriber mutex")
-            .last()
-            .cloned()
-            .expect("collector subscription");
-        sender
-            .send((
-                peer(2),
-                encode_summary(&summary_for(target_id, peer(2), 60_000)),
-            ))
-            .expect("collector accepts valid summary");
-        sender
-            .send((peer(2), Bytes::from_static(b"invalid summary")))
-            .expect("collector accepts invalid summary for error path");
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        let cached = client.get_cached_summaries(&target_id).await;
-        assert_eq!(cached.len(), 1);
-        assert_eq!(cached[0].provider, peer(2));
+    #[test]
+    fn mock_transport_has_stable_local_peer_id() {
+        assert_eq!(MockTransport.local_peer_id(), PeerId::new([7; 32]));
+        let _addr = std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     }
 }

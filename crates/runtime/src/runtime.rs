@@ -320,6 +320,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_with_peer_health_oracle_wires_pubsub() {
+        let runtime = GossipRuntimeBuilder::new()
+            .peer_health_oracle(Arc::new(MockOracle))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.peer_id(), runtime.identity.peer_id());
+        assert!(runtime
+            .pubsub
+            .read()
+            .await
+            .trigger_anti_entropy(TopicId::new([7; 32]))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn build_with_explicit_identity_wires_clients_and_empty_group_maps() {
         let identity = MlDsaKeyPair::generate().unwrap();
         let expected_peer = identity.peer_id();

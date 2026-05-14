@@ -4202,6 +4202,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         if !self.verify_message_signature(&message) {
             warn!(peer_id = %from, msg_id = ?msg_id, "Invalid signature, dropping");
+            // X0X-0071 P4: a bad signature is the canonical invalid-message
+            // signal — record it against (topic, sender).
+            self.peer_scoring.record_invalid_message(topic, from);
             return Err(anyhow!("Invalid signature"));
         }
 
@@ -4227,6 +4230,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // PRUNE: move sender from eager to lazy
             if state.prune_peer(from) {
                 self.stage_stats.record_prune();
+                // X0X-0071 P3b: a prune bumps the (topic, peer) delivery
+                // deficit — sticky across a later re-graft.
+                self.peer_scoring.record_mesh_pruned(topic, from);
             }
             self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
             return Ok(());
@@ -4248,6 +4254,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .entry(from)
             .or_insert_with(PeerScore::new)
             .record_delivery();
+        // X0X-0071 P2: the sender delivered a msg_id we had not seen —
+        // a first-delivery credit against (topic, sender).
+        self.peer_scoring.record_first_delivery(topic, from);
 
         // Check if this message was requested via IWANT (anti-entropy or IHAVE recovery)
         if state.outstanding_iwants.remove(&msg_id).is_some() {
@@ -4284,6 +4293,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if grafted > 0 {
                 self.stage_stats.record_grafts(grafted);
             }
+        }
+        // X0X-0071 P1: if the sender is part of our eager mesh for this
+        // topic, (idempotently) start its time-in-mesh clock. Reads the
+        // post-maintenance eager set so a just-grafted peer is counted.
+        if state.eager_peers.contains(&from) {
+            self.peer_scoring.note_mesh_join(topic, from);
         }
 
         // Forward to eager_peers (except sender)
@@ -6480,65 +6495,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_scoring_events_surface_through_stage_stats() {
-        // Why X0X-0071: the libp2p-style peer scores must be reachable
-        // from the `/diagnostics/gossip` snapshot path so operators
-        // (and the future X0X-0071b threshold wiring) can see them.
-        // This drives a few P2/P4 events through the engine and asserts
-        // they appear in `PubSubStageStatsSnapshot.peer_scores_v2`,
-        // sorted worst-first.
+    async fn peer_scoring_populated_by_real_handle_eager_path() {
+        // Why X0X-0071 (reviewer P2 regression guard): `peer_scores_v2`
+        // must be populated by PRODUCTION pubsub events, not just by a
+        // test poking the engine directly. Under the original PR, the
+        // only integration was `stage_stats()` snapshotting an engine
+        // that no production path ever wrote to — so the diagnostic was
+        // permanently empty. This test drives REAL `handle_eager` calls
+        // (a valid delivery and a forged-signature message) and asserts
+        // the scores surface through `stage_stats()`, each scoped to
+        // the `(topic, peer)` it was driven on.
         let peer_id = test_peer_id(1);
-        let (transport, _started_rx) = BlockingTransport::new(peer_id);
-        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
-            peer_id,
-            Arc::clone(&transport),
-            test_signing_key(),
-            false,
-        ));
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([71u8; 32]);
         let good_peer = test_peer_id(2);
         let bad_peer = test_peer_id(3);
 
-        // good_peer delivers novel messages (P2 positive).
-        pubsub.peer_scoring().record_first_delivery(good_peer);
-        pubsub.peer_scoring().record_first_delivery(good_peer);
-        // bad_peer sends invalid messages (P4 heavy negative, squared).
-        pubsub.peer_scoring().record_invalid_message(bad_peer);
-        pubsub.peer_scoring().record_invalid_message(bad_peer);
+        // good_peer starts in our eager mesh for the topic.
+        pubsub.initialize_topic_peers(topic, vec![good_peer]).await;
 
+        // 1. good_peer delivers a novel, correctly-signed message —
+        //    drives P2 (first delivery) + P1 (note_mesh_join, eager).
+        let payload = Bytes::from("novel message");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let header_bytes = postcard::to_stdvec(&header).expect("serialize");
+        let signature = signing_key.sign(&header_bytes).expect("sign");
+        let good_msg = GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+        pubsub
+            .handle_eager(good_peer, topic, good_msg)
+            .await
+            .expect("valid handle_eager");
+
+        // 2. bad_peer sends a message whose signature is over the wrong
+        //    bytes — verification fails, driving P4 (invalid message).
+        let bad_payload = Bytes::from("forged message");
+        let bad_msg_id = pubsub.calculate_msg_id(&topic, &bad_payload);
+        let bad_header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: bad_msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let forged_signature = signing_key.sign(b"not the header bytes").expect("sign");
+        let bad_msg = GossipMessage {
+            header: bad_header,
+            payload: Some(bad_payload),
+            signature: forged_signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+        // Returns Err (invalid signature) — the P4 record happens before
+        // the early return.
+        assert!(
+            pubsub.handle_eager(bad_peer, topic, bad_msg).await.is_err(),
+            "forged-signature message must be rejected"
+        );
+
+        // 3. The scores surface through the production diagnostic path.
         let snapshot = pubsub.stage_stats();
         assert_eq!(
             snapshot.peer_scores_v2.len(),
             2,
-            "both scored peers must surface in the stage-stats snapshot"
-        );
-        // Sorted worst-first: bad_peer (negative) before good_peer.
-        assert_eq!(
-            snapshot.peer_scores_v2[0].peer_id,
-            bad_peer.to_string(),
-            "worst peer (invalid messages) sorts first"
+            "both (topic, peer) pairs must surface from the real handle_eager path"
         );
         assert!(
-            snapshot.peer_scores_v2[0].score < 0.0,
-            "invalid-message peer has a negative score (got {})",
-            snapshot.peer_scores_v2[0].score
+            snapshot
+                .peer_scores_v2
+                .iter()
+                .all(|r| r.topic_id == topic.to_string()),
+            "every snapshot row is scoped to the topic it was driven on"
         );
-        assert_eq!(
-            snapshot.peer_scores_v2[1].peer_id,
-            good_peer.to_string(),
-            "best peer (first deliveries) sorts last"
+
+        let bad_row = snapshot
+            .peer_scores_v2
+            .iter()
+            .find(|r| r.peer_id == bad_peer.to_string())
+            .expect("bad_peer scored via the real path");
+        // ~1.0 — the running count decays by 0.97^elapsed between the
+        // record call and the snapshot, so a few millis of drift leaves
+        // it a hair under 1.0.
+        assert!(
+            (bad_row.p4_invalid_messages - 1.0).abs() < 0.01,
+            "P4 invalid-message count (~1.0) recorded from the real verify path (got {})",
+            bad_row.p4_invalid_messages
         );
         assert!(
-            snapshot.peer_scores_v2[1].score > 0.0,
+            bad_row.score < 0.0,
+            "forged-signature peer has a negative score (got {})",
+            bad_row.score
+        );
+
+        let good_row = snapshot
+            .peer_scores_v2
+            .iter()
+            .find(|r| r.peer_id == good_peer.to_string())
+            .expect("good_peer scored via the real path");
+        assert!(
+            (good_row.p2_first_deliveries - 1.0).abs() < 0.01,
+            "P2 first-delivery (~1.0) recorded from the real handle_eager path (got {})",
+            good_row.p2_first_deliveries
+        );
+        assert!(
+            good_row.score > 0.0,
             "first-delivery peer has a positive score (got {})",
-            snapshot.peer_scores_v2[1].score
-        );
-        // P2 count is ~2.0 — the running value decays by 0.97^elapsed
-        // between the two record calls and the snapshot, so a couple of
-        // millis of wall-clock drift leaves it a hair under 2.0.
-        assert!(
-            (snapshot.peer_scores_v2[1].p2_first_deliveries - 2.0).abs() < 0.01,
-            "P2 first-delivery count (~2.0, minus tiny decay) is exposed in the snapshot (got {})",
-            snapshot.peer_scores_v2[1].p2_first_deliveries
+            good_row.score
         );
     }
 

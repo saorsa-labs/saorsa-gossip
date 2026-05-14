@@ -493,6 +493,7 @@ struct SignableFields<'a> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn test_shard_calculation_deterministic() {
@@ -756,6 +757,55 @@ mod tests {
 
         // After round-trip, extensions should still be None (default)
         assert!(decoded.extensions.is_none());
+    }
+
+    #[test]
+    fn test_optional_byte_adapter_round_trips_explicit_none() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        struct OptionalBytesHarness {
+            #[serde(with = "super::optional_serde_bytes")]
+            field: Option<Vec<u8>>,
+        }
+
+        let original = OptionalBytesHarness { field: None };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&original, &mut encoded).expect("serialize none field");
+
+        let decoded: OptionalBytesHarness =
+            ciborium::from_reader(&encoded[..]).expect("deserialize none field");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_optional_byte_adapter_rejects_non_bytes_value() {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(transparent)]
+        struct OptionalBytesHarness {
+            #[serde(with = "super::optional_serde_bytes")]
+            field: Option<Vec<u8>>,
+        }
+
+        // CBOR text string "hello" is not valid for the optional byte adapter's
+        // Some(bytes) path, so malformed wire payloads are rejected.
+        let cbor_text_hello = [0x65, b'h', b'e', b'l', b'l', b'o'];
+        let decoded = ciborium::from_reader::<OptionalBytesHarness, _>(&cbor_text_hello[..]);
+        assert!(decoded.is_err(), "text is not accepted as optional bytes");
+    }
+
+    #[test]
+    fn test_required_byte_adapter_rejects_non_bytes_value() {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(transparent)]
+        struct RequiredBytesHarness {
+            #[serde(with = "super::serde_bytes")]
+            field: Vec<u8>,
+        }
+
+        // CBOR text string "hello" is not valid for required byte fields such
+        // as ProviderSummary::sig, so decoding must fail instead of coercing.
+        let cbor_text_hello = [0x65, b'h', b'e', b'l', b'l', b'o'];
+        let decoded = ciborium::from_reader::<RequiredBytesHarness, _>(&cbor_text_hello[..]);
+        assert!(decoded.is_err(), "text is not accepted as required bytes");
     }
 
     #[test]

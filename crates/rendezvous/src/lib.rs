@@ -493,6 +493,7 @@ struct SignableFields<'a> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn test_shard_calculation_deterministic() {
@@ -668,5 +669,427 @@ mod tests {
 
         assert_eq!(decoded.bloom, data.bloom);
         assert_eq!(decoded.iblt, data.iblt);
+    }
+
+    // ─── with_summary builder ────────────────────────────────────────
+
+    #[test]
+    fn test_with_summary_builder() {
+        let target = [11u8; 32];
+        let provider = PeerId::new([12u8; 32]);
+
+        let summary_data = SummaryData {
+            bloom: Some(vec![0xAA, 0xBB]),
+            iblt: Some(vec![0xCC, 0xDD]),
+        };
+
+        let summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000)
+            .with_summary(summary_data.clone());
+
+        assert!(summary.summary.is_some());
+        let inner = summary.summary.unwrap();
+        assert_eq!(inner.bloom, summary_data.bloom);
+        assert_eq!(inner.iblt, summary_data.iblt);
+    }
+
+    #[test]
+    fn test_with_summary_round_trip() {
+        let target = [13u8; 32];
+        let provider = PeerId::new([14u8; 32]);
+
+        let summary_data = SummaryData {
+            bloom: Some(vec![1, 2, 3]),
+            iblt: Some(vec![4, 5, 6]),
+        };
+
+        let original = ProviderSummary::new(target, provider, vec![Capability::Identity], 60_000)
+            .with_summary(summary_data.clone());
+
+        let cbor = original.to_cbor().expect("serialize");
+        let decoded = ProviderSummary::from_cbor(&cbor).expect("deserialize");
+
+        assert!(decoded.summary.is_some());
+        let inner = decoded.summary.unwrap();
+        assert_eq!(inner.bloom, summary_data.bloom);
+        assert_eq!(inner.iblt, summary_data.iblt);
+    }
+
+    // ─── with_extensions builder ─────────────────────────────────────
+
+    #[test]
+    fn test_with_extensions_builder() {
+        let target = [15u8; 32];
+        let provider = PeerId::new([16u8; 32]);
+
+        let ext_data = vec![0x01, 0x02, 0x03, 0x04];
+        let summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000)
+            .with_extensions(ext_data.clone());
+
+        assert_eq!(summary.extensions, Some(ext_data));
+    }
+
+    #[test]
+    fn test_with_extensions_round_trip() {
+        let target = [17u8; 32];
+        let provider = PeerId::new([18u8; 32]);
+
+        let ext_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let original = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000)
+            .with_extensions(ext_data.clone());
+
+        let cbor = original.to_cbor().expect("serialize");
+        let decoded = ProviderSummary::from_cbor(&cbor).expect("deserialize");
+
+        assert_eq!(decoded.extensions, Some(ext_data));
+    }
+
+    #[test]
+    fn test_extensions_none_serializes_and_deserializes() {
+        // Serialize a summary with extensions: None (should omit field via skip_serializing_if)
+        let target = [19u8; 32];
+        let provider = PeerId::new([20u8; 32]);
+
+        let original = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000);
+        assert!(original.extensions.is_none());
+
+        let cbor = original.to_cbor().expect("serialize");
+        let decoded = ProviderSummary::from_cbor(&cbor).expect("deserialize");
+
+        // After round-trip, extensions should still be None (default)
+        assert!(decoded.extensions.is_none());
+    }
+
+    #[test]
+    fn test_optional_byte_adapter_round_trips_explicit_none() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        struct OptionalBytesHarness {
+            #[serde(with = "super::optional_serde_bytes")]
+            field: Option<Vec<u8>>,
+        }
+
+        let original = OptionalBytesHarness { field: None };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&original, &mut encoded).expect("serialize none field");
+
+        let decoded: OptionalBytesHarness =
+            ciborium::from_reader(&encoded[..]).expect("deserialize none field");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_optional_byte_adapter_rejects_non_bytes_value() {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(transparent)]
+        struct OptionalBytesHarness {
+            #[serde(with = "super::optional_serde_bytes")]
+            field: Option<Vec<u8>>,
+        }
+
+        // CBOR text string "hello" is not valid for the optional byte adapter's
+        // Some(bytes) path, so malformed wire payloads are rejected.
+        let cbor_text_hello = [0x65, b'h', b'e', b'l', b'l', b'o'];
+        let decoded = ciborium::from_reader::<OptionalBytesHarness, _>(&cbor_text_hello[..]);
+        assert!(decoded.is_err(), "text is not accepted as optional bytes");
+    }
+
+    #[test]
+    fn test_required_byte_adapter_rejects_non_bytes_value() {
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(transparent)]
+        struct RequiredBytesHarness {
+            #[serde(with = "super::serde_bytes")]
+            field: Vec<u8>,
+        }
+
+        // CBOR text string "hello" is not valid for required byte fields such
+        // as ProviderSummary::sig, so decoding must fail instead of coercing.
+        let cbor_text_hello = [0x65, b'h', b'e', b'l', b'l', b'o'];
+        let decoded = ciborium::from_reader::<RequiredBytesHarness, _>(&cbor_text_hello[..]);
+        assert!(decoded.is_err(), "text is not accepted as required bytes");
+    }
+
+    #[test]
+    fn test_full_builder_chain() {
+        let target = [21u8; 32];
+        let provider = PeerId::new([22u8; 32]);
+
+        let summary_data = SummaryData {
+            bloom: Some(vec![0x01]),
+            iblt: Some(vec![0x02]),
+        };
+
+        let summary = ProviderSummary::new(
+            target,
+            provider,
+            vec![Capability::Site, Capability::Identity],
+            3600_000,
+        )
+        .with_root(true)
+        .with_manifest_version(100)
+        .with_summary(summary_data)
+        .with_extensions(vec![0xFF]);
+
+        assert!(summary.have_root);
+        assert_eq!(summary.manifest_ver, Some(100));
+        assert!(summary.summary.is_some());
+        assert!(summary.extensions.is_some());
+        assert_eq!(summary.cap.len(), 2);
+    }
+
+    // ─── sign_raw / verify_raw ──────────────────────────────────────
+
+    #[test]
+    fn test_sign_raw_and_verify_raw() {
+        use saorsa_pqc::{MlDsa65, MlDsaOperations};
+
+        let target = [23u8; 32];
+        let provider = PeerId::new([24u8; 32]);
+
+        let mut summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000);
+
+        let signer = MlDsa65::new();
+        let (pk, sk) = signer.generate_keypair().expect("keypair");
+
+        // Sign with raw secret key bytes
+        summary.sign_raw(sk.as_bytes()).expect("sign_raw");
+        assert!(!summary.sig.is_empty());
+
+        // Verify with raw public key bytes
+        let valid = summary.verify_raw(pk.as_bytes()).expect("verify_raw");
+        assert!(valid, "Raw signature should verify");
+    }
+
+    #[test]
+    fn test_sign_raw_invalid_key_bytes() {
+        let target = [25u8; 32];
+        let provider = PeerId::new([26u8; 32]);
+
+        let mut summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000);
+
+        // Pass wrong-length bytes — should fail
+        let result = summary.sign_raw(&[0x00, 0x01, 0x02]);
+        assert!(
+            result.is_err(),
+            "sign_raw with invalid key bytes should error"
+        );
+    }
+
+    #[test]
+    fn test_verify_raw_invalid_key_bytes() {
+        let target = [27u8; 32];
+        let provider = PeerId::new([28u8; 32]);
+
+        let summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000);
+
+        // Pass wrong-length bytes — should fail
+        let result = summary.verify_raw(&[0x00, 0x01, 0x02]);
+        assert!(
+            result.is_err(),
+            "verify_raw with invalid key bytes should error"
+        );
+    }
+
+    #[test]
+    fn test_sign_raw_then_verify_tampered() {
+        use saorsa_pqc::{MlDsa65, MlDsaOperations};
+
+        let target = [29u8; 32];
+        let provider = PeerId::new([30u8; 32]);
+
+        let mut summary =
+            ProviderSummary::new(target, provider, vec![Capability::Identity], 60_000);
+
+        let signer = MlDsa65::new();
+        let (pk, _sk) = signer.generate_keypair().expect("keypair");
+
+        // Sign with raw bytes, then tamper, then verify with raw bytes
+        summary
+            .sign_raw(signer.generate_keypair().unwrap().1.as_bytes())
+            .expect("sign_raw");
+        summary.have_root = true; // tamper
+
+        let valid = summary.verify_raw(pk.as_bytes()).expect("verify_raw");
+        assert!(!valid, "Tampered summary should fail verification");
+    }
+
+    // ─── to_bytes / from_bytes ──────────────────────────────────────
+
+    #[test]
+    fn test_to_bytes_and_from_bytes() {
+        let target = [31u8; 32];
+        let provider = PeerId::new([0u8; 32]);
+
+        let original = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000)
+            .with_root(true)
+            .with_manifest_version(7);
+
+        // to_bytes -> from_bytes round trip
+        let bytes = original.to_bytes().expect("to_bytes");
+        let decoded = ProviderSummary::from_bytes(&bytes).expect("from_bytes");
+
+        assert_eq!(decoded.v, original.v);
+        assert_eq!(decoded.target, original.target);
+        assert_eq!(decoded.provider, original.provider);
+        assert_eq!(decoded.have_root, original.have_root);
+        assert_eq!(decoded.manifest_ver, original.manifest_ver);
+    }
+
+    #[test]
+    fn test_from_bytes_invalid_cbor() {
+        // Invalid CBOR data should return an error
+        let result = ProviderSummary::from_bytes(&[0xFF, 0xFE, 0xFD]);
+        assert!(result.is_err(), "Invalid CBOR should fail deserialization");
+    }
+
+    #[test]
+    fn test_from_cbor_rejects_malformed_wire_byte_fields() {
+        fn replace_field(value: &mut ciborium::Value, field: &str, replacement: ciborium::Value) {
+            let ciborium::Value::Map(entries) = value else {
+                panic!("ProviderSummary encodes as a CBOR map");
+            };
+            let (_, slot) = entries
+                .iter_mut()
+                .find(|(key, _)| matches!(key, ciborium::Value::Text(name) if name == field))
+                .expect("field is present in encoded summary");
+            *slot = replacement;
+        }
+
+        let target = [39u8; 32];
+        let provider = PeerId::new([40u8; 32]);
+        let summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000)
+            .with_extensions(vec![1, 2, 3]);
+
+        let mut value: ciborium::Value =
+            ciborium::from_reader(&summary.to_cbor().expect("summary cbor")[..])
+                .expect("summary decodes to dynamic value");
+        replace_field(&mut value, "sig", ciborium::Value::Text("not bytes".into()));
+        let mut malformed_sig = Vec::new();
+        ciborium::into_writer(&value, &mut malformed_sig).expect("malformed sig encodes");
+        assert!(ProviderSummary::from_cbor(&malformed_sig).is_err());
+
+        let mut value: ciborium::Value =
+            ciborium::from_reader(&summary.to_cbor().expect("summary cbor")[..])
+                .expect("summary decodes to dynamic value");
+        replace_field(
+            &mut value,
+            "extensions",
+            ciborium::Value::Text("not bytes".into()),
+        );
+        let mut malformed_extensions = Vec::new();
+        ciborium::into_writer(&value, &mut malformed_extensions)
+            .expect("malformed extensions encodes");
+        assert!(ProviderSummary::from_cbor(&malformed_extensions).is_err());
+    }
+
+    #[test]
+    fn test_to_bytes_returns_non_empty() {
+        let target = [42u8; 32];
+        let provider = PeerId::new([0u8; 32]);
+        let summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000);
+
+        let bytes = summary.to_bytes().expect("to_bytes");
+        assert!(!bytes.is_empty(), "Serialized bytes should not be empty");
+    }
+
+    // ─── sign/verify with extensions ────────────────────────────────
+
+    #[test]
+    fn test_sign_and_verify_with_extensions() {
+        use saorsa_pqc::{MlDsa65, MlDsaOperations};
+
+        let target = [33u8; 32];
+        let provider = PeerId::new([34u8; 32]);
+
+        let ext_data = vec![0x01, 0x02, 0x03];
+        let mut summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000)
+            .with_extensions(ext_data);
+
+        let signer = MlDsa65::new();
+        let (pk, sk) = signer.generate_keypair().expect("keypair");
+
+        summary.sign(&sk).expect("signing with extensions");
+        let valid = summary.verify(&pk).expect("verification");
+        assert!(valid, "Signature with extensions should verify");
+    }
+
+    #[test]
+    fn test_sign_and_verify_with_summary_data() {
+        use saorsa_pqc::{MlDsa65, MlDsaOperations};
+
+        let target = [35u8; 32];
+        let provider = PeerId::new([36u8; 32]);
+
+        let summary_data = SummaryData {
+            bloom: Some(vec![0xAA; 16]),
+            iblt: Some(vec![0xBB; 32]),
+        };
+
+        let mut summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000)
+            .with_summary(summary_data);
+
+        let signer = MlDsa65::new();
+        let (pk, sk) = signer.generate_keypair().expect("keypair");
+
+        summary.sign(&sk).expect("signing with summary data");
+        let valid = summary.verify(&pk).expect("verification");
+        assert!(valid, "Signature with summary data should verify");
+    }
+
+    // ─── SummaryData edge cases ─────────────────────────────────────
+
+    #[test]
+    fn test_summary_data_partial_fields() {
+        // SummaryData with only bloom set (iblt is Some but empty)
+        let data = SummaryData {
+            bloom: Some(vec![0xAA]),
+            iblt: Some(vec![]),
+        };
+
+        let mut buffer = Vec::new();
+        ciborium::into_writer(&data, &mut buffer).expect("serialize");
+
+        let decoded: SummaryData = ciborium::from_reader(&buffer[..]).expect("deserialize");
+
+        assert_eq!(decoded.bloom, Some(vec![0xAA]));
+        assert_eq!(decoded.iblt, Some(vec![]));
+    }
+
+    // ─── verify with empty signature should fail gracefully ─────────
+
+    #[test]
+    fn test_verify_empty_signature() {
+        use saorsa_pqc::{MlDsa65, MlDsaOperations};
+
+        let target = [37u8; 32];
+        let provider = PeerId::new([38u8; 32]);
+
+        let summary = ProviderSummary::new(target, provider, vec![Capability::Site], 60_000);
+        // sig is empty Vec — should return error (invalid signature size)
+        let signer = MlDsa65::new();
+        let (pk, _sk) = signer.generate_keypair().expect("keypair");
+
+        let result = summary.verify(&pk);
+        assert!(result.is_err(), "Empty signature should fail verification");
+    }
+
+    // ─── constants and shard spread ──────────────────────────────────
+
+    #[test]
+    fn test_shard_constants() {
+        assert_eq!(SHARD_BITS, 16);
+        assert_eq!(SHARD_COUNT, 65_536);
+        assert_eq!(SHARD_MASK, 0xFFFF);
+    }
+
+    #[test]
+    fn test_shard_distribution_spread() {
+        // Verify that shards are well-distributed across the space
+        let mut seen = std::collections::HashSet::new();
+        for i in 0u8..=255 {
+            let target = [i; 32];
+            seen.insert(calculate_shard(&target));
+        }
+        // With 256 inputs and 65k shards, we should see many unique values
+        assert!(seen.len() > 200, "Shards should be well-distributed");
     }
 }

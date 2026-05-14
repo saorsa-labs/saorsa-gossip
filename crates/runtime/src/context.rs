@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn test_with_stream_read_limit() {
         let ctx = GossipContext::new().with_stream_read_limit(50 * 1024 * 1024);
-        assert_eq!(ctx.stream_read_limit, 50 * 1024 * 1024);
+        assert_eq!(ctx.stream_read_limit(), 50 * 1024 * 1024);
     }
 
     // Integration tests for build() - require async runtime

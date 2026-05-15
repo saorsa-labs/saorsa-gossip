@@ -30,6 +30,11 @@ saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-wo
 proptest = { workspace = true }
 tokio-test = { workspace = true }
 saorsa-gossip-transport = { workspace = true, features = ["test-helpers"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "peer_scoring_contention"
+harness = false
 
 [lints]
 workspace = true

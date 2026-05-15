@@ -1,10 +1,9 @@
 # saorsa-gossip — workspace task runner
 #
 # Standard recipes: check / fmt / lint / test / doc / build / coverage
-# Heavy recipes:    test-all / bench-* / soak / nat-loopback / testnet-smoke
+# Heavy recipes:    test-all / bench-* / nat-loopback
 #
-# Heavy / multi-minute benches are gated by SAORSA_BENCH_HEAVY=1.
-# Testnet recipes that touch VPS bootstrap nodes are gated by SAORSA_TESTNET=1.
+# Heavy / multi-minute benches are not defined yet.
 
 default:
     @just --list
@@ -55,19 +54,15 @@ coverage-strict:
 #   - all unit + integration tests
 #   - all doctests
 #   - examples build-check
-# Does NOT run #[ignore]d tests (use `just test-all-including-ignored` for those).
+# Does NOT run #[ignore]d tests; some ignored tests are intentionally
+# documentation for currently unsupported/heavy scenarios and are not expected
+# to pass in normal local/CI validation.
 test-all: test-all-rust test-doctests examples-build
     @echo ""
     @echo "test-all complete"
 
 test-all-rust:
     cargo nextest run --workspace --all-features
-
-# Run all tests including #[ignore]d ones. Some ignored tests are known to
-# fail (e.g., 10 MiB transfer blocked by ant-quic limits) so this is not the
-# default test recipe.
-test-all-including-ignored:
-    cargo nextest run --workspace --all-features --run-ignored all
 
 test-doctests:
     cargo test --doc --workspace --all-features
@@ -77,7 +72,7 @@ examples-build:
 
 # ===== Benchmarks (criterion) =====
 
-# Runs every fast criterion bench. Heavy benches require SAORSA_BENCH_HEAVY=1.
+# Runs every fast criterion bench when benchmark targets exist.
 bench-all:
     cargo bench --workspace --all-features
 

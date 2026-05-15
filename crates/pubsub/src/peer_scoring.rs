@@ -26,6 +26,16 @@
 //! P5 (application-specific) and P6 (IP colocation) are intentionally
 //! out of scope for this MVP.
 //!
+//! ## Scoping: per `(TopicId, PeerId)`
+//!
+//! P1/P2/P3b are mesh-membership signals — a peer is in *our mesh for a
+//! topic*, delivers novel messages *on a topic*, is pruned *from a
+//! topic's mesh*. A peer that is an excellent forwarder on topic A may
+//! be absent from topic B entirely. The engine therefore keys every
+//! score by `(TopicId, PeerId)`, matching the per-`TopicState` legacy
+//! `PeerScore` map. A global per-`PeerId` score would blend behaviour
+//! across topics and make later mesh-selection wiring unsound.
+//!
 //! ## Composite score
 //!
 //! ```text
@@ -56,19 +66,28 @@
 //! [`PeerScoring::tick_decay`] decays *every* entry so idle-peer
 //! snapshots stay fresh. This matches libp2p's continuous decay model.
 //!
-//! ## MVP scope
+//! ## MVP scope: populated telemetry, no enforcement
 //!
-//! This ships the **primitives + telemetry** only — the score is
-//! computed and exposed on `/diagnostics/gossip` via
-//! `PubSubStageStatsSnapshot.peer_scores_v2`, but the thresholds are
-//! NOT yet wired into admission or cooling decisions. Wiring the
-//! `gossip_threshold` / `publish_threshold` / `graylist_threshold`
-//! into the mesh-selection + admission paths is X0X-0071b (same MVP
-//! split pattern as X0X-0073 → X0X-0073b).
+//! This ships the engine **plus real production wiring**: the inbound
+//! EAGER path (`PlumtreePubSub::handle_eager`) records P1 (mesh join),
+//! P2 (first delivery), P3b (prune on duplicate), and P4 (invalid
+//! signature) as they happen, so `PubSubStageStatsSnapshot.peer_scores_v2`
+//! is genuinely populated on `/diagnostics/gossip` in production.
+//!
+//! What is **not** in this MVP:
+//! - **Threshold enforcement.** The `gossip_threshold` /
+//!   `publish_threshold` / `graylist_threshold` are computed and
+//!   surfaced but NOT yet consulted by mesh-selection or admission —
+//!   that changes runtime policy and needs its own validation
+//!   (X0X-0071b).
+//! - **`record_delivery_deficit` / `record_behavioral_penalty`.** These
+//!   API entry points exist for P3b-by-amount and P7, but have no
+//!   production call site yet — there is no single clean signal for
+//!   them without deeper changes. Reserved for X0X-0071b.
 //!
 //! Reference: <https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.1.md>
 
-use saorsa_gossip_types::PeerId;
+use saorsa_gossip_types::{PeerId, TopicId};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -236,9 +255,12 @@ impl PeerScoreState {
     }
 }
 
-/// JSON-friendly per-peer score snapshot for `/diagnostics/gossip`.
+/// JSON-friendly per-`(topic, peer)` score snapshot for
+/// `/diagnostics/gossip`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PeerScoreV2Snapshot {
+    /// Topic this score is scoped to, formatted the same way as logs.
+    pub topic_id: String,
     /// Peer identifier, formatted the same way as logs.
     pub peer_id: String,
     /// Composite score (sum of the weighted P-terms).
@@ -263,15 +285,16 @@ pub struct PeerScoreV2Snapshot {
     pub gossiped: bool,
 }
 
-/// libp2p-style per-peer scoring engine.
+/// libp2p-style per-`(topic, peer)` scoring engine.
 ///
-/// All mutating methods decay the touched peer's state to "now" before
-/// applying the update, so the running values are always current. The
-/// hot path is a single `Mutex<HashMap>` lookup per call — no async.
+/// All mutating methods decay the touched `(topic, peer)` state to "now"
+/// before applying the update, so the running values are always
+/// current. The hot path is a single `Mutex<HashMap>` lookup per call —
+/// no async.
 #[derive(Debug)]
 pub struct PeerScoring {
     config: PeerScoringConfig,
-    inner: Mutex<HashMap<PeerId, PeerScoreState>>,
+    inner: Mutex<HashMap<(TopicId, PeerId), PeerScoreState>>,
 }
 
 impl Default for PeerScoring {
@@ -305,56 +328,59 @@ impl PeerScoring {
         &self.config
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, PeerScoreState>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(TopicId, PeerId), PeerScoreState>> {
         match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 
-    /// Mark that `peer` has joined our mesh — starts the P1 clock.
-    /// Idempotent: a second call does not reset the join timestamp, so
-    /// a peer's accumulated time-in-mesh survives transient churn.
-    pub fn note_mesh_join(&self, peer: PeerId) {
+    /// Mark that `peer` has joined our mesh for `topic` — starts the P1
+    /// clock. Idempotent: a second call does not reset the join
+    /// timestamp, so a peer's accumulated time-in-mesh survives
+    /// transient churn.
+    pub fn note_mesh_join(&self, topic: TopicId, peer: PeerId) {
         let now = Instant::now();
         let mut guard = self.lock();
         let entry = guard
-            .entry(peer)
+            .entry((topic, peer))
             .or_insert_with(|| PeerScoreState::new(now));
         if entry.joined_mesh_at.is_none() {
             entry.joined_mesh_at = Some(now);
         }
     }
 
-    /// P2 — record that `peer` delivered a message we had not seen
-    /// before. Positive signal.
-    pub fn record_first_delivery(&self, peer: PeerId) {
+    /// P2 — record that `peer` delivered a message on `topic` that we
+    /// had not seen before. Positive signal.
+    pub fn record_first_delivery(&self, topic: TopicId, peer: PeerId) {
         let now = Instant::now();
         let mut guard = self.lock();
         let entry = guard
-            .entry(peer)
+            .entry((topic, peer))
             .or_insert_with(|| PeerScoreState::new(now));
         entry.decay_to(now, self.config.decay_per_sec);
         entry.first_deliveries += 1.0;
     }
 
-    /// P3b — record that `peer` was pruned from our mesh. A prune bumps
-    /// the delivery deficit so a flapping peer carries the penalty
-    /// across a later re-graft (the "sticky on prune" libp2p rule).
-    pub fn record_mesh_pruned(&self, peer: PeerId) {
+    /// P3b — record that `peer` was pruned from our mesh for `topic`. A
+    /// prune bumps the delivery deficit so a flapping peer carries the
+    /// penalty across a later re-graft (the "sticky on prune" libp2p
+    /// rule).
+    pub fn record_mesh_pruned(&self, topic: TopicId, peer: PeerId) {
         let now = Instant::now();
         let mut guard = self.lock();
         let entry = guard
-            .entry(peer)
+            .entry((topic, peer))
             .or_insert_with(|| PeerScoreState::new(now));
         entry.decay_to(now, self.config.decay_per_sec);
         entry.delivery_deficit += 1.0;
     }
 
-    /// P3b — record `amount` of mesh-delivery deficit for `peer` (how
-    /// far below the expected delivery rate it ran this window).
-    /// Negative `amount` is clamped to 0 — deficit never goes negative.
-    pub fn record_delivery_deficit(&self, peer: PeerId, amount: f64) {
+    /// P3b — record `amount` of mesh-delivery deficit for `peer` on
+    /// `topic` (how far below the expected delivery rate it ran this
+    /// window). Negative `amount` is clamped to 0 — deficit never goes
+    /// negative.
+    pub fn record_delivery_deficit(&self, topic: TopicId, peer: PeerId, amount: f64) {
         let now = Instant::now();
         let add = if amount.is_finite() && amount > 0.0 {
             amount
@@ -363,28 +389,29 @@ impl PeerScoring {
         };
         let mut guard = self.lock();
         let entry = guard
-            .entry(peer)
+            .entry((topic, peer))
             .or_insert_with(|| PeerScoreState::new(now));
         entry.decay_to(now, self.config.decay_per_sec);
         entry.delivery_deficit += add;
     }
 
-    /// P4 — record that `peer` sent an invalid message (bad signature,
-    /// malformed payload, unsupported version). Heavy, squared penalty.
-    pub fn record_invalid_message(&self, peer: PeerId) {
+    /// P4 — record that `peer` sent an invalid message on `topic` (bad
+    /// signature, malformed payload, unsupported version). Heavy,
+    /// squared penalty.
+    pub fn record_invalid_message(&self, topic: TopicId, peer: PeerId) {
         let now = Instant::now();
         let mut guard = self.lock();
         let entry = guard
-            .entry(peer)
+            .entry((topic, peer))
             .or_insert_with(|| PeerScoreState::new(now));
         entry.decay_to(now, self.config.decay_per_sec);
         entry.invalid_messages += 1.0;
     }
 
-    /// P7 — record `amount` of behavioural penalty for `peer` (IWANT
-    /// flood, graft-backoff violation, etc.). Negative `amount` is
-    /// clamped to 0.
-    pub fn record_behavioral_penalty(&self, peer: PeerId, amount: f64) {
+    /// P7 — record `amount` of behavioural penalty for `peer` on
+    /// `topic` (IWANT flood, graft-backoff violation, etc.). Negative
+    /// `amount` is clamped to 0.
+    pub fn record_behavioral_penalty(&self, topic: TopicId, peer: PeerId, amount: f64) {
         let now = Instant::now();
         let add = if amount.is_finite() && amount > 0.0 {
             amount
@@ -393,7 +420,7 @@ impl PeerScoring {
         };
         let mut guard = self.lock();
         let entry = guard
-            .entry(peer)
+            .entry((topic, peer))
             .or_insert_with(|| PeerScoreState::new(now));
         entry.decay_to(now, self.config.decay_per_sec);
         entry.behavioral_penalty += add;
@@ -410,14 +437,15 @@ impl PeerScoring {
         }
     }
 
-    /// Current composite score for `peer`, or `0.0` if the peer is not
-    /// tracked. Decays the peer's state to "now" before evaluating.
+    /// Current composite score for `peer` on `topic`, or `0.0` if the
+    /// `(topic, peer)` pair is not tracked. Decays the entry's state to
+    /// "now" before evaluating.
     #[must_use]
-    pub fn score(&self, peer: &PeerId) -> f64 {
+    pub fn score(&self, topic: &TopicId, peer: &PeerId) -> f64 {
         let now = Instant::now();
         let decay = self.config.decay_per_sec;
         let mut guard = self.lock();
-        match guard.get_mut(peer) {
+        match guard.get_mut(&(*topic, *peer)) {
             Some(entry) => {
                 entry.decay_to(now, decay);
                 entry.score(now, &self.config)
@@ -447,10 +475,10 @@ impl PeerScoring {
         score < self.config.graylist_threshold
     }
 
-    /// Snapshot every tracked peer's score, sorted lowest-score-first
-    /// (the worst peers — graylist candidates — appear at the top).
-    /// Decays each entry to "now" so the snapshot reflects current
-    /// state without requiring a prior `tick_decay`.
+    /// Snapshot every tracked `(topic, peer)` score, sorted
+    /// lowest-score-first (the worst peers — graylist candidates —
+    /// appear at the top). Decays each entry to "now" so the snapshot
+    /// reflects current state without requiring a prior `tick_decay`.
     #[must_use]
     pub fn snapshot(&self) -> Vec<PeerScoreV2Snapshot> {
         let now = Instant::now();
@@ -458,7 +486,7 @@ impl PeerScoring {
         let mut guard = self.lock();
         let mut rows: Vec<PeerScoreV2Snapshot> = guard
             .iter_mut()
-            .map(|(peer, entry)| {
+            .map(|((topic, peer), entry)| {
                 entry.decay_to(now, decay);
                 let score = entry.score(now, &self.config);
                 let p1 = match entry.joined_mesh_at {
@@ -469,6 +497,7 @@ impl PeerScoring {
                     None => 0.0,
                 };
                 PeerScoreV2Snapshot {
+                    topic_id: topic.to_string(),
                     peer_id: peer.to_string(),
                     score,
                     p1_time_in_mesh_secs: p1,
@@ -483,25 +512,27 @@ impl PeerScoring {
             })
             .collect();
         // Lowest score first — worst peers (graylist candidates) on top.
+        // Tie-break by (topic, peer) for a deterministic ordering.
         rows.sort_by(|a, b| {
             a.score
                 .partial_cmp(&b.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.topic_id.cmp(&b.topic_id))
                 .then_with(|| a.peer_id.cmp(&b.peer_id))
         });
         rows
     }
 
-    /// Number of tracked peers (diagnostic).
+    /// Number of tracked `(topic, peer)` score entries (diagnostic).
     #[must_use]
     pub fn tracked_peer_count(&self) -> usize {
         self.lock().len()
     }
 
-    /// Drop a peer's score state entirely — call when the peer
-    /// disconnects so the map doesn't grow unbounded.
+    /// Drop every score entry for `peer` across all topics — call when
+    /// the peer disconnects so the map doesn't grow unbounded.
     pub fn forget_peer(&self, peer: &PeerId) {
-        self.lock().remove(peer);
+        self.lock().retain(|(_, tracked), _| tracked != peer);
     }
 }
 
@@ -515,13 +546,17 @@ mod tests {
         PeerId::new([seed; 32])
     }
 
+    fn t(seed: u8) -> TopicId {
+        TopicId::new([seed; 32])
+    }
+
     #[test]
     fn unknown_peer_scores_zero() {
         // Why: a peer we've never seen has no evidence either way —
         // its score must be exactly 0, not a default penalty or bonus,
         // so a fresh peer isn't graylisted on sight.
         let scoring = PeerScoring::new();
-        assert_eq!(scoring.score(&p(1)), 0.0);
+        assert_eq!(scoring.score(&t(1), &p(1)), 0.0);
         assert_eq!(scoring.tracked_peer_count(), 0);
     }
 
@@ -532,9 +567,9 @@ mod tests {
         // score near +3 (P1 ~0 since note_mesh_join not called).
         let scoring = PeerScoring::new();
         for _ in 0..3 {
-            scoring.record_first_delivery(p(1));
+            scoring.record_first_delivery(t(1), p(1));
         }
-        let score = scoring.score(&p(1));
+        let score = scoring.score(&t(1), &p(1));
         assert!(
             (score - 3.0).abs() < 0.1,
             "3 first-deliveries × w_p2=1.0 ≈ +3 (got {score})"
@@ -548,9 +583,9 @@ mod tests {
         // → -100 × 3² = -900.
         let scoring = PeerScoring::new();
         for _ in 0..3 {
-            scoring.record_invalid_message(p(1));
+            scoring.record_invalid_message(t(1), p(1));
         }
-        let score = scoring.score(&p(1));
+        let score = scoring.score(&t(1), &p(1));
         assert!(
             (score - (-900.0)).abs() < 1.0,
             "3 invalid msgs squared × w_p4=-100 ≈ -900 (got {score})"
@@ -562,8 +597,8 @@ mod tests {
         // Why: P7 mirrors P4's squared shape for protocol-violation
         // catch-all. penalty=4.0 with w_p7=-10 → -10 × 4² = -160.
         let scoring = PeerScoring::new();
-        scoring.record_behavioral_penalty(p(1), 4.0);
-        let score = scoring.score(&p(1));
+        scoring.record_behavioral_penalty(t(1), p(1), 4.0);
+        let score = scoring.score(&t(1), &p(1));
         assert!(
             (score - (-160.0)).abs() < 1.0,
             "behavioural penalty 4² × w_p7=-10 ≈ -160 (got {score})"
@@ -576,9 +611,9 @@ mod tests {
         // deficit penalty into its next graft, so churn doesn't reset
         // the score. Two prunes → deficit 2 → w_p3b=-1 → score -2.
         let scoring = PeerScoring::new();
-        scoring.record_mesh_pruned(p(1));
-        scoring.record_mesh_pruned(p(1));
-        let score = scoring.score(&p(1));
+        scoring.record_mesh_pruned(t(1), p(1));
+        scoring.record_mesh_pruned(t(1), p(1));
+        let score = scoring.score(&t(1), &p(1));
         assert!(
             (score - (-2.0)).abs() < 0.1,
             "2 prunes × w_p3b=-1 ≈ -2 (got {score})"
@@ -586,14 +621,51 @@ mod tests {
     }
 
     #[test]
+    fn scores_are_isolated_per_topic() {
+        // Why (X0X-0071 reviewer P2 regression guard): P1/P2/P3b/P4 are
+        // mesh-membership signals scoped to a topic. A peer that is a
+        // bad actor on topic A must NOT have that penalty leak onto its
+        // score for topic B. Under the original global `PeerId` keying
+        // this test fails — both topics would read the same blended
+        // score.
+        let scoring = PeerScoring::new();
+        let peer = p(1);
+        let topic_a = t(10);
+        let topic_b = t(20);
+
+        // Peer behaves badly on topic A only.
+        for _ in 0..3 {
+            scoring.record_invalid_message(topic_a, peer);
+        }
+        // ...and well on topic B only.
+        for _ in 0..2 {
+            scoring.record_first_delivery(topic_b, peer);
+        }
+
+        let score_a = scoring.score(&topic_a, &peer);
+        let score_b = scoring.score(&topic_b, &peer);
+        assert!(
+            score_a < -800.0,
+            "topic A score reflects 3 invalid msgs only (got {score_a})"
+        );
+        assert!(
+            (score_b - 2.0).abs() < 0.1,
+            "topic B score reflects 2 first-deliveries only — NOT blended \
+             with topic A's penalty (got {score_b})"
+        );
+        // Two distinct entries, not one shared one.
+        assert_eq!(scoring.tracked_peer_count(), 2);
+    }
+
+    #[test]
     fn negative_deficit_and_penalty_amounts_are_clamped_to_zero() {
         // Why: a buggy caller passing a negative amount must not be
         // able to *raise* a peer's score by feeding negative penalty.
         let scoring = PeerScoring::new();
-        scoring.record_delivery_deficit(p(1), -50.0);
-        scoring.record_behavioral_penalty(p(1), -50.0);
+        scoring.record_delivery_deficit(t(1), p(1), -50.0);
+        scoring.record_behavioral_penalty(t(1), p(1), -50.0);
         assert_eq!(
-            scoring.score(&p(1)),
+            scoring.score(&t(1), &p(1)),
             0.0,
             "negative penalty amounts clamp to 0 — cannot game the score"
         );
@@ -606,8 +678,8 @@ mod tests {
         // magnitude. We can't sleep a real second in a unit test, so
         // we drive decay via a manufactured future `Instant`.
         let scoring = PeerScoring::new();
-        scoring.record_invalid_message(p(1));
-        let before = scoring.score(&p(1));
+        scoring.record_invalid_message(t(1), p(1));
+        let before = scoring.score(&t(1), &p(1));
         assert!(before < 0.0, "invalid message → negative score");
 
         // Decay 10 seconds into the future: 0.97^10 ≈ 0.737, applied to
@@ -654,13 +726,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_sorts_lowest_score_first() {
+    fn snapshot_sorts_lowest_score_first_and_carries_topic() {
         // Why: operators (and X0X-0071b's wiring) want the worst peers
-        // — graylist candidates — at the top of the diagnostic list.
+        // — graylist candidates — at the top of the diagnostic list,
+        // and each row must name the topic it is scoped to.
         let scoring = PeerScoring::new();
-        scoring.record_first_delivery(p(1)); // +1 — best
-        scoring.record_invalid_message(p(2)); // -100 — worst
-        scoring.record_mesh_pruned(p(3)); // -1 — middle
+        scoring.record_first_delivery(t(1), p(1)); // +1 — best
+        scoring.record_invalid_message(t(1), p(2)); // -100 — worst
+        scoring.record_mesh_pruned(t(1), p(3)); // -1 — middle
 
         let snap = scoring.snapshot();
         assert_eq!(snap.len(), 3);
@@ -669,6 +742,10 @@ mod tests {
         assert_eq!(snap[2].peer_id, p(1).to_string(), "best peer last");
         assert!(snap[0].score < snap[1].score);
         assert!(snap[1].score < snap[2].score);
+        assert!(
+            snap.iter().all(|r| r.topic_id == t(1).to_string()),
+            "every snapshot row carries the topic it is scoped to"
+        );
     }
 
     #[test]
@@ -677,15 +754,21 @@ mod tests {
         // NOT reset the clock — a peer that briefly re-grafts keeps
         // its accrued tenure.
         let scoring = PeerScoring::new();
-        scoring.note_mesh_join(p(1));
+        scoring.note_mesh_join(t(1), p(1));
         let joined_first = {
             let guard = scoring.lock();
-            guard.get(&p(1)).and_then(|e| e.joined_mesh_at).unwrap()
+            guard
+                .get(&(t(1), p(1)))
+                .and_then(|e| e.joined_mesh_at)
+                .unwrap()
         };
-        scoring.note_mesh_join(p(1));
+        scoring.note_mesh_join(t(1), p(1));
         let joined_second = {
             let guard = scoring.lock();
-            guard.get(&p(1)).and_then(|e| e.joined_mesh_at).unwrap()
+            guard
+                .get(&(t(1), p(1)))
+                .and_then(|e| e.joined_mesh_at)
+                .unwrap()
         };
         assert_eq!(
             joined_first, joined_second,
@@ -694,13 +777,24 @@ mod tests {
     }
 
     #[test]
-    fn forget_peer_removes_score_state() {
+    fn forget_peer_removes_score_state_across_all_topics() {
+        // Why: forget_peer is the disconnect hook — a disconnected peer
+        // must leave no score state behind on ANY topic, or the map
+        // grows unbounded.
         let scoring = PeerScoring::new();
-        scoring.record_first_delivery(p(1));
-        assert_eq!(scoring.tracked_peer_count(), 1);
+        scoring.record_first_delivery(t(1), p(1));
+        scoring.record_first_delivery(t(2), p(1));
+        scoring.record_first_delivery(t(1), p(2));
+        assert_eq!(scoring.tracked_peer_count(), 3);
         scoring.forget_peer(&p(1));
-        assert_eq!(scoring.tracked_peer_count(), 0);
-        assert_eq!(scoring.score(&p(1)), 0.0);
+        assert_eq!(
+            scoring.tracked_peer_count(),
+            1,
+            "p(1) forgotten on every topic; p(2) untouched"
+        );
+        assert_eq!(scoring.score(&t(1), &p(1)), 0.0);
+        assert_eq!(scoring.score(&t(2), &p(1)), 0.0);
+        assert!(scoring.score(&t(1), &p(2)) > 0.0, "p(2) still tracked");
     }
 
     #[test]

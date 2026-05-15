@@ -510,7 +510,7 @@ impl std::fmt::Display for TopicPriority {
 
 /// X0X-0074 — outcome of an admission-control decision.
 ///
-/// Returned by [`AdmissionControl::admit`] (in saorsa-gossip-pubsub).
+/// Returned by `AdmissionControl::admit` (in saorsa-gossip-pubsub).
 /// Consumers use the `dropped` variant to update per-priority drop
 /// counters and skip the per-peer send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

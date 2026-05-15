@@ -822,7 +822,7 @@ mod tests {
             target,
             provider,
             vec![Capability::Site, Capability::Identity],
-            3600_000,
+            3_600_000,
         )
         .with_root(true)
         .with_manifest_version(100)

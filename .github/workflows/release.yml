@@ -184,8 +184,12 @@ jobs:
             echo "Publishing $crate..."
             cd "$crate"
 
-            # Try to publish, handle already-published gracefully
-            OUTPUT=$(cargo publish --no-verify 2>&1) && {
+            # Try to publish, handle already-published gracefully.
+            # --allow-dirty: the prior `cargo hakari remove-deps --yes` step
+            # modifies member Cargo.toml in-place (strips workspace-hack
+            # dep). Those changes are uncommitted but intentional, and
+            # cargo publish needs --allow-dirty to proceed.
+            OUTPUT=$(cargo publish --no-verify --allow-dirty 2>&1) && {
               echo "Successfully published $crate"
             } || {
               if echo "$OUTPUT" | grep -q "already exists"; then

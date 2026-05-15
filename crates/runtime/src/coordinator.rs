@@ -640,7 +640,7 @@ mod tests {
         // No responses → empty result
         assert!(adverts.is_empty());
         // At least one send succeeded (covering query_count branch)
-        assert!(sent.lock().await.len() >= 1);
+        assert!(!sent.lock().await.is_empty());
     }
 
     #[tokio::test]

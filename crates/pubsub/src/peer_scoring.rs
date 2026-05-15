@@ -9,8 +9,8 @@
 //! ## Scored parameters (subset of the libp2p P1-P7 set)
 //!
 //! - **P1 — time in mesh**: small positive weight. Rewards peers that
-//!   have stuck around. Capped at [`PeerScoringConfig::p1_time_cap`] so
-//!   it can't dominate. Derived from a join timestamp — not decayed.
+//!   have stuck around. Capped at [`PeerScoringConfig::p1_time_cap_secs`]
+//!   so it can't dominate. Derived from a join timestamp — not decayed.
 //! - **P2 — first message deliveries**: positive weight, decays.
 //!   Rewards peers that deliver messages we haven't seen yet.
 //! - **P3b — mesh message delivery deficit**: negative weight, decays,

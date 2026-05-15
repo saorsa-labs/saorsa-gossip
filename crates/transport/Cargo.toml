@@ -33,6 +33,7 @@ saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-wo
 [dev-dependencies]
 proptest = { workspace = true }
 tracing-subscriber = "0.3"
+saorsa-gossip-transport = { path = ".", features = ["test-helpers"] }
 
 [[example]]
 name = "throughput_test"

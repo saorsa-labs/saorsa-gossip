@@ -78,8 +78,7 @@ pub async fn connected_pair() -> (
 /// `known_peers` list. Returns the nodes paired with their loopback addrs.
 ///
 /// Each non-bootstrap node is verified to be connected to the bootstrap.
-/// The full mesh (every-to-every) is *not* established by this helper —
-/// callers that need it should use `connect_all_pairs`.
+/// The full mesh (every-to-every) is *not* established by this helper.
 pub async fn loopback_star(n: usize) -> Vec<(UdpTransportAdapter, SocketAddr)> {
     assert!(n >= 1, "need at least one node");
     init_tracing();

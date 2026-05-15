@@ -6,9 +6,11 @@
 //! 1. Wire roundtrip: a `send_ping` from node1 to node2 results in an
 //!    Ack on node1's swim detector, which clears the pending probe and
 //!    marks node2 alive.
-//! 2. Failure detection: when node2's transport is closed and node1
-//!    issues a probe to node2 with no Ack, the SWIM background tasks
-//!    promote node2 from `Alive` → `Suspect` → `Dead` within budget.
+//! 2. Failure detection: when node2's membership pump is aborted (simulating
+//!    a non-responsive peer) and node1 issues a probe to node2 with no Ack,
+//!    the SWIM background tasks promote node2 from `Alive` → `Suspect` → `Dead`
+//!    within budget. The underlying QUIC connection remains up; this tests
+//!    "dispatcher stops responding" rather than true transport failure.
 //!
 //! Existing inline tests cover the SWIM state machine in isolation
 //! (mock transport). This is the first end-to-end exercise of SWIM

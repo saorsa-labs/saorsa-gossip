@@ -144,6 +144,21 @@ jobs:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install cargo-hakari
+        # Required to strip the workspace-hack dependency from member crates
+        # before publish. workspace-hack itself has `publish = false`, so leaving
+        # it as a dep blocks `cargo publish` with "no matching package named
+        # `saorsa-gossip-workspace-hack` found / location searched: crates.io".
+        uses: taiki-e/install-action@cargo-hakari
+
+      - name: Strip workspace-hack deps for publish
+        # `cargo hakari remove-deps --yes` removes the workspace-hack dep
+        # from every member crate's Cargo.toml in-place. Safe in CI because
+        # the runner is ephemeral — local dev keeps hakari enabled via
+        # `cargo hakari generate`. After this step, cargo publish can resolve
+        # every member's dep graph against crates.io alone.
+        run: cargo hakari remove-deps --yes
+
       - name: Publish crates (in dependency order)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

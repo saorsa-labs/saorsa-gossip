@@ -149,7 +149,9 @@ jobs:
         # before publish. workspace-hack itself has `publish = false`, so leaving
         # it as a dep blocks `cargo publish` with "no matching package named
         # `saorsa-gossip-workspace-hack` found / location searched: crates.io".
-        uses: taiki-e/install-action@cargo-hakari
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
 
       - name: Strip workspace-hack deps for publish
         # `cargo hakari remove-deps --yes` removes the workspace-hack dep

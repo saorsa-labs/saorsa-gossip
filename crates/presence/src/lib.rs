@@ -2806,6 +2806,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_signed_beacon_sender_mismatch_rejected() {
+        let manager = create_test_manager().await;
+        let topic = TopicId::new([1u8; 32]);
+        let identity = MlDsaKeyPair::generate().expect("keygen");
+        let sender = PeerId::new([99u8; 32]);
+        assert_ne!(sender, identity.peer_id());
+
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+
+        let mut record = PresenceRecord::new([3u8; 32], vec!["127.0.0.1:8080".to_string()], 900);
+        let signable = record.signable_bytes();
+        record.signature = identity.sign(&signable).expect("sign");
+        record.signer_pubkey = identity.public_key.clone();
+
+        let message = PresenceMessage::Beacon {
+            topic_id: topic,
+            sender,
+            record,
+            epoch: 0,
+        };
+
+        let data = postcard::to_stdvec(&message).expect("serialize");
+        let result = manager.handle_presence_message(&data).await;
+
+        assert!(result.is_ok(), "Should not error");
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "Mismatched sender should be rejected"
+        );
+        assert_eq!(
+            manager.get_status(sender, topic).await,
+            PresenceStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
     async fn test_invalid_signature_rejected() {
         // Test that beacons with invalid signatures are rejected
         let manager = create_test_manager().await;

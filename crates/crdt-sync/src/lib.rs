@@ -34,7 +34,10 @@ pub trait DeltaCrdt: Send + Sync {
     /// Merge a delta into this CRDT
     fn merge(&mut self, delta: &Self::Delta) -> Result<()>;
 
-    /// Generate a delta for changes since a given version
+    /// Generate a delta for changes since a given version.
+    ///
+    /// Returns `None` if there are no changes or retained history cannot
+    /// produce a complete delta for `since_version`.
     fn delta(&self, since_version: u64) -> Option<Self::Delta>;
 
     /// Get current version
@@ -56,6 +59,9 @@ pub struct OrSet<T: Hash + Eq + Clone> {
     tombstones: HashMap<T, HashSet<UniqueTag>>,
     /// Local changelog version for delta generation
     version: u64,
+    /// Oldest source version that can still produce a complete delta
+    #[serde(default)]
+    changelog_floor: u64,
     /// Local version -> (additions, removals) for delta tracking
     changelog: HashMap<u64, ChangelogEntry<T>>,
 }
@@ -73,6 +79,7 @@ impl<T: Hash + Eq + Clone> OrSet<T> {
             elements: HashMap::new(),
             tombstones: HashMap::new(),
             version: 0,
+            changelog_floor: 0,
             changelog: HashMap::new(),
         }
     }
@@ -251,6 +258,7 @@ impl<T: Hash + Eq + Clone> OrSet<T> {
         if self.version > keep_versions {
             let min_version = self.version - keep_versions;
             self.changelog.retain(|v, _| *v > min_version);
+            self.changelog_floor = self.changelog_floor.max(min_version);
         }
     }
 }
@@ -286,19 +294,21 @@ impl<T: Hash + Eq + Clone + Send + Sync + Serialize + DeserializeOwned> DeltaCrd
         if since_version >= self.version {
             return None;
         }
+        if since_version < self.changelog_floor {
+            return None;
+        }
 
         let mut added: HashMap<T, HashSet<UniqueTag>> = HashMap::new();
         let mut removed: HashMap<T, HashSet<UniqueTag>> = HashMap::new();
 
         // Collect changes from changelog
         for version in (since_version + 1)..=self.version {
-            if let Some((adds, removes)) = self.changelog.get(&version) {
-                for (elem, tags) in adds {
-                    added.entry(elem.clone()).or_default().extend(tags);
-                }
-                for (elem, tags) in removes {
-                    removed.entry(elem.clone()).or_default().extend(tags);
-                }
+            let (adds, removes) = self.changelog.get(&version)?;
+            for (elem, tags) in adds {
+                added.entry(elem.clone()).or_default().extend(tags);
+            }
+            for (elem, tags) in removes {
+                removed.entry(elem.clone()).or_default().extend(tags);
             }
         }
 
@@ -930,6 +940,27 @@ mod tests {
 
         assert!(changelog_after <= 10);
         assert!(changelog_after < changelog_before);
+    }
+
+    #[test]
+    fn test_or_set_compacted_delta_before_floor_is_unavailable() {
+        let mut set = OrSet::new();
+        let p1 = peer(1);
+
+        set.add("old".to_string(), (p1, 1)).ok();
+        set.add("new".to_string(), (p1, 2)).ok();
+
+        set.compact(1);
+
+        assert!(
+            set.delta(0).is_none(),
+            "compacted history must not produce a partial current delta"
+        );
+
+        let delta = set.delta(1).expect("retained history should produce delta");
+        assert!(!delta.added.contains_key("old"));
+        assert!(delta.added.contains_key("new"));
+        assert_eq!(delta.version, set.version());
     }
 
     // Anti-Entropy Manager Tests

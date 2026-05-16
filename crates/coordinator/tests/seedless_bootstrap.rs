@@ -120,8 +120,21 @@ async fn handle_advert_rejects_pubkey_peer_id_mismatch() {
         !accepted,
         "advert with pk/peer-id mismatch must be rejected"
     );
+    // Query the cache with the peer the advert ACTUALLY claimed (the
+    // [0xFF;32] mismatch), not legit_peer. legit_peer was never written
+    // by handle_advert under any code path (the advert never claimed
+    // that identity), so the previous lookup against legit_peer always
+    // missed and the assertion was vacuous (per PR #12 round-2 review).
+    assert!(
+        adapter.get_advert(&PeerId::new([0xFF; 32])).is_none(),
+        "rejected advert (claimed peer = [0xFF;32]) must not be cached"
+    );
+    // Defense in depth: legit_peer is never cached either — the advert
+    // never claimed that identity, so neither path should have written
+    // it. This keeps the original intent while making the meaningful
+    // check explicit above.
     assert!(
         adapter.get_advert(&legit_peer).is_none(),
-        "rejected advert must not be cached"
+        "legit_peer cache entry must remain unset (it was never claimed)"
     );
 }

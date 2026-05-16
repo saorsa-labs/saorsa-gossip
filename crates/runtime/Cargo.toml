@@ -32,6 +32,7 @@ saorsa-gossip-types = { workspace = true }
 saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }
 
 [dev-dependencies]
+saorsa-gossip-transport = { workspace = true, features = ["test-helpers"] }
 
 [lints]
 workspace = true

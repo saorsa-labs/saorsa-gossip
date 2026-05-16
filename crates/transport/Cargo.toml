@@ -10,7 +10,7 @@ keywords = ["p2p", "gossip", "quic", "nat-traversal", "networking"]
 categories = ["network-programming", "asynchronous"]
 
 [features]
-test-helpers = []
+test-helpers = ["dep:tracing-subscriber", "tracing-subscriber/env-filter"]
 
 [dependencies]
 saorsa-gossip-types = { workspace = true }
@@ -27,11 +27,13 @@ postcard = { workspace = true }
 dirs = "5.0"
 uuid = { version = "1.6", features = ["v4"] }
 futures = "0.3"
+tracing-subscriber = { version = "0.3", optional = true }
 saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }
 
 [dev-dependencies]
 proptest = { workspace = true }
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+saorsa-gossip-transport = { path = ".", features = ["test-helpers"] }
 
 [[example]]
 name = "throughput_test"

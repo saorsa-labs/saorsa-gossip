@@ -184,14 +184,20 @@ impl<T: Hash + Eq + Clone> OrSet<T> {
         // Merge elements
         for (elem, tags) in incoming_added {
             let tombstoned_tags = self.tombstones.get(elem);
-            let our_tags = self.elements.entry(elem.clone()).or_default();
-            for tag in tags {
-                if tombstoned_tags.is_some_and(|tombstones| tombstones.contains(tag)) {
-                    continue;
-                }
+            let mut live_tags = tags
+                .iter()
+                .filter(|tag| !tombstoned_tags.is_some_and(|tombstones| tombstones.contains(*tag)))
+                .copied()
+                .peekable();
 
-                if our_tags.insert(*tag) {
-                    added.entry(elem.clone()).or_default().insert(*tag);
+            if live_tags.peek().is_none() {
+                continue;
+            }
+
+            let our_tags = self.elements.entry(elem.clone()).or_default();
+            for tag in live_tags {
+                if our_tags.insert(tag) {
+                    added.entry(elem.clone()).or_default().insert(tag);
                 }
             }
         }
@@ -755,6 +761,28 @@ mod tests {
         assert!(set1.contains(&"alice".to_string()));
         assert!(set1.contains(&"bob".to_string()));
         assert!(set1.contains(&"charlie".to_string()));
+    }
+
+    #[test]
+    fn test_or_set_delta_replay_does_not_resurrect_removed_tag() {
+        let mut source = OrSet::new();
+        let mut replica = OrSet::new();
+        let p1 = peer(1);
+        let element = "alice".to_string();
+
+        let v0 = source.version();
+        source.add(element.clone(), (p1, 1)).expect("add element");
+        let add_delta = source.delta(v0).expect("should have add delta");
+
+        replica.merge(&add_delta).expect("apply add delta");
+        assert!(replica.contains(&element));
+
+        replica.remove(&element).expect("remove element");
+        assert!(!replica.contains(&element));
+
+        replica.merge(&add_delta).expect("replay stale add delta");
+        assert!(!replica.contains(&element));
+        assert_eq!(replica.len(), 0);
     }
 
     #[test]

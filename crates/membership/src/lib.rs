@@ -479,7 +479,11 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
         let transport = self.transport.clone();
 
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_millis(SWIM_ACK_TIMEOUT_MS));
+            // Delay first tick by SWIM_ACK_TIMEOUT_MS so the timeout scan
+            // does not fire at startup before any probe has been recorded
+            // (see #9 — background tasks racing test setup).
+            let period = Duration::from_millis(SWIM_ACK_TIMEOUT_MS);
+            let mut interval = time::interval_at(time::Instant::now() + period, period);
 
             loop {
                 interval.tick().await;
@@ -586,7 +590,14 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
 
         tokio::spawn(async move {
             use rand::seq::SliceRandom;
-            let mut interval = time::interval(Duration::from_secs(probe_period));
+            // Delay the first tick by `probe_period` so the background probe
+            // task does not fire at startup before any peers are known. This
+            // also closes a proptest race (#9) where the immediate first tick
+            // could insert a peer into `pending_probes` between a test's
+            // `mark_alive` and `clear_probe`, violating the `handle_ack`
+            // postcondition `!pending.contains_key(peer)`.
+            let period = Duration::from_secs(probe_period);
+            let mut interval = time::interval_at(time::Instant::now() + period, period);
 
             loop {
                 interval.tick().await;
@@ -653,7 +664,10 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
         let suspect_timeout = self.suspect_timeout;
 
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(1));
+            // Delay first tick by 1 s so the suspect-timeout scan does not
+            // fire at startup before any state exists (see #9).
+            let period = Duration::from_secs(1);
+            let mut interval = time::interval_at(time::Instant::now() + period, period);
 
             loop {
                 interval.tick().await;
@@ -2534,7 +2548,10 @@ mod tests {
     async fn test_probe_task_probes_multiple_peers() {
         let transport = test_transport().await;
         let fanout = 3;
-        let swim = SwimDetector::new(test_peer_id(), 10, 100, fanout, transport); // 10 second probe period to ensure only one round
+        // probe_period = 1 s so the first scheduled tick lands within the
+        // test budget. (Per #9 the first tick is delayed by `probe_period`
+        // — previously it fired immediately and races with test setup.)
+        let swim = SwimDetector::new(test_peer_id(), 1, 100, fanout, transport);
 
         // Add 10 alive peers
         for i in 1..=10 {
@@ -2542,8 +2559,8 @@ mod tests {
             swim.mark_alive(peer).await;
         }
 
-        // Wait briefly for the immediate first tick of the interval
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait past the first delayed tick (period=1s + slack).
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
 
         // Check pending_probes - should have multiple entries (at least 2, up to fanout)
         let pending = swim.pending_probes.read().await;
@@ -2564,7 +2581,9 @@ mod tests {
     async fn test_probe_task_probes_all_when_fewer_than_fanout() {
         let transport = test_transport().await;
         let fanout = 3;
-        let swim = SwimDetector::new(test_peer_id(), 10, 100, fanout, transport); // 10 second probe period to ensure only one round
+        // probe_period = 1 s so the first scheduled tick lands within the
+        // test budget. (Per #9 the first tick is delayed by `probe_period`.)
+        let swim = SwimDetector::new(test_peer_id(), 1, 100, fanout, transport);
 
         // Add only 2 alive peers (fewer than fanout)
         let peer1 = PeerId::new([1; 32]);
@@ -2572,8 +2591,8 @@ mod tests {
         swim.mark_alive(peer1).await;
         swim.mark_alive(peer2).await;
 
-        // Wait briefly for the immediate first tick of the interval
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait past the first delayed tick (period=1s + slack).
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
 
         // Check pending_probes - should have probed both peers
         let pending = swim.pending_probes.read().await;

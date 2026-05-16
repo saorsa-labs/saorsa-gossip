@@ -846,7 +846,26 @@ impl GossipTransport for UdpTransportAdapter {
 
     async fn close(&self) -> Result<()> {
         info!("Closing Ant-QUIC transport");
-        // Node cleanup is handled by Drop
+        // Issue #14: disconnect every live ant-quic connection so the
+        // underlying QUIC connections are actually torn down. Without this,
+        // `close()` only clears local tracking and the node remains reachable
+        // on the wire — SWIM/Plumtree on peers cannot observe the close.
+        //
+        // Iterate the *node*'s live peers rather than the adapter's locally
+        // cached map: the local map is populated lazily by `connected_peers()`
+        // and may be empty even when the underlying node holds connections.
+        let live_peers = self.node.connected_peers().await;
+        for conn in &live_peers {
+            if let Err(err) = self.node.disconnect(&conn.peer_id).await {
+                warn!(
+                    "close: disconnect peer {} failed: {}",
+                    ant_peer_id_to_gossip(&conn.peer_id),
+                    err
+                );
+            }
+        }
+        self.connected_peers.write().await.clear();
+        self.bootstrap_peer_ids.write().await.clear();
         Ok(())
     }
 
@@ -1205,10 +1224,23 @@ impl TransportAdapter for UdpTransportAdapter {
 
     async fn close(&self) -> TransportResult<()> {
         info!("Closing TransportAdapter");
-        // The underlying node will be closed when dropped
-        // For now, just clear tracked peers
-        let mut peers = self.connected_peers.write().await;
-        peers.clear();
+        // Issue #14: disconnect every tracked peer via ant-quic so the underlying
+        // QUIC connections are actually torn down. Without this, `close()` only
+        // clears local tracking and the node remains reachable on the wire —
+        // SWIM/Plumtree on peers cannot observe the close, and re-`open()` after
+        // `close()` may race against a still-live previous connection.
+        let peer_ids: Vec<GossipPeerId> = {
+            let peers = self.connected_peers.read().await;
+            peers.keys().copied().collect()
+        };
+        for peer in &peer_ids {
+            let ant_peer_id = gossip_peer_id_to_ant(peer);
+            if let Err(err) = self.node.disconnect(&ant_peer_id).await {
+                warn!("close: disconnect peer {} failed: {}", peer, err);
+            }
+        }
+        self.connected_peers.write().await.clear();
+        self.bootstrap_peer_ids.write().await.clear();
         Ok(())
     }
 

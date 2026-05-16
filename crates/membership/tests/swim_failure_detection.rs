@@ -153,10 +153,18 @@ async fn swim_promotes_unresponsive_peer_to_suspect_then_dead() {
     );
 
     // Simulate node2 failure: abort the pump so node1's pings no longer
-    // get dispatched to `handle_ping`. The QUIC connection is still up
-    // (saorsa-gossip's `close()` only clears tracking, not the underlying
-    // ant-quic Node), but with no dispatcher node2 is functionally dead
-    // from SWIM's point of view.
+    // get dispatched to `handle_ping`. This exercises the "dispatcher
+    // stops responding" path: the QUIC connection is still up but no
+    // handler exists to send Acks, so SWIM observes ack-timeout and
+    // promotes the peer through Suspect → Dead.
+    //
+    // Issue #14 separately fixed `close()` so it tears down the
+    // ant-quic connection too; that path is covered by
+    // `close_teardown::close_disconnects_peers_at_ant_quic_node_layer`
+    // in the transport crate. Either approach (`pump.abort()` or
+    // `transport.close()`) now reaches Dead — this test keeps the
+    // dispatcher-abort variant on purpose to exercise the pure
+    // ack-timeout code path.
     pump2.abort();
 
     // Record a probe on node1 — the SWIM background task uses pending

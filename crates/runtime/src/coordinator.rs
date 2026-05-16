@@ -5,7 +5,7 @@ use saorsa_gossip_coordinator::{
 };
 use saorsa_gossip_membership::Membership;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
-use saorsa_gossip_types::PeerId;
+use saorsa_gossip_types::{LogPeerId, PeerId};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,7 +83,11 @@ impl CoordinatorClient {
                 }
                 Err(e) => {
                     failed_count += 1;
-                    warn!("Failed to broadcast advert to peer {:?}: {}", peer_id, e);
+                    warn!(
+                        "Failed to broadcast advert to peer {}: {}",
+                        LogPeerId::from(peer_id),
+                        e
+                    );
                 }
             }
         }
@@ -161,7 +165,11 @@ impl CoordinatorClient {
                 }
                 Err(e) => {
                     failed_count += 1;
-                    warn!("Failed to send FOAF query to peer {:?}: {}", peer_id, e);
+                    warn!(
+                        "Failed to send FOAF query to peer {}: {}",
+                        LogPeerId::from(peer_id),
+                        e
+                    );
                 }
             }
         }

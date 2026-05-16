@@ -26,7 +26,7 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2" }
 once_cell = { version = "1" }
-ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
+rand_chacha = { version = "0.3" }
 rand_core-274715c4dabd11b0 = { package = "rand_core", version = "0.9", default-features = false, features = ["os_rng", "std"] }
 rand_core-3b31131e45eafb45 = { package = "rand_core", version = "0.6", default-features = false, features = ["std"] }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }

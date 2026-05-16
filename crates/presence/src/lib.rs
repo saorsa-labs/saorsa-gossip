@@ -17,7 +17,7 @@ use rand::Rng;
 use saorsa_gossip_groups::GroupContext;
 use saorsa_gossip_identity::MlDsaKeyPair;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
-use saorsa_gossip_types::{PeerId, PresenceRecord, TopicId};
+use saorsa_gossip_types::{LogPeerId, LogTopicId, PeerId, PresenceRecord, TopicId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -413,7 +413,7 @@ impl PresenceManager {
                                 None => {
                                     if !allow_plaintext {
                                         warn!(
-                                            ?topic_id,
+                                            topic_id = %LogTopicId::from(topic_id),
                                             "Skipping beacon broadcast: missing MLS exporter secret"
                                         );
                                         continue;
@@ -468,7 +468,7 @@ impl PresenceManager {
                                         debug!(?topic_id, "Signed presence beacon");
                                     }
                                     Err(e) => {
-                                        warn!(?e, ?topic_id, "Failed to sign beacon, sending unsigned");
+                                        warn!(?e, topic_id = %LogTopicId::from(topic_id), "Failed to sign beacon, sending unsigned");
                                     }
                                 }
                             }
@@ -533,7 +533,7 @@ impl PresenceManager {
                                     }
                                     Ok((target_peer, Err(_))) => {
                                         warn!(
-                                            ?target_peer,
+                                            target_peer = %LogPeerId::from(target_peer),
                                             timeout_secs = BEACON_SEND_TIMEOUT.as_secs(),
                                             "Timed out sending beacon to peer"
                                         );
@@ -972,16 +972,16 @@ impl PresenceManager {
                         }
                         Ok(false) => {
                             warn!(
-                                ?sender,
-                                ?topic_id,
+                                sender = %LogPeerId::from(sender),
+                                topic_id = %LogTopicId::from(topic_id),
                                 "Beacon signature verification failed (invalid)"
                             );
                             return Ok(None);
                         }
                         Err(e) => {
                             warn!(
-                                ?sender,
-                                ?topic_id,
+                                sender = %LogPeerId::from(sender),
+                                topic_id = %LogTopicId::from(topic_id),
                                 ?e,
                                 "Beacon signature verification failed (error)"
                             );
@@ -1001,8 +1001,8 @@ impl PresenceManager {
 
                     if require_signed {
                         warn!(
-                            ?sender,
-                            ?topic_id,
+                            sender = %LogPeerId::from(sender),
+                            topic_id = %LogTopicId::from(topic_id),
                             "Rejecting unsigned beacon (REQUIRE_SIGNED enabled)"
                         );
                         return Ok(None);
@@ -1072,7 +1072,7 @@ impl PresenceManager {
                             }
                         }
                         Err(e) => {
-                            warn!(?e, ?topic_id, "Failed to serialize query response");
+                            warn!(?e, topic_id = %LogTopicId::from(topic_id), "Failed to serialize query response");
                         }
                     }
                 }
@@ -1124,7 +1124,7 @@ impl PresenceManager {
                                 }
                             }
                             Err(e) => {
-                                warn!(?e, ?topic_id, "Failed to serialize forwarded query");
+                                warn!(?e, topic_id = %LogTopicId::from(topic_id), "Failed to serialize forwarded query");
                             }
                         }
                     }
@@ -1153,8 +1153,8 @@ impl PresenceManager {
                         if pending_query.topic_id != topic_id {
                             warn!(
                                 ?query_id,
-                                expected = ?pending_query.topic_id,
-                                received = ?topic_id,
+                                expected = %LogTopicId::from(pending_query.topic_id),
+                                received = %LogTopicId::from(topic_id),
                                 "QueryResponse topic_id mismatch - ignoring"
                             );
                         } else {

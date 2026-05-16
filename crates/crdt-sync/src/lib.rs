@@ -10,7 +10,7 @@
 //! - IBLT reconciliation for large sets (future)
 
 use anyhow::Result;
-use saorsa_gossip_types::PeerId;
+use saorsa_gossip_types::{LogPeerId, PeerId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -506,7 +506,7 @@ where
                             if let Some(delta) = delta {
                                 let callback = sync_callback.clone();
                                 if let Err(e) = callback(peer_id, delta).await {
-                                    tracing::warn!("Failed to sync with peer {:?}: {}", peer_id, e);
+                                    tracing::warn!("Failed to sync with peer {}: {}", LogPeerId::from(peer_id), e);
                                 }
                             }
                         }

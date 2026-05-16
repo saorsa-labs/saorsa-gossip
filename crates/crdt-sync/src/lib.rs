@@ -54,9 +54,9 @@ pub struct OrSet<T: Hash + Eq + Clone> {
     elements: HashMap<T, HashSet<UniqueTag>>,
     /// Tombstones: tags that have been removed
     tombstones: HashMap<T, HashSet<UniqueTag>>,
-    /// Current version for delta generation
+    /// Local changelog version for delta generation
     version: u64,
-    /// Version -> (additions, removals) for delta tracking
+    /// Local version -> (additions, removals) for delta tracking
     changelog: HashMap<u64, ChangelogEntry<T>>,
 }
 
@@ -160,38 +160,82 @@ impl<T: Hash + Eq + Clone> OrSet<T> {
         self.elements.is_empty()
     }
 
+    fn record_changelog_entry(
+        &mut self,
+        added: HashMap<T, HashSet<UniqueTag>>,
+        removed: HashMap<T, HashSet<UniqueTag>>,
+    ) {
+        if added.is_empty() && removed.is_empty() {
+            return;
+        }
+
+        self.version += 1;
+        self.changelog.insert(self.version, (added, removed));
+    }
+
+    fn apply_delta_parts(
+        &mut self,
+        incoming_added: &HashMap<T, HashSet<UniqueTag>>,
+        incoming_removed: &HashMap<T, HashSet<UniqueTag>>,
+    ) {
+        let mut added: HashMap<T, HashSet<UniqueTag>> = HashMap::new();
+        let mut removed: HashMap<T, HashSet<UniqueTag>> = HashMap::new();
+
+        // Merge elements
+        for (elem, tags) in incoming_added {
+            let tombstoned_tags = self.tombstones.get(elem);
+            let our_tags = self.elements.entry(elem.clone()).or_default();
+            for tag in tags {
+                if tombstoned_tags.is_some_and(|tombstones| tombstones.contains(tag)) {
+                    continue;
+                }
+
+                if our_tags.insert(*tag) {
+                    added.entry(elem.clone()).or_default().insert(*tag);
+                }
+            }
+        }
+
+        // Merge tombstones
+        for (elem, tags) in incoming_removed {
+            let mut new_tombstones = HashSet::new();
+            {
+                let our_tombstones = self.tombstones.entry(elem.clone()).or_default();
+                for tag in tags {
+                    if our_tombstones.insert(*tag) {
+                        new_tombstones.insert(*tag);
+                    }
+                }
+            }
+
+            if !new_tombstones.is_empty() {
+                removed.insert(elem.clone(), new_tombstones);
+            }
+
+            // Remove tombstoned tags from our elements
+            let remove_element = if let Some(our_tags) = self.elements.get_mut(elem) {
+                if let Some(our_tombstones) = self.tombstones.get(elem) {
+                    our_tags.retain(|tag| !our_tombstones.contains(tag));
+                }
+                our_tags.is_empty()
+            } else {
+                false
+            };
+
+            if remove_element {
+                self.elements.remove(elem);
+            }
+        }
+
+        self.record_changelog_entry(added, removed);
+    }
+
     /// Merge another OR-Set into this one
     ///
     /// This implements the merge operation for state-based CRDTs.
     /// Preserves all concurrent adds and removes.
     pub fn merge_state(&mut self, other: &OrSet<T>) -> Result<()> {
-        // Merge elements
-        for (elem, tags) in &other.elements {
-            let our_tags = self.elements.entry(elem.clone()).or_default();
-            our_tags.extend(tags);
-
-            // Remove any tags that are in our tombstones
-            if let Some(our_tombstones) = self.tombstones.get(elem) {
-                our_tags.retain(|tag| !our_tombstones.contains(tag));
-            }
-        }
-
-        // Merge tombstones
-        for (elem, tags) in &other.tombstones {
-            let our_tombstones = self.tombstones.entry(elem.clone()).or_default();
-            our_tombstones.extend(tags);
-
-            // Remove tombstoned tags from our elements
-            if let Some(our_tags) = self.elements.get_mut(elem) {
-                our_tags.retain(|tag| !our_tombstones.contains(tag));
-                if our_tags.is_empty() {
-                    self.elements.remove(elem);
-                }
-            }
-        }
-
-        // Update version to max
-        self.version = self.version.max(other.version);
+        self.apply_delta_parts(&other.elements, &other.tombstones);
 
         Ok(())
     }
@@ -227,28 +271,7 @@ impl<T: Hash + Eq + Clone + Send + Sync + Serialize + DeserializeOwned> DeltaCrd
     type Delta = OrSetDelta<T>;
 
     fn merge(&mut self, delta: &Self::Delta) -> Result<()> {
-        // Apply additions
-        for (elem, tags) in &delta.added {
-            let our_tags = self.elements.entry(elem.clone()).or_default();
-            our_tags.extend(tags);
-        }
-
-        // Apply removals (tombstones)
-        for (elem, tags) in &delta.removed {
-            let our_tombstones = self.tombstones.entry(elem.clone()).or_default();
-            our_tombstones.extend(tags);
-
-            // Remove tombstoned tags from elements
-            if let Some(our_tags) = self.elements.get_mut(elem) {
-                our_tags.retain(|tag| !our_tombstones.contains(tag));
-                if our_tags.is_empty() {
-                    self.elements.remove(elem);
-                }
-            }
-        }
-
-        // Update version
-        self.version = self.version.max(delta.version);
+        self.apply_delta_parts(&delta.added, &delta.removed);
 
         Ok(())
     }
@@ -430,7 +453,7 @@ where
 {
     /// The CRDT being synchronized
     crdt: std::sync::Arc<tokio::sync::RwLock<T>>,
-    /// Peer versions we've seen (peer_id -> version)
+    /// Local CRDT versions successfully delivered to each peer
     peer_versions: std::sync::Arc<tokio::sync::RwLock<HashMap<PeerId, u64>>>,
     /// Sync interval in seconds
     interval_secs: u64,
@@ -500,13 +523,18 @@ where
                         for (peer_id, peer_version) in peers_to_sync {
                             let delta = {
                                 let crdt_lock = crdt.read().await;
-                                crdt_lock.delta(peer_version)
+                                crdt_lock
+                                    .delta(peer_version)
+                                    .map(|delta| (delta, crdt_lock.version()))
                             };
 
-                            if let Some(delta) = delta {
+                            if let Some((delta, sent_version)) = delta {
                                 let callback = sync_callback.clone();
                                 if let Err(e) = callback(peer_id, delta).await {
                                     tracing::warn!("Failed to sync with peer {}: {}", LogPeerId::from(peer_id), e);
+                                } else {
+                                    let mut versions = peer_versions.write().await;
+                                    versions.insert(peer_id, sent_version);
                                 }
                             }
                         }
@@ -547,10 +575,9 @@ where
         }
     }
 
-    /// Update the version we've seen from a peer
+    /// Update the local version a peer has acknowledged
     ///
-    /// Call this when receiving a delta from a peer to track
-    /// what they've sent us.
+    /// Call this after successfully sending a local delta to a peer.
     pub async fn update_peer_version(&self, peer_id: PeerId, version: u64) {
         let mut versions = self.peer_versions.write().await;
         versions.insert(peer_id, version);
@@ -558,16 +585,22 @@ where
 
     /// Apply a delta from a peer
     ///
-    /// Merges the delta and updates the peer's version.
-    pub async fn apply_delta(&self, peer_id: PeerId, delta: &T::Delta, version: u64) -> Result<()> {
+    /// Merges the delta and registers the peer without treating its remote
+    /// version as an acknowledgement of our local changelog.
+    pub async fn apply_delta(
+        &self,
+        peer_id: PeerId,
+        delta: &T::Delta,
+        _version: u64,
+    ) -> Result<()> {
         // Merge delta into our CRDT
         {
             let mut crdt = self.crdt.write().await;
             crdt.merge(delta)?;
         }
 
-        // Update peer version
-        self.update_peer_version(peer_id, version).await;
+        let mut versions = self.peer_versions.write().await;
+        versions.entry(peer_id).or_insert(0);
 
         Ok(())
     }
@@ -722,6 +755,25 @@ mod tests {
         assert!(set1.contains(&"alice".to_string()));
         assert!(set1.contains(&"bob".to_string()));
         assert!(set1.contains(&"charlie".to_string()));
+    }
+
+    #[test]
+    fn test_or_set_delta_merge_is_available_for_onward_delta() {
+        let mut relay = OrSet::new();
+        let mut source = OrSet::new();
+        let p2 = peer(2);
+
+        source.add("from-source".to_string(), (p2, 1)).ok();
+        let source_delta = source.delta(0).expect("should have source delta");
+
+        relay.merge(&source_delta).ok();
+
+        let onward_delta = relay.delta(0).expect("should have onward delta");
+        assert!(onward_delta
+            .added
+            .get("from-source")
+            .expect("forwarded add should be present")
+            .contains(&(p2, 1)));
     }
 
     // Vector Clock Tests
@@ -916,9 +968,58 @@ mod tests {
         assert!(state.contains(&"alice".to_string()));
         assert!(state.contains(&"bob".to_string()));
 
-        // Verify peer version updated
+        // The remote version is not an acknowledgement of our local changelog.
         let versions = manager.peer_versions.read().await;
-        assert_eq!(versions.get(&p1), Some(&2));
+        assert_eq!(versions.get(&p1), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn test_apply_high_remote_version_does_not_ack_local_delta() {
+        let crdt = std::sync::Arc::new(tokio::sync::RwLock::new(OrSet::<String>::new()));
+        let manager = AntiEntropyManager::new(crdt.clone(), 1);
+
+        let local_peer = peer(1);
+        let remote_peer = peer(2);
+        manager.add_peer(remote_peer).await;
+
+        {
+            let mut crdt_lock = crdt.write().await;
+            crdt_lock.add("local".to_string(), (local_peer, 1)).ok();
+        }
+
+        let mut remote = OrSet::new();
+        for seq in 1..=10 {
+            remote
+                .add(format!("remote-{}", seq), (remote_peer, seq))
+                .ok();
+        }
+        let remote_delta = remote.delta(0).expect("should have remote delta");
+
+        manager
+            .apply_delta(remote_peer, &remote_delta, remote_delta.version)
+            .await
+            .ok();
+
+        let peer_version = {
+            let versions = manager.peer_versions.read().await;
+            *versions
+                .get(&remote_peer)
+                .expect("remote peer should be tracked")
+        };
+        assert_eq!(peer_version, 0);
+
+        let delta_to_remote = {
+            let crdt_lock = crdt.read().await;
+            crdt_lock
+                .delta(peer_version)
+                .expect("local add should still be sent")
+        };
+
+        assert!(delta_to_remote
+            .added
+            .get("local")
+            .expect("local add should be included")
+            .contains(&(local_peer, 1)));
     }
 
     #[tokio::test]
@@ -965,6 +1066,8 @@ mod tests {
 
         // Should have synced at least once
         assert!(sync_count.load(Ordering::SeqCst) >= 1);
+        let versions = manager.peer_versions.read().await;
+        assert_eq!(versions.get(&p1), Some(&1));
     }
 
     #[tokio::test]

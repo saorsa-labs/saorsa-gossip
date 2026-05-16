@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+pub mod logging;
+pub use logging::{LogPeerId, LogTopicId};
+
 /// Domain separator for PeerId derivation (must match ant-quic)
 const PEER_ID_DOMAIN_SEPARATOR: &[u8] = b"AUTONOMI_PEER_ID_V2:";
 

@@ -12,7 +12,7 @@
 use anyhow::{anyhow, Result};
 use rand::SeedableRng;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
-use saorsa_gossip_types::{PeerHealth, PeerHealthOracle, PeerId};
+use saorsa_gossip_types::{LogPeerId, PeerHealth, PeerHealthOracle, PeerId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -272,7 +272,7 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                 last_update: Instant::now(),
             },
         );
-        warn!(peer_id = %peer, "SWIM: Marked peer as dead");
+        warn!(peer_id = %LogPeerId::from(peer), "SWIM: Marked peer as dead");
     }
 
     /// Get the state of a peer
@@ -681,7 +681,7 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                             last_update: now,
                         },
                     );
-                    warn!(peer_id = %peer, "SWIM: Suspect timeout → marked dead");
+                    warn!(peer_id = %LogPeerId::from(peer), "SWIM: Suspect timeout → marked dead");
                 }
             }
         });

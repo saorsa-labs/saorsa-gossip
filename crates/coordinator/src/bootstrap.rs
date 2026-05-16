@@ -3,7 +3,7 @@
 //! Implements SPEC2 §7.4 bootstrap flow: cache → FOAF → connect
 
 use crate::{CoordinatorHandler, FindCoordinatorQuery, GossipCacheAdapter};
-use saorsa_gossip_types::PeerId;
+use saorsa_gossip_types::{LogPeerId, PeerId};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -151,7 +151,7 @@ impl Bootstrap {
             // This is NOT cryptographic verification (requires public key)
             if advert.sig.is_empty() {
                 tracing::warn!(
-                    peer = ?advert.peer,
+                    peer = %LogPeerId::from(advert.peer),
                     "Rejecting FOAF advert: missing signature"
                 );
                 rejected += 1;

@@ -34,8 +34,8 @@ use bytes::Bytes;
 use lru::LruCache;
 use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
 use saorsa_gossip_types::{
-    AdmissionDecision, MessageHeader, MessageKind, PeerHealth, PeerHealthOracle, PeerId, TopicId,
-    TopicPriority,
+    AdmissionDecision, LogPeerId, LogTopicId, MessageHeader, MessageKind, PeerHealth,
+    PeerHealthOracle, PeerId, TopicId, TopicPriority,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -751,21 +751,21 @@ impl PeerOutboundBudgets {
     fn release(&self, peer: PeerId, class: OutboundSendClass) {
         let mut guard = self.peers_guard();
         let Some(entry) = guard.get_mut(&peer) else {
-            warn!(peer_id = %peer, class = class.label(), "PubSub outbound permit released after peer budget entry was removed");
+            warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound permit released after peer budget entry was removed");
             return;
         };
 
         match class {
             OutboundSendClass::Data => {
                 if entry.data_in_flight == 0 {
-                    warn!(peer_id = %peer, class = class.label(), "PubSub outbound data permit released with zero in-flight count");
+                    warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound data permit released with zero in-flight count");
                 } else {
                     entry.data_in_flight -= 1;
                 }
             }
             OutboundSendClass::Control => {
                 if entry.control_in_flight == 0 {
-                    warn!(peer_id = %peer, class = class.label(), "PubSub outbound control permit released with zero in-flight count");
+                    warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound control permit released with zero in-flight count");
                 } else {
                     entry.control_in_flight -= 1;
                 }
@@ -908,7 +908,7 @@ impl Drop for SendAttemptClaims {
             }
             Err(e) => {
                 warn!(
-                    topic = ?topic,
+                    topic = %LogTopicId::from(topic),
                     "Unable to release cancelled PubSub recovery probes: {e}"
                 );
             }
@@ -981,7 +981,7 @@ impl SendTaskSet {
                 Err(e) => {
                     timed_out.extend(recovery_probe_timeout(attempt));
                     warn!(
-                        peer_id = %attempt.peer,
+                        peer_id = %LogPeerId::from(attempt.peer),
                         op = self.op,
                         "{} per-peer send task panicked: {e}",
                         self.op
@@ -1172,7 +1172,7 @@ fn spawn_indirect_probe_request(
             });
         }
         Err(e) => {
-            warn!(peer_id = %peer, "Unable to request indirect peer probe: {e}");
+            warn!(peer_id = %LogPeerId::from(peer), "Unable to request indirect peer probe: {e}");
         }
     }
 }
@@ -2692,8 +2692,8 @@ async fn record_topic_send_attempt_results_for_state(
                 stage_stats.record_prune();
             }
             warn!(
-                peer_id = %attempt.peer,
-                topic = ?topic,
+                peer_id = %LogPeerId::from(attempt.peer),
+                topic = %LogTopicId::from(topic),
                 cooldown_ms = duration_millis_u64(event.cooldown),
                 recent_timeout_count = event.recent_timeout_count,
                 demoted = event.demoted,
@@ -3418,7 +3418,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }),
             Ok(Err(e)) => {
                 warn!(
-                    peer_id = %peer,
+                    peer_id = %LogPeerId::from(peer),
                     op,
                     "{op} per-peer send failed: {e}"
                 );
@@ -3427,7 +3427,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Err(_) => {
                 stage_stats.record_per_peer_timeout();
                 warn!(
-                    peer_id = %peer,
+                    peer_id = %LogPeerId::from(peer),
                     op,
                     timeout_ms = duration_millis_u64(timeout),
                     "{op} per-peer send timed out — peer skipped, recorded in republish_per_peer_timeout"
@@ -3481,8 +3481,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if priority == TopicPriority::Critical {
                 self.admission.stats().record_critical_hard_error();
                 warn!(
-                    peer_id = %peer,
-                    topic = %topic,
+                    peer_id = %LogPeerId::from(peer),
+                    topic = %LogTopicId::from(topic),
                     op,
                     "X0X-0074 hard error: Critical admission failed to claim outbound budget"
                 );
@@ -3494,8 +3494,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if priority == TopicPriority::Critical {
                 self.admission.stats().record_critical_hard_error();
                 warn!(
-                    peer_id = %peer,
-                    topic = %topic,
+                    peer_id = %LogPeerId::from(peer),
+                    topic = %LogTopicId::from(topic),
                     op,
                     "X0X-0074 hard error: Critical admission claimed attempt but lost permit"
                 );
@@ -3541,7 +3541,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let timed_out = recovery_probe_timeout(attempt);
                 claims.record_results(Vec::new(), timed_out).await;
                 warn!(
-                    peer_id = %attempt.peer,
+                    peer_id = %LogPeerId::from(attempt.peer),
                     op,
                     "{op} per-peer send task panicked: {e}"
                 );
@@ -3726,8 +3726,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 claim_context.stage_stats.record_prune();
             }
             warn!(
-                peer_id = %attempt.peer,
-                topic = ?claim_context.topic,
+                peer_id = %LogPeerId::from(attempt.peer),
+                topic = %LogTopicId::from(claim_context.topic),
                 op = claim_context.op,
                 class = claim_context.send_class.label(),
                 cooldown_ms = duration_millis_u64(event.cooldown),
@@ -3904,7 +3904,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 self.admission.stats().record_critical_hard_error();
             }
             warn!(
-                topic = %topic,
+                topic = %LogTopicId::from(topic),
                 op,
                 lost,
                 admitted = admitted_count,
@@ -4201,7 +4201,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let msg_id = message.header.msg_id;
 
         if !self.verify_message_signature(&message) {
-            warn!(peer_id = %from, msg_id = ?msg_id, "Invalid signature, dropping");
+            warn!(peer_id = %LogPeerId::from(from), msg_id = ?msg_id, "Invalid signature, dropping");
             // X0X-0071 P4: a bad signature is the canonical invalid-message
             // signal — record it against (topic, sender).
             self.peer_scoring.record_invalid_message(topic, from);
@@ -4527,7 +4527,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         message: GossipMessage,
     ) -> Result<()> {
         if !self.verify_message_signature(&message) {
-            warn!(peer_id = %from, "Anti-entropy: invalid signature, dropping");
+            warn!(peer_id = %LogPeerId::from(from), "Anti-entropy: invalid signature, dropping");
             return Err(anyhow!("Invalid signature on anti-entropy message"));
         }
         self.record_verified_inbound_from_peer(topic, from, message.header.kind)
@@ -4872,7 +4872,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let signature = match postcard::to_stdvec(&ihave_header) {
                 Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
                 Err(e) => {
-                    warn!(topic = ?topic_id, "IHAVE header serialize failed: {e}");
+                    warn!(topic = %LogTopicId::from(topic_id), "IHAVE header serialize failed: {e}");
                     continue;
                 }
             };
@@ -4880,7 +4880,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let payload = match postcard::to_stdvec(&batch) {
                 Ok(bytes) => bytes.into(),
                 Err(e) => {
-                    warn!(topic = ?topic_id, "IHAVE batch serialize failed: {e}");
+                    warn!(topic = %LogTopicId::from(topic_id), "IHAVE batch serialize failed: {e}");
                     continue;
                 }
             };
@@ -4894,7 +4894,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let bytes: Bytes = match postcard::to_stdvec(&ihave_msg) {
                 Ok(bytes) => bytes.into(),
                 Err(e) => {
-                    warn!(topic = ?topic_id, "IHAVE message serialize failed: {e}");
+                    warn!(topic = %LogTopicId::from(topic_id), "IHAVE message serialize failed: {e}");
                     continue;
                 }
             };
@@ -5292,7 +5292,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                     .record_results(Vec::new(), recovery_probe_timeout(attempt))
                                     .await;
                                 warn!(
-                                    peer_id = %attempt.peer,
+                                    peer_id = %LogPeerId::from(attempt.peer),
                                     "ANTI_ENTROPY per-peer send task panicked: {e}"
                                 );
                             }
@@ -5474,7 +5474,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
             MessageKind::Eager => self.handle_eager(from, topic_id, message).await,
             MessageKind::IHave => {
                 if !self.verify_message_signature(&message) {
-                    warn!(peer_id = %from, "IHAVE: invalid signature, dropping");
+                    warn!(peer_id = %LogPeerId::from(from), "IHAVE: invalid signature, dropping");
                     return Err(anyhow!("Invalid signature on IHAVE message"));
                 }
                 self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
@@ -5500,7 +5500,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
             }
             MessageKind::IWant => {
                 if !self.verify_message_signature(&message) {
-                    warn!(peer_id = %from, "IWANT: invalid signature, dropping");
+                    warn!(peer_id = %LogPeerId::from(from), "IWANT: invalid signature, dropping");
                     return Err(anyhow!("Invalid signature on IWANT message"));
                 }
                 self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
@@ -5532,7 +5532,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
                         .await;
                 } else {
                     warn!(
-                        peer_id = %from,
+                        peer_id = %LogPeerId::from(from),
                         msg_kind = ?msg_kind,
                         "PubSub received non-pubsub message kind with invalid signature; cooling not reset"
                     );

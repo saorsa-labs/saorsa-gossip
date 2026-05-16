@@ -3,7 +3,7 @@
 //! Manages coordinator discovery and FOAF query routing
 
 use crate::{CoordinatorAdvert, FindCoordinatorQuery, FindCoordinatorResponse, GossipCacheAdapter};
-use saorsa_gossip_types::PeerId;
+use saorsa_gossip_types::{LogPeerId, PeerId};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -88,8 +88,8 @@ impl CoordinatorHandler {
         let expected_peer_id = PeerId::from_pubkey(public_key.as_bytes());
         if expected_peer_id != advert.peer {
             tracing::warn!(
-                claimed_peer = ?advert.peer,
-                actual_peer = ?expected_peer_id,
+                claimed_peer = %LogPeerId::from(advert.peer),
+                actual_peer = %LogPeerId::from(expected_peer_id),
                 "Rejecting advert: public key does not match claimed peer ID"
             );
             return Ok(false);
@@ -98,7 +98,7 @@ impl CoordinatorHandler {
         // Verify signature
         let valid = advert.verify(public_key)?;
         if !valid {
-            tracing::warn!(peer = ?advert.peer, "Rejecting advert: invalid signature");
+            tracing::warn!(peer = %LogPeerId::from(advert.peer), "Rejecting advert: invalid signature");
             return Ok(false);
         }
 

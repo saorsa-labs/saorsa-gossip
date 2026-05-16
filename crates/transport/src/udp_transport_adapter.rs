@@ -496,7 +496,8 @@ impl UdpTransportAdapter {
                     } else {
                         warn!(
                             "Skipping unusable peer addr {} for {}",
-                            peer_addr, gossip_peer_id
+                            peer_addr,
+                            LogPeerId::from(gossip_peer_id)
                         );
                     }
                 }
@@ -576,13 +577,14 @@ impl UdpTransportAdapter {
                 if gossip_id != peer {
                     warn!(
                         "Reconnect to {} returned unexpected peer {}",
-                        addr, gossip_id
+                        addr,
+                        LogPeerId::from(gossip_id)
                     );
                     self.remove_peer(&peer).await;
                     return Err(anyhow!(
                         "Reconnect returned unexpected peer {} for {}",
-                        gossip_id,
-                        peer
+                        LogPeerId::from(gossip_id),
+                        LogPeerId::from(peer)
                     ));
                 }
                 self.add_peer(peer, addr).await;
@@ -591,10 +593,14 @@ impl UdpTransportAdapter {
             Ok(Err(err)) => Err(anyhow!(
                 "Reconnect to {} for peer {} failed: {}",
                 addr,
-                peer,
+                LogPeerId::from(peer),
                 err
             )),
-            Err(_) => Err(anyhow!("Reconnect to {} for peer {} timed out", addr, peer)),
+            Err(_) => Err(anyhow!(
+                "Reconnect to {} for peer {} timed out",
+                addr,
+                LogPeerId::from(peer)
+            )),
         }
     }
 
@@ -733,13 +739,15 @@ impl GossipTransport for UdpTransportAdapter {
                 if gossip_id != peer {
                     warn!(
                         "Connected to peer {} at {} but expected {}",
-                        gossip_id, addr, peer
+                        LogPeerId::from(gossip_id),
+                        addr,
+                        LogPeerId::from(peer)
                     );
                     self.remove_peer(&peer).await;
                     return Err(anyhow!(
                         "Connected to unexpected peer {} when dialing {}",
-                        gossip_id,
-                        peer
+                        LogPeerId::from(gossip_id),
+                        LogPeerId::from(peer)
                     ));
                 }
 
@@ -764,13 +772,14 @@ impl GossipTransport for UdpTransportAdapter {
                         if gossip_id != peer {
                             warn!(
                                 "NAT fallback connected to {} but expected {}",
-                                gossip_id, peer
+                                LogPeerId::from(gossip_id),
+                                LogPeerId::from(peer)
                             );
                             self.remove_peer(&peer).await;
                             return Err(anyhow!(
                                 "Connected to unexpected peer {} when dialing {}",
-                                gossip_id,
-                                peer
+                                LogPeerId::from(gossip_id),
+                                LogPeerId::from(peer)
                             ));
                         }
 
@@ -789,7 +798,10 @@ impl GossipTransport for UdpTransportAdapter {
                     Err(fallback_err) => {
                         warn!(
                             "All connection strategies failed for peer {} at {}: direct={}, fallback={}",
-                            peer, addr, direct_err, fallback_err
+                            LogPeerId::from(peer),
+                            addr,
+                            direct_err,
+                            fallback_err
                         );
 
                         if let Some(cache) = &self.bootstrap_cache {
@@ -800,7 +812,10 @@ impl GossipTransport for UdpTransportAdapter {
                         self.remove_peer(&peer).await;
                         Err(anyhow!(
                             "Failed to connect to peer {} at {}: direct failed ({}), NAT fallback failed ({})",
-                            peer, addr, direct_err, fallback_err
+                            LogPeerId::from(peer),
+                            addr,
+                            direct_err,
+                            fallback_err
                         ))
                     }
                 }
@@ -902,7 +917,7 @@ impl GossipTransport for UdpTransportAdapter {
             } else {
                 return Err(anyhow!(
                     "Peer {} not connected and no cached address is available",
-                    peer
+                    LogPeerId::from(peer)
                 ));
             }
         }
@@ -925,11 +940,11 @@ impl GossipTransport for UdpTransportAdapter {
             }
             Ok(Err(e)) => {
                 warn!("Failed to send to peer {}: {}", LogPeerId::from(peer), e);
-                anyhow!("Failed to send to peer {}: {}", peer, e)
+                anyhow!("Failed to send to peer {}: {}", LogPeerId::from(peer), e)
             }
             Err(_) => {
                 warn!("Send to peer {} timed out", LogPeerId::from(peer));
-                anyhow!("Send to peer {} timed out", peer)
+                anyhow!("Send to peer {} timed out", LogPeerId::from(peer))
             }
         };
 
@@ -940,7 +955,9 @@ impl GossipTransport for UdpTransportAdapter {
             if let Err(err) = self.reconnect_peer(peer, addr).await {
                 warn!(
                     "Retry reconnect to {} for peer {} failed: {}",
-                    addr, peer, err
+                    addr,
+                    LogPeerId::from(peer),
+                    err
                 );
                 return Err(err);
             }
@@ -957,17 +974,18 @@ impl GossipTransport for UdpTransportAdapter {
                 }
                 Ok(Err(e)) => {
                     warn!("Retry send to peer {} failed: {}", LogPeerId::from(peer), e);
-                    last_err = anyhow!("Retry send to peer {} failed: {}", peer, e);
+                    last_err =
+                        anyhow!("Retry send to peer {} failed: {}", LogPeerId::from(peer), e);
                 }
                 Err(_) => {
                     warn!("Retry send to peer {} timed out", LogPeerId::from(peer));
-                    last_err = anyhow!("Retry send to peer {} timed out", peer);
+                    last_err = anyhow!("Retry send to peer {} timed out", LogPeerId::from(peer));
                 }
             }
         } else {
             return Err(anyhow!(
                 "Failed to send to peer {} (no cached address): {}",
-                peer,
+                LogPeerId::from(peer),
                 last_err
             ));
         }
@@ -1120,7 +1138,7 @@ impl TransportAdapter for UdpTransportAdapter {
                     peer_id,
                     source: anyhow!(
                         "Peer {} not connected and no cached address is available",
-                        peer_id
+                        LogPeerId::from(peer_id)
                     ),
                 });
             }
@@ -1209,7 +1227,7 @@ impl TransportAdapter for UdpTransportAdapter {
                 peer_id,
                 source: anyhow!(
                     "Failed to send to peer {} (no cached address): {}",
-                    peer_id,
+                    LogPeerId::from(peer_id),
                     last_err
                 ),
             });

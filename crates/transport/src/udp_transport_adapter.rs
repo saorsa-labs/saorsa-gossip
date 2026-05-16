@@ -291,6 +291,19 @@ impl UdpTransportAdapter {
         self.ant_peer_id
     }
 
+    /// **Test-only:** clear the adapter's lazy local `connected_peers`
+    /// cache without touching the underlying ant-quic node. This models
+    /// the production accept-side scenario where the node has a live
+    /// connection that the adapter has not yet observed via a
+    /// `connected_peers()` refresh — used by issue #14's regression
+    /// tests to prove that `close()` reaches the wire even when the
+    /// lazy cache is cold.
+    #[doc(hidden)]
+    pub async fn clear_lazy_peer_cache_for_test(&self) {
+        self.connected_peers.write().await.clear();
+        self.bootstrap_peer_ids.write().await.clear();
+    }
+
     /// Get list of connected peers
     ///
     /// Returns a vector of (PeerId, SocketAddr) tuples for all currently connected peers.
@@ -1224,19 +1237,30 @@ impl TransportAdapter for UdpTransportAdapter {
 
     async fn close(&self) -> TransportResult<()> {
         info!("Closing TransportAdapter");
-        // Issue #14: disconnect every tracked peer via ant-quic so the underlying
-        // QUIC connections are actually torn down. Without this, `close()` only
-        // clears local tracking and the node remains reachable on the wire —
-        // SWIM/Plumtree on peers cannot observe the close, and re-`open()` after
-        // `close()` may race against a still-live previous connection.
-        let peer_ids: Vec<GossipPeerId> = {
-            let peers = self.connected_peers.read().await;
-            peers.keys().copied().collect()
-        };
-        for peer in &peer_ids {
-            let ant_peer_id = gossip_peer_id_to_ant(peer);
-            if let Err(err) = self.node.disconnect(&ant_peer_id).await {
-                warn!("close: disconnect peer {} failed: {}", peer, err);
+        // Issue #14: disconnect every live ant-quic connection so the
+        // underlying QUIC connections are actually torn down. Without this,
+        // `close()` only clears local tracking and the node remains reachable
+        // on the wire — SWIM/Plumtree on peers cannot observe the close, and
+        // re-`open()` after `close()` may race against a still-live previous
+        // connection.
+        //
+        // Iterate the *node*'s live peers rather than the adapter's locally
+        // cached map (same fix as `GossipTransport::close` above): the local
+        // map is populated lazily by `connected_peers()` and may be empty
+        // even when the underlying node holds connections established via the
+        // accept path. PR #16 review caught that this impl previously walked
+        // the lazy cache; the regression test
+        // `transport_adapter_close_disconnects_even_when_lazy_cache_is_cold`
+        // models that production gap by explicitly clearing the lazy cache
+        // before calling `close()` and asserting the wire connection drops.
+        let live_peers = self.node.connected_peers().await;
+        for conn in &live_peers {
+            if let Err(err) = self.node.disconnect(&conn.peer_id).await {
+                warn!(
+                    "close: disconnect peer {} failed: {}",
+                    ant_peer_id_to_gossip(&conn.peer_id),
+                    err
+                );
             }
         }
         self.connected_peers.write().await.clear();

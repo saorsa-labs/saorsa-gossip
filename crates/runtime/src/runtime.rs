@@ -115,31 +115,83 @@ impl GossipRuntimeBuilder {
     }
 
     /// Build the runtime.
+    ///
+    /// # Identity / transport coherence (issue #15)
+    ///
+    /// `GossipRuntime` and its underlying `UdpTransportAdapter` must
+    /// agree on the local peer id, otherwise pubsub routes messages to
+    /// `runtime.peer_id()` but the transport delivers under
+    /// `transport.peer_id()` and sends fail with the misleading
+    /// "Peer not connected and no cached address available".
+    ///
+    /// This builder enforces coherence at `build()` time:
+    ///
+    /// 1. **Neither supplied** → generate an identity and create the
+    ///    transport with that same keypair. Peer-ids match by
+    ///    construction.
+    /// 2. **Identity only** → create the transport with the identity's
+    ///    keypair. Peer-ids match by construction.
+    /// 3. **Transport only** → return an error. We cannot derive a
+    ///    signing keypair from the transport's public peer-id alone,
+    ///    and silently generating a fresh runtime identity is the
+    ///    footgun the issue describes. Caller must pass the matching
+    ///    identity via `.identity(...)`.
+    /// 4. **Both supplied** → verify `identity.peer_id() ==
+    ///    transport.peer_id()`; return a clear error if they differ.
     pub async fn build(self) -> Result<GossipRuntime> {
-        let identity = match self.identity {
-            Some(id) => id,
-            None => MlDsaKeyPair::generate()?,
+        // Resolve identity and transport together so we can enforce the
+        // peer-id invariant before constructing any other layer.
+        let (identity, transport) = match (self.identity, self.transport) {
+            // Case 3: transport without identity — refuse rather than
+            // silently fabricate a fresh keypair the transport will
+            // disagree with.
+            (None, Some(_)) => {
+                return Err(anyhow::anyhow!(
+                    "GossipRuntimeBuilder: a pre-configured transport requires the matching \
+                     `.identity(...)`. The runtime needs the ML-DSA secret key to sign pubsub \
+                     messages, which cannot be derived from the transport's public peer-id."
+                ));
+            }
+            // Case 4: both supplied — verify peer-id coherence.
+            (Some(id), Some(t)) => {
+                if id.peer_id() != t.peer_id() {
+                    return Err(anyhow::anyhow!(
+                        "GossipRuntimeBuilder: identity peer-id {} does not match transport \
+                         peer-id {}. Pass the same keypair to both \
+                         (`UdpTransportAdapterConfig::with_keypair(..)` and \
+                         `GossipRuntimeBuilder::identity(..)`), or omit one of them so the \
+                         builder can sync them.",
+                        id.peer_id(),
+                        t.peer_id(),
+                    ));
+                }
+                (id, t)
+            }
+            // Cases 1 + 2: build the transport from the identity so the
+            // wire-level peer-id matches the runtime's application-level
+            // peer-id by construction.
+            (id_opt, None) => {
+                let identity = match id_opt {
+                    Some(id) => id,
+                    None => MlDsaKeyPair::generate()?,
+                };
+                let cfg =
+                    UdpTransportAdapterConfig::new(self.config.bind_addr, self.config.known_peers)
+                        .with_keypair(
+                            identity.public_key().to_vec(),
+                            identity.secret_key().to_vec(),
+                        );
+                let transport = Arc::new(UdpTransportAdapter::with_config(cfg, None).await?);
+                (identity, transport)
+            }
         };
 
         let peer_id = identity.peer_id();
-
-        // Create the transport - either from provided transport or default UDP
-        let transport: Arc<UdpTransportAdapter> = match self.transport {
-            Some(transport) => transport,
-            None => {
-                // Create default UDP transport
-                Arc::new(
-                    UdpTransportAdapter::with_config(
-                        UdpTransportAdapterConfig::new(
-                            self.config.bind_addr,
-                            self.config.known_peers,
-                        ),
-                        None,
-                    )
-                    .await?,
-                )
-            }
-        };
+        debug_assert_eq!(
+            peer_id,
+            transport.peer_id(),
+            "GossipRuntime peer-id must match transport peer-id at this point"
+        );
 
         let membership_impl =
             HyParViewMembership::new(peer_id, MembershipConfig::default(), transport.clone());
@@ -325,5 +377,123 @@ mod tests {
             .await;
 
         assert!(runtime.is_ok());
+    }
+
+    // === Issue #15: identity / transport peer-id coherence ===
+
+    /// Case 1: neither identity nor transport supplied. The builder
+    /// must generate an identity AND build the transport from that same
+    /// keypair so peer-ids match by construction.
+    #[tokio::test]
+    async fn build_with_nothing_supplied_aligns_runtime_and_transport_peer_ids() {
+        let runtime = GossipRuntimeBuilder::new()
+            .build()
+            .await
+            .expect("build should succeed");
+        assert_eq!(
+            runtime.peer_id(),
+            runtime.transport.peer_id(),
+            "runtime and transport peer-ids must match when builder \
+             owns both ends"
+        );
+    }
+
+    /// Case 2: identity supplied, transport not. The builder must
+    /// create the transport from the supplied identity so peer-ids
+    /// match. Before issue #15 the builder created the transport with
+    /// a fresh random key and the two diverged silently.
+    #[tokio::test]
+    async fn build_with_identity_only_propagates_keypair_to_default_transport() {
+        let identity = MlDsaKeyPair::generate().unwrap();
+        let expected = identity.peer_id();
+        let runtime = GossipRuntimeBuilder::new()
+            .identity(identity)
+            .build()
+            .await
+            .expect("build should succeed");
+        assert_eq!(runtime.peer_id(), expected);
+        assert_eq!(
+            runtime.transport.peer_id(),
+            expected,
+            "transport peer-id must equal identity peer-id when \
+             builder creates the transport itself"
+        );
+    }
+
+    /// Case 3: transport supplied without identity. The builder MUST
+    /// refuse rather than silently fabricate a fresh identity that
+    /// disagrees with the transport — this is the original #15 footgun.
+    #[tokio::test]
+    async fn build_with_transport_only_returns_clear_error() {
+        let any: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        let transport = Arc::new(
+            UdpTransportAdapter::with_config(UdpTransportAdapterConfig::new(any, vec![]), None)
+                .await
+                .unwrap(),
+        );
+        let result = GossipRuntimeBuilder::new()
+            .with_transport(transport)
+            .build()
+            .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("build must reject transport-without-identity"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("identity") && msg.contains("transport"),
+            "error must mention identity + transport, got: {msg}"
+        );
+    }
+
+    /// Case 4a: matching identity + transport — must succeed.
+    #[tokio::test]
+    async fn build_with_matching_identity_and_transport_succeeds() {
+        let kp = MlDsaKeyPair::generate().unwrap();
+        let any: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        let cfg = UdpTransportAdapterConfig::new(any, vec![])
+            .with_keypair(kp.public_key().to_vec(), kp.secret_key().to_vec());
+        let transport = Arc::new(UdpTransportAdapter::with_config(cfg, None).await.unwrap());
+        assert_eq!(transport.peer_id(), kp.peer_id());
+
+        let runtime = GossipRuntimeBuilder::new()
+            .identity(kp.clone())
+            .with_transport(transport)
+            .build()
+            .await
+            .expect("matching identity + transport must build");
+        assert_eq!(runtime.peer_id(), kp.peer_id());
+    }
+
+    /// Case 4b: mismatched identity + transport — must fail with a
+    /// clear error at build() time, NOT later with a misleading
+    /// "Peer not connected" runtime error.
+    #[tokio::test]
+    async fn build_with_mismatched_identity_and_transport_returns_clear_error() {
+        let kp_transport = MlDsaKeyPair::generate().unwrap();
+        let kp_runtime = MlDsaKeyPair::generate().unwrap();
+        assert_ne!(kp_transport.peer_id(), kp_runtime.peer_id());
+
+        let any: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        let cfg = UdpTransportAdapterConfig::new(any, vec![]).with_keypair(
+            kp_transport.public_key().to_vec(),
+            kp_transport.secret_key().to_vec(),
+        );
+        let transport = Arc::new(UdpTransportAdapter::with_config(cfg, None).await.unwrap());
+
+        let result = GossipRuntimeBuilder::new()
+            .identity(kp_runtime)
+            .with_transport(transport)
+            .build()
+            .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("mismatched identity + transport must fail at build()"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not match transport"),
+            "error must explain the mismatch, got: {msg}"
+        );
     }
 }

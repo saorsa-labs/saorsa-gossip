@@ -252,17 +252,25 @@ impl GossipContext {
     ///     .await?;
     /// ```
     pub async fn build(self) -> Result<GossipRuntime> {
-        // Create UDP transport config with context settings
-        let udp_config = UdpTransportAdapterConfig::new(self.bind_addr, self.known_peers.clone())
-            .with_channel_capacity(self.channel_capacity)
-            .with_max_peers(self.max_peers)
-            .with_stream_read_limit(self.stream_read_limit);
-
         // Get identity (generate if not provided)
         let identity = match self.identity {
             Some(id) => id,
             None => MlDsaKeyPair::generate().context("failed to generate identity keypair")?,
         };
+
+        // Create UDP transport config with context settings AND the identity
+        // keypair so the transport's wire-level peer-id matches the runtime's
+        // application-level peer-id (issue #15). Without this, the runtime
+        // peer-id and the transport peer-id diverge silently and pubsub
+        // sends fail with the misleading "Peer not connected".
+        let udp_config = UdpTransportAdapterConfig::new(self.bind_addr, self.known_peers.clone())
+            .with_channel_capacity(self.channel_capacity)
+            .with_max_peers(self.max_peers)
+            .with_stream_read_limit(self.stream_read_limit)
+            .with_keypair(
+                identity.public_key().to_vec(),
+                identity.secret_key().to_vec(),
+            );
 
         // Create UDP transport adapter
         let udp_adapter = Arc::new(
@@ -271,7 +279,9 @@ impl GossipContext {
                 .context("failed to create UDP transport adapter")?,
         );
 
-        // Use the standard builder with our configured transport
+        // Use the standard builder with our configured transport. Identity
+        // and transport keypair are now in sync, so the builder's
+        // coherence check (issue #15) passes.
         GossipRuntimeBuilder::new()
             .bind_addr(self.bind_addr)
             .known_peers(self.known_peers)

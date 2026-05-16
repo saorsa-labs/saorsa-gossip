@@ -200,6 +200,8 @@ pub struct SwimDetector<T: GossipTransport + 'static> {
     states: Arc<RwLock<HashMap<PeerId, SwimPeerEntry>>>,
     /// Pending probes with timestamps for timeout detection
     pending_probes: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    /// Pending indirect probes keyed by (target, original requester).
+    pending_indirect_probes: Arc<RwLock<HashMap<(PeerId, PeerId), Instant>>>,
     /// Probe period in seconds
     probe_period: u64,
     /// Suspect timeout in seconds
@@ -223,6 +225,7 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
             self_peer_id,
             states: Arc::new(RwLock::new(HashMap::new())),
             pending_probes: Arc::new(RwLock::new(HashMap::new())),
+            pending_indirect_probes: Arc::new(RwLock::new(HashMap::new())),
             probe_period,
             suspect_timeout,
             probe_fanout,
@@ -365,11 +368,31 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
 
         // Clear pending probe if one exists
         let was_pending = self.clear_probe(&sender).await;
+        let indirect_requesters = self.take_indirect_probe_requesters(sender).await;
 
         if was_pending {
             trace!(peer_id = %sender, "SWIM: Received Ack, cleared pending probe");
         } else {
             trace!(peer_id = %sender, "SWIM: Received Ack (no pending probe)");
+        }
+
+        for requester in indirect_requesters {
+            let wrapped = MembershipProtocolMessage::Swim(SwimMessage::AckResponse {
+                target: sender,
+                requester,
+            });
+            let bytes = postcard::to_stdvec(&wrapped)
+                .map_err(|e| anyhow!("Failed to serialize AckResponse message: {}", e))?;
+
+            self.transport
+                .send_to_peer(requester, GossipStreamType::Membership, bytes.into())
+                .await?;
+
+            trace!(
+                requester = %requester,
+                target = %sender,
+                "SWIM: Forwarded indirect AckResponse"
+            );
         }
 
         Ok(())
@@ -442,17 +465,59 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
             "SWIM: Received PingReq, probing target"
         );
 
+        self.record_indirect_probe_request(requester, target).await;
+
         // Send Ping to target wrapped in MembershipProtocolMessage
         let wrapped = MembershipProtocolMessage::Swim(SwimMessage::Ping);
         let bytes = postcard::to_stdvec(&wrapped)
             .map_err(|e| anyhow!("Failed to serialize Ping message: {}", e))?;
 
-        self.transport
+        if let Err(err) = self
+            .transport
             .send_to_peer(target, GossipStreamType::Membership, bytes.into())
-            .await?;
+            .await
+        {
+            self.clear_indirect_probe_request(requester, target).await;
+            return Err(err);
+        }
 
         trace!(target = %target, "SWIM: Indirect probe Ping sent to target");
         Ok(())
+    }
+
+    async fn record_indirect_probe_request(&self, requester: PeerId, target: PeerId) {
+        let now = Instant::now();
+        let mut pending = self.pending_indirect_probes.write().await;
+        pending.retain(|_, requested_at| {
+            now.duration_since(*requested_at) < Duration::from_millis(SWIM_ACK_TIMEOUT_MS)
+        });
+        pending.insert((target, requester), now);
+    }
+
+    async fn clear_indirect_probe_request(&self, requester: PeerId, target: PeerId) {
+        let mut pending = self.pending_indirect_probes.write().await;
+        pending.remove(&(target, requester));
+    }
+
+    async fn take_indirect_probe_requesters(&self, target: PeerId) -> Vec<PeerId> {
+        let now = Instant::now();
+        let mut requesters = Vec::new();
+        let mut pending = self.pending_indirect_probes.write().await;
+
+        pending.retain(|(pending_target, requester), requested_at| {
+            let is_expired =
+                now.duration_since(*requested_at) >= Duration::from_millis(SWIM_ACK_TIMEOUT_MS);
+            if *pending_target == target {
+                if !is_expired {
+                    requesters.push(*requester);
+                }
+                false
+            } else {
+                !is_expired
+            }
+        });
+
+        requesters
     }
 
     /// Handle incoming AckResponse message from indirect probe
@@ -1723,6 +1788,7 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use saorsa_gossip_transport::UdpTransportAdapter;
     use std::net::SocketAddr;
 
@@ -1733,6 +1799,72 @@ mod tests {
                 .await
                 .expect("transport"),
         )
+    }
+
+    #[derive(Clone)]
+    struct RecordedMessage {
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        data: Bytes,
+    }
+
+    struct RecordingTransport {
+        local_peer_id: PeerId,
+        sent: Arc<RwLock<Vec<RecordedMessage>>>,
+    }
+
+    impl RecordingTransport {
+        fn new(local_peer_id: PeerId) -> Self {
+            Self {
+                local_peer_id,
+                sent: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+
+        async fn sent_messages(&self) -> Vec<RecordedMessage> {
+            self.sent.read().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for RecordingTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(self.local_peer_id)
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            peer: PeerId,
+            stream_type: GossipStreamType,
+            data: Bytes,
+        ) -> Result<()> {
+            self.sent.write().await.push(RecordedMessage {
+                peer,
+                stream_type,
+                data,
+            });
+            Ok(())
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+            Err(anyhow!("recording transport has no receive queue"))
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.local_peer_id
+        }
     }
 
     fn test_peer_id() -> PeerId {
@@ -2713,6 +2845,48 @@ mod tests {
         let result = swim.handle_ping_req(requester, target).await;
         // Expected to fail due to no real transport connection
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_indirect_probe_ack_forwards_ack_response_to_requester() {
+        let helper = test_peer_id();
+        let requester = PeerId::new([1u8; 32]);
+        let target = PeerId::new([2u8; 32]);
+        let transport = Arc::new(RecordingTransport::new(helper));
+        let swim = SwimDetector::new(helper, 100, 100, SWIM_PROBE_FANOUT, Arc::clone(&transport));
+
+        swim.handle_ping_req(requester, target)
+            .await
+            .expect("ping request should send helper ping");
+
+        let sent = transport.sent_messages().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].peer, target);
+        assert_eq!(sent[0].stream_type, GossipStreamType::Membership);
+        match postcard::from_bytes(&sent[0].data).expect("deserialize helper ping") {
+            MembershipProtocolMessage::Swim(SwimMessage::Ping) => {}
+            other => panic!("expected helper Ping, got {other:?}"),
+        }
+        drop(sent);
+
+        swim.handle_ack(target)
+            .await
+            .expect("target ack should be forwarded to requester");
+
+        let sent = transport.sent_messages().await;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].peer, requester);
+        assert_eq!(sent[1].stream_type, GossipStreamType::Membership);
+        match postcard::from_bytes(&sent[1].data).expect("deserialize ack response") {
+            MembershipProtocolMessage::Swim(SwimMessage::AckResponse {
+                target: ack_target,
+                requester: ack_requester,
+            }) => {
+                assert_eq!(ack_target, target);
+                assert_eq!(ack_requester, requester);
+            }
+            other => panic!("expected AckResponse, got {other:?}"),
+        }
     }
 
     #[tokio::test]

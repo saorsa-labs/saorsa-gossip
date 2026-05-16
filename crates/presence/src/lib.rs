@@ -924,6 +924,92 @@ impl PresenceManager {
         Ok(())
     }
 
+    async fn validate_presence_record(
+        &self,
+        topic_id: TopicId,
+        peer: PeerId,
+        record: &PresenceRecord,
+    ) -> Result<bool> {
+        // Verify we're in this group
+        let groups = self.groups.read().await;
+        if !groups.contains_key(&topic_id) {
+            debug!(?topic_id, "Received presence record for unknown topic");
+            return Ok(false);
+        }
+        drop(groups);
+
+        let has_signature = !record.signature.is_empty();
+        let has_signer_pubkey = !record.signer_pubkey.is_empty();
+
+        match (has_signature, has_signer_pubkey) {
+            (true, true) => {
+                let expected_peer = PeerId::from_pubkey(&record.signer_pubkey);
+                if expected_peer != peer {
+                    warn!(
+                        claimed_peer = %LogPeerId::from(peer),
+                        signer_peer = %LogPeerId::from(expected_peer),
+                        topic_id = %LogTopicId::from(topic_id),
+                        "Rejecting presence record: signer public key does not match claimed peer"
+                    );
+                    return Ok(false);
+                }
+
+                let signable = record.signable_bytes();
+                match MlDsaKeyPair::verify(&record.signer_pubkey, &signable, &record.signature) {
+                    Ok(true) => {
+                        debug!(?peer, ?topic_id, "Presence record signature verified");
+                    }
+                    Ok(false) => {
+                        warn!(
+                            peer = %LogPeerId::from(peer),
+                            topic_id = %LogTopicId::from(topic_id),
+                            "Presence record signature verification failed (invalid)"
+                        );
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        warn!(
+                            peer = %LogPeerId::from(peer),
+                            topic_id = %LogTopicId::from(topic_id),
+                            ?e,
+                            "Presence record signature verification failed (error)"
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+            (false, false) => {
+                let require_signed = matches!(
+                    std::env::var("COMMUNITAS_PRESENCE_REQUIRE_SIGNED")
+                        .unwrap_or_else(|_| "0".to_string())
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "1" | "true" | "yes"
+                );
+
+                if require_signed {
+                    warn!(
+                        peer = %LogPeerId::from(peer),
+                        topic_id = %LogTopicId::from(topic_id),
+                        "Rejecting unsigned presence record (REQUIRE_SIGNED enabled)"
+                    );
+                    return Ok(false);
+                }
+            }
+            _ => {
+                warn!(
+                    peer = %LogPeerId::from(peer),
+                    topic_id = %LogTopicId::from(topic_id),
+                    "Rejecting malformed presence record signature fields"
+                );
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     /// Handle received presence message from wire
     ///
     /// Deserializes and processes a PresenceMessage received via transport.
@@ -936,7 +1022,7 @@ impl PresenceManager {
         let rate_limit_peer = match &message {
             PresenceMessage::Beacon { sender, .. } => Some(*sender),
             PresenceMessage::Query { origin, .. } => Some(*origin),
-            PresenceMessage::QueryResponse { .. } => None, // No rate limiting for responses
+            PresenceMessage::QueryResponse { .. } => None, // Matched to pending queries below.
         };
 
         if let Some(peer) = rate_limit_peer {
@@ -954,59 +1040,11 @@ impl PresenceManager {
                 record,
                 epoch: _,
             } => {
-                // Verify we're in this group
-                let groups = self.groups.read().await;
-                if !groups.contains_key(&topic_id) {
-                    debug!(?topic_id, "Received beacon for unknown topic");
+                if !self
+                    .validate_presence_record(topic_id, sender, &record)
+                    .await?
+                {
                     return Ok(None);
-                }
-                drop(groups);
-
-                // Verify signature if present
-                if !record.signature.is_empty() && !record.signer_pubkey.is_empty() {
-                    let signable = record.signable_bytes();
-                    match MlDsaKeyPair::verify(&record.signer_pubkey, &signable, &record.signature)
-                    {
-                        Ok(true) => {
-                            debug!(?sender, ?topic_id, "Beacon signature verified");
-                        }
-                        Ok(false) => {
-                            warn!(
-                                sender = %LogPeerId::from(sender),
-                                topic_id = %LogTopicId::from(topic_id),
-                                "Beacon signature verification failed (invalid)"
-                            );
-                            return Ok(None);
-                        }
-                        Err(e) => {
-                            warn!(
-                                sender = %LogPeerId::from(sender),
-                                topic_id = %LogTopicId::from(topic_id),
-                                ?e,
-                                "Beacon signature verification failed (error)"
-                            );
-                            return Ok(None);
-                        }
-                    }
-                } else if record.signature.is_empty() {
-                    // Check if unsigned beacons are allowed
-                    let require_signed = matches!(
-                        std::env::var("COMMUNITAS_PRESENCE_REQUIRE_SIGNED")
-                            .unwrap_or_else(|_| "0".to_string())
-                            .trim()
-                            .to_ascii_lowercase()
-                            .as_str(),
-                        "1" | "true" | "yes"
-                    );
-
-                    if require_signed {
-                        warn!(
-                            sender = %LogPeerId::from(sender),
-                            topic_id = %LogTopicId::from(topic_id),
-                            "Rejecting unsigned beacon (REQUIRE_SIGNED enabled)"
-                        );
-                        return Ok(None);
-                    }
                 }
 
                 // Store the beacon
@@ -1145,32 +1183,66 @@ impl PresenceManager {
                     "Received query response"
                 );
 
-                // Aggregate into the specific pending query (matched by query_id)
+                // Only process responses for a pending query with the expected topic.
+                {
+                    let pending = self.pending_queries.read().await;
+                    let Some(pending_query) = pending.get(&query_id) else {
+                        debug!(?query_id, "Received response for unknown query");
+                        return Ok(None);
+                    };
+
+                    if pending_query.topic_id != topic_id {
+                        warn!(
+                            ?query_id,
+                            expected = %LogTopicId::from(pending_query.topic_id),
+                            received = %LogTopicId::from(topic_id),
+                            "QueryResponse topic_id mismatch - ignoring"
+                        );
+                        return Ok(None);
+                    }
+                }
+
+                let mut valid_records = Vec::new();
+                for (peer, record) in records {
+                    if record.is_expired() {
+                        continue;
+                    }
+
+                    if self
+                        .validate_presence_record(topic_id, peer, &record)
+                        .await?
+                    {
+                        valid_records.push((peer, record));
+                    }
+                }
+
+                if valid_records.is_empty() {
+                    return Ok(None);
+                }
+
+                // Aggregate into the specific pending query (matched by query_id).
                 {
                     let mut pending = self.pending_queries.write().await;
                     if let Some(pending_query) = pending.get_mut(&query_id) {
-                        // Validate topic_id matches expected (defense in depth)
-                        if pending_query.topic_id != topic_id {
+                        if pending_query.topic_id == topic_id {
+                            pending_query.add_responses(&valid_records);
+                        } else {
                             warn!(
                                 ?query_id,
                                 expected = %LogTopicId::from(pending_query.topic_id),
                                 received = %LogTopicId::from(topic_id),
                                 "QueryResponse topic_id mismatch - ignoring"
                             );
-                        } else {
-                            pending_query.add_responses(&records);
                         }
                     } else {
                         debug!(?query_id, "Received response for unknown query");
+                        return Ok(None);
                     }
                 }
 
-                // Also store records locally for presence tracking
-                for (peer, record) in records {
-                    // Only store non-expired records
-                    if !record.is_expired() {
-                        self.handle_beacon(topic_id, peer, record).await?;
-                    }
+                // Also store validated records locally for presence tracking.
+                for (peer, record) in valid_records {
+                    self.handle_beacon(topic_id, peer, record).await?;
                 }
                 Ok(None)
             }
@@ -1243,9 +1315,48 @@ pub fn derive_presence_tag(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use saorsa_gossip_transport::UdpTransportAdapter;
     use std::net::SocketAddr;
     use tokio::sync::Notify;
+
+    struct NoopTransport {
+        peer_id: PeerId,
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for NoopTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(self.peer_id)
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            _peer: PeerId,
+            _stream_type: GossipStreamType,
+            _data: bytes::Bytes,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)> {
+            std::future::pending::<Result<(PeerId, GossipStreamType, bytes::Bytes)>>().await
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.peer_id
+        }
+    }
 
     struct BlockingSendTransport {
         peer_id: PeerId,
@@ -1292,12 +1403,7 @@ mod tests {
     // Helper: Create test presence manager
     async fn create_test_manager() -> PresenceManager {
         let peer_id = PeerId::new([1u8; 32]);
-        let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
-        let transport = Arc::new(
-            UdpTransportAdapter::new(bind, vec![])
-                .await
-                .expect("transport"),
-        );
+        let transport = Arc::new(NoopTransport { peer_id });
         let groups = Arc::new(RwLock::new(HashMap::new()));
         PresenceManager::new(peer_id, transport, groups)
     }
@@ -1305,6 +1411,11 @@ mod tests {
     fn group_ctx_with_secret(topic: TopicId) -> saorsa_gossip_groups::GroupContext {
         let secret = topic.to_bytes();
         saorsa_gossip_groups::GroupContext::with_presence_exporter(topic, secret)
+    }
+
+    async fn insert_pending_query(manager: &PresenceManager, query_id: [u8; 32], topic: TopicId) {
+        let mut pending = manager.pending_queries.write().await;
+        pending.insert(query_id, PendingQuery::new(topic));
     }
 
     #[tokio::test]
@@ -1872,12 +1983,14 @@ mod tests {
         // Test that responses are aggregated properly
         let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
+        let query_id = [0u8; 32];
 
         // Add topic to groups
         {
             let mut groups = manager.groups.write().await;
             groups.insert(topic, group_ctx_with_secret(topic));
         }
+        insert_pending_query(&manager, query_id, topic).await;
 
         // Create two QueryResponse messages with different records
         let peer1 = PeerId::new([10u8; 32]);
@@ -1886,13 +1999,13 @@ mod tests {
         let record2 = PresenceRecord::new([2u8; 32], vec!["192.168.1.2:8080".to_string()], 900);
 
         let response1 = PresenceMessage::QueryResponse {
-            query_id: [0u8; 32],
+            query_id,
             topic_id: topic,
             records: vec![(peer1, record1.clone())],
         };
 
         let response2 = PresenceMessage::QueryResponse {
-            query_id: [0u8; 32],
+            query_id,
             topic_id: topic,
             records: vec![(peer2, record2.clone())],
         };
@@ -1923,19 +2036,21 @@ mod tests {
         // Test that duplicate records from multiple responses are deduplicated
         let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
+        let query_id = [0u8; 32];
 
         // Add topic to groups
         {
             let mut groups = manager.groups.write().await;
             groups.insert(topic, group_ctx_with_secret(topic));
         }
+        insert_pending_query(&manager, query_id, topic).await;
 
         let peer = PeerId::new([10u8; 32]);
         let record = PresenceRecord::new([1u8; 32], vec!["192.168.1.1:8080".to_string()], 900);
 
         // Send same record twice (simulating responses from different peers)
         let response = PresenceMessage::QueryResponse {
-            query_id: [0u8; 32],
+            query_id,
             topic_id: topic,
             records: vec![(peer, record.clone())],
         };
@@ -1960,12 +2075,14 @@ mod tests {
         // Test that expired records in responses are not stored
         let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
+        let query_id = [0u8; 32];
 
         // Add topic to groups
         {
             let mut groups = manager.groups.write().await;
             groups.insert(topic, group_ctx_with_secret(topic));
         }
+        insert_pending_query(&manager, query_id, topic).await;
 
         let peer = PeerId::new([10u8; 32]);
         // Create an expired record (TTL = 0)
@@ -1975,7 +2092,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         let response = PresenceMessage::QueryResponse {
-            query_id: [0u8; 32],
+            query_id,
             topic_id: topic,
             records: vec![(peer, expired_record)],
         };
@@ -1992,6 +2109,150 @@ mod tests {
         assert!(
             status == PresenceStatus::Unknown || status == PresenceStatus::Offline,
             "Expired record should not show as online"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_foaf_query_response_unknown_query_ignored() {
+        let manager = create_test_manager().await;
+        let topic = TopicId::new([1u8; 32]);
+        let peer = PeerId::new([10u8; 32]);
+        let record = PresenceRecord::new([1u8; 32], vec!["192.168.1.1:8080".to_string()], 900);
+
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+
+        let response = PresenceMessage::QueryResponse {
+            query_id: [99u8; 32],
+            topic_id: topic,
+            records: vec![(peer, record)],
+        };
+
+        let data = postcard::to_stdvec(&response).expect("serialize");
+        manager
+            .handle_presence_message(&data)
+            .await
+            .expect("process");
+
+        assert_eq!(
+            manager.get_status(peer, topic).await,
+            PresenceStatus::Unknown
+        );
+        assert!(manager.get_group_presence(topic).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_foaf_query_response_topic_mismatch_ignored() {
+        let manager = create_test_manager().await;
+        let expected_topic = TopicId::new([1u8; 32]);
+        let response_topic = TopicId::new([2u8; 32]);
+        let query_id = [7u8; 32];
+        let peer = PeerId::new([10u8; 32]);
+        let record = PresenceRecord::new([1u8; 32], vec!["192.168.1.1:8080".to_string()], 900);
+
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(expected_topic, group_ctx_with_secret(expected_topic));
+            groups.insert(response_topic, group_ctx_with_secret(response_topic));
+        }
+        insert_pending_query(&manager, query_id, expected_topic).await;
+
+        let response = PresenceMessage::QueryResponse {
+            query_id,
+            topic_id: response_topic,
+            records: vec![(peer, record)],
+        };
+
+        let data = postcard::to_stdvec(&response).expect("serialize");
+        manager
+            .handle_presence_message(&data)
+            .await
+            .expect("process");
+
+        assert_eq!(
+            manager.get_status(peer, response_topic).await,
+            PresenceStatus::Unknown
+        );
+        assert!(manager.get_group_presence(expected_topic).await.is_empty());
+        assert!(manager.get_group_presence(response_topic).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_foaf_query_response_invalid_signature_rejected() {
+        let manager = create_test_manager().await;
+        let topic = TopicId::new([1u8; 32]);
+        let query_id = [8u8; 32];
+        let identity = MlDsaKeyPair::generate().expect("keygen");
+        let peer = identity.peer_id();
+
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+        insert_pending_query(&manager, query_id, topic).await;
+
+        let mut record = PresenceRecord::new([1u8; 32], vec!["192.168.1.1:8080".to_string()], 900);
+        record.signature = identity.sign(b"wrong data").expect("sign");
+        record.signer_pubkey = identity.public_key.clone();
+
+        let response = PresenceMessage::QueryResponse {
+            query_id,
+            topic_id: topic,
+            records: vec![(peer, record)],
+        };
+
+        let data = postcard::to_stdvec(&response).expect("serialize");
+        manager
+            .handle_presence_message(&data)
+            .await
+            .expect("process");
+
+        assert_eq!(
+            manager.get_status(peer, topic).await,
+            PresenceStatus::Unknown
+        );
+        let pending = manager.pending_queries.read().await;
+        let query = pending.get(&query_id).expect("pending query");
+        assert!(query.responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_foaf_query_response_signer_peer_mismatch_rejected() {
+        let manager = create_test_manager().await;
+        let topic = TopicId::new([1u8; 32]);
+        let query_id = [9u8; 32];
+        let identity = MlDsaKeyPair::generate().expect("keygen");
+        let claimed_peer = PeerId::new([99u8; 32]);
+        assert_ne!(claimed_peer, identity.peer_id());
+
+        {
+            let mut groups = manager.groups.write().await;
+            groups.insert(topic, group_ctx_with_secret(topic));
+        }
+        insert_pending_query(&manager, query_id, topic).await;
+
+        let mut record = PresenceRecord::new([1u8; 32], vec!["192.168.1.1:8080".to_string()], 900);
+        let signable = record.signable_bytes();
+        record.signature = identity.sign(&signable).expect("sign");
+        record.signer_pubkey = identity.public_key.clone();
+
+        let response = PresenceMessage::QueryResponse {
+            query_id,
+            topic_id: topic,
+            records: vec![(claimed_peer, record)],
+        };
+
+        let data = postcard::to_stdvec(&response).expect("serialize");
+        manager
+            .handle_presence_message(&data)
+            .await
+            .expect("process");
+
+        assert_eq!(
+            manager.get_status(claimed_peer, topic).await,
+            PresenceStatus::Unknown
         );
     }
 
@@ -2370,12 +2631,7 @@ mod tests {
     async fn test_presence_manager_with_identity() {
         // Test creating PresenceManager with identity
         let peer_id = PeerId::new([1u8; 32]);
-        let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
-        let transport = Arc::new(
-            UdpTransportAdapter::new(bind, vec![])
-                .await
-                .expect("transport"),
-        );
+        let transport = Arc::new(NoopTransport { peer_id });
         let groups = Arc::new(RwLock::new(HashMap::new()));
         let identity = MlDsaKeyPair::generate().expect("keygen");
 
@@ -2421,12 +2677,7 @@ mod tests {
     async fn test_signed_beacon_contains_valid_signature() {
         // Test that beacons are signed when identity is present
         let peer_id = PeerId::new([1u8; 32]);
-        let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
-        let transport = Arc::new(
-            UdpTransportAdapter::new(bind, vec![])
-                .await
-                .expect("transport"),
-        );
+        let transport = Arc::new(NoopTransport { peer_id });
         let groups = Arc::new(RwLock::new(HashMap::new()));
         let identity = MlDsaKeyPair::generate().expect("keygen");
         let topic = TopicId::new([10u8; 32]);
@@ -2517,8 +2768,8 @@ mod tests {
         // Test that valid signed beacons are accepted
         let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
-        let sender = PeerId::new([2u8; 32]);
         let identity = MlDsaKeyPair::generate().expect("keygen");
+        let sender = identity.peer_id();
 
         // Add topic to groups
         {
@@ -2559,8 +2810,8 @@ mod tests {
         // Test that beacons with invalid signatures are rejected
         let manager = create_test_manager().await;
         let topic = TopicId::new([1u8; 32]);
-        let sender = PeerId::new([2u8; 32]);
         let identity = MlDsaKeyPair::generate().expect("keygen");
+        let sender = identity.peer_id();
 
         // Add topic to groups
         {

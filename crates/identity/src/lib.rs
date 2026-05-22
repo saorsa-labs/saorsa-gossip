@@ -37,6 +37,25 @@ impl MlDsaKeyPair {
         })
     }
 
+    /// Construct a key pair from raw ML-DSA-65 public and secret key bytes.
+    ///
+    /// For callers that already hold an ML-DSA-65 identity outside this crate
+    /// — e.g. the machine keypair that backs a node's QUIC peer id — and need
+    /// to sign gossip messages (presence beacons, FOAF responses) with that
+    /// same identity. Signing with the identity that derives `peer_id` is
+    /// required so receivers can verify `PeerId::from_pubkey(public_key)`
+    /// binds to the claimed sender; a freshly generated key would fail that
+    /// binding check.
+    ///
+    /// The bytes are taken as-is; callers are responsible for supplying a
+    /// matching ML-DSA-65 public/secret pair.
+    pub fn from_keypair_bytes(public_key: Vec<u8>, secret_key: Vec<u8>) -> Self {
+        Self {
+            public_key,
+            secret_key,
+        }
+    }
+
     /// Get public key bytes
     pub fn public_key(&self) -> &[u8] {
         &self.public_key

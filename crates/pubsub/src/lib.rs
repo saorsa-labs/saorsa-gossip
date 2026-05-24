@@ -1444,6 +1444,25 @@ pub struct GossipMessage {
     pub public_key: Vec<u8>,
 }
 
+/// Cheaply peek the [`MessageKind`] of a serialized PubSub [`GossipMessage`]
+/// frame without verifying its signature or decoding the payload.
+///
+/// The header is the first field of `GossipMessage`, so postcard decodes only
+/// its prefix (`take_from_bytes`) and stops — no allocation for payload /
+/// signature / public key, and no ML-DSA verification. Returns `None` if the
+/// header prefix cannot be decoded (malformed frame).
+///
+/// Intended for receive-pump load-shedding: a consumer can drop recoverable
+/// control frames (`IHave`/`IWant`/`AntiEntropy`) ahead of data (`Eager`) when
+/// its receive channel is near-full, preserving delivery of payload-bearing
+/// messages. The peek is only worth doing under pressure; do not call it on the
+/// steady-state hot path.
+pub fn peek_message_kind(frame: &[u8]) -> Option<MessageKind> {
+    postcard::take_from_bytes::<MessageHeader>(frame)
+        .ok()
+        .map(|(header, _rest)| header.kind)
+}
+
 /// Anti-entropy reconciliation payload
 ///
 /// Used for periodic set reconciliation between peers to recover
@@ -5703,6 +5722,36 @@ mod tests {
             signature,
             public_key: signing_key.public_key().to_vec(),
         }
+    }
+
+    #[test]
+    fn peek_message_kind_reads_kind_without_full_decode() {
+        let key = test_signing_key();
+        let topic = TopicId::new([3u8; 32]);
+        // EAGER (data) — preserved under pressure.
+        let eager = signed_eager_message(&key, topic, [1u8; 32], Bytes::from_static(b"data"));
+        let eager_wire = postcard::to_stdvec(&eager).expect("serializes");
+        assert_eq!(peek_message_kind(&eager_wire), Some(MessageKind::Eager));
+
+        // Recoverable control kinds — shed-eligible under pressure.
+        for kind in [
+            MessageKind::IHave,
+            MessageKind::IWant,
+            MessageKind::AntiEntropy,
+        ] {
+            let msg =
+                signed_control_message(&key, topic, [2u8; 32], kind, Bytes::from_static(b"c"));
+            let wire = postcard::to_stdvec(&msg).expect("serializes");
+            assert_eq!(
+                peek_message_kind(&wire),
+                Some(kind),
+                "peek must read {kind:?} from the header prefix"
+            );
+        }
+
+        // Garbage / truncated frame decodes to None, never panics.
+        assert_eq!(peek_message_kind(b""), None);
+        assert_eq!(peek_message_kind(&[0xff, 0xff, 0xff]), None);
     }
 
     fn unsigned_control_message(

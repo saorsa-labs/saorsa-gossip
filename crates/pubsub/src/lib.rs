@@ -3858,6 +3858,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         stream_type: GossipStreamType,
         bytes: Bytes,
         op: &'static str,
+        detach_accounting: bool,
     ) {
         // X0X-0074: admission gate runs once per (topic, peer) before
         // we claim attempts. Dropped peers never enter the send
@@ -3941,10 +3942,31 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             });
             send_tasks.push(attempt, handle);
         }
-        let (sent, timed_out) = send_tasks.collect_results().await;
-        claims.record_results(sent, timed_out).await;
-        // _bulk_guard drops here, releasing every Bulk admission exactly
-        // once. No manual release call needed.
+        if detach_accounting {
+            // Dispatcher forward path: detach fan-out result accounting so
+            // the worker is not pinned for the slowest peer's full timeout
+            // (~PER_PEER_REPUBLISH_TIMEOUT). The per-peer sends above are
+            // already spawned with permits, and concurrency stays bounded by
+            // the outbound budget (try_acquire is non-blocking — an exhausted
+            // budget skips the peer rather than blocking). Awaiting
+            // collect_results inline here collapsed dispatcher drain
+            // throughput under degraded links and overflowed the shared recv
+            // channel (recv_pump.dropped_full). `_bulk_guard` moves into the
+            // detached task so Bulk admissions still release exactly once when
+            // accounting completes. See docs/design/pubsub-fanout-backpressure.md.
+            tokio::spawn(async move {
+                let _bulk_guard = _bulk_guard;
+                let (sent, timed_out) = send_tasks.collect_results().await;
+                claims.record_results(sent, timed_out).await;
+            });
+        } else {
+            // Publish path (and tests): await the fan-out so publish() retains
+            // its established semantics (returns after sends are attempted).
+            let (sent, timed_out) = send_tasks.collect_results().await;
+            claims.record_results(sent, timed_out).await;
+            // _bulk_guard drops here, releasing every Bulk admission exactly
+            // once. No manual release call needed.
+        }
     }
 }
 
@@ -4175,8 +4197,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         };
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Sending EAGER fan-out");
-        self.parallel_send_to_peers(topic, eager_peers, GossipStreamType::PubSub, bytes, "EAGER")
-            .await;
+        // Publish path: await accounting (detach_accounting = false) so
+        // publish() returns only after its EAGER sends are attempted.
+        self.parallel_send_to_peers(
+            topic,
+            eager_peers,
+            GossipStreamType::PubSub,
+            bytes,
+            "EAGER",
+            false,
+        )
+        .await;
 
         // Batch msg_id to pending_ihave
         let mut topics = self.topics.write().await;
@@ -4344,8 +4375,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // `for peer { send.await }` which made one slow peer pin the entire
         // dispatcher (X0X-0006: 73% of dispatcher wall-clock).
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Forwarding EAGER");
-        self.parallel_send_to_peers(topic, eager_peers, GossipStreamType::PubSub, bytes, "EAGER")
-            .await;
+        // Dispatcher forward path: detach accounting (detach_accounting =
+        // true) so a slow peer cannot pin this worker for its full timeout
+        // and starve the shared recv channel (recv_pump.dropped_full).
+        self.parallel_send_to_peers(
+            topic,
+            eager_peers,
+            GossipStreamType::PubSub,
+            bytes,
+            "EAGER",
+            true,
+        )
+        .await;
         self.record_stage(PubSubStage::Republish, republish_started);
 
         Ok(())
@@ -6642,6 +6683,7 @@ mod tests {
                     GossipStreamType::PubSub,
                     Bytes::from_static(b"budgeted-eager"),
                     "EAGER",
+                    false,
                 )
                 .await;
         });
@@ -6688,6 +6730,64 @@ mod tests {
         assert_eq!(stats.suppressed_peers[0].peer_id, slow_peer.to_string());
     }
 
+    /// Regression: the dispatcher EAGER-forward path must not pin its worker
+    /// on a slow peer. With `detach_accounting = true` the call returns
+    /// promptly even though the only peer's send is blocked indefinitely; the
+    /// send is still dispatched (in-flight), proving concurrency is preserved
+    /// while the worker is freed to drain the next message.
+    ///
+    /// WHY this matters: awaiting the fan-out inline pinned the dispatcher
+    /// worker for the slowest peer's full `PER_PEER_REPUBLISH_TIMEOUT` under
+    /// degraded links, collapsing drain throughput and overflowing the shared
+    /// recv channel (`recv_pump.dropped_full`). If the detach is reverted,
+    /// the forward becomes synchronous and blocks ~2.5 s here, so the 500 ms
+    /// timeout below fails — this test cannot pass without the fix.
+    #[tokio::test]
+    async fn test_dispatcher_forward_detaches_accounting_and_does_not_pin_on_slow_peer() {
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([66u8; 32]);
+        let slow_peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![slow_peer]).await;
+
+        // Dispatcher forward path (detach_accounting = true). The slow peer's
+        // send is never released, so a synchronous fan-out would block until
+        // the per-peer timeout. The detached path must return promptly.
+        let forward = pubsub.parallel_send_to_peers(
+            topic,
+            vec![slow_peer],
+            GossipStreamType::PubSub,
+            Bytes::from_static(b"detached-eager"),
+            "EAGER",
+            true,
+        );
+        tokio::time::timeout(Duration::from_millis(500), forward)
+            .await
+            .expect("detached forward must return promptly, not pin on the slow peer");
+
+        // The send was still dispatched — it is in-flight, blocked on the
+        // transport — so detaching the accounting did not drop the send.
+        let record = tokio::time::timeout(Duration::from_millis(200), started_rx.recv())
+            .await
+            .expect("the detached send should still have started")
+            .expect("send channel should stay open");
+        assert_eq!(record.peer, slow_peer);
+        assert_eq!(
+            transport.max_in_flight(),
+            1,
+            "the per-peer send is still in-flight after the worker returned"
+        );
+
+        // Release the blocked send so the detached accounting task can finish.
+        transport.release_sends(1);
+    }
+
     #[tokio::test]
     async fn test_one_budget_exhausted_peer_does_not_block_healthy_peer_send() {
         let peer_id = test_peer_id(1);
@@ -6716,6 +6816,7 @@ mod tests {
                     GossipStreamType::PubSub,
                     Bytes::from_static(b"mixed-budgeted-eager"),
                     "EAGER",
+                    false,
                 )
                 .await;
         });
@@ -7328,6 +7429,7 @@ mod tests {
                 GossipStreamType::PubSub,
                 Bytes::from_static(b"panic-probe"),
                 "EAGER",
+                false,
             )
             .await;
 
@@ -8101,17 +8203,18 @@ mod tests {
             .expect("send channel should stay open");
         assert_eq!(record.peer, forward_peer);
 
-        // Never release the send — the per-peer timeout (X0X-0007) must
-        // fire and unblock the dispatcher within `PER_PEER_REPUBLISH_TIMEOUT`
-        // plus slack. Pre-X0X-0007 this test asserted republish > 1 s by
-        // sleeping 1.1 s before releasing the send; under X0X-0007 the slow
-        // peer is isolated and the republish stage is bounded by the
-        // per-peer budget instead.
+        // Never release the send. The dispatcher forward path now DETACHES
+        // fan-out accounting, so handle_message returns immediately rather
+        // than blocking until the per-peer timeout fires — that is the
+        // backpressure fix (a slow peer must not pin the dispatcher worker
+        // and starve the recv channel). The republish STAGE timing is
+        // therefore bounded by the spawn cost, not PER_PEER_REPUBLISH_TIMEOUT.
         tokio::time::timeout(Duration::from_secs(5), handle)
             .await
-            .expect("handle task should finish bounded by PER_PEER_REPUBLISH_TIMEOUT — slow peer must not pin the dispatcher")
+            .expect("detached forward must let handle_message return promptly — slow peer must not pin the dispatcher")
             .expect("handle task should not panic");
 
+        // Synchronous stages are recorded before the detached fan-out.
         let stats = pubsub.stage_stats();
         assert_eq!(stats.decode.count, 1);
         assert_eq!(stats.verify.count, 1);
@@ -8119,14 +8222,8 @@ mod tests {
         assert_eq!(stats.dedupe_check.count, 1);
         assert_eq!(stats.eager_fanout.count, 1);
         assert_eq!(stats.republish.count, 1);
-        assert_eq!(
-            stats.republish_per_peer_timeout, 1,
-            "the unreleased peer should have hit the per-peer timeout exactly once"
-        );
-        // Republish stage time bounded by PER_PEER_REPUBLISH_TIMEOUT + tokio
-        // task scheduling slack. The bound uses the constant directly so it
-        // tracks future tuning automatically (X0X-0061 bumped this from
-        // 750 ms → 2500 ms).
+        // Republish stage time is now bounded well below the per-peer timeout
+        // because the worker no longer awaits the slow send inline.
         let max_bound_ns =
             (PER_PEER_REPUBLISH_TIMEOUT + Duration::from_millis(1_000)).as_nanos() as u64;
         assert!(
@@ -8135,6 +8232,25 @@ mod tests {
             stats.republish.max_ns,
             max_bound_ns
         );
+
+        // The per-peer timeout telemetry + cooling feedback is still recorded,
+        // but now ASYNCHRONOUSLY in the detached accounting task once the
+        // unreleased send hits PER_PEER_REPUBLISH_TIMEOUT. Poll for it within
+        // the timeout budget plus slack — the counter must still reach exactly
+        // 1, proving the detach defers (does not drop) the accounting.
+        let deadline =
+            tokio::time::Instant::now() + PER_PEER_REPUBLISH_TIMEOUT + Duration::from_secs(2);
+        loop {
+            if pubsub.stage_stats().republish_per_peer_timeout == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "detached accounting should record the per-peer timeout exactly once within PER_PEER_REPUBLISH_TIMEOUT + slack (got {})",
+                pubsub.stage_stats().republish_per_peer_timeout
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]

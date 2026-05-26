@@ -3445,7 +3445,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
             Err(_) => {
                 stage_stats.record_per_peer_timeout();
-                warn!(
+                // Per-message occurrence at debug — already counted in the
+                // republish_per_peer_timeout metric (the gate signal). Avoids
+                // GB/hr WARN spam when many peers time out on degraded links.
+                debug!(
                     peer_id = %LogPeerId::from(peer),
                     op,
                     timeout_ms = duration_millis_u64(timeout),
@@ -3499,7 +3502,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let Some(attempt) = claims.attempts().first().copied() else {
             if priority == TopicPriority::Critical {
                 self.admission.stats().record_critical_hard_error();
-                warn!(
+                // Per-peer occurrence at debug — the record_critical_hard_error
+                // counter is the gate signal, and the aggregated per-fanout
+                // WARN (below) keeps operator visibility. Avoids GB/hr WARN
+                // spam when budgets are exhausted across many peers on
+                // degraded links.
+                debug!(
                     peer_id = %LogPeerId::from(peer),
                     topic = %LogTopicId::from(topic),
                     op,
@@ -3512,7 +3520,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let Some(permit) = claims.take_permits().into_iter().next() else {
             if priority == TopicPriority::Critical {
                 self.admission.stats().record_critical_hard_error();
-                warn!(
+                debug!(
                     peer_id = %LogPeerId::from(peer),
                     topic = %LogTopicId::from(topic),
                     op,
@@ -4524,7 +4532,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 to_send.push((msg_id, cached));
                 requester_has_cached_message = true;
             } else {
-                warn!(msg_id = ?msg_id, "IWANT for unknown message");
+                // Routine under loss/churn: a peer requests a message we no
+                // longer cache (evicted) or never received. Not a fault —
+                // logged at debug to avoid GB/hr WARN spam on degraded links.
+                debug!(msg_id = ?msg_id, "IWANT for unknown message");
             }
         }
 

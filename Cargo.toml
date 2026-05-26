@@ -22,7 +22,7 @@ version = "0.5.53"
 edition = "2021"
 authors = ["David Irvine <david@saorsalabs.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/dirvine/saorsa-gossip"
+repository = "https://github.com/saorsa-labs/saorsa-gossip"
 
 [workspace.dependencies]
 # Async runtime

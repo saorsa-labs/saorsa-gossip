@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use std::time::Duration;
 
-const REPO_OWNER: &str = "dirvine";
+const REPO_OWNER: &str = "saorsa-labs";
 const REPO_NAME: &str = "saorsa-gossip";
 const BIN_NAME: &str = "saorsa-gossip";
 

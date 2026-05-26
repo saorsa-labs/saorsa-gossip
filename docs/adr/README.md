@@ -118,7 +118,7 @@ Relevant commits, RFCs, code paths.
 ## Related Documentation
 
 - [Project README](../../README.md)
-- [ant-quic ADRs](https://github.com/dirvine/ant-quic/tree/main/docs/adr) - Transport layer decisions
+- [ant-quic ADRs](https://github.com/saorsa-labs/ant-quic/tree/main/docs/adr) - Transport layer decisions
 - [RFC 9420 - MLS](https://www.rfc-editor.org/rfc/rfc9420) - Group encryption protocol
 - [FIPS 203](https://csrc.nist.gov/pubs/fips/203/final) - ML-KEM specification
 - [FIPS 204](https://csrc.nist.gov/pubs/fips/204/final) - ML-DSA specification

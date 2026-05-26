@@ -1,6 +1,6 @@
 # Saorsa Gossip Overlay
 
-[![CI](https://github.com/dirvine/saorsa-gossip/workflows/CI/badge.svg)](https://github.com/dirvine/saorsa-gossip/actions)
+[![CI](https://github.com/saorsa-labs/saorsa-gossip/workflows/CI/badge.svg)](https://github.com/saorsa-labs/saorsa-gossip/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust Version](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org)
 
@@ -137,7 +137,7 @@ Or build from source:
 
 ```bash
 # Clone repository
-git clone https://github.com/dirvine/saorsa-gossip.git
+git clone https://github.com/saorsa-labs/saorsa-gossip.git
 cd saorsa-gossip
 
 # Build both binaries
@@ -370,7 +370,7 @@ saorsa-gossip-crdt-sync = "0.2.1"
 ```
 
 > NOTE: A few crates are still stabilising; if `cargo add` cannot find a version yet, depend on the git repository for now:
-> `saorsa-gossip-pubsub = { git = "https://github.com/dirvine/saorsa-gossip", tag = "v0.2.1" }`
+> `saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip", tag = "v0.2.1" }`
 
 ### Basic Usage
 
@@ -758,8 +758,8 @@ Inspired by:
 
 ## 📞 Contact
 
-- **Project**: [github.com/dirvine/saorsa-gossip](https://github.com/dirvine/saorsa-gossip)
-- **Issues**: [github.com/dirvine/saorsa-gossip/issues](https://github.com/dirvine/saorsa-gossip/issues)
+- **Project**: [github.com/saorsa-labs/saorsa-gossip](https://github.com/saorsa-labs/saorsa-gossip)
+- **Issues**: [github.com/saorsa-labs/saorsa-gossip/issues](https://github.com/saorsa-labs/saorsa-gossip/issues)
 - **Author**: David Irvine ([@dirvine](https://github.com/dirvine))
 
 ---

@@ -189,8 +189,14 @@ const OPPORTUNISTIC_GRAFT_MAX_REPLACEMENTS: usize = 1;
 /// Score advantage required before replacing an eager peer with a lazy peer.
 const OPPORTUNISTIC_GRAFT_MIN_SCORE_DELTA: f64 = 0.20;
 
-/// Per-peer concurrent EAGER/data sends allowed by the PubSub outbound budget.
-const OUTBOUND_DATA_PERMITS_PER_PEER: usize = 1;
+/// Per-peer concurrent Critical EAGER/data sends allowed by the PubSub outbound budget.
+///
+/// Critical gets a dedicated lane so Normal/Bulk cannot starve DM/control-plane
+/// traffic on slow links.
+const OUTBOUND_CRITICAL_DATA_PERMITS_PER_PEER: usize = 1;
+
+/// Per-peer concurrent Normal/Bulk EAGER/data sends allowed beside Critical.
+const OUTBOUND_BEST_EFFORT_DATA_PERMITS_PER_PEER: usize = 1;
 
 /// Per-peer concurrent control sends allowed beside one data send.
 const OUTBOUND_CONTROL_PERMITS_PER_PEER: usize = 2;
@@ -642,13 +648,6 @@ impl OutboundSendClass {
         }
     }
 
-    fn limit(self) -> usize {
-        match self {
-            Self::Data => OUTBOUND_DATA_PERMITS_PER_PEER,
-            Self::Control => OUTBOUND_CONTROL_PERMITS_PER_PEER,
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             Self::Data => "data",
@@ -674,30 +673,51 @@ struct PeerSendCompletion {
     observed: Duration,
 }
 
-#[derive(Debug)]
+/// Monotonic id for an in-flight Data send slot. `0` is reserved to mean
+/// "no slot" (Control permits, which are never evictable).
+type BudgetSlotId = u64;
+
+static NEXT_BUDGET_SLOT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A single in-flight Data/EAGER send occupying either the Critical lane or
+/// the best-effort (Normal/Bulk) lane for a peer.
+struct InFlightDataSlot {
+    slot_id: BudgetSlotId,
+    priority: TopicPriority,
+}
+
 struct PeerOutboundBudgetEntry {
-    data_in_flight: usize,
+    critical_data_in_flight: usize,
+    best_effort_data_in_flight: usize,
     control_in_flight: usize,
+    /// One entry per in-flight Data permit. Critical and Normal/Bulk use
+    /// separate lanes (X0X-0074c); each slot records which lane it occupies so
+    /// `release` decrements the right counter.
+    data_slots: Vec<InFlightDataSlot>,
     last_used: Instant,
 }
 
 impl PeerOutboundBudgetEntry {
     fn new(now: Instant) -> Self {
         Self {
-            data_in_flight: 0,
+            critical_data_in_flight: 0,
+            best_effort_data_in_flight: 0,
             control_in_flight: 0,
+            data_slots: Vec::new(),
             last_used: now,
         }
     }
 
     fn is_idle_at(&self, now: Instant) -> bool {
-        self.data_in_flight == 0
+        self.critical_data_in_flight == 0
+            && self.best_effort_data_in_flight == 0
             && self.control_in_flight == 0
+            && self.data_slots.is_empty()
             && now.saturating_duration_since(self.last_used) > OUTBOUND_BUDGET_REAP_AFTER
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PeerOutboundBudgets {
     peers: Mutex<HashMap<PeerId, PeerOutboundBudgetEntry>>,
 }
@@ -713,10 +733,16 @@ impl PeerOutboundBudgets {
         }
     }
 
+    /// Try to reserve an outbound permit for `peer`.
+    ///
+    /// Critical Data sends use a dedicated per-peer lane while Normal and Bulk
+    /// share a separate best-effort lane. This keeps Critical from being
+    /// starved by Normal/Bulk work without raising best-effort concurrency.
     fn try_acquire(
         self: &Arc<Self>,
         peer: PeerId,
         class: OutboundSendClass,
+        priority: TopicPriority,
         now: Instant,
     ) -> Option<OutboundSendPermit> {
         let mut guard = self.peers_guard();
@@ -725,30 +751,58 @@ impl PeerOutboundBudgets {
         let entry = guard
             .entry(peer)
             .or_insert_with(|| PeerOutboundBudgetEntry::new(now));
-        let in_flight = match class {
-            OutboundSendClass::Data => entry.data_in_flight,
-            OutboundSendClass::Control => entry.control_in_flight,
+
+        let exhausted = match class {
+            OutboundSendClass::Data if priority == TopicPriority::Critical => {
+                entry.critical_data_in_flight >= OUTBOUND_CRITICAL_DATA_PERMITS_PER_PEER
+            }
+            OutboundSendClass::Data => {
+                entry.best_effort_data_in_flight >= OUTBOUND_BEST_EFFORT_DATA_PERMITS_PER_PEER
+            }
+            OutboundSendClass::Control => {
+                entry.control_in_flight >= OUTBOUND_CONTROL_PERMITS_PER_PEER
+            }
         };
-        if in_flight >= class.limit() {
+        if exhausted {
             entry.last_used = now;
             return None;
         }
 
-        match class {
-            OutboundSendClass::Data => entry.data_in_flight += 1,
-            OutboundSendClass::Control => entry.control_in_flight += 1,
-        }
+        let slot_id = match class {
+            OutboundSendClass::Data => {
+                if priority == TopicPriority::Critical {
+                    entry.critical_data_in_flight += 1;
+                } else {
+                    entry.best_effort_data_in_flight += 1;
+                }
+                let slot_id = NEXT_BUDGET_SLOT_ID.fetch_add(1, Ordering::Relaxed);
+                entry
+                    .data_slots
+                    .push(InFlightDataSlot { slot_id, priority });
+                slot_id
+            }
+            OutboundSendClass::Control => {
+                entry.control_in_flight += 1;
+                0
+            }
+        };
         entry.last_used = now;
+        drop(guard);
 
         Some(OutboundSendPermit {
             budgets: Arc::clone(self),
             peer,
             class,
+            slot_id,
             active: true,
         })
     }
 
-    fn release(&self, peer: PeerId, class: OutboundSendClass) {
+    /// Release an outbound permit. Idempotent for Data permits: the
+    /// Data-lane counters decrement ONLY when this call actually removes the
+    /// matching slot. The slot presence in `data_slots`, guarded by the mutex,
+    /// is the single source of truth.
+    fn release(&self, peer: PeerId, class: OutboundSendClass, slot_id: BudgetSlotId) {
         let mut guard = self.peers_guard();
         let Some(entry) = guard.get_mut(&peer) else {
             warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound permit released after peer budget entry was removed");
@@ -757,11 +811,26 @@ impl PeerOutboundBudgets {
 
         match class {
             OutboundSendClass::Data => {
-                if entry.data_in_flight == 0 {
-                    warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound data permit released with zero in-flight count");
-                } else {
-                    entry.data_in_flight -= 1;
+                if let Some(idx) = entry
+                    .data_slots
+                    .iter()
+                    .position(|slot| slot.slot_id == slot_id)
+                {
+                    let slot = entry.data_slots.remove(idx);
+                    if slot.priority == TopicPriority::Critical {
+                        if entry.critical_data_in_flight == 0 {
+                            warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound Critical data permit released with zero in-flight count");
+                        } else {
+                            entry.critical_data_in_flight -= 1;
+                        }
+                    } else if entry.best_effort_data_in_flight == 0 {
+                        warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound best-effort data permit released with zero in-flight count");
+                    } else {
+                        entry.best_effort_data_in_flight -= 1;
+                    }
                 }
+                // else: the slot was already removed (evicted) — the evictor
+                // already decremented, so do nothing.
             }
             OutboundSendClass::Control => {
                 if entry.control_in_flight == 0 {
@@ -779,15 +848,19 @@ struct OutboundSendPermit {
     budgets: Arc<PeerOutboundBudgets>,
     peer: PeerId,
     class: OutboundSendClass,
+    slot_id: BudgetSlotId,
     active: bool,
 }
 
 impl Drop for OutboundSendPermit {
     fn drop(&mut self) {
-        if self.active {
-            self.budgets.release(self.peer, self.class);
-            self.active = false;
+        if !self.active {
+            return;
         }
+        self.active = false;
+        // `release` decrements the lane counter and removes the slot under the
+        // mutex (idempotent on the slot id).
+        self.budgets.release(self.peer, self.class, self.slot_id);
     }
 }
 
@@ -810,6 +883,9 @@ struct SendClaimContext<'a> {
     topic: TopicId,
     op: &'static str,
     send_class: OutboundSendClass,
+    /// Topic priority for the claim, used to choose the Critical or
+    /// best-effort per-peer Data lane.
+    priority: TopicPriority,
 }
 
 struct SendAttemptClaims {
@@ -3611,6 +3687,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         let now = Instant::now();
         let send_class = OutboundSendClass::for_op(op);
+        let priority = self.admission.registry().priority_for(&topic);
         let mut topics = self.topics.write().await;
         let (attempts, permits) = if let Some(state) = topics.get_mut(&topic) {
             let claim_context = SendClaimContext {
@@ -3620,13 +3697,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 topic,
                 op,
                 send_class,
+                priority,
             };
             Self::claim_topic_send_attempts_for_state(&claim_context, state, peers, now)
         } else {
             let mut attempts = Vec::with_capacity(peers.len());
             let mut permits = Vec::with_capacity(peers.len());
             for peer in peers {
-                if let Some(permit) = self.outbound_budgets.try_acquire(peer, send_class, now) {
+                if let Some(permit) = self
+                    .outbound_budgets
+                    .try_acquire(peer, send_class, priority, now)
+                {
                     attempts.push(PeerSendAttempt {
                         peer,
                         kind: SendAttemptKind::Normal,
@@ -3694,6 +3775,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     let Some(permit) = claim_context.outbound_budgets.try_acquire(
                         peer,
                         claim_context.send_class,
+                        claim_context.priority,
                         now,
                     ) else {
                         Self::record_outbound_budget_pressure_for_state(
@@ -5003,6 +5085,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     topic: topic_id,
                     op: "IHAVE",
                     send_class: OutboundSendClass::for_op("IHAVE"),
+                    priority: send_path.admission.registry().priority_for(&topic_id),
                 };
                 let (attempts, permits) =
                     Self::claim_topic_send_attempts_for_state(&claim_context, state, admitted, now);
@@ -5300,6 +5383,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 topic: topic_id,
                                 op: "ANTI_ENTROPY",
                                 send_class: OutboundSendClass::for_op("ANTI_ENTROPY"),
+                                priority: send_path.admission.registry().priority_for(&topic_id),
                             };
                             let (attempts, permits) = Self::claim_topic_send_attempts_for_state(
                                 &claim_context,
@@ -5972,7 +6056,7 @@ mod tests {
             _stream_type: GossipStreamType,
             _data: Bytes,
         ) -> Result<()> {
-            panic!("panic transport send_to_peer");
+            Err(anyhow!("panic transport send_to_peer"))
         }
 
         async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
@@ -6596,6 +6680,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn critical_bypasses_in_flight_bulk_via_dedicated_data_lane() {
+        // Why: X0X-0074c — production telemetry showed most Critical drops
+        // were not Bulk contention; they were Critical/Normal contention on
+        // the single per-peer Data permit. Critical now has a dedicated Data
+        // lane, so a blocked Bulk send in the best-effort lane must not prevent
+        // Critical from starting or increment dropped_critical_hard_error.
+        let peer_id = test_peer_id(1);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let target_peer = test_peer_id(2);
+        let topic_bulk = TopicId::new([74u8; 32]);
+        let topic_crit = TopicId::new([75u8; 32]);
+        // Same peer is an eager target for both topics. Bulk uses the
+        // best-effort data lane; Critical uses the dedicated Critical lane.
+        pubsub
+            .initialize_topic_peers(topic_bulk, vec![target_peer])
+            .await;
+        pubsub
+            .initialize_topic_peers(topic_crit, vec![target_peer])
+            .await;
+        pubsub
+            .admission()
+            .registry()
+            .register(topic_bulk, TopicPriority::Bulk);
+        pubsub
+            .admission()
+            .registry()
+            .register(topic_crit, TopicPriority::Critical);
+
+        // Pin a Bulk EAGER send: it claims the best-effort data lane and
+        // blocks forever on the transport semaphore (never released).
+        let bulk_task = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                let _ = pubsub
+                    .publish_local(topic_bulk, Bytes::from_static(b"bulk"))
+                    .await;
+            })
+        };
+        // Wait for the Bulk send to actually reach the transport (permit
+        // now held).
+        let first = tokio::time::timeout(Duration::from_secs(2), started_rx.recv()).await;
+        assert!(
+            first.is_ok() && first.expect("recv").is_some(),
+            "Bulk EAGER send must reach the blocking transport and hold the data permit"
+        );
+
+        let baseline_hard = pubsub
+            .admission()
+            .stats()
+            .snapshot()
+            .dropped_critical_hard_error;
+
+        // Publish Critical to the same peer. The best-effort lane is held by
+        // Bulk, but Critical must still start via its dedicated lane.
+        let crit_task = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                let _ = pubsub
+                    .publish_local(topic_crit, Bytes::from_static(b"crit"))
+                    .await;
+            })
+        };
+
+        // The Critical send reaches the transport without waiting for the
+        // blocked Bulk send to release the best-effort lane.
+        let second = tokio::time::timeout(Duration::from_secs(2), started_rx.recv()).await;
+        assert!(
+            second.is_ok() && second.expect("recv").is_some(),
+            "Critical EAGER send must reach the transport via its dedicated lane"
+        );
+
+        let post_hard = pubsub
+            .admission()
+            .stats()
+            .snapshot()
+            .dropped_critical_hard_error;
+        assert_eq!(
+            post_hard, baseline_hard,
+            "Critical must not record a hard error while Bulk holds the best-effort lane \
+             (baseline={baseline_hard}, post={post_hard})"
+        );
+
+        transport.release_sends(8);
+        bulk_task.abort();
+        crit_task.abort();
+    }
+
+    #[tokio::test]
+    async fn critical_and_best_effort_data_lanes_release_independently() {
+        // Why: X0X-0074c — Critical has a dedicated per-peer Data lane while
+        // Normal/Bulk share a best-effort lane. A Bulk permit must not block a
+        // Critical permit, and dropping either permit must only release its own
+        // lane.
+        let budgets = Arc::new(PeerOutboundBudgets::default());
+        let peer = test_peer_id(2);
+        let now = Instant::now();
+
+        let bulk_permit = budgets
+            .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Bulk, now)
+            .expect("Bulk should claim the best-effort data lane");
+
+        let crit_permit = budgets
+            .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Critical, now)
+            .expect("Critical should claim its dedicated data lane while Bulk is in flight");
+
+        assert!(
+            budgets
+                .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Bulk, now)
+                .is_none(),
+            "best-effort lane remains held by the first Bulk send"
+        );
+
+        drop(bulk_permit);
+        assert!(
+            budgets
+                .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Bulk, now)
+                .is_some(),
+            "dropping Bulk releases only the best-effort lane"
+        );
+
+        assert!(
+            budgets
+                .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Critical, now)
+                .is_none(),
+            "Critical lane remains held by the first Critical send"
+        );
+
+        drop(crit_permit);
+        assert!(
+            budgets
+                .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Critical, now)
+                .is_some(),
+            "dropping Critical releases the Critical lane"
+        );
+    }
+
+    #[tokio::test]
     async fn peer_scoring_populated_by_real_handle_eager_path() {
         // Why X0X-0071 (reviewer P2 regression guard): `peer_scores_v2`
         // must be populated by PRODUCTION pubsub events, not just by a
@@ -7101,10 +7328,20 @@ mod tests {
 
         let now = Instant::now();
         let first_permit = outbound_budgets
-            .try_acquire(lazy_peer, OutboundSendClass::Control, now)
+            .try_acquire(
+                lazy_peer,
+                OutboundSendClass::Control,
+                TopicPriority::Normal,
+                now,
+            )
             .expect("first control permit should be available");
         let second_permit = outbound_budgets
-            .try_acquire(lazy_peer, OutboundSendClass::Control, now)
+            .try_acquire(
+                lazy_peer,
+                OutboundSendClass::Control,
+                TopicPriority::Normal,
+                now,
+            )
             .expect("second control permit should be available");
 
         PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
@@ -7172,7 +7409,9 @@ mod tests {
                     let guard = pubsub.outbound_budgets.peers_guard();
                     guard
                         .get(&peer)
-                        .map(|entry| entry.data_in_flight)
+                        .map(|entry| {
+                            entry.critical_data_in_flight + entry.best_effort_data_in_flight
+                        })
                         .unwrap_or(0)
                 };
                 if in_flight == 0 {
@@ -9176,16 +9415,15 @@ mod tests {
         let deserialized: AntiEntropyPayload =
             postcard::from_bytes(&bytes).expect("deserialize digest");
 
-        match deserialized {
-            AntiEntropyPayload::Digest { msg_ids } => {
-                assert_eq!(msg_ids.len(), 3);
-                assert_eq!(msg_ids[0], [1u8; 32]);
-                assert_eq!(msg_ids[1], [2u8; 32]);
-                assert_eq!(msg_ids[2], [3u8; 32]);
-            }
-            AntiEntropyPayload::Response { .. } => {
-                panic!("Expected Digest, got Response");
-            }
+        assert!(
+            matches!(deserialized, AntiEntropyPayload::Digest { .. }),
+            "Expected Digest, got Response"
+        );
+        if let AntiEntropyPayload::Digest { msg_ids } = deserialized {
+            assert_eq!(msg_ids.len(), 3);
+            assert_eq!(msg_ids[0], [1u8; 32]);
+            assert_eq!(msg_ids[1], [2u8; 32]);
+            assert_eq!(msg_ids[2], [3u8; 32]);
         }
 
         // Test Response variant round-trips through postcard
@@ -9196,15 +9434,14 @@ mod tests {
         let deserialized: AntiEntropyPayload =
             postcard::from_bytes(&bytes).expect("deserialize response");
 
-        match deserialized {
-            AntiEntropyPayload::Response { missing_ids } => {
-                assert_eq!(missing_ids.len(), 2);
-                assert_eq!(missing_ids[0], [4u8; 32]);
-                assert_eq!(missing_ids[1], [5u8; 32]);
-            }
-            AntiEntropyPayload::Digest { .. } => {
-                panic!("Expected Response, got Digest");
-            }
+        assert!(
+            matches!(deserialized, AntiEntropyPayload::Response { .. }),
+            "Expected Response, got Digest"
+        );
+        if let AntiEntropyPayload::Response { missing_ids } = deserialized {
+            assert_eq!(missing_ids.len(), 2);
+            assert_eq!(missing_ids[0], [4u8; 32]);
+            assert_eq!(missing_ids[1], [5u8; 32]);
         }
     }
 
@@ -9218,13 +9455,12 @@ mod tests {
         let deserialized: AntiEntropyPayload =
             postcard::from_bytes(&bytes).expect("deserialize empty digest");
 
-        match deserialized {
-            AntiEntropyPayload::Digest { msg_ids } => {
-                assert!(msg_ids.is_empty());
-            }
-            AntiEntropyPayload::Response { .. } => {
-                panic!("Expected Digest, got Response");
-            }
+        assert!(
+            matches!(deserialized, AntiEntropyPayload::Digest { .. }),
+            "Expected Digest, got Response"
+        );
+        if let AntiEntropyPayload::Digest { msg_ids } = deserialized {
+            assert!(msg_ids.is_empty());
         }
     }
 

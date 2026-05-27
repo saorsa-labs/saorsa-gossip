@@ -15,11 +15,11 @@
 //! `C` (from the per-topic cooling map), and per-peer bulk-queue depth
 //! `Q_bulk`:
 //!
-//! - **Critical** → always admit at the admission layer. A downstream
-//!   `claim_topic_send_attempts` failure (outbound budget exhausted)
-//!   records `dropped_critical_hard_error` and logs a `warn!`; the
-//!   counter must remain zero in production. See "Bulk-evict-before-
-//!   Critical-drop" under Limitations below for the future contract.
+//! - **Critical** → always admit at the admission layer and use a dedicated
+//!   per-peer outbound Data lane. Normal/Bulk work cannot occupy that lane,
+//!   so Critical only fails to claim a permit when another Critical send to
+//!   the same peer is already in flight; that records
+//!   `dropped_critical_hard_error`, which must remain zero in production.
 //! - **Normal** → admit unless `H ∈ {Dead, Suspect}`. The Suspect drop
 //!   matches the X0X-0074 ticket text ("admitted unless peer is under
 //!   suspicion or peer score below threshold"); the score check is
@@ -48,21 +48,16 @@
 //! compose: admission relieves pressure, cooling handles peers that
 //! still time out at the reduced load.
 //!
-//! ## Limitations (MVP — future ticket X0X-0074b)
+//! ## X0X-0074c — Dedicated Critical Data lane
 //!
-//! - **Bulk-evict-before-Critical-drop is not implemented.** The
-//!   original X0X-0074 ticket called for the Critical contract to
-//!   include "drop oldest Bulk before dropping any Critical, bypass
-//!   cooling on Critical claim". This MVP records the
-//!   `dropped_critical_hard_error` counter when a Critical admission
-//!   fails to claim an outbound budget permit, but does not actively
-//!   evict an in-flight Bulk send to make room. Reaching the full
-//!   contract requires either an explicit per-peer queue with
-//!   priority eviction (replacing today's permit/slack model) or
-//!   transport-layer cancellation of Bulk sends. Tracked as
-//!   X0X-0074b; soak interpretation today is "non-zero counter
-//!   means the soak is blocked", not "Critical succeeded under
-//!   pressure".
+//! X0X-0074b relieved only the Bulk-holds-permit slice: Critical could evict
+//! an in-flight Bulk send, but still hard-dropped when the single Data permit
+//! was held by Normal or another Critical send. Production soak telemetry showed
+//! most `dropped_critical_hard_error` growth came from that Critical/Normal
+//! contention, not Bulk backpressure. The outbound-budget layer now splits Data
+//! permits per peer into one Critical lane plus one best-effort lane shared by
+//! Normal/Bulk. This preserves the old best-effort bound while ensuring Normal
+//! and Bulk cannot starve Critical.
 
 use saorsa_gossip_types::{
     AdmissionDecision, AdmissionDropReason, PeerHealth, PeerId, TopicId, TopicPriority,

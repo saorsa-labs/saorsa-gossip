@@ -11,7 +11,7 @@ use saorsa_gossip_types::{PeerId, TopicId};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 /// Default bind address for the runtime (0.0.0.0:0 - bind to all interfaces, OS-assigned port)
 const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
@@ -284,6 +284,34 @@ impl GossipRuntime {
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
     }
+
+    /// Subscribe to a PubSub topic and return only after local subscription
+    /// registration has completed when the configured PubSub implementation
+    /// supports a readiness barrier.
+    ///
+    /// This is the preferred API for callers that publish immediately after
+    /// joining a topic, because the legacy `PubSub::subscribe` surface may
+    /// register subscribers asynchronously for compatibility.
+    pub async fn subscribe_ready(
+        &self,
+        topic: TopicId,
+    ) -> mpsc::UnboundedReceiver<(PeerId, bytes::Bytes)> {
+        let pubsub = self.pubsub.read().await;
+        pubsub.subscribe_ready(topic).await
+    }
+
+    /// Return PubSub stage diagnostics when the configured PubSub
+    /// implementation exposes them.
+    ///
+    /// This gives downstream runtimes a stable way to inspect first-message
+    /// races, subscriber delivery, eager fanout, admission, and peer scoring
+    /// without downcasting the runtime's trait-object PubSub handle.
+    pub async fn pubsub_stage_stats(
+        &self,
+    ) -> Option<saorsa_gossip_pubsub::PubSubStageStatsSnapshot> {
+        let pubsub = self.pubsub.read().await;
+        pubsub.stage_stats_snapshot()
+    }
 }
 
 #[cfg(test)]
@@ -435,11 +463,12 @@ mod tests {
             .with_transport(transport)
             .build()
             .await;
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("build must reject transport-without-identity"),
-        };
-        let msg = err.to_string();
+        let err = result.err();
+        assert!(
+            err.is_some(),
+            "build must reject transport-without-identity"
+        );
+        let msg = err.map(|error| error.to_string()).unwrap_or_default();
         assert!(
             msg.contains("identity") && msg.contains("transport"),
             "error must mention identity + transport, got: {msg}"
@@ -486,11 +515,12 @@ mod tests {
             .with_transport(transport)
             .build()
             .await;
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("mismatched identity + transport must fail at build()"),
-        };
-        let msg = err.to_string();
+        let err = result.err();
+        assert!(
+            err.is_some(),
+            "mismatched identity + transport must fail at build()"
+        );
+        let msg = err.map(|error| error.to_string()).unwrap_or_default();
         assert!(
             msg.contains("does not match transport"),
             "error must explain the mismatch, got: {msg}"

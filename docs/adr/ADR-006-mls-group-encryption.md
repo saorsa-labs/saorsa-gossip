@@ -336,3 +336,5 @@ Use existing MLS implementations directly.
 - **Implementation**: `crates/groups/src/`
 - **Dependency**: `saorsa-mls` (post-quantum MLS implementation)
 - **Key derivation**: `crates/groups/src/kdf.rs`
+- **IETF Draft**: `draft-ietf-mls-pq-ciphersuites-04` — ML-KEM and Hybrid Cipher Suites for MLS (March 2026)
+  - https://datatracker.ietf.org/doc/draft-ietf-mls-pq-ciphersuites/

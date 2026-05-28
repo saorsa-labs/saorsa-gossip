@@ -2902,8 +2902,22 @@ pub trait PubSub: Send + Sync {
     /// Publish a message to a topic
     async fn publish(&self, topic: TopicId, data: Bytes) -> Result<()>;
 
-    /// Subscribe to a topic and receive messages
+    /// Subscribe to a topic and receive messages.
+    ///
+    /// Implementations may register the local subscriber asynchronously; callers
+    /// that need a readiness barrier before publishing should use
+    /// [`Self::subscribe_ready`].
     fn subscribe(&self, topic: TopicId) -> mpsc::UnboundedReceiver<(PeerId, Bytes)>;
+
+    /// Subscribe to a topic and return only after the local subscriber is registered.
+    ///
+    /// The default implementation preserves compatibility by delegating to
+    /// [`Self::subscribe`]. Implementations with asynchronous subscription
+    /// bookkeeping should override this method to provide a true readiness
+    /// barrier.
+    async fn subscribe_ready(&self, topic: TopicId) -> mpsc::UnboundedReceiver<(PeerId, Bytes)> {
+        self.subscribe(topic)
+    }
 
     /// Unsubscribe from a topic
     async fn unsubscribe(&self, topic: TopicId) -> Result<()>;
@@ -2930,6 +2944,15 @@ pub trait PubSub: Send + Sync {
     /// Routes the message to appropriate handler based on MessageKind (Eager, IHave, IWant).
     /// Called by the transport layer when receiving PubSub messages.
     async fn handle_message(&self, from: PeerId, data: Bytes) -> Result<()>;
+
+    /// Return implementation-specific PubSub diagnostics, when available.
+    ///
+    /// Trait-object users such as `GossipRuntime` can call this without
+    /// downcasting. Implementations that do not expose PlumTree-style stage
+    /// counters may return `None`.
+    fn stage_stats_snapshot(&self) -> Option<PubSubStageStatsSnapshot> {
+        None
+    }
 
     /// Trigger an anti-entropy round for a specific topic
     ///
@@ -5583,6 +5606,17 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
         rx
     }
 
+    async fn subscribe_ready(&self, topic: TopicId) -> mpsc::UnboundedReceiver<(PeerId, Bytes)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut topics_guard = self.topics.write().await;
+        let state = topics_guard
+            .entry(topic)
+            .or_insert_with(|| TopicState::with_cache_config(self.cache_config));
+        state.touch();
+        state.subscribers.push(tx);
+        rx
+    }
+
     async fn unsubscribe(&self, topic: TopicId) -> Result<()> {
         let mut topics = self.topics.write().await;
         topics.remove(&topic);
@@ -5597,6 +5631,10 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
 
     async fn set_topic_peers(&self, topic: TopicId, connected: Vec<PeerId>) {
         PlumtreePubSub::set_topic_peers(self, topic, connected).await
+    }
+
+    fn stage_stats_snapshot(&self) -> Option<PubSubStageStatsSnapshot> {
+        Some(self.stage_stats())
     }
 
     async fn handle_message(&self, from: PeerId, data: Bytes) -> Result<()> {
@@ -6295,6 +6333,26 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         let data = Bytes::from("test message");
+        pubsub.publish(topic, data.clone()).await.ok();
+
+        let received =
+            tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await;
+
+        assert!(received.is_ok());
+        let (_, payload) = received.unwrap().unwrap();
+        assert_eq!(payload, data);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_ready_delivers_immediate_local_publish() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+        let topic = TopicId::new([0x5a; 32]);
+
+        let mut rx = pubsub.subscribe_ready(topic).await;
+        let data = Bytes::from("first message after subscribe_ready");
         pubsub.publish(topic, data.clone()).await.ok();
 
         let received =

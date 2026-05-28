@@ -124,12 +124,10 @@ async fn two_runtimes_publish_subscribe_round_trip() {
 
     let topic = TopicId::new([0xCD; 32]);
 
-    // Subscribe on rt1 BEFORE seeding eager peers on rt2 so the
-    // subscription channel is live by the time the publish fans out.
-    let mut rx = {
-        let pubsub = rt1.pubsub.read().await;
-        pubsub.subscribe(topic)
-    };
+    // Subscribe on rt1 BEFORE seeding eager peers on rt2. Use the runtime
+    // readiness barrier so the first publish cannot race ahead of local
+    // subscriber registration.
+    let mut rx = rt1.subscribe_ready(topic).await;
     {
         let pubsub = rt1.pubsub.read().await;
         pubsub.initialize_topic_peers(topic, vec![peer2]).await;
@@ -138,9 +136,6 @@ async fn two_runtimes_publish_subscribe_round_trip() {
         let pubsub = rt2.pubsub.read().await;
         pubsub.initialize_topic_peers(topic, vec![peer1]).await;
     }
-
-    // Tiny settle so eager-peer init propagates before publish.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let payload = Bytes::from_static(b"runtime-end-to-end-roundtrip");
     {

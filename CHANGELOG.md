@@ -5,6 +5,121 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.56] - 2026-05-28
+
+### Added
+
+- **PubSubManager subscribe-readiness barrier (#21).** Downstream
+  consumers can now rely on a deterministic "first message will not be
+  dropped" guarantee instead of the previous "subscribe + sleep" warm-up
+  pattern. ant-quic stays at 0.27.24.
+
+## [0.5.55] - 2026-05-27
+
+### Changed
+
+- **X0X-0074c — dedicated per-peer Critical Data lane.** Split the single
+  per-peer outbound Data permit into a dedicated Critical lane plus a
+  best-effort lane shared by Normal/Bulk, so Normal/Bulk can no longer
+  starve Critical DM / control-plane traffic. Release decrements the
+  correct lane idempotently by slot. Validated: 164/164 pubsub tests,
+  workspace clippy -D warnings + fmt clean, 4-model adversarial review
+  unanimous SHIP.
+- Pins ant-quic 0.27.24 (connection-level `receive_window` memory bound).
+
+### Removed
+
+- The inert **X0X-0074b** Bulk-evict-before-Critical-drop prototype
+  (`CancellationToken`, `PeerSendOutcome::Evicted`,
+  `evicted_bulk_for_critical`), now superseded by the X0X-0074c dedicated
+  lane.
+
+### Known limitation
+
+- `dropped_critical_hard_error` is not driven to zero: a second
+  *concurrent Critical send to the same peer* still hard-drops (the
+  single Critical lane holds one in-flight send). Tracked as **X0X-0074d**
+  (GitHub #22).
+
+## [0.5.54] - 2026-05-26
+
+### Changed
+
+- Demoted per-message degradation logs to DEBUG (IWANT-for-unknown,
+  per-peer X0X-0074 hard-error, per-peer send-timeout), cutting ~90% of
+  WARN-level syslog volume under severe cross-region degradation. Gate
+  counters and aggregated WARNs are preserved. See pubsub commit 59153b1.
+  162/162 pubsub tests, fmt + clippy clean.
+
+## [0.5.53] - 2026-05-25
+
+### Changed
+
+- **PubSub fan-out detach + `peek_message_kind`.** Validated by a
+  6h / 12-window VPS soak: scenario `drop_full=0` in all windows across
+  36.3M dispatched messages (vs the 27,560-drop incident that motivated
+  the fix); dispatcher adaptive-rate policy OK. See x0x ADR 0010 and
+  `docs/design/pubsub-fanout-backpressure.md`.
+
+## [0.5.52] - 2026-05-23
+
+### Fixed
+
+- Clawpatch auto-review fixes (6h x0x soak GO). Re-pins ant-quic to the
+  freshly-published 0.27.23. Patch release.
+
+## [0.5.51] - 2026-05-16
+
+Four review-driven correctness fixes shipped as PRs #16–#19 against the
+open issue backlog (#14, #9, #15, #13).
+
+### Fixed
+
+- **#14** — `UdpTransportAdapter::close()` (both `GossipTransport` and
+  legacy `TransportAdapter` impls) now iterates `Node::connected_peers()`
+  and calls `Node::disconnect()` for every live ant-quic connection
+  before clearing local tracking, instead of only emptying the lazy
+  adapter map. Fixes graceful shutdown.
+- **#9** — `SwimDetector` background tasks (probe, probe-timeout,
+  suspect-timeout) use `tokio::time::interval_at(now + period, period)`
+  so the first tick fires after one full period, closing a `handle_ack`
+  proptest race.
+- **#15** — `GossipRuntimeBuilder::build()` enforces identity / transport
+  peer-id coherence (creates transport from identity keypair when only
+  identity is given; errors clearly on transport-only or on peer-id
+  mismatch), closing the silent "Peer not connected" footgun.
+
+### Added
+
+- **#13** — Layer 2 privacy: `LogPeerId` / `LogTopicId` newtypes in
+  `saorsa-gossip-types` (per-process random salt + BLAKE3 keyed hash).
+  Migrated all PII-bearing `warn!` / `error!` callsites across pubsub,
+  membership, presence, transport, runtime, crdt-sync, and coordinator.
+  616/616 workspace tests pass; clippy and fmt clean.
+
+## [0.5.50] - 2026-05-15
+
+### Added
+
+- **X0X-0071** — libp2p-style P1–P7 peer-scoring engine, topic-scoped by
+  `(TopicId, PeerId)` and wired into the production `handle_eager` path so
+  `PubSubStageStatsSnapshot.peer_scores_v2` is populated from real EAGER
+  traffic. Telemetry-only — threshold enforcement is X0X-0071b. (PR #6,
+  commit 3aeea04)
+
+### Changed
+
+- May 2026 coverage gains across runtime / rendezvous / coordinator
+  (runtime 43% → 95.26%; rendezvous 94.37%) — purely test-additive.
+- main hygiene: rendezvous clippy `inconsistent_digit_grouping`, runtime
+  `clippy::len_zero`, two broken intra-doc links, regenerated
+  workspace-hack. (PR #8, commit 30caeb5)
+
+### Known
+
+- `membership::pending_probes_cleared_on_ack` proptest is intermittent
+  (issue #9, pre-dates this release; fixed in 0.5.51).
+
 ## [0.5.49] - 2026-05-13
 
 Reviewer round 3 corrections to X0X-0074 admission control. Three of

@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.57] - 2026-05-29
+
+### Changed
+
+- **X0X-0074d — per-peer FIFO Critical send gate.** Concurrent Critical
+  pub/sub sends to the same peer are now serialized through a bounded
+  per-peer FIFO gate instead of hard-dropping the second one. The single
+  in-flight Critical send per peer holds a `tokio::Semaphore` permit; the
+  rest wait FIFO up to `OUTBOUND_CRITICAL_QUEUE_PER_PEER = 64`. Reservation
+  is synchronous/non-blocking (runs under the topics lock, bounds spawned
+  tasks); the FIFO wait happens inside the already-detached per-peer send
+  task, so the dispatcher worker is never pinned. This drives the
+  production `dropped_critical_hard_error` counter — previously non-zero and
+  climbing fleet-wide after 0074c — toward zero: only genuine queue overflow
+  (past the bound) now records a hard error.
+- Critical Data sends no longer occupy the budget's in-flight lane; the gate
+  is their sole limiter.
+
+### Added
+
+- **`dropped_critical_cooling`** admission counter. Critical sends skipped
+  because the peer is actively cooling/suppressed (or has a recovery probe
+  in flight) are now recorded here instead of being miscounted as
+  `dropped_critical_hard_error`. Legitimate transient backpressure, distinct
+  from the soak-blocking hard-error contract. (Additive snapshot field.)
+
 ## [0.5.56] - 2026-05-28
 
 ### Added

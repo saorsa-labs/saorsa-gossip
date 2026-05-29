@@ -112,6 +112,11 @@ pub struct AdmissionStats {
     /// Hard error: a Critical message was dropped. Must stay zero in
     /// production; surfaced as a violation on `/diagnostics/gossip`.
     dropped_critical_hard_error: AtomicU64,
+    /// X0X-0074d: a Critical send was skipped because the target peer is
+    /// actively cooling/suppressed (or has a recovery probe in flight) —
+    /// NOT a budget/gate violation. Legitimate, transient backpressure;
+    /// tracked separately so `dropped_critical_hard_error` can hold at zero.
+    dropped_critical_cooling: AtomicU64,
 }
 
 /// JSON-friendly snapshot of admission counters.
@@ -145,6 +150,12 @@ pub struct AdmissionStatsSnapshot {
     /// **Hard error**: a Critical admission was dropped. Must remain
     /// zero in production; non-zero is a soak-blocking violation.
     pub dropped_critical_hard_error: u64,
+    /// X0X-0074d: Critical sends skipped because the peer is actively
+    /// cooling/suppressed (or has a recovery probe in flight). Legitimate
+    /// transient backpressure, distinct from the hard-error budget/gate
+    /// violation — does NOT block the broad-launch soak gate.
+    #[serde(default)]
+    pub dropped_critical_cooling: u64,
 }
 
 impl AdmissionStats {
@@ -162,6 +173,7 @@ impl AdmissionStats {
             dropped_normal_peer_dead: self.dropped_normal_peer_dead.load(Ordering::Relaxed),
             dropped_normal_peer_suspect: self.dropped_normal_peer_suspect.load(Ordering::Relaxed),
             dropped_critical_hard_error: self.dropped_critical_hard_error.load(Ordering::Relaxed),
+            dropped_critical_cooling: self.dropped_critical_cooling.load(Ordering::Relaxed),
         }
     }
 
@@ -182,6 +194,15 @@ impl AdmissionStats {
     /// downstream of [`AdmissionControl::admit`].
     pub fn record_critical_hard_error(&self) {
         self.dropped_critical_hard_error
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// X0X-0074d: record a Critical send skipped because the peer is
+    /// actively cooling/suppressed (or has a recovery probe in flight).
+    /// Distinct from [`Self::record_critical_hard_error`] — this is
+    /// legitimate transient backpressure and does NOT block the soak gate.
+    pub fn record_critical_cooling(&self) {
+        self.dropped_critical_cooling
             .fetch_add(1, Ordering::Relaxed);
     }
 

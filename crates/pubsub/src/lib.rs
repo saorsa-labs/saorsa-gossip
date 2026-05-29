@@ -40,10 +40,10 @@ use saorsa_gossip_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time;
 use tracing::{debug, error, trace, warn};
 
@@ -203,6 +203,16 @@ const OUTBOUND_CONTROL_PERMITS_PER_PEER: usize = 2;
 
 /// Idle outbound budget entries are reaped after this duration.
 const OUTBOUND_BUDGET_REAP_AFTER: Duration = Duration::from_secs(600);
+
+/// X0X-0074d: maximum number of concurrent Critical sends that may queue for a
+/// single peer's serialized Critical lane before the excess is hard-dropped.
+///
+/// The lane itself admits one Critical send at a time (the in-flight one); the
+/// rest wait FIFO. Steady-state concurrency is 1–3, so this bound is only hit
+/// under genuine overload, where a hard error is the correct signal. Bounding
+/// the queue at reservation time (sync, pre-spawn) also caps spawned send tasks,
+/// preserving the OOM-on-spawn protection the non-blocking budget provided.
+const OUTBOUND_CRITICAL_QUEUE_PER_PEER: usize = 64;
 
 /// Message ID type alias
 type MessageIdType = [u8; 32];
@@ -717,9 +727,161 @@ impl PeerOutboundBudgetEntry {
     }
 }
 
+/// X0X-0074d: per-peer FIFO serialization for Critical sends.
+///
+/// The single per-peer Critical budget lane (0074c) hard-dropped a second
+/// concurrent Critical send to the same peer rather than queuing it, so
+/// `dropped_critical_hard_error` never reached zero under normal load. This
+/// gate replaces that drop with a bounded FIFO wait: one Critical send is
+/// in-flight per peer; the rest wait (FIFO) until it completes. Only when the
+/// queue exceeds [`OUTBOUND_CRITICAL_QUEUE_PER_PEER`] (genuine overload) is the
+/// excess hard-dropped.
+///
+/// Reservation (`try_reserve`) is synchronous and non-blocking so it runs under
+/// the topics lock and bounds spawned send tasks; the actual wait
+/// (`CriticalReservation::engage`) happens inside the already-detached per-peer
+/// send task so the dispatcher worker is never pinned.
+#[derive(Default)]
+struct CriticalSendGate {
+    peers: Mutex<HashMap<PeerId, Arc<CriticalPeerSlot>>>,
+}
+
+struct CriticalPeerSlot {
+    /// One permit = the single in-flight Critical send for this peer.
+    sem: Arc<Semaphore>,
+    /// Reserved-or-in-flight count, used to enforce the queue bound at
+    /// reservation time without blocking.
+    queued: AtomicUsize,
+}
+
+impl CriticalPeerSlot {
+    fn new() -> Self {
+        Self {
+            sem: Arc::new(Semaphore::new(OUTBOUND_CRITICAL_DATA_PERMITS_PER_PEER)),
+            queued: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl CriticalSendGate {
+    fn peers_guard(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, Arc<CriticalPeerSlot>>> {
+        match self.peers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("PubSub Critical-gate lock was poisoned; recovering");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// Reserve a slot in `peer`'s Critical queue without blocking. Returns
+    /// `None` when the per-peer queue bound is already reached (overload →
+    /// caller records a hard error). On success the returned reservation must
+    /// be [`CriticalReservation::engage`]d inside the send task to obtain the
+    /// in-flight permit (FIFO).
+    fn try_reserve(&self, peer: PeerId) -> Option<CriticalReservation> {
+        let slot = {
+            let mut guard = self.peers_guard();
+            // Reap slots only the map still references (no in-flight reservation
+            // or permit holds an Arc clone). Safe under the lock: strong_count
+            // == 1 means no other thread holds a clone and none can obtain one
+            // without this same lock.
+            guard.retain(|_, slot| Arc::strong_count(slot) > 1);
+            Arc::clone(
+                guard
+                    .entry(peer)
+                    .or_insert_with(|| Arc::new(CriticalPeerSlot::new())),
+            )
+        };
+
+        // Bound the queue. `queued` counts reservations + in-flight sends.
+        let prev = slot.queued.fetch_add(1, Ordering::AcqRel);
+        if prev >= OUTBOUND_CRITICAL_QUEUE_PER_PEER {
+            slot.queued.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(CriticalReservation {
+            slot,
+            consumed: false,
+        })
+    }
+}
+
+/// A reserved place in a peer's Critical FIFO. Releases the reservation on drop
+/// if never engaged (e.g. the peer was cooling-skipped after reservation).
+struct CriticalReservation {
+    slot: Arc<CriticalPeerSlot>,
+    consumed: bool,
+}
+
+impl CriticalReservation {
+    /// Wait (FIFO) for the peer's single Critical in-flight permit. Held for the
+    /// duration of the send via the returned [`CriticalGateHold`]. Runs inside
+    /// the detached send task, so waiting never pins the dispatcher.
+    async fn engage(mut self) -> Option<CriticalGateHold> {
+        self.consumed = true;
+        let slot = Arc::clone(&self.slot);
+        // tokio's Semaphore hands out permits in FIFO order, giving the queue
+        // its serialization. `acquire_owned` only errors if the semaphore is
+        // closed, which never happens here.
+        match Arc::clone(&slot.sem).acquire_owned().await {
+            Ok(permit) => Some(CriticalGateHold {
+                permit: Some(permit),
+                slot,
+            }),
+            Err(_) => {
+                slot.queued.fetch_sub(1, Ordering::AcqRel);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for CriticalReservation {
+    fn drop(&mut self) {
+        if !self.consumed {
+            // Reserved but never engaged (cooling-skip path): release the queue
+            // slot so the bound reflects reality.
+            self.slot.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Holds a peer's in-flight Critical permit for the duration of one send.
+/// Releasing the semaphore permit (on drop) lets the next FIFO waiter proceed,
+/// and decrements the queue count.
+struct CriticalGateHold {
+    permit: Option<OwnedSemaphorePermit>,
+    slot: Arc<CriticalPeerSlot>,
+}
+
+impl Drop for CriticalGateHold {
+    fn drop(&mut self) {
+        // Release the in-flight permit FIRST (waking the next FIFO waiter),
+        // THEN free the queue slot. Decrementing `queued` before releasing the
+        // permit would let a concurrent `try_reserve` observe the lower count
+        // and transiently admit one reservation past the bound.
+        drop(self.permit.take());
+        self.slot.queued.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// X0X-0074d: the Critical-gate state carried by an [`OutboundSendPermit`].
+/// Normal/Bulk sends carry `None`; Critical sends carry a `Reserved` slot that
+/// the send task upgrades to `Engaged` (the in-flight permit) before sending.
+enum CriticalPermitState {
+    None,
+    Reserved(CriticalReservation),
+    /// Held only for its `Drop`, which releases the in-flight Critical permit
+    /// (waking the next FIFO waiter) and decrements the queue count.
+    Engaged(#[allow(dead_code)] CriticalGateHold),
+}
+
 #[derive(Default)]
 struct PeerOutboundBudgets {
     peers: Mutex<HashMap<PeerId, PeerOutboundBudgetEntry>>,
+    /// X0X-0074d: serializes concurrent Critical sends per peer.
+    critical_gate: CriticalSendGate,
 }
 
 impl PeerOutboundBudgets {
@@ -735,9 +897,12 @@ impl PeerOutboundBudgets {
 
     /// Try to reserve an outbound permit for `peer`.
     ///
-    /// Critical Data sends use a dedicated per-peer lane while Normal and Bulk
-    /// share a separate best-effort lane. This keeps Critical from being
-    /// starved by Normal/Bulk work without raising best-effort concurrency.
+    /// Critical Data sends are serialized per-peer by the FIFO Critical gate
+    /// (X0X-0074d): `try_reserve` is non-blocking and bounds the queue, and the
+    /// send task later [`CriticalReservation::engage`]s to wait for the single
+    /// in-flight permit. Normal and Bulk Data share a separate best-effort lane;
+    /// Control has its own. `None` means: Critical queue overflow (caller records
+    /// a hard error) or best-effort/control lane exhausted.
     fn try_acquire(
         self: &Arc<Self>,
         peer: PeerId,
@@ -745,6 +910,19 @@ impl PeerOutboundBudgets {
         priority: TopicPriority,
         now: Instant,
     ) -> Option<OutboundSendPermit> {
+        // Critical Data: reserve a FIFO queue slot before touching the budget
+        // map. On overflow, bail before any budget mutation so the caller's
+        // hard-error accounting is the only side effect.
+        let critical =
+            if matches!(class, OutboundSendClass::Data) && priority == TopicPriority::Critical {
+                match self.critical_gate.try_reserve(peer) {
+                    Some(reservation) => CriticalPermitState::Reserved(reservation),
+                    None => return None,
+                }
+            } else {
+                CriticalPermitState::None
+            };
+
         let mut guard = self.peers_guard();
         guard.retain(|_, entry| !entry.is_idle_at(now));
 
@@ -752,10 +930,10 @@ impl PeerOutboundBudgets {
             .entry(peer)
             .or_insert_with(|| PeerOutboundBudgetEntry::new(now));
 
+        // Non-Critical lanes keep the original non-blocking budget check.
         let exhausted = match class {
-            OutboundSendClass::Data if priority == TopicPriority::Critical => {
-                entry.critical_data_in_flight >= OUTBOUND_CRITICAL_DATA_PERMITS_PER_PEER
-            }
+            // Critical is bounded by the gate above, not the in-flight lane.
+            OutboundSendClass::Data if priority == TopicPriority::Critical => false,
             OutboundSendClass::Data => {
                 entry.best_effort_data_in_flight >= OUTBOUND_BEST_EFFORT_DATA_PERMITS_PER_PEER
             }
@@ -769,12 +947,11 @@ impl PeerOutboundBudgets {
         }
 
         let slot_id = match class {
+            // Critical no longer occupies a budget lane slot — the gate (carried
+            // in `critical`) is its sole limiter, so `release` is a no-op for it.
+            OutboundSendClass::Data if priority == TopicPriority::Critical => 0,
             OutboundSendClass::Data => {
-                if priority == TopicPriority::Critical {
-                    entry.critical_data_in_flight += 1;
-                } else {
-                    entry.best_effort_data_in_flight += 1;
-                }
+                entry.best_effort_data_in_flight += 1;
                 let slot_id = NEXT_BUDGET_SLOT_ID.fetch_add(1, Ordering::Relaxed);
                 entry
                     .data_slots
@@ -795,6 +972,7 @@ impl PeerOutboundBudgets {
             class,
             slot_id,
             active: true,
+            critical,
         })
     }
 
@@ -850,6 +1028,35 @@ struct OutboundSendPermit {
     class: OutboundSendClass,
     slot_id: BudgetSlotId,
     active: bool,
+    /// X0X-0074d: Critical-gate reservation/hold. `None` for Normal/Bulk/Control.
+    /// Dropping it releases the FIFO queue slot (and the in-flight permit once
+    /// engaged), letting the next waiter proceed.
+    critical: CriticalPermitState,
+}
+
+impl OutboundSendPermit {
+    /// X0X-0074d: for a Critical send, wait (FIFO) for the peer's single
+    /// in-flight Critical permit before transmitting. No-op for Normal, Bulk,
+    /// Control, or an already-engaged permit. Must be called inside the
+    /// (already-detached) send task so waiting never pins the dispatcher.
+    ///
+    /// Returns `false` only if the gate could not be engaged (semaphore
+    /// closed — never in practice); callers then skip the send.
+    async fn engage_critical_gate(&mut self) -> bool {
+        match std::mem::replace(&mut self.critical, CriticalPermitState::None) {
+            CriticalPermitState::Reserved(reservation) => match reservation.engage().await {
+                Some(hold) => {
+                    self.critical = CriticalPermitState::Engaged(hold);
+                    true
+                }
+                None => false,
+            },
+            other => {
+                self.critical = other;
+                true
+            }
+        }
+    }
 }
 
 impl Drop for OutboundSendPermit {
@@ -859,7 +1066,9 @@ impl Drop for OutboundSendPermit {
         }
         self.active = false;
         // `release` decrements the lane counter and removes the slot under the
-        // mutex (idempotent on the slot id).
+        // mutex (idempotent on the slot id; a no-op for Critical, which the
+        // gate in `critical` bounds instead). The `critical` field's own Drop
+        // then releases the gate reservation/permit.
         self.budgets.release(self.peer, self.class, self.slot_id);
     }
 }
@@ -3599,31 +3808,37 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         let mut claims = self.claim_topic_send_attempts(topic, vec![peer], op).await;
         let Some(attempt) = claims.attempts().first().copied() else {
-            if priority == TopicPriority::Critical {
+            // X0X-0074d: Critical *Data* skips (cooling vs gate overflow) are
+            // now counted inside claim_topic_send_attempts where the reason is
+            // known, so we must not re-count them here. Only the Critical
+            // *Control* case (e.g. IWANT) is still counted at the caller.
+            if priority == TopicPriority::Critical
+                && !matches!(OutboundSendClass::for_op(op), OutboundSendClass::Data)
+            {
                 self.admission.stats().record_critical_hard_error();
-                // Per-peer occurrence at debug — the record_critical_hard_error
-                // counter is the gate signal, and the aggregated per-fanout
-                // WARN (below) keeps operator visibility. Avoids GB/hr WARN
-                // spam when budgets are exhausted across many peers on
-                // degraded links.
                 debug!(
                     peer_id = %LogPeerId::from(peer),
                     topic = %LogTopicId::from(topic),
                     op,
-                    "X0X-0074 hard error: Critical admission failed to claim outbound budget"
+                    "X0X-0074 hard error: Critical control admission failed to claim outbound budget"
                 );
             }
             drop(release_guard);
             return Ok(());
         };
         let Some(permit) = claims.take_permits().into_iter().next() else {
-            if priority == TopicPriority::Critical {
+            // Defensive: claim pushes attempt+permit together, so this is
+            // unreachable. Critical Data is accounted in claim; only count the
+            // Control case here for symmetry with the no-attempt path above.
+            if priority == TopicPriority::Critical
+                && !matches!(OutboundSendClass::for_op(op), OutboundSendClass::Data)
+            {
                 self.admission.stats().record_critical_hard_error();
                 debug!(
                     peer_id = %LogPeerId::from(peer),
                     topic = %LogTopicId::from(topic),
                     op,
-                    "X0X-0074 hard error: Critical admission claimed attempt but lost permit"
+                    "X0X-0074 hard error: Critical control admission claimed attempt but lost permit"
                 );
             }
             drop(release_guard);
@@ -3634,7 +3849,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let stage_stats = Arc::clone(&self.stage_stats);
         let rtt_tracker = Arc::clone(&self.peer_rtt_tracker);
         let handle = AbortOnDropSendHandle::new(tokio::spawn(async move {
-            let _permit = permit;
+            let mut permit = permit;
+            // X0X-0074d: for Critical, wait FIFO for the peer's in-flight slot
+            // (no-op otherwise). Held until the send completes.
+            if !permit.engage_critical_gate().await {
+                return Ok(PeerSendOutcome::TimedOut);
+            }
             Self::send_to_peer_with_timeout(
                 transport,
                 stage_stats,
@@ -3739,6 +3959,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     permits.push(permit);
                 } else {
                     self.stage_stats.record_outbound_budget_exhausted();
+                    if priority == TopicPriority::Critical
+                        && matches!(send_class, OutboundSendClass::Data)
+                    {
+                        // X0X-0074d: no TopicState means no cooling state, so a
+                        // Critical None here is a Critical gate overflow.
+                        self.admission.stats().record_critical_hard_error();
+                    }
                     trace!(
                         peer_id = %peer,
                         topic = ?topic,
@@ -3801,6 +4028,42 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         claim_context.priority,
                         now,
                     ) else {
+                        if claim_context.priority == TopicPriority::Critical
+                            && matches!(claim_context.send_class, OutboundSendClass::Data)
+                        {
+                            // X0X-0074d: Critical no longer fails on a budget
+                            // lane — a None here means the per-peer Critical
+                            // FIFO gate is full (genuine overload). Record the
+                            // hard error, but do NOT cool the peer: the queue
+                            // saturation is our side, not peer slowness.
+                            claim_context.stage_stats.record_outbound_budget_exhausted();
+                            claim_context
+                                .send_path
+                                .admission
+                                .stats()
+                                .record_critical_hard_error();
+                            warn!(
+                                peer_id = %LogPeerId::from(peer),
+                                topic = %LogTopicId::from(claim_context.topic),
+                                op = claim_context.op,
+                                "X0X-0074d Critical gate overflow: per-peer Critical send queue full"
+                            );
+                            // `claim_send_attempt_at` may have just claimed a
+                            // recovery probe (setting recovery_probe_in_flight).
+                            // The normal budget-pressure path below would clear
+                            // it; since we skip that for Critical, un-claim it
+                            // here or the peer is permanently blocked (every
+                            // future claim short-circuits on the in-flight
+                            // probe). Overflow is our-side saturation, so do not
+                            // escalate cooling — only release the probe.
+                            if attempt.kind == SendAttemptKind::RecoveryProbe {
+                                if let Some(cooling) = state.peer_cooling.get_mut(&peer) {
+                                    cooling.recovery_probe_in_flight = false;
+                                    cooling.recovery_probe_id = None;
+                                }
+                            }
+                            continue;
+                        }
                         Self::record_outbound_budget_pressure_for_state(
                             claim_context,
                             state,
@@ -3813,6 +4076,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     permits.push(permit);
                 }
                 None => {
+                    if claim_context.priority == TopicPriority::Critical
+                        && matches!(claim_context.send_class, OutboundSendClass::Data)
+                    {
+                        // X0X-0074d: Critical send skipped because the peer is
+                        // actively cooling/suppressed (or has a recovery probe
+                        // in flight). Legitimate transient backpressure — NOT a
+                        // hard-error budget/gate violation.
+                        claim_context
+                            .send_path
+                            .admission
+                            .stats()
+                            .record_critical_cooling();
+                    }
                     trace!(
                         peer_id = %peer,
                         topic = ?claim_context.topic,
@@ -4024,27 +4300,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         };
 
         let mut claims = self.claim_topic_send_attempts(topic, admitted, op).await;
-        let attempts_count = claims.attempts().len();
 
-        // X0X-0074 hard error: a Critical admission must reach the
-        // per-peer pipeline. If `claim_topic_send_attempts` returns
-        // fewer attempts than admitted (e.g. outbound budgets
-        // exhausted), every missing claim is a hard error. Surface as
-        // a counter so the soak gate can fail the run.
-        if priority == TopicPriority::Critical && attempts_count < admitted_count {
-            let lost = admitted_count - attempts_count;
-            for _ in 0..lost {
-                self.admission.stats().record_critical_hard_error();
-            }
-            warn!(
-                topic = %LogTopicId::from(topic),
-                op,
-                lost,
-                admitted = admitted_count,
-                attempted = attempts_count,
-                "X0X-0074 hard error: Critical admission(s) failed to claim outbound budget"
-            );
-        }
+        // X0X-0074d: per-peer Critical accounting now happens inside
+        // `claim_topic_send_attempts`, where the skip reason is known —
+        // cooling/suppression → `dropped_critical_cooling`, Critical FIFO gate
+        // overflow → `dropped_critical_hard_error`. Counting a bare
+        // attempts-vs-admitted shortfall here (the old behaviour) conflated the
+        // two and double-counted, so it is removed.
 
         if claims.is_empty() {
             // No peers got attempts. Bulk reservations release when
@@ -4060,7 +4322,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let stage_stats = Arc::clone(&self.stage_stats);
             let rtt_tracker = Arc::clone(&self.peer_rtt_tracker);
             let handle = tokio::spawn(async move {
-                let _permit = permit;
+                let mut permit = permit;
+                // X0X-0074d: Critical sends wait FIFO for the peer's single
+                // in-flight slot here, inside the detached task — no-op for
+                // Normal/Bulk. Keeps the dispatcher worker unpinned.
+                if !permit.engage_critical_gate().await {
+                    return Ok(PeerSendOutcome::TimedOut);
+                }
                 Self::send_to_peer_with_timeout(
                     transport,
                     stage_stats,
@@ -6667,15 +6935,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_records_critical_hard_error_when_outbound_budget_exhausted() {
-        // Why: reviewer P1.1 (2026-05-12) — after admission says Admit,
-        // the shared outbound budget can still refuse a permit. For
-        // Critical traffic that shortcut is the very thing the
-        // X0X-0074 contract forbids, so a non-zero
-        // `dropped_critical_hard_error` is a soak-blocking violation.
-        // This test exhausts the per-peer outbound budget by spamming
-        // a topic and confirms the next Critical publish records the
-        // hard error counter.
+    async fn critical_sends_serialize_under_budget_pressure_without_hard_error() {
+        // Why: X0X-0074d supersedes the pre-0074d behaviour this test used to
+        // assert. Before 0074d a Critical send that found the per-peer budget
+        // held by another in-flight Critical send was *hard-dropped*
+        // (`dropped_critical_hard_error`). Now the per-peer Critical FIFO gate
+        // makes the second send WAIT for the first instead of dropping it, so
+        // under contention below the queue bound the hard-error counter must
+        // stay at ZERO. This test reproduces the old contention scenario (one
+        // Critical send pinned in the blocking transport, a second concurrent
+        // Critical send to the same peer) and confirms the second is queued —
+        // not counted as a hard error, and not counted as cooling.
         let peer_id = test_peer_id(1);
         let (transport, _started_rx) = BlockingTransport::new(peer_id);
         let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
@@ -6725,14 +6995,26 @@ mod tests {
         )
         .await;
 
-        let post = pubsub
-            .admission()
-            .stats()
-            .snapshot()
-            .dropped_critical_hard_error;
+        let snapshot = pubsub.admission().stats().snapshot();
+        let post = snapshot.dropped_critical_hard_error;
+        assert_eq!(
+            baseline, 0,
+            "no hard error should accrue while sends merely serialize (baseline={baseline})"
+        );
+        assert_eq!(
+            post, 0,
+            "X0X-0074d: a Critical send contending for an in-flight peer must QUEUE, not hard-drop (post={post})"
+        );
+        assert_eq!(
+            snapshot.dropped_critical_cooling, 0,
+            "no peer is cooling in this scenario, so no cooling skips either"
+        );
+        // Serialization holds: never more than one Critical send reaches the
+        // transport for the same peer at once.
         assert!(
-            post > baseline || baseline > 0,
-            "Critical-without-permit must record dropped_critical_hard_error (baseline={baseline}, post={post})"
+            transport.max_in_flight() <= 1,
+            "gate must serialize Critical sends per peer (max_in_flight={})",
+            transport.max_in_flight()
         );
         saturate_task.abort();
     }
@@ -6832,11 +7114,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn critical_and_best_effort_data_lanes_release_independently() {
-        // Why: X0X-0074c — Critical has a dedicated per-peer Data lane while
-        // Normal/Bulk share a best-effort lane. A Bulk permit must not block a
-        // Critical permit, and dropping either permit must only release its own
-        // lane.
+    async fn best_effort_lane_independent_of_gate_managed_critical() {
+        // Why: X0X-0074c gave Critical a dedicated single-permit per-peer Data
+        // lane; X0X-0074d replaced that lane with the FIFO Critical gate
+        // (one-at-a-time serialization enforced at engage time, bounded by
+        // OUTBOUND_CRITICAL_QUEUE_PER_PEER). At the budget layer this means:
+        // (1) the Normal/Bulk best-effort lane is still a single permit and is
+        // unaffected by Critical, and (2) Critical reservations no longer occupy
+        // a budget lane, so several can be reserved at once — the real
+        // serialization is the gate's job (see
+        // `test_x0x_0074d_critical_gate_serializes_per_peer`).
         let budgets = Arc::new(PeerOutboundBudgets::default());
         let peer = test_peer_id(2);
         let now = Instant::now();
@@ -6845,9 +7132,11 @@ mod tests {
             .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Bulk, now)
             .expect("Bulk should claim the best-effort data lane");
 
+        // A Critical reservation succeeds alongside in-flight Bulk and does not
+        // consume the best-effort lane.
         let crit_permit = budgets
             .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Critical, now)
-            .expect("Critical should claim its dedicated data lane while Bulk is in flight");
+            .expect("Critical reserves the gate while Bulk is in flight");
 
         assert!(
             budgets
@@ -6861,23 +7150,17 @@ mod tests {
             budgets
                 .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Bulk, now)
                 .is_some(),
-            "dropping Bulk releases only the best-effort lane"
+            "dropping Bulk releases only the best-effort lane (Critical is gate-managed)"
         );
 
-        assert!(
-            budgets
-                .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Critical, now)
-                .is_none(),
-            "Critical lane remains held by the first Critical send"
-        );
+        // Critical is no longer a single budget lane: a second Critical
+        // reservation is also admitted (the gate queues them; it does not drop).
+        let crit_permit2 = budgets
+            .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Critical, now)
+            .expect("a second Critical reservation is admitted (gate queues, not drops)");
 
         drop(crit_permit);
-        assert!(
-            budgets
-                .try_acquire(peer, OutboundSendClass::Data, TopicPriority::Critical, now)
-                .is_some(),
-            "dropping Critical releases the Critical lane"
-        );
+        drop(crit_permit2);
     }
 
     #[tokio::test]
@@ -11300,5 +11583,167 @@ mod tests {
             .expect("suspect peer keeps cooling state");
         assert_eq!(cooling.timeout_count, PEER_TIMEOUT_THRESHOLD - 1);
         assert!(cooling.suppressed_until.is_none());
+    }
+
+    // ---- X0X-0074d: per-peer Critical send serialization gate ----
+
+    #[test]
+    fn test_x0x_0074d_critical_gate_bounds_queue_depth() {
+        // The gate must accept up to OUTBOUND_CRITICAL_QUEUE_PER_PEER concurrent
+        // reservations for one peer and reject (overflow) beyond that, so
+        // genuine overload still surfaces as a hard error rather than queuing
+        // unboundedly (and spawning unbounded tasks).
+        let gate = CriticalSendGate::default();
+        let peer = test_peer_id(7);
+
+        let mut held = Vec::new();
+        for _ in 0..OUTBOUND_CRITICAL_QUEUE_PER_PEER {
+            held.push(
+                gate.try_reserve(peer)
+                    .expect("reservations within the bound succeed"),
+            );
+        }
+        assert!(
+            gate.try_reserve(peer).is_none(),
+            "reservation past the per-peer bound must overflow (caller records a hard error)"
+        );
+
+        // Freeing one reservation reopens exactly one slot.
+        held.pop();
+        assert!(
+            gate.try_reserve(peer).is_some(),
+            "a freed reservation must reopen a queue slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_x0x_0074d_critical_gate_serializes_per_peer() {
+        // Two reservations for the same peer: the first engages immediately, the
+        // second must WAIT (FIFO) until the first's in-flight permit is released
+        // — proving serialization rather than a second hard-drop.
+        let gate = CriticalSendGate::default();
+        let peer = test_peer_id(7);
+
+        let r1 = gate.try_reserve(peer).expect("first reserve");
+        let hold1 = r1.engage().await.expect("first engages immediately");
+
+        let r2 = gate
+            .try_reserve(peer)
+            .expect("second reserve (within bound)");
+        let waiter = tokio::spawn(async move { r2.engage().await });
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !waiter.is_finished(),
+            "second Critical send must wait for the in-flight one, not proceed concurrently"
+        );
+
+        drop(hold1);
+        let hold2 = waiter
+            .await
+            .expect("waiter task joins")
+            .expect("second engages once the first releases");
+        drop(hold2);
+    }
+
+    #[tokio::test]
+    async fn test_x0x_0074d_concurrent_critical_sends_serialized_not_dropped() {
+        // End-to-end through send_to_peer_bounded: two concurrent Critical
+        // (EAGER) sends to the SAME peer must both be delivered, serialized one
+        // at a time, with zero hard errors and zero cooling skips.
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([42u8; 32]);
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        {
+            let mut topics = pubsub.topics.write().await;
+            topics.insert(topic, TopicState::new());
+        }
+
+        let p1 = Arc::clone(&pubsub);
+        let send1 = tokio::spawn(async move {
+            p1.send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"critical-1"),
+                "EAGER",
+            )
+            .await
+        });
+        let p2 = Arc::clone(&pubsub);
+        let send2 = tokio::spawn(async move {
+            p2.send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"critical-2"),
+                "EAGER",
+            )
+            .await
+        });
+
+        // First send reaches the transport; the second must be parked at the
+        // gate (not in the transport, not dropped).
+        let _first = started_rx.recv().await.expect("first Critical send starts");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            transport.max_in_flight(),
+            1,
+            "only one Critical send to a peer may be in flight at a time"
+        );
+        assert_eq!(
+            transport.send_count(),
+            1,
+            "the second Critical send must be queued at the gate, not dropped"
+        );
+
+        // Release the first; the second then proceeds.
+        transport.release_sends(1);
+        let _second = started_rx
+            .recv()
+            .await
+            .expect("second Critical send starts after the first releases");
+        transport.release_sends(1);
+
+        send1
+            .await
+            .expect("send1 task joins")
+            .expect("send1 succeeds");
+        send2
+            .await
+            .expect("send2 task joins")
+            .expect("send2 succeeds");
+
+        assert_eq!(
+            transport.send_count(),
+            2,
+            "both Critical sends must be delivered"
+        );
+        assert_eq!(
+            transport.max_in_flight(),
+            1,
+            "serialization holds for the whole exchange"
+        );
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_critical_hard_error, 0,
+            "queuing the second send must NOT record a hard error"
+        );
+        assert_eq!(
+            stats.dropped_critical_cooling, 0,
+            "no peer was cooling in this scenario"
+        );
+        assert_eq!(stats.admitted_critical, 2, "both sends were admitted");
     }
 }

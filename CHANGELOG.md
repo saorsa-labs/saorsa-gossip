@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.58] - 2026-05-29
+
+### Changed
+
+- Re-pin `ant-quic` 0.27.24 → 0.27.25 across the workspace. ant-quic 0.27.25
+  adds the ACK-v2 empty-response duplicate-safe retry (an intermittent
+  `invalid ACK-v2 response envelope: len=0` mid-exchange drop is now retried
+  with the same request id instead of surfacing a hard `Connection` error).
+  No saorsa-gossip code changes; this release re-pins and re-publishes the
+  workspace against the fixed transport.
+
 ## [0.5.57] - 2026-05-29
 
 ### Changed

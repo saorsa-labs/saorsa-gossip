@@ -1034,6 +1034,14 @@ impl GossipTransport for UdpTransportAdapter {
             .ok_or_else(|| anyhow!("Receive channel closed"))
     }
 
+    async fn connected_peer_ids(&self) -> Vec<GossipPeerId> {
+        self.connected_peers()
+            .await
+            .into_iter()
+            .map(|(peer, _addr)| peer)
+            .collect()
+    }
+
     fn local_peer_id(&self) -> GossipPeerId {
         self.gossip_peer_id
     }

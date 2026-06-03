@@ -306,6 +306,14 @@ pub trait GossipTransport: Send + Sync {
     /// Receive a message from any peer on any stream
     async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)>;
 
+    /// Return peers with a currently live transport connection.
+    ///
+    /// The default is empty so transports that cannot report live
+    /// connectivity keep existing fail-open pubsub behaviour.
+    async fn connected_peer_ids(&self) -> Vec<PeerId> {
+        Vec::new()
+    }
+
     /// Returns the local peer ID for this transport.
     fn local_peer_id(&self) -> PeerId;
 }
@@ -340,6 +348,10 @@ impl<T: GossipTransport + ?Sized> GossipTransport for std::sync::Arc<T> {
 
     async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)> {
         (**self).receive_message().await
+    }
+
+    async fn connected_peer_ids(&self) -> Vec<PeerId> {
+        (**self).connected_peer_ids().await
     }
 
     fn local_peer_id(&self) -> PeerId {

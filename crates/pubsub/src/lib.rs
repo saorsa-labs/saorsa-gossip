@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Maximum message cache size per topic.
 ///
@@ -158,6 +158,10 @@ const PEER_SUPPRESSION_BACKOFF_MAX: Duration = Duration::from_secs(1_800);
 /// Refresh cadence for the SWIM peer-health snapshot consumed by the
 /// pub-sub cooling hot path.
 const PEER_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Refresh cadence for the transport-connected peer snapshot consumed by
+/// the pub-sub send-admission hot path.
+const CONNECTED_PEERS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Half-life for decayed peer-score send-health evidence.
 const PEER_SCORE_DECAY_HALF_LIFE: Duration = Duration::from_secs(300);
@@ -1078,6 +1082,7 @@ struct SendPathContext {
     rtt_tracker: Arc<PerPeerRttTracker>,
     cooling_config: AdaptiveCoolingConfig,
     peer_health_snapshot: Arc<StdRwLock<HashMap<PeerId, PeerHealth>>>,
+    connected_peers_snapshot: Arc<StdRwLock<Option<HashSet<PeerId>>>>,
     peer_health_oracle: Arc<StdRwLock<Option<Arc<dyn PeerHealthOracle>>>>,
     /// X0X-0074 admission control engine — shared with the foreground
     /// publish path so background IHAVE flush + anti-entropy operations
@@ -1261,8 +1266,7 @@ impl SendTaskSet {
                 Ok(Ok(PeerSendOutcome::Sent { observed })) => {
                     sent.push(PeerSendCompletion { attempt, observed });
                 }
-                Ok(Ok(PeerSendOutcome::TimedOut)) => timed_out.push(attempt),
-                Ok(Err(_)) => timed_out.extend(recovery_probe_timeout(attempt)),
+                Ok(Ok(PeerSendOutcome::TimedOut) | Err(_)) => timed_out.push(attempt),
                 Err(e) => {
                     timed_out.extend(recovery_probe_timeout(attempt));
                     warn!(
@@ -1328,6 +1332,33 @@ fn store_peer_health_snapshot(
     }
 }
 
+fn connected_peers_from_snapshot(
+    snapshot: &StdRwLock<Option<HashSet<PeerId>>>,
+) -> Option<HashSet<PeerId>> {
+    match snapshot.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            warn!("PubSub connected-peers snapshot lock was poisoned; recovering");
+            poisoned.into_inner().clone()
+        }
+    }
+}
+
+fn store_connected_peers_snapshot(
+    snapshot: &StdRwLock<Option<HashSet<PeerId>>>,
+    refreshed: Option<HashSet<PeerId>>,
+) {
+    match snapshot.write() {
+        Ok(mut guard) => {
+            *guard = refreshed;
+        }
+        Err(poisoned) => {
+            warn!("PubSub connected-peers snapshot lock was poisoned; recovering");
+            *poisoned.into_inner() = refreshed;
+        }
+    }
+}
+
 async fn known_pubsub_peers(topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>) -> HashSet<PeerId> {
     let topics_guard = topics.read().await;
     let mut peers = HashSet::new();
@@ -1353,6 +1384,67 @@ async fn refresh_peer_health_snapshot_once(
         }
     }
     store_peer_health_snapshot(snapshot.as_ref(), refreshed);
+}
+
+async fn refresh_connected_peers_snapshot_once<T: GossipTransport + 'static>(
+    topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
+    snapshot: &Arc<StdRwLock<Option<HashSet<PeerId>>>>,
+    transport: &Arc<T>,
+    stage_stats: &Arc<PubSubStageStats>,
+) {
+    let connected: HashSet<PeerId> = transport.connected_peer_ids().await.into_iter().collect();
+    if connected.is_empty() {
+        store_connected_peers_snapshot(snapshot.as_ref(), None);
+        debug!("PubSub transport connectivity snapshot unavailable; failing open");
+        return;
+    }
+
+    store_connected_peers_snapshot(snapshot.as_ref(), Some(connected.clone()));
+
+    let mut total_eager_pruned = 0usize;
+    let mut total_lazy_pruned = 0usize;
+    let mut total_cooling_removed = 0usize;
+    let mut topics_guard = topics.write().await;
+    for (topic, state) in topics_guard.iter_mut() {
+        let eager_before = state.eager_peers.len();
+        let lazy_before = state.lazy_peers.len();
+
+        state.eager_peers.retain(|peer| connected.contains(peer));
+        state.lazy_peers.retain(|peer| connected.contains(peer));
+
+        let eager_pruned = eager_before.saturating_sub(state.eager_peers.len());
+        let lazy_pruned = lazy_before.saturating_sub(state.lazy_peers.len());
+        let removed_cooling = state.clear_disconnected_peer_cooling(&connected);
+        for peer in &removed_cooling {
+            stage_stats.clear_peer_suppression(*topic, *peer);
+        }
+
+        if eager_pruned > 0 || lazy_pruned > 0 || !removed_cooling.is_empty() {
+            debug!(
+                topic = %LogTopicId::from(*topic),
+                eager_pruned,
+                lazy_pruned,
+                cooling_removed = removed_cooling.len(),
+                connected = connected.len(),
+                "PubSub pruned transport-disconnected topic peers"
+            );
+        }
+
+        total_eager_pruned += eager_pruned;
+        total_lazy_pruned += lazy_pruned;
+        total_cooling_removed += removed_cooling.len();
+    }
+
+    if total_eager_pruned > 0 || total_lazy_pruned > 0 || total_cooling_removed > 0 {
+        stage_stats.record_prunes(total_eager_pruned + total_lazy_pruned);
+        info!(
+            eager_pruned = total_eager_pruned,
+            lazy_pruned = total_lazy_pruned,
+            cooling_removed = total_cooling_removed,
+            connected = connected.len(),
+            "PubSub pruned transport-disconnected peers from topic meshes"
+        );
+    }
 }
 
 fn peer_health_oracle_from_slot(
@@ -1394,21 +1486,38 @@ fn store_peer_health_oracle(
 ///   `release_bulk_admissions_free(&admission, &bulk_admitted)` once the
 ///   spawned send tasks complete (including on early-return paths).
 fn filter_peers_through_admission_in_state(
-    admission: &Arc<admission::AdmissionControl>,
-    peer_health_snapshot: &Arc<StdRwLock<HashMap<PeerId, PeerHealth>>>,
+    send_path: &SendPathContext,
     state: &TopicState,
     topic: &TopicId,
     peers: Vec<PeerId>,
     op: &'static str,
     now: Instant,
 ) -> (Vec<PeerId>, Vec<PeerId>) {
-    let priority = admission.registry().priority_for(topic);
+    let priority = send_path.admission.registry().priority_for(topic);
+    let connected_snapshot =
+        connected_peers_from_snapshot(send_path.connected_peers_snapshot.as_ref());
     let mut admitted = Vec::with_capacity(peers.len());
     let mut bulk_admitted = Vec::new();
     for peer in peers {
-        let health = peer_health_from_snapshot(peer_health_snapshot.as_ref(), &peer);
+        if let Some(connected) = connected_snapshot.as_ref() {
+            if !connected.contains(&peer) {
+                debug!(
+                    peer_id = %peer,
+                    topic = %topic,
+                    op,
+                    priority = %priority,
+                    "PubSub admission skipped transport-disconnected peer send (background)"
+                );
+                continue;
+            }
+        }
+
+        let health = peer_health_from_snapshot(send_path.peer_health_snapshot.as_ref(), &peer);
         let is_peer_cooled = state.is_peer_suppressed_at(peer, now);
-        match admission.admit(topic, &peer, health, is_peer_cooled) {
+        match send_path
+            .admission
+            .admit(topic, &peer, health, is_peer_cooled)
+        {
             AdmissionDecision::Admit => {
                 if priority == TopicPriority::Bulk {
                     bulk_admitted.push(peer);
@@ -3205,6 +3314,11 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     cache_config: PubSubCacheConfig,
     /// Hot-path SWIM health cache refreshed outside the topic lock.
     peer_health_snapshot: Arc<StdRwLock<HashMap<PeerId, PeerHealth>>>,
+    /// Hot-path transport connectivity cache refreshed outside the send path.
+    ///
+    /// `None` means the transport cannot currently provide authoritative
+    /// connectivity, so pubsub must fail open and preserve existing behaviour.
+    connected_peers_snapshot: Arc<StdRwLock<Option<HashSet<PeerId>>>>,
     /// X0X-0069: optional SWIM-derived peer-health oracle slot.
     ///
     /// Stored behind a shared lock so background PubSub tasks spawned during
@@ -3293,6 +3407,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             cooling_config: AdaptiveCoolingConfig::default(),
             cache_config,
             peer_health_snapshot: Arc::new(StdRwLock::new(HashMap::new())),
+            connected_peers_snapshot: Arc::new(StdRwLock::new(None)),
             peer_health_oracle: Arc::new(StdRwLock::new(None)),
             admission: Arc::new(admission::AdmissionControl::new()),
             peer_scoring: Arc::new(peer_scoring::PeerScoring::new()),
@@ -3303,6 +3418,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             pubsub.spawn_cache_cleaner();
             pubsub.spawn_degree_maintainer();
             pubsub.spawn_anti_entropy_task();
+            pubsub.spawn_connected_peers_snapshot_refresher();
         }
 
         pubsub
@@ -3313,6 +3429,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             rtt_tracker: Arc::clone(&self.peer_rtt_tracker),
             cooling_config: self.cooling_config,
             peer_health_snapshot: Arc::clone(&self.peer_health_snapshot),
+            connected_peers_snapshot: Arc::clone(&self.connected_peers_snapshot),
             peer_health_oracle: Arc::clone(&self.peer_health_oracle),
             admission: Arc::clone(&self.admission),
         }
@@ -3382,12 +3499,49 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
     }
 
+    fn spawn_connected_peers_snapshot_refresher(&self) {
+        let topics = Arc::clone(&self.topics);
+        let snapshot = Arc::clone(&self.connected_peers_snapshot);
+        let transport = Arc::clone(&self.transport);
+        let stage_stats = Arc::clone(&self.stage_stats);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    loop {
+                        refresh_connected_peers_snapshot_once(
+                            &topics,
+                            &snapshot,
+                            &transport,
+                            &stage_stats,
+                        )
+                        .await;
+                        time::sleep(CONNECTED_PEERS_REFRESH_INTERVAL).await;
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("Unable to spawn PubSub connected-peers snapshot refresher: {e}");
+            }
+        }
+    }
+
     #[cfg(test)]
     async fn refresh_peer_health_snapshot_for_test(&self) {
         if let Some(oracle) = peer_health_oracle_from_slot(self.peer_health_oracle.as_ref()) {
             refresh_peer_health_snapshot_once(&self.topics, &self.peer_health_snapshot, &oracle)
                 .await;
         }
+    }
+
+    #[cfg(test)]
+    async fn refresh_connected_peers_snapshot_for_test(&self) {
+        refresh_connected_peers_snapshot_once(
+            &self.topics,
+            &self.connected_peers_snapshot,
+            &self.transport,
+            &self.stage_stats,
+        )
+        .await;
     }
 
     fn new_topic_state(&self) -> TopicState {
@@ -4221,11 +4375,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ) {
         let rtt_tracker = Arc::new(PerPeerRttTracker::new());
         let peer_health_snapshot = Arc::new(StdRwLock::new(HashMap::new()));
+        let connected_peers_snapshot = Arc::new(StdRwLock::new(None));
         let peer_health_oracle = Arc::new(StdRwLock::new(None));
         let send_path = SendPathContext {
             rtt_tracker,
             cooling_config: AdaptiveCoolingConfig::default(),
             peer_health_snapshot,
+            connected_peers_snapshot,
             peer_health_oracle,
             admission: Arc::new(admission::AdmissionControl::new()),
         };
@@ -4448,8 +4604,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         };
 
+        let connected_snapshot =
+            connected_peers_from_snapshot(self.connected_peers_snapshot.as_ref());
         let mut admitted = Vec::with_capacity(peers.len());
         for peer in peers {
+            if let Some(connected) = connected_snapshot.as_ref() {
+                if !connected.contains(&peer) {
+                    debug!(
+                        peer_id = %peer,
+                        topic = %topic,
+                        op,
+                        priority = %priority,
+                        "PubSub admission skipped transport-disconnected peer send"
+                    );
+                    continue;
+                }
+            }
+
             let health = peer_health_from_snapshot(self.peer_health_snapshot.as_ref(), &peer);
             let is_peer_cooled = cooled_set.contains(&peer);
             match self.admission.admit(topic, &peer, health, is_peer_cooled) {
@@ -5357,13 +5528,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     continue;
                 };
                 let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
-                    &send_path.admission,
-                    &send_path.peer_health_snapshot,
-                    state,
-                    &topic_id,
-                    lazy_peers,
-                    "IHAVE",
-                    now,
+                    send_path, state, &topic_id, lazy_peers, "IHAVE", now,
                 );
                 if admitted.is_empty() {
                     release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
@@ -5655,8 +5820,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 continue;
                             };
                             let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
-                                &send_path.admission,
-                                &send_path.peer_health_snapshot,
+                                &send_path,
                                 state,
                                 &topic_id,
                                 vec![peer],
@@ -6270,6 +6434,7 @@ mod tests {
     struct RecordingTransport {
         local_peer: PeerId,
         send_counts: Mutex<HashMap<PeerId, usize>>,
+        connected_peer_ids: Mutex<Vec<PeerId>>,
     }
 
     struct PanicTransport {
@@ -6281,7 +6446,15 @@ mod tests {
             Arc::new(Self {
                 local_peer,
                 send_counts: Mutex::new(HashMap::new()),
+                connected_peer_ids: Mutex::new(Vec::new()),
             })
+        }
+
+        fn set_connected_peer_ids(&self, peers: Vec<PeerId>) {
+            *self
+                .connected_peer_ids
+                .lock()
+                .expect("connected peers lock") = peers;
         }
 
         fn send_count_to(&self, peer: PeerId) -> usize {
@@ -6331,6 +6504,13 @@ mod tests {
 
         async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
             Err(anyhow!("recording test transport does not receive"))
+        }
+
+        async fn connected_peer_ids(&self) -> Vec<PeerId> {
+            self.connected_peer_ids
+                .lock()
+                .expect("connected peers lock")
+                .clone()
         }
 
         fn local_peer_id(&self) -> PeerId {
@@ -7649,11 +7829,13 @@ mod tests {
         let outbound_budgets = Arc::new(PeerOutboundBudgets::default());
         let rtt_tracker = Arc::new(PerPeerRttTracker::new());
         let peer_health_snapshot = Arc::new(StdRwLock::new(HashMap::new()));
+        let connected_peers_snapshot = Arc::new(StdRwLock::new(None));
         let peer_health_oracle = Arc::new(StdRwLock::new(None));
         let send_path = SendPathContext {
             rtt_tracker,
             cooling_config: AdaptiveCoolingConfig::default(),
             peer_health_snapshot,
+            connected_peers_snapshot,
             peer_health_oracle,
             admission: Arc::new(admission::AdmissionControl::new()),
         };
@@ -8916,11 +9098,13 @@ mod tests {
         let flush_outbound_budgets = Arc::new(PeerOutboundBudgets::default());
         let flush_rtt_tracker = Arc::new(PerPeerRttTracker::new());
         let flush_peer_health_snapshot = Arc::new(StdRwLock::new(HashMap::new()));
+        let flush_connected_peers_snapshot = Arc::new(StdRwLock::new(None));
         let flush_peer_health_oracle = Arc::new(StdRwLock::new(None));
         let flush_send_path = SendPathContext {
             rtt_tracker: flush_rtt_tracker,
             cooling_config: AdaptiveCoolingConfig::default(),
             peer_health_snapshot: flush_peer_health_snapshot,
+            connected_peers_snapshot: flush_connected_peers_snapshot,
             peer_health_oracle: flush_peer_health_oracle,
             admission: Arc::new(admission::AdmissionControl::new()),
         };
@@ -8989,11 +9173,13 @@ mod tests {
         let flush_outbound_budgets = Arc::new(PeerOutboundBudgets::default());
         let flush_rtt_tracker = Arc::new(PerPeerRttTracker::new());
         let flush_peer_health_snapshot = Arc::new(StdRwLock::new(HashMap::new()));
+        let flush_connected_peers_snapshot = Arc::new(StdRwLock::new(None));
         let flush_peer_health_oracle = Arc::new(StdRwLock::new(None));
         let flush_send_path = SendPathContext {
             rtt_tracker: flush_rtt_tracker,
             cooling_config: AdaptiveCoolingConfig::default(),
             peer_health_snapshot: flush_peer_health_snapshot,
+            connected_peers_snapshot: flush_connected_peers_snapshot,
             peer_health_oracle: flush_peer_health_oracle,
             admission: Arc::new(admission::AdmissionControl::new()),
         };
@@ -10782,6 +10968,103 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(count_peer_cooling_entries(&topics), 0);
         assert!(stats.suppressed_peer_snapshots().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transport_disconnected_peer_is_skipped_before_send_attempt() {
+        let peer_id = test_peer_id(1);
+        let connected_peer = test_peer_id(2);
+        let ghost_peer = test_peer_id(3);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([90u8; 32]);
+
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(connected_peer);
+            state.eager_peers.insert(ghost_peer);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([connected_peer])),
+        );
+
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        assert_eq!(transport.send_count_to(connected_peer), 1);
+        assert_eq!(transport.send_count_to(ghost_peer), 0);
+    }
+
+    #[tokio::test]
+    async fn transport_connectivity_refresher_prunes_disconnected_mesh_peers() {
+        let peer_id = test_peer_id(1);
+        let connected_peer = test_peer_id(2);
+        let ghost_peer = test_peer_id(3);
+        let transport = RecordingTransport::new(peer_id);
+        transport.set_connected_peer_ids(vec![connected_peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([91u8; 32]);
+
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(connected_peer);
+            state.eager_peers.insert(ghost_peer);
+            state.lazy_peers.insert(ghost_peer);
+        }
+
+        pubsub.refresh_connected_peers_snapshot_for_test().await;
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert!(state.eager_peers.contains(&connected_peer));
+        assert!(!state.eager_peers.contains(&ghost_peer));
+        assert!(!state.lazy_peers.contains(&ghost_peer));
+    }
+
+    #[tokio::test]
+    async fn empty_transport_connectivity_snapshot_fails_open() {
+        let peer_id = test_peer_id(1);
+        let ghost_peer = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([92u8; 32]);
+
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(ghost_peer);
+        }
+
+        pubsub.refresh_connected_peers_snapshot_for_test().await;
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let topics = pubsub.topics.read().await;
+        let state = topics.get(&topic).unwrap();
+        assert!(state.eager_peers.contains(&ghost_peer));
+        assert_eq!(transport.send_count_to(ghost_peer), 1);
     }
 
     #[tokio::test]

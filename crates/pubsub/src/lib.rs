@@ -2755,6 +2755,59 @@ impl TopicState {
         self.record_send_timeout_inner_at(attempt, now, Some(cooling_config), health)
     }
 
+    fn record_critical_gate_overflow_with_context_at(
+        &mut self,
+        attempt: PeerSendAttempt,
+        now: Instant,
+        health: Option<PeerHealth>,
+        cooling_config: AdaptiveCoolingConfig,
+    ) -> PeerTimeoutOutcome {
+        if attempt.kind == SendAttemptKind::Normal {
+            self.peer_scores
+                .entry(attempt.peer)
+                .or_insert_with(|| PeerScore::new_at(now))
+                .record_outbound_send_timeout_at(now);
+        }
+
+        let cooling = self
+            .peer_cooling
+            .entry(attempt.peer)
+            .or_insert_with(|| PeerCoolingState::new(now));
+        if cooling.is_suppressed_at(now) {
+            return PeerTimeoutOutcome::default();
+        }
+
+        let cooldown = if matches!(health, Some(PeerHealth::Dead)) {
+            cooling.dead_cooldown(cooling_config)
+        } else {
+            cooling.next_adaptive_cooldown(cooling_config)
+        };
+        let suppressed_until = now + cooldown;
+        cooling.cooldown = cooldown;
+        cooling.suppressed_until = Some(suppressed_until);
+        cooling.last_suppressed_at = Some(now);
+        cooling.last_suppression_timeout_count = OUTBOUND_CRITICAL_QUEUE_PER_PEER;
+        cooling.recovery_probe_in_flight = false;
+        cooling.recovery_probe_id = None;
+        cooling.timeout_window_started = now;
+        cooling.timeout_count = 0;
+
+        self.peer_scores
+            .entry(attempt.peer)
+            .or_insert_with(|| PeerScore::new_at(now))
+            .record_cooling_event_at(now);
+        let demoted = self.prune_peer(attempt.peer);
+        PeerTimeoutOutcome {
+            suppression: Some(PeerSuppressionEvent {
+                suppressed_until,
+                recent_timeout_count: OUTBOUND_CRITICAL_QUEUE_PER_PEER,
+                cooldown,
+                demoted,
+            }),
+            request_indirect_probe: false,
+        }
+    }
+
     fn record_send_timeout_inner_at(
         &mut self,
         attempt: PeerSendAttempt,
@@ -4232,23 +4285,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             // X0X-0074d: Critical no longer fails on a budget
                             // lane — a None here means the per-peer Critical
                             // FIFO gate is full (genuine overload). Record the
-                            // hard error and feed the same timeout/cooling path
-                            // used by best-effort budget pressure. A full Critical
-                            // FIFO means this peer/path is not draining fast enough;
-                            // leaving it uncooled turns one slow peer into WARN spam
-                            // and keeps retrying into an already-full queue.
+                            // hard error and immediately cool the peer/topic. A
+                            // full 64-deep Critical FIFO is threshold-equivalent
+                            // pressure: this peer/path is not draining fast enough,
+                            // and feeding it through five more WARNing attempts
+                            // turns controlled backpressure into log spam.
                             claim_context
                                 .send_path
                                 .admission
                                 .stats()
                                 .record_critical_hard_error();
-                            warn!(
-                                peer_id = %LogPeerId::from(peer),
-                                topic = %LogTopicId::from(claim_context.topic),
-                                op = claim_context.op,
-                                "X0X-0074d Critical gate overflow: per-peer Critical send queue full"
-                            );
-                            Self::record_outbound_budget_pressure_for_state(
+                            Self::record_critical_gate_overflow_for_state(
                                 claim_context,
                                 state,
                                 attempt,
@@ -4292,6 +4339,44 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         }
         (attempts, permits)
+    }
+
+    fn record_critical_gate_overflow_for_state(
+        claim_context: &SendClaimContext<'_>,
+        state: &mut TopicState,
+        attempt: PeerSendAttempt,
+        now: Instant,
+    ) {
+        claim_context.stage_stats.record_outbound_budget_exhausted();
+        let health = peer_health_from_snapshot(
+            claim_context.send_path.peer_health_snapshot.as_ref(),
+            &attempt.peer,
+        );
+        let event = state.record_critical_gate_overflow_with_context_at(
+            attempt,
+            now,
+            health,
+            claim_context.send_path.cooling_config,
+        );
+        if let Some(event) = event.suppression {
+            claim_context.stage_stats.record_peer_suppressed(
+                claim_context.topic,
+                attempt.peer,
+                event.suppressed_until,
+                event.recent_timeout_count,
+                event.cooldown,
+            );
+            warn!(
+                peer_id = %LogPeerId::from(attempt.peer),
+                topic = %LogTopicId::from(claim_context.topic),
+                op = claim_context.op,
+                class = claim_context.send_class.label(),
+                cooldown_ms = duration_millis_u64(event.cooldown),
+                recent_timeout_count = event.recent_timeout_count,
+                demoted = event.demoted,
+                "Peer cooled after Critical gate saturation"
+            );
+        }
     }
 
     fn record_outbound_budget_pressure_for_state(
@@ -12028,6 +12113,58 @@ mod tests {
         );
         drop(held);
         drop(hold1);
+    }
+
+    #[tokio::test]
+    async fn test_x0x_0074d_gate_overflow_immediately_cools_peer() {
+        // A full Critical FIFO is already threshold-equivalent pressure. The
+        // first claim past the bound should cool the peer/topic immediately so
+        // follow-up Critical claims are skipped by cooling instead of emitting
+        // repeated X0X-0074d overflow WARNs.
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([44u8; 32]);
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        {
+            let mut topics = pubsub.topics.write().await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(target);
+        }
+
+        let held = pubsub
+            .claim_topic_send_attempts(
+                topic,
+                vec![target; OUTBOUND_CRITICAL_QUEUE_PER_PEER],
+                "EAGER",
+            )
+            .await;
+        assert_eq!(held.attempts().len(), OUTBOUND_CRITICAL_QUEUE_PER_PEER);
+
+        let overflow = pubsub
+            .claim_topic_send_attempts(topic, vec![target], "EAGER")
+            .await;
+        assert!(overflow.is_empty());
+        {
+            let topics = pubsub.topics.read().await;
+            let state = topics.get(&topic).expect("topic exists");
+            assert!(state.is_peer_suppressed_at(target, Instant::now()));
+        }
+
+        let cooled = pubsub
+            .claim_topic_send_attempts(topic, vec![target], "EAGER")
+            .await;
+        assert!(cooled.is_empty());
+        drop(held);
     }
 
     #[tokio::test]

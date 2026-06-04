@@ -823,20 +823,21 @@ impl CriticalReservation {
     /// duration of the send via the returned [`CriticalGateHold`]. Runs inside
     /// the detached send task, so waiting never pins the dispatcher.
     async fn engage(mut self) -> Option<CriticalGateHold> {
-        self.consumed = true;
         let slot = Arc::clone(&self.slot);
         // tokio's Semaphore hands out permits in FIFO order, giving the queue
         // its serialization. `acquire_owned` only errors if the semaphore is
-        // closed, which never happens here.
+        // closed, which never happens here. Keep `consumed = false` while
+        // awaiting so cancellation/timeouts drop the reservation and release the
+        // queued slot; mark consumed only after the in-flight hold takes over.
         match Arc::clone(&slot.sem).acquire_owned().await {
-            Ok(permit) => Some(CriticalGateHold {
-                permit: Some(permit),
-                slot,
-            }),
-            Err(_) => {
-                slot.queued.fetch_sub(1, Ordering::AcqRel);
-                None
+            Ok(permit) => {
+                self.consumed = true;
+                Some(CriticalGateHold {
+                    permit: Some(permit),
+                    slot,
+                })
             }
+            Err(_) => None,
         }
     }
 }
@@ -1044,17 +1045,22 @@ impl OutboundSendPermit {
     /// Control, or an already-engaged permit. Must be called inside the
     /// (already-detached) send task so waiting never pins the dispatcher.
     ///
-    /// Returns `false` only if the gate could not be engaged (semaphore
-    /// closed — never in practice); callers then skip the send.
-    async fn engage_critical_gate(&mut self) -> bool {
+    /// Returns `false` if the gate could not be engaged before `wait_timeout`
+    /// (or if the semaphore closed — never in practice); callers then record
+    /// the send as timed out and skip it. The timeout bounds queue residency so
+    /// a slow peer cannot hold 64 queued Critical sends for 64× the send
+    /// timeout before cooling catches up.
+    async fn engage_critical_gate(&mut self, wait_timeout: Duration) -> bool {
         match std::mem::replace(&mut self.critical, CriticalPermitState::None) {
-            CriticalPermitState::Reserved(reservation) => match reservation.engage().await {
-                Some(hold) => {
-                    self.critical = CriticalPermitState::Engaged(hold);
-                    true
+            CriticalPermitState::Reserved(reservation) => {
+                match time::timeout(wait_timeout, reservation.engage()).await {
+                    Ok(Some(hold)) => {
+                        self.critical = CriticalPermitState::Engaged(hold);
+                        true
+                    }
+                    Ok(None) | Err(_) => false,
                 }
-                None => false,
-            },
+            }
             other => {
                 self.critical = other;
                 true
@@ -4015,7 +4021,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let mut permit = permit;
             // X0X-0074d: for Critical, wait FIFO for the peer's in-flight slot
             // (no-op otherwise). Held until the send completes.
-            if !permit.engage_critical_gate().await {
+            let gate_wait_timeout =
+                rtt_tracker.adaptive_timeout(&attempt.peer, PER_PEER_REPUBLISH_TIMEOUT);
+            if !permit.engage_critical_gate(gate_wait_timeout).await {
+                stage_stats.record_per_peer_timeout();
                 return Ok(PeerSendOutcome::TimedOut);
             }
             Self::send_to_peer_with_timeout(
@@ -4223,9 +4232,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             // X0X-0074d: Critical no longer fails on a budget
                             // lane — a None here means the per-peer Critical
                             // FIFO gate is full (genuine overload). Record the
-                            // hard error, but do NOT cool the peer: the queue
-                            // saturation is our side, not peer slowness.
-                            claim_context.stage_stats.record_outbound_budget_exhausted();
+                            // hard error and feed the same timeout/cooling path
+                            // used by best-effort budget pressure. A full Critical
+                            // FIFO means this peer/path is not draining fast enough;
+                            // leaving it uncooled turns one slow peer into WARN spam
+                            // and keeps retrying into an already-full queue.
                             claim_context
                                 .send_path
                                 .admission
@@ -4237,20 +4248,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 op = claim_context.op,
                                 "X0X-0074d Critical gate overflow: per-peer Critical send queue full"
                             );
-                            // `claim_send_attempt_at` may have just claimed a
-                            // recovery probe (setting recovery_probe_in_flight).
-                            // The normal budget-pressure path below would clear
-                            // it; since we skip that for Critical, un-claim it
-                            // here or the peer is permanently blocked (every
-                            // future claim short-circuits on the in-flight
-                            // probe). Overflow is our-side saturation, so do not
-                            // escalate cooling — only release the probe.
-                            if attempt.kind == SendAttemptKind::RecoveryProbe {
-                                if let Some(cooling) = state.peer_cooling.get_mut(&peer) {
-                                    cooling.recovery_probe_in_flight = false;
-                                    cooling.recovery_probe_id = None;
-                                }
-                            }
+                            Self::record_outbound_budget_pressure_for_state(
+                                claim_context,
+                                state,
+                                attempt,
+                                now,
+                            );
                             continue;
                         }
                         Self::record_outbound_budget_pressure_for_state(
@@ -4517,7 +4520,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // X0X-0074d: Critical sends wait FIFO for the peer's single
                 // in-flight slot here, inside the detached task — no-op for
                 // Normal/Bulk. Keeps the dispatcher worker unpinned.
-                if !permit.engage_critical_gate().await {
+                let gate_wait_timeout =
+                    rtt_tracker.adaptive_timeout(&attempt.peer, PER_PEER_REPUBLISH_TIMEOUT);
+                if !permit.engage_critical_gate(gate_wait_timeout).await {
+                    stage_stats.record_per_peer_timeout();
                     return Ok(PeerSendOutcome::TimedOut);
                 }
                 Self::send_to_peer_with_timeout(
@@ -11992,6 +11998,36 @@ mod tests {
             .expect("waiter task joins")
             .expect("second engages once the first releases");
         drop(hold2);
+    }
+
+    #[tokio::test]
+    async fn test_x0x_0074d_critical_gate_wait_timeout_releases_queue_slot() {
+        // A queued Critical send that gives up waiting must release its reserved
+        // queue slot. Otherwise one slow in-flight send can pin 64 queued tasks
+        // for 64× the send timeout and produce prolonged X0X-0074d overflow.
+        let gate = CriticalSendGate::default();
+        let peer = test_peer_id(8);
+
+        let r1 = gate.try_reserve(peer).expect("first reserve");
+        let hold1 = r1.engage().await.expect("first engages immediately");
+
+        let r2 = gate.try_reserve(peer).expect("second reserve");
+        let waited = tokio::time::timeout(Duration::from_millis(20), r2.engage()).await;
+        assert!(waited.is_err(), "second reservation should still be queued");
+
+        let mut held = Vec::new();
+        for _ in 0..(OUTBOUND_CRITICAL_QUEUE_PER_PEER - 1) {
+            held.push(
+                gate.try_reserve(peer)
+                    .expect("timed-out reservation released its queue slot"),
+            );
+        }
+        assert!(
+            gate.try_reserve(peer).is_none(),
+            "only one in-flight plus 63 queued reservations should fit"
+        );
+        drop(held);
+        drop(hold1);
     }
 
     #[tokio::test]

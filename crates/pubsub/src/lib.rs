@@ -1344,6 +1344,15 @@ fn connected_peers_from_snapshot(
     }
 }
 
+fn peer_is_transport_disconnected(
+    snapshot: &StdRwLock<Option<HashSet<PeerId>>>,
+    peer: &PeerId,
+) -> bool {
+    connected_peers_from_snapshot(snapshot)
+        .as_ref()
+        .is_some_and(|connected| !connected.contains(peer))
+}
+
 fn store_connected_peers_snapshot(
     snapshot: &StdRwLock<Option<HashSet<PeerId>>>,
     refreshed: Option<HashSet<PeerId>>,
@@ -4101,6 +4110,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let mut attempts = Vec::with_capacity(peers.len());
             let mut permits = Vec::with_capacity(peers.len());
             for peer in peers {
+                if peer_is_transport_disconnected(
+                    send_path.connected_peers_snapshot.as_ref(),
+                    &peer,
+                ) {
+                    debug!(
+                        peer_id = %LogPeerId::from(peer),
+                        topic = %LogTopicId::from(topic),
+                        op,
+                        priority = %priority,
+                        "PubSub claim skipped transport-disconnected peer send"
+                    );
+                    continue;
+                }
                 if let Some(permit) = self
                     .outbound_budgets
                     .try_acquire(peer, send_class, priority, now)
@@ -4151,6 +4173,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let mut attempts = Vec::with_capacity(peers.len());
         let mut permits = Vec::with_capacity(peers.len());
         for peer in peers {
+            if peer_is_transport_disconnected(
+                claim_context.send_path.connected_peers_snapshot.as_ref(),
+                &peer,
+            ) {
+                debug!(
+                    peer_id = %LogPeerId::from(peer),
+                    topic = %LogTopicId::from(claim_context.topic),
+                    op = claim_context.op,
+                    priority = %claim_context.priority,
+                    "PubSub claim skipped transport-disconnected peer send"
+                );
+                continue;
+            }
             match state.claim_send_attempt_at(peer, now) {
                 Some((attempt, recovery_event)) => {
                     if attempt.kind == SendAttemptKind::RecoveryProbe {
@@ -11002,6 +11037,36 @@ mod tests {
 
         assert_eq!(transport.send_count_to(connected_peer), 1);
         assert_eq!(transport.send_count_to(ghost_peer), 0);
+    }
+
+    #[tokio::test]
+    async fn transport_disconnected_peer_is_skipped_at_claim_time() {
+        let peer_id = test_peer_id(1);
+        let connected_peer = test_peer_id(2);
+        let ghost_peer = test_peer_id(3);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([93u8; 32]);
+
+        {
+            let mut topics = pubsub.topics.write().await;
+            topics.entry(topic).or_insert_with(TopicState::new);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([connected_peer])),
+        );
+
+        let claims = pubsub
+            .claim_topic_send_attempts(topic, vec![ghost_peer], "EAGER")
+            .await;
+
+        assert!(claims.is_empty());
     }
 
     #[tokio::test]

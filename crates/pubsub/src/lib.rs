@@ -2220,6 +2220,18 @@ struct CachedMessage {
     header: MessageHeader,
 }
 
+/// Number of trailing zero bytes in a payload — corruption discriminator for
+/// the `sg.payload.trace` diagnostics (a healthy ML-DSA-signed x0x frame has
+/// a near-zero tail; a partially-filled buffer has thousands).
+fn payload_zero_tail(payload: &Bytes) -> usize {
+    payload.iter().rev().take_while(|b| **b == 0).count()
+}
+
+/// Short hex of a message-id prefix for `sg.payload.trace` lines.
+fn msg_id_hex8(msg_id: &MessageIdType) -> String {
+    msg_id[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Clone)]
 struct CachedEntry {
     message: CachedMessage,
@@ -2494,6 +2506,14 @@ impl TopicState {
 
     /// Add message to cache
     fn cache_message(&mut self, msg_id: MessageIdType, payload: Bytes, header: MessageHeader) {
+        debug!(
+            target: "sg.payload.trace",
+            stage = "cache_insert",
+            msg_id = %msg_id_hex8(&msg_id),
+            len = payload.len(),
+            zero_tail = payload_zero_tail(&payload),
+            kind = ?header.kind,
+        );
         let cached = CachedMessage { payload, header };
         self.message_cache.insert(msg_id, cached);
         self.touch();
@@ -4912,6 +4932,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             state.pending_ihave.push(msg_id);
 
             // Deliver to local subscribers
+            debug!(
+                target: "sg.payload.trace",
+                stage = "publish_self_deliver",
+                msg_id = %msg_id_hex8(&msg_id),
+                len = payload.len(),
+                zero_tail = payload_zero_tail(&payload),
+            );
             let data = (self.peer_id, payload);
             state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
         }
@@ -4974,6 +5001,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 return Err(anyhow!("EAGER missing payload"));
             }
         };
+        debug!(
+            target: "sg.payload.trace",
+            stage = "eager_recv",
+            from = %from,
+            msg_id = %msg_id_hex8(&msg_id),
+            len = payload.len(),
+            zero_tail = payload_zero_tail(&payload),
+        );
         state.cache_message(msg_id, payload.clone(), message.header.clone());
 
         // Update peer score for the sender
@@ -5045,6 +5080,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let fanout_started = Instant::now();
         let sub_count = state.subscribers.len();
         let data = (from, payload.clone());
+        debug!(
+            target: "sg.payload.trace",
+            stage = "subscriber_deliver",
+            from = %from,
+            msg_id = %msg_id_hex8(&msg_id),
+            len = payload.len(),
+            zero_tail = payload_zero_tail(&payload),
+        );
         state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
         let delivered = state.subscribers.len();
         self.record_stage(PubSubStage::EagerFanout, fanout_started);
@@ -5229,6 +5272,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Send EAGER with payloads
         for (msg_id, cached) in to_send {
             debug!(peer_id = %from, msg_id = ?msg_id, "Sending EAGER in response to IWANT");
+            debug!(
+                target: "sg.payload.trace",
+                stage = "iwant_serve",
+                msg_id = %msg_id_hex8(&msg_id),
+                len = cached.payload.len(),
+                zero_tail = payload_zero_tail(&cached.payload),
+            );
 
             let _message = GossipMessage {
                 header: cached.header.clone(),
@@ -5332,6 +5382,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let republish_started = Instant::now();
                 // Send cached messages the peer is missing as EAGER
                 for cached in &messages_to_send {
+                    debug!(
+                        target: "sg.payload.trace",
+                        stage = "anti_entropy_serve",
+                        msg_id = %msg_id_hex8(&cached.header.msg_id),
+                        len = cached.payload.len(),
+                        zero_tail = payload_zero_tail(&cached.payload),
+                    );
                     let eager_msg = GossipMessage {
                         header: cached.header.clone(),
                         payload: Some(cached.payload.clone()),

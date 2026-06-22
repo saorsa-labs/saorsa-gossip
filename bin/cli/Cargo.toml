@@ -5,9 +5,14 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CLI tool for Saorsa Gossip network - demonstration and testing"
-keywords = ["gossip", "p2p", "post-quantum", "networking", "cli"]
-categories = ["network-programming", "command-line-utilities"]
+description = "Canonical facade and CLI for the Saorsa Gossip post-quantum gossip stack"
+keywords = ["gossip", "p2p", "post-quantum", "networking", "crdt"]
+categories = ["network-programming", "asynchronous", "cryptography", "command-line-utilities"]
+readme = "../../README.md"
+
+[lib]
+name = "saorsa_gossip"
+path = "src/lib.rs"
 
 [[bin]]
 name = "saorsa-gossip"
@@ -41,6 +46,7 @@ saorsa-gossip-coordinator = { workspace = true }
 saorsa-gossip-membership = { workspace = true }
 saorsa-gossip-pubsub = { workspace = true }
 saorsa-gossip-rendezvous = { workspace = true }
+saorsa-gossip-runtime = { workspace = true }
 saorsa-gossip-groups = { workspace = true }
 saorsa-gossip-presence = { workspace = true }
 saorsa-gossip-crdt-sync = { workspace = true }

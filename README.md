@@ -8,6 +8,7 @@
 
 | Crate | Version | Docs | Downloads |
 |-------|---------|------|-----------|
+| [saorsa-gossip] | [![Crates.io](https://img.shields.io/crates/v/saorsa-gossip.svg)][gossip-crate] | [![Docs](https://docs.rs/saorsa-gossip/badge.svg)][gossip-docs] | [![Downloads](https://img.shields.io/crates/d/saorsa-gossip.svg)][gossip-crate] |
 | [saorsa-gossip-types] | [![Crates.io](https://img.shields.io/crates/v/saorsa-gossip-types.svg)][types-crate] | [![Docs](https://docs.rs/saorsa-gossip-types/badge.svg)][types-docs] | [![Downloads](https://img.shields.io/crates/d/saorsa-gossip-types.svg)][types-crate] |
 | [saorsa-gossip-identity] | [![Crates.io](https://img.shields.io/crates/v/saorsa-gossip-identity.svg)][identity-crate] | [![Docs](https://docs.rs/saorsa-gossip-identity/badge.svg)][identity-docs] | [![Downloads](https://img.shields.io/crates/d/saorsa-gossip-identity.svg)][identity-crate] |
 | [saorsa-gossip-transport] | [![Crates.io](https://img.shields.io/crates/v/saorsa-gossip-transport.svg)][transport-crate] | [![Docs](https://docs.rs/saorsa-gossip-transport/badge.svg)][transport-docs] | [![Downloads](https://img.shields.io/crates/d/saorsa-gossip-transport.svg)][transport-crate] |
@@ -19,6 +20,7 @@
 | [saorsa-gossip-presence] | [![Crates.io](https://img.shields.io/crates/v/saorsa-gossip-presence.svg)][presence-crate] | [![Docs](https://docs.rs/saorsa-gossip-presence/badge.svg)][presence-docs] | [![Downloads](https://img.shields.io/crates/d/saorsa-gossip-presence.svg)][presence-crate] |
 | [saorsa-gossip-crdt-sync] | [![Crates.io](https://img.shields.io/crates/v/saorsa-gossip-crdt-sync.svg)][crdt-crate] | [![Docs](https://docs.rs/saorsa-gossip-crdt-sync/badge.svg)][crdt-docs] | [![Downloads](https://img.shields.io/crates/d/saorsa-gossip-crdt-sync.svg)][crdt-crate] |
 
+[saorsa-gossip]: #canonical-facade-crate
 [saorsa-gossip-types]: #core-crates
 [saorsa-gossip-identity]: #core-crates
 [saorsa-gossip-transport]: #core-crates
@@ -30,6 +32,8 @@
 [saorsa-gossip-presence]: #core-crates
 [saorsa-gossip-crdt-sync]: #core-crates
 
+[gossip-crate]: https://crates.io/crates/saorsa-gossip
+[gossip-docs]: https://docs.rs/saorsa-gossip
 [types-crate]: https://crates.io/crates/saorsa-gossip-types
 [types-docs]: https://docs.rs/saorsa-gossip-types
 [identity-crate]: https://crates.io/crates/saorsa-gossip-identity
@@ -64,7 +68,7 @@ Saorsa Gossip implements a complete gossip overlay with:
 - **Local-First CRDTs**: Delta-CRDTs with anti-entropy synchronization
 - **No DHT**: Contact-graph-based discovery, no global directory
 
-**Status**: ⚠️ **Alpha (workspace v0.2.1)** – libraries compile and ship with >260 automated tests, but the CLI/coordinator binaries are still experimental and several protocols (e.g. presence MLS export) are not finalized. See [DESIGN.md](DESIGN.md) for current limitations.
+**Status**: ⚠️ **Alpha (workspace v0.5.64)** – libraries compile and ship with >260 automated tests, but the CLI/coordinator binaries are still experimental and several protocols (e.g. presence MLS export) are not finalized. See [DESIGN.md](DESIGN.md) for current limitations.
 
 ## 🏗️ Architecture
 
@@ -89,9 +93,28 @@ Saorsa Gossip implements a complete gossip overlay with:
 └─────────────────────────────────────────────────────────┘
 ```
 
+### Canonical Facade Crate
+
+Most Rust applications should start with the top-level facade crate:
+
+```toml
+[dependencies]
+saorsa-gossip = "0.5"
+```
+
+The `saorsa-gossip` crate re-exports the component crates under predictable
+modules such as `saorsa_gossip::runtime`, `saorsa_gossip::types`,
+`saorsa_gossip::transport`, `saorsa_gossip::pubsub`, and
+`saorsa_gossip::crdt`. Advanced users can still depend on the lower-level
+component crates directly when they need finer dependency control.
+
+The historical `0.1.x` `saorsa-gossip` releases were early CLI/demo packages.
+From the `0.5.x` line, `saorsa-gossip` is the canonical facade crate and still
+ships the experimental `saorsa-gossip` binary for test and demo workflows.
+
 ### Core Crates
 
-This repository tracks the Saorsa Gossip workspace at **v0.5.14**. Some crates are published on [crates.io](https://crates.io) already, but others are only available from source while the alpha stabilises.
+This repository tracks the Saorsa Gossip workspace at **v0.5.64**. Some crates are published on [crates.io](https://crates.io) already, but others are only available from source while the alpha stabilises.
 
 | Crate | Purpose | Why It's Important |
 |-------|---------|-------------------|
@@ -117,7 +140,7 @@ Saorsa Gossip provides two production-ready binaries for testing and deployment:
 | Binary | Crate | Purpose |
 |--------|-------|---------|
 | `saorsa-gossip-coordinator` | [saorsa-coordinator](https://crates.io/crates/saorsa-coordinator) | Bootstrap/coordinator node for network discovery (alpha – adverts generated but not broadcast on the wire yet) |
-| `saorsa-gossip` | [saorsa-gossip](https://crates.io/crates/saorsa-gossip) | CLI tool for testing network features (alpha – commands are gradually being implemented) |
+| `saorsa-gossip` | [saorsa-gossip](https://crates.io/crates/saorsa-gossip) | Experimental CLI shipped by the canonical facade package for testing network features |
 
 > These binaries are still under heavy development. Use them for experimentation, not production deployments, until the remaining TODOs tracked in this README/DESIGN are resolved.
 
@@ -192,7 +215,7 @@ DEBUG Published coordinator advert (3551 bytes)
 
 ### 🧪 Using the CLI Tool
 
-The `saorsa-gossip` CLI exercises all library features:
+The `saorsa-gossip` CLI is an experimental tool for exercising implemented parts of the library stack. Identity management is usable today; several network, pub/sub, presence, group, CRDT and rendezvous commands are still placeholders while the runtime stabilises.
 
 #### Identity Management
 
@@ -265,12 +288,12 @@ Run a multi-node test network on your local machine:
 
 **Terminal 1 - Start Coordinator:**
 ```bash
-saorsa-coordinator --verbose --bind 127.0.0.1:7000 --roles coordinator,reflector --publish-interval 10
+saorsa-gossip-coordinator --verbose --bind 127.0.0.1:7000 --roles coordinator,reflector --publish-interval 10
 ```
 
 **Terminal 2 - Start Second Coordinator:**
 ```bash
-saorsa-coordinator --verbose --bind 127.0.0.1:7001 --roles coordinator,relay --publish-interval 15 \
+saorsa-gossip-coordinator --verbose --bind 127.0.0.1:7001 --roles coordinator,relay --publish-interval 15 \
   --identity-path ~/.saorsa-gossip/coordinator2.identity
 ```
 
@@ -309,7 +332,7 @@ All binaries use structured logging with the `tracing` crate:
 **Enable verbose logging:**
 ```bash
 # For coordinator
-saorsa-coordinator --verbose ...
+saorsa-gossip-coordinator --verbose ...
 
 # For CLI tool
 saorsa-gossip --verbose identity create --alias Test
@@ -353,71 +376,39 @@ Before deploying to production, verify:
 
 ### Installation
 
-Add to your `Cargo.toml`:
+Add the facade crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-saorsa-gossip-types = "0.2.1"
-saorsa-gossip-identity = "0.2.1"
-saorsa-gossip-transport = "0.2.1"
-saorsa-gossip-membership = "0.2.1"
-saorsa-gossip-pubsub = "0.2.1"
-saorsa-gossip-coordinator = "0.2.1"
-saorsa-gossip-rendezvous = "0.2.1"
-saorsa-gossip-groups = "0.2.1"
-saorsa-gossip-presence = "0.2.1"
-saorsa-gossip-crdt-sync = "0.2.1"
+saorsa-gossip = "0.5"
 ```
 
-> NOTE: A few crates are still stabilising; if `cargo add` cannot find a version yet, depend on the git repository for now:
-> `saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip", tag = "v0.2.1" }`
+For lower-level integrations you can depend on individual component crates such
+as `saorsa-gossip-types`, `saorsa-gossip-transport`, or
+`saorsa-gossip-pubsub` directly. Keep component crate versions aligned with the
+workspace release when doing that.
 
 ### Basic Usage
 
-```rust
-use std::{net::SocketAddr, sync::Arc};
-
-use bytes::Bytes;
-use saorsa_gossip_identity::MlDsaKeyPair;
-use saorsa_gossip_membership::{
-    Membership, HyParViewMembership, MembershipConfig,
-};
-use saorsa_gossip_pubsub::{PubSub, PlumtreePubSub};
-use saorsa_gossip_transport::UdpTransportAdapter;
-use saorsa_gossip_types::{PeerId, TopicId};
+```rust,no_run
+use saorsa_gossip::{GossipRuntimeBuilder, TopicId};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let topic = TopicId::from_entity("demo-room");
-    let peer_id = PeerId::new([7u8; 32]);
-    let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
-    let transport = Arc::new(UdpTransportAdapter::new(bind_addr, vec![]).await?);
-    let signing_key = MlDsaKeyPair::generate()?;
+    let runtime = GossipRuntimeBuilder::new()
+        .bind_addr("0.0.0.0:0".parse()?)
+        .build()
+        .await?;
 
-    // Membership can run without seeds for local experimentation.
-    let membership = HyParViewMembership::new(
-        peer_id,
-        MembershipConfig::default(),
-        transport.clone(),
-    );
-    membership.join(vec![]).await?;
-
-    // PubSub requires a signing key and the shared transport.
-    let pubsub = PlumtreePubSub::new(peer_id, transport.clone(), signing_key);
-    let mut rx = pubsub.subscribe(topic);
-    pubsub
-        .initialize_topic_peers(topic, membership.active_view())
-        .await;
-
-    // Publish and observe the loopback delivery.
-    pubsub.publish(topic, Bytes::from("Hello, gossip!")).await?;
-    if let Some((from, data)) = rx.recv().await {
-        println!("Received from {}: {:?}", from, data);
-    }
-
+    println!("started gossip runtime for topic {topic}: peer {}", runtime.peer_id());
     Ok(())
 }
 ```
+
+For lower-level control, import the namespaced component APIs through the facade,
+for example `saorsa_gossip::transport`, `saorsa_gossip::pubsub`,
+`saorsa_gossip::membership`, and `saorsa_gossip::crdt`.
 
 ## 📚 Protocol Specifications
 

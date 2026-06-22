@@ -159,7 +159,12 @@ jobs:
         # the runner is ephemeral — local dev keeps hakari enabled via
         # `cargo hakari generate`. After this step, cargo publish can resolve
         # every member's dep graph against crates.io alone.
-        run: cargo hakari remove-deps --yes
+        run: |
+          cargo hakari remove-deps --yes
+          if grep -R "saorsa-gossip-workspace-hack" crates bin --include Cargo.toml; then
+            echo "workspace-hack dependency remains in a publishable manifest" >&2
+            exit 1
+          fi
 
       - name: Publish crates (in dependency order)
         env:
@@ -178,6 +183,8 @@ jobs:
             "crates/coordinator"
             "crates/rendezvous"
             "crates/runtime"
+            "bin/coordinator"
+            "bin/cli"
           )
 
           for crate in "${CRATES[@]}"; do

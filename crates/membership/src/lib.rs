@@ -973,8 +973,11 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         let seen = self.seen_peers.read().await;
 
         // Filter to peers seen in last 5 minutes
-        let cutoff = Instant::now() - Duration::from_secs(300);
-        let recent_count = seen.values().filter(|&&t| t > cutoff).count();
+        let now = Instant::now();
+        let recent_count = seen
+            .values()
+            .filter(|&&t| now.saturating_duration_since(t) < Duration::from_secs(300))
+            .count();
 
         // Use max of (active + passive + 1) and recent unique peers
         (active_count + passive_count + 1).max(recent_count)
@@ -1520,8 +1523,11 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                     let active_count = active.read().await.len();
                     let passive_count = passive.read().await.len();
                     let seen = seen_peers.read().await;
-                    let cutoff = Instant::now() - Duration::from_secs(300);
-                    let recent_count = seen.values().filter(|&&t| t > cutoff).count();
+                    let now = Instant::now();
+                    let recent_count = seen
+                        .values()
+                        .filter(|&&t| now.saturating_duration_since(t) < Duration::from_secs(300))
+                        .count();
                     let n = (active_count + passive_count + 1).max(recent_count);
                     drop(seen);
 
@@ -1612,8 +1618,8 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
 
                 // Clean up stale seen_peers entries (older than 5 minutes)
                 let mut seen = seen_peers.write().await;
-                let cutoff = Instant::now() - Duration::from_secs(300);
-                seen.retain(|_, t| *t > cutoff);
+                let now = Instant::now();
+                seen.retain(|_, t| now.saturating_duration_since(*t) < Duration::from_secs(300));
             }
         });
     }

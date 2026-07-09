@@ -24,19 +24,25 @@ pub async fn check_for_update() -> Result<Option<String>> {
         .build()
     {
         Ok(updater) => match updater.get_latest_release() {
-            Ok(release) => {
-                if release.version.as_str() > current_version {
-                    tracing::info!(
-                        "New version available: {} (current: {})",
-                        release.version,
-                        current_version
-                    );
-                    Ok(Some(release.version))
-                } else {
-                    tracing::debug!("Already on latest version: {}", current_version);
+            Ok(releases) => match releases.latest() {
+                Some(release) => {
+                    if release.version() > current_version {
+                        tracing::info!(
+                            "New version available: {} (current: {})",
+                            release.version(),
+                            current_version
+                        );
+                        Ok(Some(release.version().to_string()))
+                    } else {
+                        tracing::debug!("Already on latest version: {}", current_version);
+                        Ok(None)
+                    }
+                }
+                None => {
+                    tracing::debug!("No releases found");
                     Ok(None)
                 }
-            }
+            },
             Err(e) => {
                 tracing::warn!("Failed to check for updates: {}", e);
                 Ok(None)
@@ -67,13 +73,14 @@ pub async fn perform_update() -> Result<()> {
         .context("Failed to perform update")?;
 
     match status {
-        self_update::Status::UpToDate(version) => {
+        self_update::VersionStatus::UpToDate(version) => {
             println!("✓ Already up to date (version: {})", version);
         }
-        self_update::Status::Updated(version) => {
+        self_update::VersionStatus::Updated(version) => {
             println!("✓ Successfully updated to version: {}", version);
             println!("  Please restart the application to use the new version.");
         }
+        _ => {}
     }
 
     Ok(())

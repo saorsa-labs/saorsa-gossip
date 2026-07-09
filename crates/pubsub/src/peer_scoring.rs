@@ -295,6 +295,8 @@ pub struct PeerScoreV2Snapshot {
 pub struct PeerScoring {
     config: PeerScoringConfig,
     inner: Mutex<HashMap<(TopicId, PeerId), PeerScoreState>>,
+    /// Lock-wait timing for `inner` (issue #27 instrumentation).
+    lock_wait: crate::StageTimingStats,
 }
 
 impl Default for PeerScoring {
@@ -310,15 +312,16 @@ impl PeerScoring {
         Self {
             config: PeerScoringConfig::default(),
             inner: Mutex::new(HashMap::new()),
+            lock_wait: crate::StageTimingStats::default(),
         }
     }
-
     /// Construct with a custom config.
     #[must_use]
     pub fn with_config(config: PeerScoringConfig) -> Self {
         Self {
             config,
             inner: Mutex::new(HashMap::new()),
+            lock_wait: crate::StageTimingStats::default(),
         }
     }
 
@@ -329,10 +332,19 @@ impl PeerScoring {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(TopicId, PeerId), PeerScoreState>> {
-        match self.inner.lock() {
+        let started = Instant::now();
+        let guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
-        }
+        };
+        self.lock_wait.record(started.elapsed());
+        guard
+    }
+
+    /// Snapshot of the `inner` lock-wait timing (issue #27 instrumentation).
+    #[must_use]
+    pub fn lock_wait_snapshot(&self) -> crate::StageTimingStatsSnapshot {
+        self.lock_wait.snapshot()
     }
 
     /// Mark that `peer` has joined our mesh for `topic` — starts the P1

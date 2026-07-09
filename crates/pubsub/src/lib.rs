@@ -329,7 +329,7 @@ pub struct StageTimingStats {
 }
 
 /// JSON-friendly snapshot of one PubSub processing stage.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct StageTimingStatsSnapshot {
     /// Number of observations recorded for the stage.
     pub count: u64,
@@ -346,7 +346,7 @@ pub struct StageTimingStatsSnapshot {
 }
 
 impl StageTimingStats {
-    fn record(&self, duration: Duration) {
+    pub(crate) fn record(&self, duration: Duration) {
         let ns = duration_to_ns(duration);
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total_ns.fetch_add(ns, Ordering::Relaxed);
@@ -362,7 +362,7 @@ impl StageTimingStats {
         }
     }
 
-    fn snapshot(&self) -> StageTimingStatsSnapshot {
+    pub(crate) fn snapshot(&self) -> StageTimingStatsSnapshot {
         StageTimingStatsSnapshot {
             count: self.count.load(Ordering::Relaxed),
             total_ns: self.total_ns.load(Ordering::Relaxed),
@@ -394,6 +394,8 @@ pub struct PubSubStageStats {
     /// spawned, and the peer/topic receives timeout pressure for cooling.
     outbound_budget_exhausted: AtomicU64,
     suppressed_peers: Mutex<HashMap<SuppressedPeerKey, SuppressedPeerState>>,
+    /// Lock-wait timing for `suppressed_peers` (issue #27 instrumentation).
+    suppressed_peers_lock: StageTimingStats,
     suppression_cleanup: SuppressionCleanupStats,
 }
 
@@ -624,6 +626,12 @@ pub struct PubSubStageStatsSnapshot {
     pub peer_scores_v2: Vec<peer_scoring::PeerScoreV2Snapshot>,
     /// Per-topic bounded message-cache usage and eviction counters.
     pub topic_caches: Vec<TopicCacheStatsSnapshot>,
+    /// Number of per-topic shards in the sharded topic map (issue #27).
+    pub topic_shard_count: usize,
+    /// Lock-wait time for the `PeerScoring` `Mutex<HashMap<..>>` (issue #27).
+    pub peer_scoring_lock_wait: StageTimingStatsSnapshot,
+    /// Lock-wait time for the `suppressed_peers` `Mutex<HashMap<..>>` (issue #27).
+    pub suppressed_peers_lock_wait: StageTimingStatsSnapshot,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1112,7 +1120,7 @@ struct SendAttemptClaims {
     topic: TopicId,
     attempts: Vec<PeerSendAttempt>,
     permits: Vec<OutboundSendPermit>,
-    topics: Arc<RwLock<HashMap<TopicId, TopicState>>>,
+    topics: Arc<ShardedTopicMap>,
     stage_stats: Arc<PubSubStageStats>,
     send_path: SendPathContext,
     armed: bool,
@@ -1123,7 +1131,7 @@ impl SendAttemptClaims {
         topic: TopicId,
         attempts: Vec<PeerSendAttempt>,
         permits: Vec<OutboundSendPermit>,
-        topics: Arc<RwLock<HashMap<TopicId, TopicState>>>,
+        topics: Arc<ShardedTopicMap>,
         stage_stats: Arc<PubSubStageStats>,
         send_path: SendPathContext,
     ) -> Self {
@@ -1374,20 +1382,22 @@ fn store_connected_peers_snapshot(
     }
 }
 
-async fn known_pubsub_peers(topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>) -> HashSet<PeerId> {
-    let topics_guard = topics.read().await;
+async fn known_pubsub_peers(topics: &ShardedTopicMap) -> HashSet<PeerId> {
+    let shards = topics.read_all().await;
     let mut peers = HashSet::new();
-    for state in topics_guard.values() {
-        peers.extend(state.eager_peers.iter().copied());
-        peers.extend(state.lazy_peers.iter().copied());
-        peers.extend(state.peer_cooling.keys().copied());
-        peers.extend(state.peer_scores.keys().copied());
+    for shard in &shards {
+        for state in shard.values() {
+            peers.extend(state.eager_peers.iter().copied());
+            peers.extend(state.lazy_peers.iter().copied());
+            peers.extend(state.peer_cooling.keys().copied());
+            peers.extend(state.peer_scores.keys().copied());
+        }
     }
     peers
 }
 
 async fn refresh_peer_health_snapshot_once(
-    topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
+    topics: &ShardedTopicMap,
     snapshot: &Arc<StdRwLock<HashMap<PeerId, PeerHealth>>>,
     oracle: &Arc<dyn PeerHealthOracle>,
 ) {
@@ -1402,7 +1412,7 @@ async fn refresh_peer_health_snapshot_once(
 }
 
 async fn refresh_connected_peers_snapshot_once<T: GossipTransport + 'static>(
-    topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
+    topics: &ShardedTopicMap,
     snapshot: &Arc<StdRwLock<Option<HashSet<PeerId>>>>,
     transport: &Arc<T>,
     stage_stats: &Arc<PubSubStageStats>,
@@ -1419,35 +1429,37 @@ async fn refresh_connected_peers_snapshot_once<T: GossipTransport + 'static>(
     let mut total_eager_pruned = 0usize;
     let mut total_lazy_pruned = 0usize;
     let mut total_cooling_removed = 0usize;
-    let mut topics_guard = topics.write().await;
-    for (topic, state) in topics_guard.iter_mut() {
-        let eager_before = state.eager_peers.len();
-        let lazy_before = state.lazy_peers.len();
+    let mut topics_guard = topics.write_all().await;
+    for shard in topics_guard.iter_mut() {
+        for (topic, state) in shard.iter_mut() {
+            let eager_before = state.eager_peers.len();
+            let lazy_before = state.lazy_peers.len();
 
-        state.eager_peers.retain(|peer| connected.contains(peer));
-        state.lazy_peers.retain(|peer| connected.contains(peer));
+            state.eager_peers.retain(|peer| connected.contains(peer));
+            state.lazy_peers.retain(|peer| connected.contains(peer));
 
-        let eager_pruned = eager_before.saturating_sub(state.eager_peers.len());
-        let lazy_pruned = lazy_before.saturating_sub(state.lazy_peers.len());
-        let removed_cooling = state.clear_disconnected_peer_cooling(&connected);
-        for peer in &removed_cooling {
-            stage_stats.clear_peer_suppression(*topic, *peer);
+            let eager_pruned = eager_before.saturating_sub(state.eager_peers.len());
+            let lazy_pruned = lazy_before.saturating_sub(state.lazy_peers.len());
+            let removed_cooling = state.clear_disconnected_peer_cooling(&connected);
+            for peer in &removed_cooling {
+                stage_stats.clear_peer_suppression(*topic, *peer);
+            }
+
+            if eager_pruned > 0 || lazy_pruned > 0 || !removed_cooling.is_empty() {
+                debug!(
+                    topic = %LogTopicId::from(*topic),
+                    eager_pruned,
+                    lazy_pruned,
+                    cooling_removed = removed_cooling.len(),
+                    connected = connected.len(),
+                    "PubSub pruned transport-disconnected topic peers"
+                );
+            }
+
+            total_eager_pruned += eager_pruned;
+            total_lazy_pruned += lazy_pruned;
+            total_cooling_removed += removed_cooling.len();
         }
-
-        if eager_pruned > 0 || lazy_pruned > 0 || !removed_cooling.is_empty() {
-            debug!(
-                topic = %LogTopicId::from(*topic),
-                eager_pruned,
-                lazy_pruned,
-                cooling_removed = removed_cooling.len(),
-                connected = connected.len(),
-                "PubSub pruned transport-disconnected topic peers"
-            );
-        }
-
-        total_eager_pruned += eager_pruned;
-        total_lazy_pruned += lazy_pruned;
-        total_cooling_removed += removed_cooling.len();
     }
 
     if total_eager_pruned > 0 || total_lazy_pruned > 0 || total_cooling_removed > 0 {
@@ -1590,13 +1602,16 @@ impl PubSubStageStats {
     fn suppressed_peers_guard(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<SuppressedPeerKey, SuppressedPeerState>> {
-        match self.suppressed_peers.lock() {
+        let started = Instant::now();
+        let guard = match self.suppressed_peers.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 warn!("PubSub suppressed-peers diagnostics lock was poisoned; recovering");
                 poisoned.into_inner()
             }
-        }
+        };
+        self.suppressed_peers_lock.record(started.elapsed());
+        guard
     }
 
     fn suppressed_peer_snapshots(&self) -> Vec<SuppressedPeerSnapshot> {
@@ -1690,6 +1705,9 @@ impl PubSubStageStats {
             admission: admission::AdmissionStatsSnapshot::default(),
             peer_scores_v2: Vec::new(),
             topic_caches: Vec::new(),
+            topic_shard_count: 0,
+            peer_scoring_lock_wait: StageTimingStatsSnapshot::default(),
+            suppressed_peers_lock_wait: self.suppressed_peers_lock.snapshot(),
         }
     }
 
@@ -3126,7 +3144,7 @@ impl TopicState {
 }
 
 async fn record_topic_send_attempt_results_for_state(
-    topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
+    topics: &ShardedTopicMap,
     stage_stats: &Arc<PubSubStageStats>,
     send_path: &SendPathContext,
     topic: TopicId,
@@ -3140,7 +3158,7 @@ async fn record_topic_send_attempt_results_for_state(
             .record(completion.attempt.peer, completion.observed);
     }
 
-    let mut topics_guard = topics.write().await;
+    let mut topics_guard = topics.write_topic(&topic).await;
     let Some(state) = topics_guard.get_mut(&topic) else {
         for attempt in sent
             .iter()
@@ -3369,10 +3387,134 @@ pub trait PubSub: Send + Sync {
     }
 }
 
+/// Sharded per-topic state map — issue #27 fix.
+///
+/// Replaces the single `RwLock<HashMap<TopicId, TopicState>>` that serialized
+/// all 32 x0x workers on one global write lock. On the 6-node testnet
+/// anchor node, `dedupe_lock_acquire` was 49.6% of handler wall-time (9 355 s
+/// of 18 853 s) because every message's dedupe/cache/republish path contended
+/// on that one lock.
+///
+/// Each shard is an independent `RwLock<HashMap<..>>`; the shard for a topic
+/// is selected by folding the first 8 bytes of the 32-byte `TopicId` into a
+/// `u64` and masking. `TopicState` is purely per-topic with **no cross-topic
+/// lock dependencies** (verified during this refactor: no method on
+/// `TopicState` or the shard guard acquires a second shard's lock), so
+/// sharding is safe — two workers on different topics never block each other.
+const TOPIC_SHARD_COUNT: usize = 32;
+
+struct ShardedTopicMap {
+    shards: Box<[RwLock<HashMap<TopicId, TopicState>>]>,
+}
+
+impl ShardedTopicMap {
+    fn new() -> Self {
+        Self::with_shard_count(TOPIC_SHARD_COUNT)
+    }
+
+    fn with_shard_count(count: usize) -> Self {
+        let n = count.next_power_of_two().max(2);
+        let shards = (0..n)
+            .map(|_| RwLock::new(HashMap::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { shards }
+    }
+
+    /// Shard index for `topic` — fold first 8 bytes of the BLAKE3-derived
+    /// `TopicId` into a `u64` and mask to the power-of-two shard count.
+    #[inline]
+    fn shard_index(&self, topic: &TopicId) -> usize {
+        let b = topic.as_bytes();
+        let fold = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+        (fold as usize) & (self.shards.len() - 1)
+    }
+
+    /// Number of shards (always a power of two).
+    fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Acquire a **write** lock on the shard containing `topic`. Only workers
+    /// touching the same shard serialize; workers on different topics proceed
+    /// concurrently.
+    async fn write_topic(
+        &self,
+        topic: &TopicId,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<TopicId, TopicState>> {
+        self.shards[self.shard_index(topic)].write().await
+    }
+
+    /// Acquire a **read** lock on the shard containing `topic`.
+    async fn read_topic(
+        &self,
+        topic: &TopicId,
+    ) -> tokio::sync::RwLockReadGuard<'_, HashMap<TopicId, TopicState>> {
+        self.shards[self.shard_index(topic)].read().await
+    }
+
+    /// Try to acquire a **write** lock on every shard (background tasks that
+    /// need to iterate or mutate all topics). Acquired in shard-index order
+    /// to avoid deadlock; since no cross-shard lock dependencies exist, this
+    /// is the only multi-shard acquisition path.
+    async fn write_all(
+        &self,
+    ) -> Vec<tokio::sync::RwLockWriteGuard<'_, HashMap<TopicId, TopicState>>> {
+        let mut guards = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            guards.push(shard.write().await);
+        }
+        guards
+    }
+
+    /// Try to acquire a **read** lock on every shard (background tasks,
+    /// diagnostics snapshots). Returns `None` if any shard is write-locked.
+    fn try_read_all(
+        &self,
+    ) -> Option<Vec<tokio::sync::RwLockReadGuard<'_, HashMap<TopicId, TopicState>>>> {
+        let mut guards = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            match shard.try_read() {
+                Ok(g) => guards.push(g),
+                Err(_) => return None,
+            }
+        }
+        Some(guards)
+    }
+
+    /// Acquire a **read** lock on every shard (background tasks).
+    async fn read_all(
+        &self,
+    ) -> Vec<tokio::sync::RwLockReadGuard<'_, HashMap<TopicId, TopicState>>> {
+        let mut guards = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            guards.push(shard.read().await);
+        }
+        guards
+    }
+
+    /// Collect every `TopicId` across all shards.
+    async fn all_topic_ids(&self) -> Vec<TopicId> {
+        let guards = self.read_all().await;
+        let total: usize = guards.iter().map(|g| g.len()).sum();
+        let mut ids = Vec::with_capacity(total);
+        for guard in &guards {
+            ids.extend(guard.keys().copied());
+        }
+        ids
+    }
+
+    /// Total number of topics across all shards.
+    async fn topic_count(&self) -> usize {
+        self.read_all().await.iter().map(|g| g.len()).sum()
+    }
+}
+
 /// Plumtree pub/sub implementation
 pub struct PlumtreePubSub<T: GossipTransport + 'static> {
-    /// Per-topic state
-    topics: Arc<RwLock<HashMap<TopicId, TopicState>>>,
+    /// Per-topic state — sharded (issue #27) to eliminate the single
+    /// `RwLock<HashMap>` write-lock that serialized all 32 x0x workers.
+    topics: Arc<ShardedTopicMap>,
     /// Local peer ID
     peer_id: PeerId,
     /// Epoch for message IDs (system time in seconds)
@@ -3385,7 +3527,7 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     stage_stats: Arc<PubSubStageStats>,
     /// Last complete peer-score diagnostics snapshot.
     ///
-    /// Diagnostics readers use `topics.try_read()` so they never block the
+    /// Diagnostics readers use `topics.try_read_all()` so they never block the
     /// PubSub hot path. If a membership refresh or cache cleanup currently
     /// holds the topic write lock, readers fall back to this copy-on-write
     /// snapshot instead of observing an empty peer-score table.
@@ -3482,7 +3624,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         cache_config: PubSubCacheConfig,
     ) -> Self {
         let pubsub = Self {
-            topics: Arc::new(RwLock::new(HashMap::new())),
+            topics: Arc::new(ShardedTopicMap::new()),
             peer_id,
             epoch_start: std::time::SystemTime::UNIX_EPOCH,
             transport,
@@ -3653,6 +3795,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         );
         snapshot.admission = self.admission.stats().snapshot();
         snapshot.peer_scores_v2 = self.peer_scoring.snapshot();
+        snapshot.topic_shard_count = self.topics.shard_count();
+        snapshot.peer_scoring_lock_wait = self.peer_scoring.lock_wait_snapshot();
         snapshot
     }
 
@@ -3817,11 +3961,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     }
 
     fn peer_score_snapshots(&self) -> Vec<PeerScoreSnapshot> {
-        let Ok(topics) = self.topics.try_read() else {
+        let Some(topics) = self.topics.try_read_all() else {
             return self.cached_peer_score_snapshots();
         };
 
-        let snapshots = Self::build_peer_score_snapshots(&topics, Instant::now());
+        let now = Instant::now();
+        let mut snapshots = Vec::new();
+        for shard in &topics {
+            snapshots.extend(Self::build_peer_score_snapshots(shard, now));
+        }
+        snapshots.sort_by(|a, b| {
+            a.peer_id
+                .cmp(&b.peer_id)
+                .then_with(|| a.topic.cmp(&b.topic))
+        });
         self.store_peer_score_snapshots(snapshots)
     }
 
@@ -3868,11 +4021,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     }
 
     fn topic_cache_snapshots(&self) -> Vec<TopicCacheStatsSnapshot> {
-        let Ok(topics) = self.topics.try_read() else {
+        let Some(topics) = self.topics.try_read_all() else {
             return self.cached_topic_cache_snapshots();
         };
 
-        let snapshots = Self::build_topic_cache_snapshots(&topics, Instant::now());
+        let now = Instant::now();
+        let mut snapshots = Vec::new();
+        for shard in &topics {
+            snapshots.extend(Self::build_topic_cache_snapshots(shard, now));
+        }
+        snapshots.sort_by(|a, b| a.topic.cmp(&b.topic));
         self.store_topic_cache_snapshots(snapshots)
     }
 
@@ -3954,7 +4112,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         peer: PeerId,
         kind: MessageKind,
     ) {
-        let mut topics = self.topics.write().await;
+        let mut topics = self.topics.write_topic(&topic).await;
         let state = topics
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
@@ -4048,7 +4206,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let bulk_admitted = priority == TopicPriority::Bulk;
         let release_guard = scopeguard_release(bulk_admitted, &peer, &self.admission);
 
-        let mut claims = self.claim_topic_send_attempts(topic, vec![peer], op).await;
+        let (mut claims, _lock_wait) = self.claim_topic_send_attempts(topic, vec![peer], op).await;
         let Some(attempt) = claims.attempts().first().copied() else {
             // X0X-0074d: Critical *Data* skips (cooling vs gate overflow) are
             // now counted inside claim_topic_send_attempts where the reason is
@@ -4148,7 +4306,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// admission gate to drop bulk admissions to cooled peers without
     /// re-entering the per-topic send pipeline.
     async fn is_peer_currently_suppressed(&self, topic: &TopicId, peer: &PeerId) -> bool {
-        let topics_guard = self.topics.read().await;
+        let topics_guard = self.topics.read_topic(topic).await;
         let now = Instant::now();
         topics_guard
             .get(topic)
@@ -4160,23 +4318,32 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         peers: Vec<PeerId>,
         op: &'static str,
-    ) -> SendAttemptClaims {
+    ) -> (SendAttemptClaims, Duration) {
         let send_path = self.send_path_context();
         if peers.is_empty() {
-            return SendAttemptClaims::new(
-                topic,
-                Vec::new(),
-                Vec::new(),
-                Arc::clone(&self.topics),
-                Arc::clone(&self.stage_stats),
-                send_path,
+            return (
+                SendAttemptClaims::new(
+                    topic,
+                    Vec::new(),
+                    Vec::new(),
+                    Arc::clone(&self.topics),
+                    Arc::clone(&self.stage_stats),
+                    send_path,
+                ),
+                Duration::ZERO,
             );
         }
 
         let now = Instant::now();
         let send_class = OutboundSendClass::for_op(op);
         let priority = self.admission.registry().priority_for(&topic);
-        let mut topics = self.topics.write().await;
+        // Issue #27: record the topics lock-wait as DedupeLockAcquire so it
+        // is NOT silently charged to the Republish stage that wraps this call.
+        let lock_started = Instant::now();
+        let mut topics = self.topics.write_topic(&topic).await;
+        let lock_wait = lock_started.elapsed();
+        self.stage_stats
+            .record(PubSubStage::DedupeLockAcquire, lock_wait);
         let (attempts, permits) = if let Some(state) = topics.get_mut(&topic) {
             let claim_context = SendClaimContext {
                 stage_stats: self.stage_stats.as_ref(),
@@ -4236,13 +4403,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             (attempts, permits)
         };
 
-        SendAttemptClaims::new(
-            topic,
-            attempts,
-            permits,
-            Arc::clone(&self.topics),
-            Arc::clone(&self.stage_stats),
-            send_path,
+        (
+            SendAttemptClaims::new(
+                topic,
+                attempts,
+                permits,
+                Arc::clone(&self.topics),
+                Arc::clone(&self.stage_stats),
+                send_path,
+            ),
+            lock_wait,
         )
     }
 
@@ -4510,7 +4680,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     #[cfg(test)]
     async fn record_topic_send_attempt_results_for(
-        topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
+        topics: &ShardedTopicMap,
         stage_stats: &Arc<PubSubStageStats>,
         topic: TopicId,
         sent: Vec<PeerSendAttempt>,
@@ -4566,7 +4736,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
         detach_accounting: bool,
-    ) {
+    ) -> Duration {
         // X0X-0074: admission gate runs once per (topic, peer) before
         // we claim attempts. Dropped peers never enter the send
         // pipeline. Bulk admissions are reserved here and released
@@ -4584,7 +4754,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         };
         let admitted_count = admitted.len();
         if admitted_count == 0 {
-            return;
+            return Duration::ZERO;
         }
         // X0X-0074: RAII guard releases Bulk admissions for the entire
         // admitted set exactly once on drop — covers no-claim, partial-
@@ -4598,7 +4768,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             admission: Arc::clone(&self.admission),
         };
 
-        let mut claims = self.claim_topic_send_attempts(topic, admitted, op).await;
+        let (mut claims, lock_wait) = self.claim_topic_send_attempts(topic, admitted, op).await;
 
         // X0X-0074d: per-peer Critical accounting now happens inside
         // `claim_topic_send_attempts`, where the skip reason is known —
@@ -4610,7 +4780,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if claims.is_empty() {
             // No peers got attempts. Bulk reservations release when
             // `_bulk_guard` drops at function exit.
-            return;
+            return lock_wait;
         }
         let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
         let attempts = claims.attempts().to_vec();
@@ -4669,6 +4839,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // _bulk_guard drops here, releasing every Bulk admission exactly
             // once. No manual release call needed.
         }
+        lock_wait
     }
 }
 
@@ -4738,7 +4909,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         op: &'static str,
     ) -> Vec<PeerId> {
         let cooled_set: HashSet<PeerId> = {
-            let topics_guard = self.topics.read().await;
+            let topics_guard = self.topics.read_topic(topic).await;
             let now = Instant::now();
             match topics_guard.get(topic) {
                 Some(state) => peers
@@ -4881,7 +5052,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             public_key: self.signing_key.public_key().to_vec(),
         };
 
-        let mut topics = self.topics.write().await;
+        let mut topics = self.topics.write_topic(&topic).await;
         let state = topics
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
@@ -4927,7 +5098,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         .await;
 
         // Batch msg_id to pending_ihave
-        let mut topics = self.topics.write().await;
+        let mut topics = self.topics.write_topic(&topic).await;
         if let Some(state) = topics.get_mut(&topic) {
             state.pending_ihave.push(msg_id);
 
@@ -4964,7 +5135,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
 
         let lock_started = Instant::now();
-        let mut topics = self.topics.write().await;
+        let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
         let state = topics
@@ -5118,16 +5289,22 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Dispatcher forward path: detach accounting (detach_accounting =
         // true) so a slow peer cannot pin this worker for its full timeout
         // and starve the shared recv channel (recv_pump.dropped_full).
-        self.parallel_send_to_peers(
-            topic,
-            eager_peers,
-            GossipStreamType::PubSub,
-            bytes,
-            "EAGER",
-            true,
-        )
-        .await;
-        self.record_stage(PubSubStage::Republish, republish_started);
+        let lock_wait = self
+            .parallel_send_to_peers(
+                topic,
+                eager_peers,
+                GossipStreamType::PubSub,
+                bytes,
+                "EAGER",
+                true,
+            )
+            .await;
+        // Issue #27: exclude the send-claim lock-wait (already recorded as
+        // DedupeLockAcquire inside claim_topic_send_attempts) so Republish
+        // measures only genuine serialization + send-dispatch work.
+        let republish_time = republish_started.elapsed().saturating_sub(lock_wait);
+        self.stage_stats
+            .record(PubSubStage::Republish, republish_time);
 
         Ok(())
     }
@@ -5140,7 +5317,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
         let lock_started = Instant::now();
-        let mut topics = self.topics.write().await;
+        let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
         let state = topics
@@ -5229,7 +5406,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
         let lock_started = Instant::now();
-        let mut topics = self.topics.write().await;
+        let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
         let state = topics
@@ -5353,7 +5530,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let their_ids: HashSet<MessageIdType> = msg_ids.into_iter().collect();
 
                 let lock_started = Instant::now();
-                let mut topics = self.topics.write().await;
+                let mut topics = self.topics.write_topic(&topic).await;
                 self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
                 let dedupe_started = Instant::now();
                 let state = topics
@@ -5465,7 +5642,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
                 // Filter out IDs we already have.
                 let lock_started = Instant::now();
-                let mut topics = self.topics.write().await;
+                let mut topics = self.topics.write_topic(&topic).await;
                 self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
                 let dedupe_started = Instant::now();
                 let ids_to_request: Vec<MessageIdType> = if let Some(state) = topics.get_mut(&topic)
@@ -5531,7 +5708,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ///
     /// Collects cached message IDs and sends them as an `AntiEntropyPayload::Digest`.
     async fn send_anti_entropy_digest(&self, topic: TopicId, peer: PeerId) -> Result<()> {
-        let topics = self.topics.read().await;
+        let topics = self.topics.read_topic(&topic).await;
         let msg_ids = if let Some(state) = topics.get(&topic) {
             state.cached_message_ids()
         } else {
@@ -5623,7 +5800,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     }
 
     async fn flush_ihave_batches(
-        topics: &Arc<RwLock<HashMap<TopicId, TopicState>>>,
+        topics: &Arc<ShardedTopicMap>,
         transport: &Arc<T>,
         signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
         stage_stats: &Arc<PubSubStageStats>,
@@ -5631,21 +5808,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         send_path: &SendPathContext,
     ) {
         let work: Vec<(TopicId, Vec<MessageIdType>, Vec<PeerId>)> = {
-            let mut topics_guard = topics.write().await;
+            let mut topics_guard = topics.write_all().await;
             let mut work = Vec::new();
 
-            for (topic_id, state) in topics_guard.iter_mut() {
-                if state.pending_ihave.is_empty() {
-                    continue;
+            for shard in topics_guard.iter_mut() {
+                for (topic_id, state) in shard.iter_mut() {
+                    if state.pending_ihave.is_empty() {
+                        continue;
+                    }
+
+                    let batch: Vec<MessageIdType> = state
+                        .pending_ihave
+                        .drain(..state.pending_ihave.len().min(MAX_IHAVE_BATCH_SIZE))
+                        .collect();
+
+                    let lazy_peers: Vec<PeerId> = state.lazy_peers.iter().copied().collect();
+                    work.push((*topic_id, batch, lazy_peers));
                 }
-
-                let batch: Vec<MessageIdType> = state
-                    .pending_ihave
-                    .drain(..state.pending_ihave.len().min(MAX_IHAVE_BATCH_SIZE))
-                    .collect();
-
-                let lazy_peers: Vec<PeerId> = state.lazy_peers.iter().copied().collect();
-                work.push((*topic_id, batch, lazy_peers));
             }
 
             work
@@ -5706,7 +5885,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // completion paths uniformly).
             let (attempts, permits, bulk_admitted) = {
                 let now = Instant::now();
-                let mut topics_guard = topics.write().await;
+                let mut topics_guard = topics.write_topic(&topic_id).await;
                 let Some(state) = topics_guard.get_mut(&topic_id) else {
                     continue;
                 };
@@ -5803,12 +5982,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
             loop {
                 time::sleep(cleanup_interval).await;
-
-                let mut topics_guard = topics.write().await;
                 let before_suppression_len = stage_stats.suppressed_peer_count();
-                let removed_suppressions =
-                    clean_expired_peer_cooling(&mut topics_guard, &stage_stats, Instant::now());
-                let idle_topics = clean_and_reap_topic_ids(&mut topics_guard, topic_idle_ttl);
+                let cleanup_now = Instant::now();
+                let mut removed_suppressions = 0;
+                let mut idle_topics = Vec::new();
+                let mut topics_guard = topics.write_all().await;
+                for shard in topics_guard.iter_mut() {
+                    removed_suppressions +=
+                        clean_expired_peer_cooling(shard, &stage_stats, cleanup_now);
+                    idle_topics.extend(clean_and_reap_topic_ids(shard, topic_idle_ttl));
+                }
                 let idle_count = idle_topics.len();
                 let after_suppression_len = stage_stats.suppressed_peer_count();
                 drop(topics_guard);
@@ -5844,7 +6027,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     "Adaptive PubSub suppression cleanup pass"
                 );
                 if idle_count > 0 {
-                    let remaining = topics.read().await.len();
+                    let remaining = topics.topic_count().await;
                     debug!(
                         idle_count = idle_count,
                         remaining, "Reaped idle TopicState entries"
@@ -5871,14 +6054,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             loop {
                 interval.tick().await;
 
-                let mut topics_guard = topics.write().await;
+                let mut topics_guard = topics.write_all().await;
                 let mut pruned = 0;
                 let mut grafted = 0;
 
-                for state in topics_guard.values_mut() {
-                    let (state_pruned, state_grafted) = state.maintain_degree();
-                    pruned += state_pruned;
-                    grafted += state_grafted;
+                for shard in topics_guard.iter_mut() {
+                    for state in shard.values_mut() {
+                        let (state_pruned, state_grafted) = state.maintain_degree();
+                        pruned += state_pruned;
+                        grafted += state_grafted;
+                    }
                 }
                 drop(topics_guard);
                 if pruned > 0 {
@@ -5918,42 +6103,43 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             loop {
                 interval.tick().await;
 
-                let topics_guard = topics.read().await;
+                let topics_guard = topics.read_all().await;
 
                 // Collect work to do (topic, peer, msg_ids) while holding the read lock.
                 let mut work: Vec<(TopicId, PeerId, Vec<MessageIdType>)> = Vec::new();
+                for shard in &topics_guard {
+                    for (topic_id, state) in shard.iter() {
+                        let msg_ids = state.cached_message_ids();
+                        if msg_ids.is_empty() {
+                            continue;
+                        }
 
-                for (topic_id, state) in topics_guard.iter() {
-                    let msg_ids = state.cached_message_ids();
-                    if msg_ids.is_empty() {
-                        continue;
+                        // Collect all peers (eager + lazy) for random selection
+                        let all_peers: Vec<PeerId> = state
+                            .eager_peers
+                            .iter()
+                            .chain(state.lazy_peers.iter())
+                            .copied()
+                            .collect();
+
+                        if all_peers.is_empty() {
+                            continue;
+                        }
+
+                        // Pick a deterministic-random peer using hash of topic + current time
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let hash_input = blake3::hash(
+                            &[topic_id.to_bytes().as_slice(), &now.to_le_bytes()].concat(),
+                        );
+                        let hash_bytes = hash_input.as_bytes();
+                        let index = (hash_bytes[0] as usize) % all_peers.len();
+                        let selected_peer = all_peers[index];
+
+                        work.push((*topic_id, selected_peer, msg_ids));
                     }
-
-                    // Collect all peers (eager + lazy) for random selection
-                    let all_peers: Vec<PeerId> = state
-                        .eager_peers
-                        .iter()
-                        .chain(state.lazy_peers.iter())
-                        .copied()
-                        .collect();
-
-                    if all_peers.is_empty() {
-                        continue;
-                    }
-
-                    // Pick a deterministic-random peer using hash of topic + current time
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let hash_input = blake3::hash(
-                        &[topic_id.to_bytes().as_slice(), &now.to_le_bytes()].concat(),
-                    );
-                    let hash_bytes = hash_input.as_bytes();
-                    let index = (hash_bytes[0] as usize) % all_peers.len();
-                    let selected_peer = all_peers[index];
-
-                    work.push((*topic_id, selected_peer, msg_ids));
                 }
 
                 drop(topics_guard);
@@ -5998,7 +6184,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         // the explicit list captured here.
                         let (attempts, permits, bulk_admitted) = {
                             let now = Instant::now();
-                            let mut topics_guard = topics.write().await;
+                            let mut topics_guard = topics.write_topic(&topic_id).await;
                             let Some(state) = topics_guard.get_mut(&topic_id) else {
                                 continue;
                             };
@@ -6108,7 +6294,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     /// Initialize peers for a topic from membership layer
     pub async fn initialize_topic_peers(&self, topic: TopicId, peers: Vec<PeerId>) {
-        let mut topics = self.topics.write().await;
+        let mut topics = self.topics.write_topic(&topic).await;
         let state = topics
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
@@ -6143,7 +6329,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             connected = connected.len(),
             "PubSub peer score rebuild start"
         );
-        let mut topics = self.topics.write().await;
+        let mut topics = self.topics.write_topic(&topic).await;
         let state = topics
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
@@ -6194,7 +6380,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// subscribed ones — otherwise pass-through topics lose their forwarding
     /// peers and gossip messages cannot propagate through relay nodes.
     pub async fn all_topic_ids(&self) -> Vec<TopicId> {
-        self.topics.read().await.keys().copied().collect()
+        self.topics.all_topic_ids().await
     }
 }
 
@@ -6210,7 +6396,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
         let cache_config = self.cache_config;
 
         tokio::spawn(async move {
-            let mut topics_guard = topics.write().await;
+            let mut topics_guard = topics.write_topic(&topic).await;
             let state = topics_guard
                 .entry(topic)
                 .or_insert_with(|| TopicState::with_cache_config(cache_config));
@@ -6223,7 +6409,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
 
     async fn subscribe_ready(&self, topic: TopicId) -> mpsc::UnboundedReceiver<(PeerId, Bytes)> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut topics_guard = self.topics.write().await;
+        let mut topics_guard = self.topics.write_topic(&topic).await;
         let state = topics_guard
             .entry(topic)
             .or_insert_with(|| TopicState::with_cache_config(self.cache_config));
@@ -6233,7 +6419,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
     }
 
     async fn unsubscribe(&self, topic: TopicId) -> Result<()> {
-        let mut topics = self.topics.write().await;
+        let mut topics = self.topics.write_topic(&topic).await;
         topics.remove(&topic);
         drop(topics);
         self.stage_stats.clear_topic_suppressions(topic);
@@ -6355,7 +6541,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
     }
 
     async fn trigger_anti_entropy(&self, topic: TopicId) -> Result<()> {
-        let topics = self.topics.read().await;
+        let topics = self.topics.read_topic(&topic).await;
 
         let peer = if let Some(state) = topics.get(&topic) {
             // Pick a peer (any eager or lazy)
@@ -6809,7 +6995,7 @@ mod tests {
         let topic = TopicId::new([8u8; 32]);
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             topics.insert(topic, TopicState::new());
         }
         pubsub.stage_stats.record_peer_suppressed(
@@ -8006,7 +8192,7 @@ mod tests {
     async fn test_ihave_flush_respects_existing_control_budget() {
         let peer_id = test_peer_id(1);
         let (transport, mut started_rx) = BlockingTransport::new(peer_id);
-        let topics = Arc::new(RwLock::new(HashMap::new()));
+        let topics = Arc::new(ShardedTopicMap::new());
         let signing_key = Arc::new(test_signing_key());
         let stage_stats = Arc::new(PubSubStageStats::default());
         let outbound_budgets = Arc::new(PeerOutboundBudgets::default());
@@ -8026,7 +8212,7 @@ mod tests {
         let lazy_peer = test_peer_id(2);
 
         {
-            let mut topics_guard = topics.write().await;
+            let mut topics_guard = topics.write_topic(&topic).await;
             let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
             state.lazy_peers.insert(lazy_peer);
             state.pending_ihave.push([9u8; 32]);
@@ -8183,7 +8369,7 @@ mod tests {
         }
 
         {
-            let topics = pubsub.topics.read().await;
+            let topics = pubsub.topics.read_topic(&topic).await;
             let state = topics.get(&topic).expect("topic exists");
             assert!(
                 !state.eager_peers.contains(&slow_peer),
@@ -8348,7 +8534,7 @@ mod tests {
                 .await;
         }
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.get_mut(&topic).expect("topic exists");
             let cooling = state
                 .peer_cooling
@@ -8421,7 +8607,7 @@ mod tests {
                 .await;
         }
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.get_mut(&topic).expect("topic exists");
             let cooling = state.peer_cooling.get_mut(&peer).expect("peer is cooling");
             cooling.suppressed_until = Some(Instant::now() - Duration::from_millis(1));
@@ -8465,7 +8651,7 @@ mod tests {
                 .await;
         }
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.get_mut(&topic).expect("topic exists");
             let cooling = state.peer_cooling.get_mut(&peer).expect("peer is cooling");
             cooling.suppressed_until = Some(Instant::now() - Duration::from_millis(1));
@@ -8512,7 +8698,7 @@ mod tests {
                 .await;
         }
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.get_mut(&topic).expect("topic exists");
             let cooling = state.peer_cooling.get_mut(&peer).expect("peer is cooling");
             cooling.suppressed_until = Some(Instant::now() - Duration::from_millis(1));
@@ -8553,7 +8739,7 @@ mod tests {
         .await
         .expect("cancelled recovery probe should be re-suppressed");
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).expect("topic exists");
         let cooling = state.peer_cooling.get(&peer).expect("peer is cooling");
         assert!(
@@ -8597,7 +8783,7 @@ mod tests {
         let pre_inbound = PEER_TIMEOUT_THRESHOLD - 1;
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             seed_subthreshold_cooling(state, from_peer, now);
             let cooling = state
@@ -8621,7 +8807,7 @@ mod tests {
             "unsigned IHAVE should be rejected"
         );
 
-        let mut topics = pubsub.topics.write().await;
+        let mut topics = pubsub.topics.write_topic(&topic).await;
         let state = topics.get_mut(&topic).expect("topic exists");
         let cooling = state
             .peer_cooling
@@ -8656,7 +8842,7 @@ mod tests {
         let pre_inbound = PEER_TIMEOUT_THRESHOLD - 1;
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             seed_subthreshold_cooling(state, from_peer, now);
         }
@@ -8677,7 +8863,7 @@ mod tests {
             .expect("signed IHAVE should be handled");
 
         let inbound_at = now + Duration::from_millis(1);
-        let mut topics = pubsub.topics.write().await;
+        let mut topics = pubsub.topics.write_topic(&topic).await;
         let state = topics.get_mut(&topic).expect("topic exists");
         assert!(
             !state.peer_cooling.contains_key(&from_peer),
@@ -8718,7 +8904,7 @@ mod tests {
         let now = Instant::now();
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             seed_subthreshold_cooling(state, from_peer, now);
         }
@@ -8739,7 +8925,7 @@ mod tests {
             .await
             .expect("signed non-pubsub frame should be ignored after reset");
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).expect("topic exists");
         assert!(
             !state.peer_cooling.contains_key(&from_peer),
@@ -8772,7 +8958,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_topic_clears_recovery_probe_diagnostic() {
-        let topics = Arc::new(RwLock::new(HashMap::new()));
+        let topics = Arc::new(ShardedTopicMap::new());
         let stage_stats = Arc::new(PubSubStageStats::default());
         let topic = TopicId::new([50u8; 32]);
         let peer = test_peer_id(2);
@@ -9149,22 +9335,26 @@ mod tests {
 
         pubsub.set_topic_peers(topic_a, vec![peer]).await;
 
-        let topics = pubsub.topics.read().await;
-        let state_a = topics.get(&topic_a).expect("topic A exists");
-        let state_b = topics.get(&topic_b).expect("topic B exists");
-
-        assert!(
-            state_a.lazy_peers.contains(&peer),
-            "active cooling should keep peer lazy on affected topic"
-        );
-        assert!(
-            !state_a.eager_peers.contains(&peer),
-            "refresh must not immediately re-promote cooled peer"
-        );
-        assert!(
-            state_b.eager_peers.contains(&peer),
-            "same peer should stay EAGER on unaffected topic"
-        );
+        {
+            let topics = pubsub.topics.read_topic(&topic_a).await;
+            let state_a = topics.get(&topic_a).expect("topic A exists");
+            assert!(
+                state_a.lazy_peers.contains(&peer),
+                "active cooling should keep peer lazy on affected topic"
+            );
+            assert!(
+                !state_a.eager_peers.contains(&peer),
+                "refresh must not immediately re-promote cooled peer"
+            );
+        }
+        {
+            let topics = pubsub.topics.read_topic(&topic_b).await;
+            let state_b = topics.get(&topic_b).expect("topic B exists");
+            assert!(
+                state_b.eager_peers.contains(&peer),
+                "same peer should stay EAGER on unaffected topic"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9223,7 +9413,10 @@ mod tests {
         let stats = pubsub.stage_stats();
         assert_eq!(stats.decode.count, 1);
         assert_eq!(stats.verify.count, 1);
-        assert_eq!(stats.dedupe_lock_acquire.count, 1);
+        // Issue #27: count is 2 — one for the dedupe path, one for the
+        // send-claim path inside parallel_send_to_peers. Previously the
+        // send-claim lock-wait was invisibly charged to Republish.
+        assert_eq!(stats.dedupe_lock_acquire.count, 2);
         assert_eq!(stats.dedupe_check.count, 1);
         assert_eq!(stats.eager_fanout.count, 1);
         assert_eq!(stats.republish.count, 1);
@@ -9258,17 +9451,113 @@ mod tests {
         }
     }
 
+    /// Issue #27 regression: the anchor node on a 6-node testnet spent 49.6%
+    /// of handler wall-time in `dedupe_lock_acquire` because all 32 x0x
+    /// workers serialized on a single `RwLock<HashMap<TopicId, TopicState>>`.
+    /// This test proves the sharded map eliminates that serialization:
+    /// holding a write lock on one topic's shard does not block a write on a
+    /// different topic's shard.
+    #[tokio::test]
+    async fn sharded_topic_map_different_shards_dont_block() {
+        let map = ShardedTopicMap::with_shard_count(32);
+
+        // Find two topics that land in different shards.
+        let topic_a = TopicId::new([0u8; 32]);
+        let topic_b = TopicId::new([1u8; 32]);
+        assert_ne!(
+            map.shard_index(&topic_a),
+            map.shard_index(&topic_b),
+            "test topics must map to different shards"
+        );
+
+        // Hold a write lock on topic_a's shard.
+        let _guard_a = map.write_topic(&topic_a).await;
+
+        // Acquiring a write lock on topic_b's shard must succeed immediately
+        // — under the old single-lock design this would block indefinitely.
+        let guard_b = tokio::time::timeout(Duration::from_millis(50), map.write_topic(&topic_b))
+            .await
+            .expect("write on a different shard must not block while another shard is locked");
+
+        // Verify both guards are functional.
+        assert!(guard_b.get(&topic_b).is_none());
+
+        drop(_guard_a);
+    }
+
+    /// Issue #27 regression: the 47.6% republish time was partly a
+    /// mis-attribution — the send-claim lock-wait inside
+    /// `parallel_send_to_peers` → `claim_topic_send_attempts` was charged to
+    /// the `Republish` stage instead of `DedupeLockAcquire`. This test
+    /// verifies that after a single inbound EAGER message, the
+    /// `DedupeLockAcquire` count is 2 (dedupe + send-claim) and the
+    /// `Republish` time excludes the send-claim lock-wait.
+    #[tokio::test]
+    async fn republish_excludes_send_claim_lock_wait() {
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([77u8; 32]);
+        let forward_peer = test_peer_id(2);
+        pubsub
+            .initialize_topic_peers(topic, vec![forward_peer])
+            .await;
+
+        let message = signed_eager_message(
+            &test_signing_key(),
+            topic,
+            [88u8; 32],
+            Bytes::from_static(b"attribution"),
+        );
+        let wire: Bytes = postcard::to_stdvec(&message)
+            .expect("message serializes")
+            .into();
+
+        pubsub
+            .handle_message(test_peer_id(3), wire)
+            .await
+            .expect("handle_message should complete");
+
+        let stats = pubsub.stage_stats();
+
+        // DedupeLockAcquire fires twice: once for dedupe/cache, once for
+        // the send-claim inside parallel_send_to_peers.
+        assert_eq!(
+            stats.dedupe_lock_acquire.count, 2,
+            "dedupe_lock_acquire must include the send-claim lock-wait (issue #27)"
+        );
+
+        // Republish fires once and its time must exclude the send-claim
+        // lock-wait (now separately accounted in DedupeLockAcquire).
+        assert_eq!(stats.republish.count, 1);
+
+        // The PeerScoring and suppressed_peers lock-wait instrumentation
+        // is present and non-panic.
+        assert!(
+            stats.topic_shard_count >= 2,
+            "sharded topic map must report its shard count"
+        );
+        // Lock-wait stats exist (count may be 0 if uncontended).
+        let _ = stats.peer_scoring_lock_wait.count;
+        let _ = stats.suppressed_peers_lock_wait.count;
+    }
+
     #[tokio::test]
     async fn test_ihave_flush_releases_topic_lock_before_network_io() {
         let peer_id = test_peer_id(1);
         let (transport, mut started_rx) = BlockingTransport::new(peer_id);
-        let topics = Arc::new(RwLock::new(HashMap::new()));
+        let topics = Arc::new(ShardedTopicMap::new());
         let signing_key = Arc::new(test_signing_key());
         let topic = TopicId::new([6u8; 32]);
         let lazy_peer = test_peer_id(2);
 
         {
-            let mut topics_guard = topics.write().await;
+            let mut topics_guard = topics.write_topic(&topic).await;
             let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
             state.lazy_peers.insert(lazy_peer);
             state.pending_ihave.push([7u8; 32]);
@@ -9310,7 +9599,7 @@ mod tests {
         assert_eq!(record.peer, lazy_peer);
         assert_eq!(record.stream_type, GossipStreamType::PubSub);
 
-        let read_guard = tokio::time::timeout(Duration::from_millis(50), topics.read())
+        let read_guard = tokio::time::timeout(Duration::from_millis(50), topics.read_topic(&topic))
             .await
             .expect("IHAVE flush must not hold the topic lock while send_to_peer is blocked");
         assert!(read_guard.contains_key(&topic));
@@ -9327,14 +9616,14 @@ mod tests {
     async fn test_ihave_flush_uses_single_recovery_probe_for_expired_cooling() {
         let peer_id = test_peer_id(1);
         let (transport, mut started_rx) = BlockingTransport::new(peer_id);
-        let topics = Arc::new(RwLock::new(HashMap::new()));
+        let topics = Arc::new(ShardedTopicMap::new());
         let signing_key = Arc::new(test_signing_key());
         let stage_stats = Arc::new(PubSubStageStats::default());
         let topic = TopicId::new([48u8; 32]);
         let lazy_peer = test_peer_id(2);
 
         {
-            let mut topics_guard = topics.write().await;
+            let mut topics_guard = topics.write_topic(&topic).await;
             let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
             state.lazy_peers.insert(lazy_peer);
             state.pending_ihave.push([8u8; 32]);
@@ -9410,7 +9699,7 @@ mod tests {
         pubsub.publish(topic, payload.clone()).await.ok();
 
         // Check cache
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(state.has_message(&msg_id));
     }
@@ -9460,7 +9749,7 @@ mod tests {
         pubsub.handle_eager(from_peer, topic, message).await.ok();
 
         // Verify peer was moved to lazy
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(!state.eager_peers.contains(&from_peer));
         assert!(state.lazy_peers.contains(&from_peer));
@@ -9482,7 +9771,7 @@ mod tests {
             .ok();
 
         // Verify IWANT was tracked
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(state.outstanding_iwants.contains_key(&unknown_msg_id));
     }
@@ -9497,7 +9786,7 @@ mod tests {
 
         // Initialize peer as lazy
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             state.lazy_peers.insert(from_peer);
         }
@@ -9508,7 +9797,7 @@ mod tests {
 
         // Get the actual cached msg_id (don't recalculate - epoch may have changed)
         let msg_id = {
-            let topics = pubsub.topics.read().await;
+            let topics = pubsub.topics.read_topic(&topic).await;
             let state = topics.get(&topic).unwrap();
             // Get the first (and only) cached message ID
             state
@@ -9524,7 +9813,7 @@ mod tests {
             .ok();
 
         // Verify peer was grafted to eager
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(state.eager_peers.contains(&from_peer));
         assert!(!state.lazy_peers.contains(&from_peer));
@@ -9541,7 +9830,7 @@ mod tests {
 
         {
             let now = Instant::now();
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             for i in 0..MAX_EAGER_DEGREE {
                 let peer = test_peer_id(i as u8 + 30);
@@ -9557,7 +9846,7 @@ mod tests {
         let payload = Bytes::from("test");
         pubsub.publish(topic, payload).await.ok();
         let msg_id = {
-            let topics = pubsub.topics.read().await;
+            let topics = pubsub.topics.read_topic(&topic).await;
             let state = topics.get(&topic).unwrap();
             state
                 .message_cache
@@ -9570,7 +9859,7 @@ mod tests {
             .await
             .ok();
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert_eq!(
             state.eager_peers.len(),
@@ -9590,7 +9879,7 @@ mod tests {
 
         {
             let now = Instant::now();
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             for i in 0..MIN_EAGER_DEGREE {
                 let peer = test_peer_id(i as u8 + 50);
@@ -9625,7 +9914,7 @@ mod tests {
             .await
             .expect("unknown sender eager should be accepted");
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert_eq!(state.eager_peers.len(), MIN_EAGER_DEGREE);
         assert!(
@@ -9649,7 +9938,7 @@ mod tests {
         }
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             for peer in &peers {
                 state.lazy_peers.insert(*peer);
@@ -9848,7 +10137,7 @@ mod tests {
 
         // Manually expire cache entry
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.get_mut(&topic).unwrap();
 
             // Modify insertion time to simulate expiry
@@ -9967,7 +10256,7 @@ mod tests {
         let known_msg_id = [9u8; 32];
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             let header = MessageHeader {
                 version: 1,
@@ -9986,7 +10275,7 @@ mod tests {
             .await
             .expect("IHAVE with known message should be handled");
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).expect("topic should still exist");
         assert!(
             state.last_activity > old_activity,
@@ -10196,7 +10485,7 @@ mod tests {
             .expect("publish 3");
 
         // Verify cached_message_ids returns all 3
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         let ids = state.cached_message_ids();
         assert_eq!(ids.len(), 3, "Should have 3 cached message IDs");
@@ -10219,7 +10508,7 @@ mod tests {
 
         // Get the cached message ID
         let our_msg_id = {
-            let topics = pubsub.topics.read().await;
+            let topics = pubsub.topics.read_topic(&topic).await;
             let state = topics.get(&topic).unwrap();
             let ids = state.cached_message_ids();
             assert_eq!(ids.len(), 1);
@@ -10258,7 +10547,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Our message should still be in cache
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(state.has_message(&our_msg_id));
     }
@@ -10718,7 +11007,7 @@ mod tests {
             .expect("handle_eager");
 
         // Verify peer score has messages_delivered == 1
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         let peer_score = state
             .peer_scores
@@ -10749,7 +11038,7 @@ mod tests {
 
         // Verify IWANT request was tracked in score
         {
-            let topics = pubsub.topics.read().await;
+            let topics = pubsub.topics.read_topic(&topic).await;
             let state = topics.get(&topic).unwrap();
             let peer_score = state
                 .peer_scores
@@ -10792,7 +11081,7 @@ mod tests {
             .expect("handle_eager");
 
         // Verify IWANT response was recorded
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         let peer_score = state
             .peer_scores
@@ -11053,7 +11342,7 @@ mod tests {
         let scored_peer = test_peer_id(42);
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             state.eager_peers.insert(scored_peer);
             let mut score = PeerScore::new_at(Instant::now());
@@ -11067,7 +11356,7 @@ mod tests {
             "warm diagnostics snapshot should contain the seeded peer"
         );
 
-        let topics_write_guard = pubsub.topics.write().await;
+        let topics_write_guard = pubsub.topics.write_topic(&topic).await;
         let mut readers = Vec::new();
         for _ in 0..16 {
             let pubsub = Arc::clone(&pubsub);
@@ -11168,7 +11457,7 @@ mod tests {
         let topic = TopicId::new([90u8; 32]);
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             state.eager_peers.insert(connected_peer);
             state.eager_peers.insert(ghost_peer);
@@ -11202,7 +11491,7 @@ mod tests {
         let topic = TopicId::new([93u8; 32]);
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             topics.entry(topic).or_insert_with(TopicState::new);
         }
         store_connected_peers_snapshot(
@@ -11210,7 +11499,7 @@ mod tests {
             Some(HashSet::from([connected_peer])),
         );
 
-        let claims = pubsub
+        let (claims, _) = pubsub
             .claim_topic_send_attempts(topic, vec![ghost_peer], "EAGER")
             .await;
 
@@ -11233,7 +11522,7 @@ mod tests {
         let topic = TopicId::new([91u8; 32]);
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             state.eager_peers.insert(connected_peer);
             state.eager_peers.insert(ghost_peer);
@@ -11242,7 +11531,7 @@ mod tests {
 
         pubsub.refresh_connected_peers_snapshot_for_test().await;
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(state.eager_peers.contains(&connected_peer));
         assert!(!state.eager_peers.contains(&ghost_peer));
@@ -11263,7 +11552,7 @@ mod tests {
         let topic = TopicId::new([92u8; 32]);
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             state.eager_peers.insert(ghost_peer);
         }
@@ -11274,7 +11563,7 @@ mod tests {
             .await
             .unwrap();
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(state.eager_peers.contains(&ghost_peer));
         assert_eq!(transport.send_count_to(ghost_peer), 1);
@@ -11299,7 +11588,7 @@ mod tests {
         // Only peer_a is still connected
         pubsub.set_topic_peers(topic, vec![peer_a]).await;
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(state.eager_peers.contains(&peer_a));
         assert!(!state.eager_peers.contains(&peer_b));
@@ -11318,7 +11607,7 @@ mod tests {
 
         // Manually set up: peer_a eager, peer_b lazy
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             state.eager_peers.insert(peer_a);
             state.lazy_peers.insert(peer_b);
@@ -11327,7 +11616,7 @@ mod tests {
         // Only peer_a is still connected — peer_b should be pruned from lazy
         pubsub.set_topic_peers(topic, vec![peer_a]).await;
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(state.eager_peers.contains(&peer_a));
         assert!(!state.lazy_peers.contains(&peer_b));
@@ -11350,7 +11639,7 @@ mod tests {
         // Now peer_b has connected too
         pubsub.set_topic_peers(topic, vec![peer_a, peer_b]).await;
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(state.eager_peers.contains(&peer_a));
         assert!(state.eager_peers.contains(&peer_b));
@@ -11369,7 +11658,7 @@ mod tests {
 
         pubsub.initialize_topic_peers(topic, peers.clone()).await;
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert_eq!(
             state.eager_peers.len(),
@@ -11393,7 +11682,7 @@ mod tests {
 
         let mut connected = Vec::new();
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             for i in 0..MIN_EAGER_DEGREE {
                 let peer = test_peer_id(i as u8 + 20);
@@ -11408,7 +11697,7 @@ mod tests {
 
         pubsub.set_topic_peers(topic, connected).await;
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert_eq!(
             state.eager_peers.len(),
@@ -11432,7 +11721,7 @@ mod tests {
 
         // peer_a eager, peer_b lazy (simulating a prior PRUNE)
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             state.eager_peers.insert(peer_a);
             state.lazy_peers.insert(peer_b);
@@ -11442,7 +11731,7 @@ mod tests {
         // score-aware maintenance may promote peer_b to keep routing viable.
         pubsub.set_topic_peers(topic, vec![peer_a, peer_b]).await;
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(state.eager_peers.contains(&peer_a));
         assert!(
@@ -11467,7 +11756,7 @@ mod tests {
         let mut connected = Vec::new();
         {
             let now = Instant::now();
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
 
             for i in 0..MIN_EAGER_DEGREE {
@@ -11492,7 +11781,7 @@ mod tests {
 
         pubsub.set_topic_peers(topic, connected).await;
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(
             state.lazy_peers.contains(&slow_peer),
@@ -11518,7 +11807,7 @@ mod tests {
 
         // Start with peer_a eager, peer_b lazy
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             state.eager_peers.insert(peer_a);
             state.lazy_peers.insert(peer_b);
@@ -11527,7 +11816,7 @@ mod tests {
         // peer_a disconnected, peer_b still connected, peer_c is new
         pubsub.set_topic_peers(topic, vec![peer_b, peer_c]).await;
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert!(
             !state.eager_peers.contains(&peer_a),
@@ -11656,7 +11945,7 @@ mod tests {
 
         {
             let now = Instant::now();
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             for i in 0..MIN_EAGER_DEGREE {
                 let peer = test_peer_id(i as u8 + 130);
@@ -11681,7 +11970,7 @@ mod tests {
             pubsub.set_topic_peers(topic, connected.clone()).await;
         }
 
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
         assert_eq!(state.eager_peers.len(), MIN_EAGER_DEGREE);
         assert!(
@@ -12039,7 +12328,7 @@ mod tests {
         .with_health_oracle(oracle_arc);
 
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             state.eager_peers.insert(suspect);
         }
@@ -12071,7 +12360,7 @@ mod tests {
             pubsub.stage_stats().suppressed_peers.is_empty(),
             "suspect snapshot should hold cooling and avoid suppression"
         );
-        let topics = pubsub.topics.read().await;
+        let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).expect("topic exists");
         let cooling = state
             .peer_cooling
@@ -12193,12 +12482,12 @@ mod tests {
             .registry()
             .register(topic, TopicPriority::Critical);
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             state.eager_peers.insert(target);
         }
 
-        let held = pubsub
+        let (held, _) = pubsub
             .claim_topic_send_attempts(
                 topic,
                 vec![target; OUTBOUND_CRITICAL_QUEUE_PER_PEER],
@@ -12207,17 +12496,17 @@ mod tests {
             .await;
         assert_eq!(held.attempts().len(), OUTBOUND_CRITICAL_QUEUE_PER_PEER);
 
-        let overflow = pubsub
+        let (overflow, _) = pubsub
             .claim_topic_send_attempts(topic, vec![target], "EAGER")
             .await;
         assert!(overflow.is_empty());
         {
-            let topics = pubsub.topics.read().await;
+            let topics = pubsub.topics.read_topic(&topic).await;
             let state = topics.get(&topic).expect("topic exists");
             assert!(state.is_peer_suppressed_at(target, Instant::now()));
         }
 
-        let cooled = pubsub
+        let (cooled, _) = pubsub
             .claim_topic_send_attempts(topic, vec![target], "EAGER")
             .await;
         assert!(cooled.is_empty());
@@ -12244,7 +12533,7 @@ mod tests {
             .registry()
             .register(topic, TopicPriority::Critical);
         {
-            let mut topics = pubsub.topics.write().await;
+            let mut topics = pubsub.topics.write_topic(&topic).await;
             topics.insert(topic, TopicState::new());
         }
 

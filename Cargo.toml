@@ -96,3 +96,8 @@ restriction = { level = "allow", priority = -1 }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(test)'] }
+
+# Agent B reassembly investigation: override ant-quic to Agent A's fix branch
+# for e2e harness rebuild. Remove before merging to main.
+[patch.crates-io]
+ant-quic = { path = "../ant-quic-wt-reassembly" }

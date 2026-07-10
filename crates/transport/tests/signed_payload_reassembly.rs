@@ -75,7 +75,11 @@ fn make_signed_envelope(seed: u64) -> Vec<u8> {
     let topic = b"x0x.presence.global";
     let pk = vec![0xA1u8; 1952]; // ML-DSA-65 public key placeholder
     let sig = vec![0xB2u8; 3309]; // ML-DSA-65 signature placeholder
-    let agent_id = [seed as u8; 32];
+    let seed_le = seed.to_le_bytes();
+    let mut agent_id = [0u8; 32];
+    for (i, b) in seed_le.iter().cycle().take(32).enumerate() {
+        agent_id[i] = *b;
+    }
 
     // Filler to reach SIGNED_ENVELOPE_SIZE.
     let overhead = 1 + 32 + 2 + pk.len() + 2 + sig.len() + 2 + topic.len() + 32; // +32 for digest

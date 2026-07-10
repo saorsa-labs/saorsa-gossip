@@ -34,6 +34,7 @@ saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-wo
 proptest = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 saorsa-gossip-transport = { path = ".", features = ["test-helpers"] }
+sha2 = { workspace = true }
 
 [[example]]
 name = "throughput_test"

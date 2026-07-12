@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **PubSub: rate-limited recovery path during peer suppression (WP6).**
+  A peer in send-suppression cooldown previously received neither EAGER
+  pushes nor lazy IHAVE/anti-entropy sends for the entire cooldown, so a
+  message published while the peer was cooling was undeliverable until the
+  cooldown expired (observed live as ≥96 s CRDT propagation stalls between
+  three healthy WAN peers). The per-(topic, peer) claim gate now admits at
+  most one `CooldownBypass` send per 5 s
+  (`PEER_COOLDOWN_BYPASS_MIN_INTERVAL`) while suppression is active, so
+  IHAVE announces, anti-entropy digests, and cached-message serves trickle
+  through and a healthy-again peer converges on the anti-entropy timescale
+  (~30 s). A successful bypass send delivers data and decays the cooldown
+  memory but does **not** clear the suppression: full eager fanout still
+  waits for cooldown expiry plus one successful recovery probe, and bypass
+  timeouts do not escalate the cooldown. New stage-stats counters
+  `cooldown_bypass_probes` / `cooldown_bypass_successes` make the path
+  observable in diagnostics snapshots.
+
+### Changed
+
+- **WAN-realistic cooling tunables.** `PER_PEER_REPUBLISH_TIMEOUT` (the
+  cold-start floor for the adaptive per-peer send timeout) 2500 ms →
+  4000 ms; `PEER_TIMEOUT_THRESHOLD` 5 → 8 timeouts per 30 s window; legacy
+  `PEER_SUPPRESSION_COOLDOWN` 120 s → 30 s and
+  `PEER_SUPPRESSION_BACKOFF_MAX` 1800 s → 300 s, aligning the legacy/test
+  fallback constants with the adaptive cooling defaults in
+  `timing.rs` (`ADAPTIVE_COOLDOWN_INITIAL` / `ADAPTIVE_COOLDOWN_MAX`).
+  Live prod bootstrap nodes showed 12k–33k budget-pressure/cooling events
+  per day at the old values — cooling fired on ordinary high-RTT NAT paths
+  rather than genuinely dead peers.
+
 ## [0.5.58] - 2026-05-29
 
 ### Changed

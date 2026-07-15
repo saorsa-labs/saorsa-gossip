@@ -616,7 +616,10 @@ pub struct PubSubStageStatsSnapshot {
     /// `dropped_bulk_backpressure` vs `dropped_bulk_peer_suspect` /
     /// `dropped_bulk_peer_cooled`. `dropped_critical_hard_error` must
     /// stay zero in production; a non-zero value is a soak-blocking
-    /// violation.
+    /// violation. Benign Critical skips are split out as
+    /// `dropped_critical_cooling` (peer cooling/suppressed) and
+    /// `dropped_critical_no_target` (control send toward a
+    /// transport-disconnected peer set).
     pub admission: admission::AdmissionStatsSnapshot,
     /// X0X-0071: libp2p-style P1-P7 peer scores, sorted lowest-score
     /// first (worst peers / graylist candidates on top). Sits alongside
@@ -924,14 +927,11 @@ impl PeerOutboundBudgets {
         now: Instant,
     ) -> Option<OutboundSendPermit> {
         // Critical Data: reserve a FIFO queue slot before touching the budget
-        // map. On overflow, bail before any budget mutation so the caller's
-        // hard-error accounting is the only side effect.
+        // map. On overflow, bail (`?`) before any budget mutation so the
+        // caller's hard-error accounting is the only side effect.
         let critical =
             if matches!(class, OutboundSendClass::Data) && priority == TopicPriority::Critical {
-                match self.critical_gate.try_reserve(peer) {
-                    Some(reservation) => CriticalPermitState::Reserved(reservation),
-                    None => return None,
-                }
+                CriticalPermitState::Reserved(self.critical_gate.try_reserve(peer)?)
             } else {
                 CriticalPermitState::None
             };
@@ -1116,6 +1116,24 @@ struct SendClaimContext<'a> {
     priority: TopicPriority,
 }
 
+/// Per-reason tally of peers that were skipped (no attempt claimed) inside
+/// `claim_topic_send_attempts`. Carried out on [`SendAttemptClaims`] so the
+/// Critical-control caller can classify a zero-attempt outcome instead of
+/// guessing: transport-disconnected targets are benign
+/// (`dropped_critical_no_target`), cooling is benign backpressure
+/// (`dropped_critical_cooling`), and an exhausted control budget is genuine
+/// local pressure (`dropped_critical_hard_error`).
+#[derive(Debug, Clone, Copy, Default)]
+struct SendClaimSkips {
+    /// Peers skipped because the transport reports them disconnected.
+    transport_disconnected: usize,
+    /// Peers skipped by cooling/suppression (`claim_send_attempt_at` → None).
+    cooling: usize,
+    /// Peers skipped because `try_acquire` had no permit (Critical FIFO gate
+    /// full, or best-effort/control lane exhausted).
+    budget_exhausted: usize,
+}
+
 struct SendAttemptClaims {
     topic: TopicId,
     attempts: Vec<PeerSendAttempt>,
@@ -1123,6 +1141,9 @@ struct SendAttemptClaims {
     topics: Arc<ShardedTopicMap>,
     stage_stats: Arc<PubSubStageStats>,
     send_path: SendPathContext,
+    /// Why peers were skipped during the claim, per reason. Only consulted
+    /// by the single-peer Critical-control path today.
+    skips: SendClaimSkips,
     armed: bool,
 }
 
@@ -1142,12 +1163,17 @@ impl SendAttemptClaims {
             topics,
             stage_stats,
             send_path,
+            skips: SendClaimSkips::default(),
             armed: true,
         }
     }
 
     fn is_empty(&self) -> bool {
         self.attempts.is_empty()
+    }
+
+    fn skips(&self) -> SendClaimSkips {
+        self.skips
     }
 
     fn attempts(&self) -> &[PeerSendAttempt] {
@@ -4184,7 +4210,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // at function exit, covering no-claim, panic, and normal
         // completion paths uniformly. Critical admissions that fail to
         // claim an outbound budget record `dropped_critical_hard_error`
-        // — a non-zero value is a soak-blocking violation.
+        // — a non-zero value is a soak-blocking violation. Critical
+        // *control* sends are classified by skip reason: transport-
+        // disconnected target → benign `dropped_critical_no_target`,
+        // cooling → `dropped_critical_cooling`, exhausted control
+        // budget → the hard error.
         let priority = self.admission.registry().priority_for(&topic);
         let health = peer_health_from_snapshot(self.peer_health_snapshot.as_ref(), &peer);
         let is_peer_cooled = self.is_peer_currently_suppressed(&topic, &peer).await;
@@ -4209,27 +4239,71 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let (mut claims, _lock_wait) = self.claim_topic_send_attempts(topic, vec![peer], op).await;
         let Some(attempt) = claims.attempts().first().copied() else {
             // X0X-0074d: Critical *Data* skips (cooling vs gate overflow) are
-            // now counted inside claim_topic_send_attempts where the reason is
+            // counted inside claim_topic_send_attempts where the reason is
             // known, so we must not re-count them here. Only the Critical
-            // *Control* case (e.g. IWANT) is still counted at the caller.
+            // *Control* case (e.g. IWANT) is counted at the caller, classified
+            // by the skip reason the claim path carries out on the claims.
+            // In-claim admission accounting is Data-only, so exactly one
+            // admission counter increments per Critical-control skip.
             if priority == TopicPriority::Critical
                 && !matches!(OutboundSendClass::for_op(op), OutboundSendClass::Data)
             {
-                self.admission.stats().record_critical_hard_error();
-                debug!(
-                    peer_id = %LogPeerId::from(peer),
-                    topic = %LogTopicId::from(topic),
-                    op,
-                    "X0X-0074 hard error: Critical control admission failed to claim outbound budget"
-                );
+                let skips = claims.skips();
+                if skips.budget_exhausted > 0 {
+                    // Control-lane budget exhausted (or any mixed case that
+                    // includes it): genuine local pressure on the control
+                    // path — this is the hard error.
+                    self.admission.stats().record_critical_hard_error();
+                    debug!(
+                        peer_id = %LogPeerId::from(peer),
+                        topic = %LogTopicId::from(topic),
+                        op,
+                        "X0X-0074 hard error: Critical control send skipped by exhausted control budget"
+                    );
+                } else if skips.cooling > 0 {
+                    // Peer cooling/suppressed: same benign transient
+                    // backpressure the Data path books as cooling.
+                    self.admission.stats().record_critical_cooling();
+                    debug!(
+                        peer_id = %LogPeerId::from(peer),
+                        topic = %LogTopicId::from(topic),
+                        op,
+                        "X0X-0074 Critical control send skipped: peer cooling"
+                    );
+                } else if skips.transport_disconnected > 0 {
+                    // Every target is transport-disconnected: unreachable
+                    // peers in the send set, not local overload or loss to
+                    // a live peer — benign no-target, NOT the hard error.
+                    self.admission.stats().record_critical_no_target();
+                    debug!(
+                        peer_id = %LogPeerId::from(peer),
+                        topic = %LogTopicId::from(topic),
+                        op,
+                        "X0X-0074 Critical control send found no transport-connected target"
+                    );
+                } else {
+                    // Defensive: zero attempts with no recorded skip reason.
+                    // Unknown cause — keep the historical hard error rather
+                    // than silently absorbing it.
+                    self.admission.stats().record_critical_hard_error();
+                    debug!(
+                        peer_id = %LogPeerId::from(peer),
+                        topic = %LogTopicId::from(topic),
+                        op,
+                        "X0X-0074 hard error: Critical control send claimed zero attempts with no skip reason"
+                    );
+                }
             }
             drop(release_guard);
             return Ok(());
         };
         let Some(permit) = claims.take_permits().into_iter().next() else {
             // Defensive: claim pushes attempt+permit together, so this is
-            // unreachable. Critical Data is accounted in claim; only count the
-            // Control case here for symmetry with the no-attempt path above.
+            // unreachable. Unlike the no-attempt path above (benign
+            // transport-disconnected target → `dropped_critical_no_target`),
+            // an attempt WITHOUT its permit indicates an internal
+            // claim-bookkeeping race, not an unreachable peer — so this stays
+            // a hard error.
             if priority == TopicPriority::Critical
                 && !matches!(OutboundSendClass::for_op(op), OutboundSendClass::Data)
             {
@@ -4344,7 +4418,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let lock_wait = lock_started.elapsed();
         self.stage_stats
             .record(PubSubStage::DedupeLockAcquire, lock_wait);
-        let (attempts, permits) = if let Some(state) = topics.get_mut(&topic) {
+        let (attempts, permits, skips) = if let Some(state) = topics.get_mut(&topic) {
             let claim_context = SendClaimContext {
                 stage_stats: self.stage_stats.as_ref(),
                 outbound_budgets: &self.outbound_budgets,
@@ -4358,11 +4432,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         } else {
             let mut attempts = Vec::with_capacity(peers.len());
             let mut permits = Vec::with_capacity(peers.len());
+            let mut skips = SendClaimSkips::default();
             for peer in peers {
                 if peer_is_transport_disconnected(
                     send_path.connected_peers_snapshot.as_ref(),
                     &peer,
                 ) {
+                    skips.transport_disconnected += 1;
                     debug!(
                         peer_id = %LogPeerId::from(peer),
                         topic = %LogTopicId::from(topic),
@@ -4383,6 +4459,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     });
                     permits.push(permit);
                 } else {
+                    skips.budget_exhausted += 1;
                     self.stage_stats.record_outbound_budget_exhausted();
                     if priority == TopicPriority::Critical
                         && matches!(send_class, OutboundSendClass::Data)
@@ -4400,20 +4477,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     );
                 }
             }
-            (attempts, permits)
+            (attempts, permits, skips)
         };
 
-        (
-            SendAttemptClaims::new(
-                topic,
-                attempts,
-                permits,
-                Arc::clone(&self.topics),
-                Arc::clone(&self.stage_stats),
-                send_path,
-            ),
-            lock_wait,
-        )
+        let mut claims = SendAttemptClaims::new(
+            topic,
+            attempts,
+            permits,
+            Arc::clone(&self.topics),
+            Arc::clone(&self.stage_stats),
+            send_path,
+        );
+        claims.skips = skips;
+        (claims, lock_wait)
     }
 
     fn claim_topic_send_attempts_for_state(
@@ -4421,14 +4497,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         state: &mut TopicState,
         peers: Vec<PeerId>,
         now: Instant,
-    ) -> (Vec<PeerSendAttempt>, Vec<OutboundSendPermit>) {
+    ) -> (
+        Vec<PeerSendAttempt>,
+        Vec<OutboundSendPermit>,
+        SendClaimSkips,
+    ) {
         let mut attempts = Vec::with_capacity(peers.len());
         let mut permits = Vec::with_capacity(peers.len());
+        let mut skips = SendClaimSkips::default();
         for peer in peers {
             if peer_is_transport_disconnected(
                 claim_context.send_path.connected_peers_snapshot.as_ref(),
                 &peer,
             ) {
+                skips.transport_disconnected += 1;
                 debug!(
                     peer_id = %LogPeerId::from(peer),
                     topic = %LogTopicId::from(claim_context.topic),
@@ -4469,6 +4551,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         claim_context.priority,
                         now,
                     ) else {
+                        skips.budget_exhausted += 1;
                         if claim_context.priority == TopicPriority::Critical
                             && matches!(claim_context.send_class, OutboundSendClass::Data)
                         {
@@ -4505,6 +4588,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     permits.push(permit);
                 }
                 None => {
+                    skips.cooling += 1;
                     if claim_context.priority == TopicPriority::Critical
                         && matches!(claim_context.send_class, OutboundSendClass::Data)
                     {
@@ -4528,7 +4612,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
         }
-        (attempts, permits)
+        (attempts, permits, skips)
     }
 
     fn record_critical_gate_overflow_for_state(
@@ -5905,7 +5989,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     send_class: OutboundSendClass::for_op("IHAVE"),
                     priority: send_path.admission.registry().priority_for(&topic_id),
                 };
-                let (attempts, permits) =
+                // Skip reasons are only consulted by the single-peer
+                // Critical-control path; this fanout path ignores them.
+                let (attempts, permits, _skips) =
                     Self::claim_topic_send_attempts_for_state(&claim_context, state, admitted, now);
                 (attempts, permits, bulk_admitted)
             };
@@ -6209,12 +6295,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 send_class: OutboundSendClass::for_op("ANTI_ENTROPY"),
                                 priority: send_path.admission.registry().priority_for(&topic_id),
                             };
-                            let (attempts, permits) = Self::claim_topic_send_attempts_for_state(
-                                &claim_context,
-                                state,
-                                admitted,
-                                now,
-                            );
+                            // Skip reasons are only consulted by the
+                            // single-peer Critical-control path.
+                            let (attempts, permits, _skips) =
+                                Self::claim_topic_send_attempts_for_state(
+                                    &claim_context,
+                                    state,
+                                    admitted,
+                                    now,
+                                );
                             (attempts, permits, bulk_admitted)
                         };
                         let mut claims = SendAttemptClaims::new(
@@ -12510,6 +12599,23 @@ mod tests {
             .claim_topic_send_attempts(topic, vec![target], "EAGER")
             .await;
         assert!(cooled.is_empty());
+
+        // Counter split (0.5.67): FIFO gate overflow is genuine overload and
+        // must STILL record the hard error — never the benign no-target
+        // counter (that one is reserved for transport-disconnected targets).
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_critical_hard_error, 1,
+            "Critical FIFO gate overflow must keep recording the hard error"
+        );
+        assert_eq!(
+            stats.dropped_critical_cooling, 1,
+            "the post-overflow claim is skipped by the immediate cooling"
+        );
+        assert_eq!(
+            stats.dropped_critical_no_target, 0,
+            "gate overflow must not be misclassified as a no-target skip"
+        );
         drop(held);
     }
 
@@ -12612,5 +12718,209 @@ mod tests {
             "no peer was cooling in this scenario"
         );
         assert_eq!(stats.admitted_critical, 2, "both sends were admitted");
+    }
+
+    #[tokio::test]
+    async fn critical_control_send_to_disconnected_peer_counts_no_target_not_hard_error() {
+        // Why: `dropped_critical_hard_error` carries a "must stay zero"
+        // contract and downstream convergence soaks gate on its growth. A
+        // Critical *control* send (IHAVE/IWANT) whose only target is
+        // transport-disconnected is NOT local overload or loss to a live
+        // peer — in a 2-node topology with unreachable bootstrap peers it
+        // happens continuously. It must book the benign
+        // `dropped_critical_no_target` counter instead, or the zero-growth
+        // contract is unenforceable in production.
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([45u8; 32]);
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics.entry(topic).or_insert_with(TopicState::new);
+        }
+        // Known-connected snapshot that does NOT contain the target: the
+        // claim path skips it as transport-disconnected, so the control
+        // send finds zero claimable peers.
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::new()),
+        );
+
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"iwant-to-ghost"),
+                "IWANT",
+            )
+            .await
+            .expect("control send toward a disconnected peer completes without error");
+
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_critical_no_target, 1,
+            "a Critical control send with only transport-disconnected targets \
+             must book the benign no-target counter"
+        );
+        assert_eq!(
+            stats.dropped_critical_hard_error, 0,
+            "unreachable peers are not overload: the hard-error zero-growth \
+             contract must hold"
+        );
+        assert_eq!(
+            transport.send_count_to(target),
+            0,
+            "no bytes may reach the transport for a disconnected peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_control_send_to_cooling_peer_counts_cooling_only() {
+        // Why: the no-target split must not swallow other zero-attempt
+        // causes. A Critical control send skipped because the (connected)
+        // peer is cooling is transient backpressure — it must land in the
+        // existing cooling accounting, exactly once, and never in the
+        // benign no-target counter or the hard error.
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([48u8; 32]);
+        pubsub.initialize_topic_peers(topic, vec![target]).await;
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Critical);
+
+        // Drive the peer into active cooling via repeated timeouts.
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![target])
+                .await;
+        }
+
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"iwant-while-cooling"),
+                "IWANT",
+            )
+            .await
+            .expect("cooling skip completes without error");
+
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_critical_cooling, 1,
+            "a Critical control skip on a cooling peer must book cooling exactly once"
+        );
+        assert_eq!(
+            stats.dropped_critical_hard_error, 0,
+            "cooling is transient backpressure, not a hard error"
+        );
+        assert_eq!(
+            stats.dropped_critical_no_target, 0,
+            "the peer is transport-connected; this is not a no-target skip"
+        );
+        assert_eq!(
+            transport.send_count_to(target),
+            0,
+            "no bytes may reach the transport for a cooling peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_control_budget_exhaustion_still_counts_hard_error() {
+        // Why: the no-target split must not mask genuine control-path
+        // pressure. When the per-peer control lane is exhausted, a Critical
+        // control send skip is real local overload and must keep recording
+        // the hard error — never the benign no-target counter.
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let (transport, mut started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([49u8; 32]);
+        pubsub.initialize_topic_peers(topic, vec![target]).await;
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Critical);
+
+        // Saturate the per-peer control lane: both sends block inside the
+        // transport while holding their control permits.
+        let mut holders = Vec::new();
+        for payload in [
+            Bytes::from_static(b"iwant-hold-1"),
+            Bytes::from_static(b"iwant-hold-2"),
+        ] {
+            let task_pubsub = Arc::clone(&pubsub);
+            holders.push(tokio::spawn(async move {
+                task_pubsub
+                    .send_to_peer_bounded(topic, target, GossipStreamType::PubSub, payload, "IWANT")
+                    .await
+            }));
+        }
+        for _ in 0..OUTBOUND_CONTROL_PERMITS_PER_PEER {
+            tokio::time::timeout(Duration::from_millis(200), started_rx.recv())
+                .await
+                .expect("control sends up to the peer budget should start")
+                .expect("send channel should stay open");
+        }
+
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"iwant-over-budget"),
+                "IWANT",
+            )
+            .await
+            .expect("budget exhaustion should skip, not return a send error");
+
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_critical_hard_error, 1,
+            "exhausted control budget is genuine pressure and must stay a hard error"
+        );
+        assert_eq!(
+            stats.dropped_critical_no_target, 0,
+            "budget exhaustion must not be misclassified as a benign no-target skip"
+        );
+        assert_eq!(
+            stats.dropped_critical_cooling, 0,
+            "the peer is not cooling in this scenario"
+        );
+
+        transport.release_sends(OUTBOUND_CONTROL_PERMITS_PER_PEER);
+        for task in holders {
+            tokio::time::timeout(Duration::from_millis(500), task)
+                .await
+                .expect("held control send should finish once released")
+                .expect("send task should not panic")
+                .expect("held control send should succeed");
+        }
     }
 }

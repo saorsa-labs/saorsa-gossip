@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.67] - 2026-07-15
+
+### Changed
+
+- **PubSub — split benign "no reachable target" Critical drops out of
+  `dropped_critical_hard_error`.** The hard-error counter carries a
+  "must stay zero" admission contract, and downstream convergence soaks
+  gate on its growth. It previously conflated genuine overload (per-peer
+  Critical FIFO gate overflow — still a hard error) with a benign
+  condition: a Critical *control* send (IHAVE/IWANT) finding zero
+  claimable peers because every target is transport-disconnected. In a
+  2-node topology with unreachable bootstrap peers the latter booked
+  ~10 false "hard errors"/minute, poisoning the zero-growth gate. That
+  path now records the new `dropped_critical_no_target` counter
+  ("Critical control send found no transport-connected target; indicates
+  unreachable peers in the send set, not local overload or loss to live
+  peers"), exposed as a new trailing field on `AdmissionStatsSnapshot`
+  (`#[serde(default)]`, appended at the END of the struct so existing
+  serialized fields are positionally unchanged). Mirrors the 0.5.57
+  split of benign cooling-suppression drops into
+  `dropped_critical_cooling`. The near-unreachable defensive "claimed
+  attempt but lost permit" twin remains a hard error (it indicates an
+  internal race, not an unreachable peer), as does FIFO gate overflow.
+
 ## [0.5.58] - 2026-05-29
 
 ### Changed

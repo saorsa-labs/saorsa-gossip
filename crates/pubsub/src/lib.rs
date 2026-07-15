@@ -616,7 +616,10 @@ pub struct PubSubStageStatsSnapshot {
     /// `dropped_bulk_backpressure` vs `dropped_bulk_peer_suspect` /
     /// `dropped_bulk_peer_cooled`. `dropped_critical_hard_error` must
     /// stay zero in production; a non-zero value is a soak-blocking
-    /// violation.
+    /// violation. Benign Critical skips are split out as
+    /// `dropped_critical_cooling` (peer cooling/suppressed) and
+    /// `dropped_critical_no_target` (control send toward a
+    /// transport-disconnected peer set).
     pub admission: admission::AdmissionStatsSnapshot,
     /// X0X-0071: libp2p-style P1-P7 peer scores, sorted lowest-score
     /// first (worst peers / graylist candidates on top). Sits alongside
@@ -4184,7 +4187,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // at function exit, covering no-claim, panic, and normal
         // completion paths uniformly. Critical admissions that fail to
         // claim an outbound budget record `dropped_critical_hard_error`
-        // — a non-zero value is a soak-blocking violation.
+        // — a non-zero value is a soak-blocking violation. Critical
+        // *control* sends whose only target is transport-disconnected
+        // record the benign `dropped_critical_no_target` instead.
         let priority = self.admission.registry().priority_for(&topic);
         let health = peer_health_from_snapshot(self.peer_health_snapshot.as_ref(), &peer);
         let is_peer_cooled = self.is_peer_currently_suppressed(&topic, &peer).await;
@@ -4209,18 +4214,28 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let (mut claims, _lock_wait) = self.claim_topic_send_attempts(topic, vec![peer], op).await;
         let Some(attempt) = claims.attempts().first().copied() else {
             // X0X-0074d: Critical *Data* skips (cooling vs gate overflow) are
-            // now counted inside claim_topic_send_attempts where the reason is
+            // counted inside claim_topic_send_attempts where the reason is
             // known, so we must not re-count them here. Only the Critical
-            // *Control* case (e.g. IWANT) is still counted at the caller.
+            // *Control* case (e.g. IWANT) is still counted at the caller —
+            // as `dropped_critical_no_target` (benign: unreachable peer).
             if priority == TopicPriority::Critical
                 && !matches!(OutboundSendClass::for_op(op), OutboundSendClass::Data)
             {
-                self.admission.stats().record_critical_hard_error();
+                // A Critical *control* send with zero claimed attempts means
+                // every candidate peer was skipped before an attempt existed —
+                // in the single-peer path that is the transport-disconnected
+                // skip inside `claim_topic_send_attempts`. That indicates an
+                // unreachable peer in the send set, not local overload or
+                // loss to a live peer, so it is counted as
+                // `dropped_critical_no_target`, NOT as the hard error.
+                // (Critical *Data* skips are counted inside
+                // `claim_topic_send_attempts` where the reason is known.)
+                self.admission.stats().record_critical_no_target();
                 debug!(
                     peer_id = %LogPeerId::from(peer),
                     topic = %LogTopicId::from(topic),
                     op,
-                    "X0X-0074 hard error: Critical control admission failed to claim outbound budget"
+                    "X0X-0074 Critical control send found no transport-connected target"
                 );
             }
             drop(release_guard);
@@ -4228,8 +4243,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         };
         let Some(permit) = claims.take_permits().into_iter().next() else {
             // Defensive: claim pushes attempt+permit together, so this is
-            // unreachable. Critical Data is accounted in claim; only count the
-            // Control case here for symmetry with the no-attempt path above.
+            // unreachable. Unlike the no-attempt path above (benign
+            // transport-disconnected target → `dropped_critical_no_target`),
+            // an attempt WITHOUT its permit indicates an internal
+            // claim-bookkeeping race, not an unreachable peer — so this stays
+            // a hard error.
             if priority == TopicPriority::Critical
                 && !matches!(OutboundSendClass::for_op(op), OutboundSendClass::Data)
             {
@@ -12510,6 +12528,23 @@ mod tests {
             .claim_topic_send_attempts(topic, vec![target], "EAGER")
             .await;
         assert!(cooled.is_empty());
+
+        // Counter split (0.5.67): FIFO gate overflow is genuine overload and
+        // must STILL record the hard error — never the benign no-target
+        // counter (that one is reserved for transport-disconnected targets).
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_critical_hard_error, 1,
+            "Critical FIFO gate overflow must keep recording the hard error"
+        );
+        assert_eq!(
+            stats.dropped_critical_cooling, 1,
+            "the post-overflow claim is skipped by the immediate cooling"
+        );
+        assert_eq!(
+            stats.dropped_critical_no_target, 0,
+            "gate overflow must not be misclassified as a no-target skip"
+        );
         drop(held);
     }
 
@@ -12612,5 +12647,70 @@ mod tests {
             "no peer was cooling in this scenario"
         );
         assert_eq!(stats.admitted_critical, 2, "both sends were admitted");
+    }
+
+    #[tokio::test]
+    async fn critical_control_send_to_disconnected_peer_counts_no_target_not_hard_error() {
+        // Why: `dropped_critical_hard_error` carries a "must stay zero"
+        // contract and downstream convergence soaks gate on its growth. A
+        // Critical *control* send (IHAVE/IWANT) whose only target is
+        // transport-disconnected is NOT local overload or loss to a live
+        // peer — in a 2-node topology with unreachable bootstrap peers it
+        // happens continuously. It must book the benign
+        // `dropped_critical_no_target` counter instead, or the zero-growth
+        // contract is unenforceable in production.
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([45u8; 32]);
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics.entry(topic).or_insert_with(TopicState::new);
+        }
+        // Known-connected snapshot that does NOT contain the target: the
+        // claim path skips it as transport-disconnected, so the control
+        // send finds zero claimable peers.
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::new()),
+        );
+
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"iwant-to-ghost"),
+                "IWANT",
+            )
+            .await
+            .expect("control send toward a disconnected peer completes without error");
+
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_critical_no_target, 1,
+            "a Critical control send with only transport-disconnected targets \
+             must book the benign no-target counter"
+        );
+        assert_eq!(
+            stats.dropped_critical_hard_error, 0,
+            "unreachable peers are not overload: the hard-error zero-growth \
+             contract must hold"
+        );
+        assert_eq!(
+            transport.send_count_to(target),
+            0,
+            "no bytes may reach the transport for a disconnected peer"
+        );
     }
 }

@@ -20,6 +20,10 @@
 //!   so Critical only fails to claim a permit when another Critical send to
 //!   the same peer is already in flight; that records
 //!   `dropped_critical_hard_error`, which must remain zero in production.
+//!   Two benign skip reasons are counted separately so the hard-error
+//!   contract holds: peer cooling/suppression → `dropped_critical_cooling`,
+//!   and a Critical *control* send whose entire target set is
+//!   transport-disconnected → `dropped_critical_no_target`.
 //! - **Normal** → admit unless `H ∈ {Dead, Suspect}`. The Suspect drop
 //!   matches the X0X-0074 ticket text ("admitted unless peer is under
 //!   suspicion or peer score below threshold"); the score check is
@@ -117,6 +121,12 @@ pub struct AdmissionStats {
     /// NOT a budget/gate violation. Legitimate, transient backpressure;
     /// tracked separately so `dropped_critical_hard_error` can hold at zero.
     dropped_critical_cooling: AtomicU64,
+    /// Critical control send found no transport-connected target; indicates
+    /// unreachable peers in the send set, not local overload or loss to live
+    /// peers. Tracked separately so `dropped_critical_hard_error` can hold at
+    /// zero when the only "failures" are sends toward disconnected peers
+    /// (e.g. unreachable bootstrap entries in a small topology).
+    dropped_critical_no_target: AtomicU64,
 }
 
 /// JSON-friendly snapshot of admission counters.
@@ -156,6 +166,14 @@ pub struct AdmissionStatsSnapshot {
     /// violation — does NOT block the broad-launch soak gate.
     #[serde(default)]
     pub dropped_critical_cooling: u64,
+    /// Critical control send found no transport-connected target; indicates
+    /// unreachable peers in the send set, not local overload or loss to live
+    /// peers. Distinct from the hard-error violation — does NOT block the
+    /// zero-growth soak gate. Appended at the END of the struct so
+    /// positional (bincode-style) serialization of the preceding fields is
+    /// unchanged.
+    #[serde(default)]
+    pub dropped_critical_no_target: u64,
 }
 
 impl AdmissionStats {
@@ -174,6 +192,7 @@ impl AdmissionStats {
             dropped_normal_peer_suspect: self.dropped_normal_peer_suspect.load(Ordering::Relaxed),
             dropped_critical_hard_error: self.dropped_critical_hard_error.load(Ordering::Relaxed),
             dropped_critical_cooling: self.dropped_critical_cooling.load(Ordering::Relaxed),
+            dropped_critical_no_target: self.dropped_critical_no_target.load(Ordering::Relaxed),
         }
     }
 
@@ -203,6 +222,17 @@ impl AdmissionStats {
     /// legitimate transient backpressure and does NOT block the soak gate.
     pub fn record_critical_cooling(&self) {
         self.dropped_critical_cooling
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a Critical control send that found no transport-connected
+    /// target: every candidate peer was skipped as transport-disconnected
+    /// before an attempt could be claimed. Indicates unreachable peers in
+    /// the send set, not local overload or loss to live peers — distinct
+    /// from [`Self::record_critical_hard_error`] and does NOT block the
+    /// soak gate.
+    pub fn record_critical_no_target(&self) {
+        self.dropped_critical_no_target
             .fetch_add(1, Ordering::Relaxed);
     }
 

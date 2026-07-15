@@ -927,14 +927,11 @@ impl PeerOutboundBudgets {
         now: Instant,
     ) -> Option<OutboundSendPermit> {
         // Critical Data: reserve a FIFO queue slot before touching the budget
-        // map. On overflow, bail before any budget mutation so the caller's
-        // hard-error accounting is the only side effect.
+        // map. On overflow, bail (`?`) before any budget mutation so the
+        // caller's hard-error accounting is the only side effect.
         let critical =
             if matches!(class, OutboundSendClass::Data) && priority == TopicPriority::Critical {
-                match self.critical_gate.try_reserve(peer) {
-                    Some(reservation) => CriticalPermitState::Reserved(reservation),
-                    None => return None,
-                }
+                CriticalPermitState::Reserved(self.critical_gate.try_reserve(peer)?)
             } else {
                 CriticalPermitState::None
             };

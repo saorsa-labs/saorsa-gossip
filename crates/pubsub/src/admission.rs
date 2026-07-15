@@ -169,9 +169,12 @@ pub struct AdmissionStatsSnapshot {
     /// Critical control send found no transport-connected target; indicates
     /// unreachable peers in the send set, not local overload or loss to live
     /// peers. Distinct from the hard-error violation — does NOT block the
-    /// zero-growth soak gate. Appended at the END of the struct so
-    /// positional (bincode-style) serialization of the preceding fields is
-    /// unchanged.
+    /// zero-growth soak gate. This snapshot derives `Serialize` only, so
+    /// adding the field is purely additive for serialized output; it is
+    /// appended at the END of the struct so positionally-encoded readers of
+    /// the preceding fields are unaffected. (`#[serde(default)]` is inert
+    /// without a `Deserialize` derive — kept only for parity with
+    /// `dropped_critical_cooling` and in case one is derived later.)
     #[serde(default)]
     pub dropped_critical_no_target: u64,
 }

@@ -17,17 +17,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   condition: a Critical *control* send (IHAVE/IWANT) finding zero
   claimable peers because every target is transport-disconnected. In a
   2-node topology with unreachable bootstrap peers the latter booked
-  ~10 false "hard errors"/minute, poisoning the zero-growth gate. That
-  path now records the new `dropped_critical_no_target` counter
-  ("Critical control send found no transport-connected target; indicates
-  unreachable peers in the send set, not local overload or loss to live
-  peers"), exposed as a new trailing field on `AdmissionStatsSnapshot`
-  (`#[serde(default)]`, appended at the END of the struct so existing
-  serialized fields are positionally unchanged). Mirrors the 0.5.57
-  split of benign cooling-suppression drops into
-  `dropped_critical_cooling`. The near-unreachable defensive "claimed
-  attempt but lost permit" twin remains a hard error (it indicates an
-  internal race, not an unreachable peer), as does FIFO gate overflow.
+  ~10 false "hard errors"/minute, poisoning the zero-growth gate. The
+  claim path now carries per-reason skip tallies (transport-disconnected
+  / cooling / budget-exhausted) out on the claims, and the single-peer
+  Critical-control caller classifies a zero-attempt outcome by reason:
+  exhausted control budget (or any mixed case including it) stays the
+  hard error; cooling books the existing `dropped_critical_cooling`;
+  transport-disconnected-only books the new
+  `dropped_critical_no_target` counter ("Critical control send found no
+  transport-connected target; indicates unreachable peers in the send
+  set, not local overload or loss to live peers"). The new counter is
+  exposed as a trailing field on `AdmissionStatsSnapshot` (the snapshot
+  is serialize-only; appended at the END of the struct so serialized
+  output is purely additive). Mirrors the 0.5.57 split of benign
+  cooling-suppression drops into `dropped_critical_cooling`. The
+  near-unreachable defensive "claimed attempt but lost permit" twin
+  remains a hard error (it indicates an internal race, not an
+  unreachable peer), as does FIFO gate overflow.
 
 ## [0.5.58] - 2026-05-29
 

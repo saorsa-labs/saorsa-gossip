@@ -1392,6 +1392,69 @@ fn peer_is_transport_disconnected(
         .as_ref()
         .is_some_and(|connected| !connected.contains(peer))
 }
+/// Transport-connected evidence for a single peer, read from the
+/// connected-peers snapshot without cloning the full set.
+///
+/// Returns `Some(true)` when an authoritative snapshot exists and lists
+/// `peer` as connected, `Some(false)` when it exists but omits `peer`,
+/// and `None` when no authoritative snapshot is available (the
+/// transport cannot currently provide a connectivity view). This is the
+/// single-peer analogue of the batched `connected_peers_from_snapshot`
+/// clone used by the fanout path, avoiding a full-set allocation for
+/// one membership probe.
+fn transport_connected_for_peer(
+    snapshot: &StdRwLock<Option<HashSet<PeerId>>>,
+    peer: &PeerId,
+) -> Option<bool> {
+    match snapshot.read() {
+        Ok(guard) => guard.as_ref().map(|set| set.contains(peer)),
+        Err(poisoned) => {
+            warn!("PubSub connected-peers snapshot lock was poisoned; recovering");
+            poisoned.into_inner().as_ref().map(|set| set.contains(peer))
+        }
+    }
+}
+
+/// Effective peer health to feed the admission gate.
+///
+/// The SWIM peer-health snapshot is refreshed on a coarse interval and
+/// can lag the authenticated transport, which holds per-connection
+/// liveness: a peer the transport still lists as *connected* is
+/// reachable on the wire right now even if a stale SWIM round marked it
+/// `Suspect`/`Dead`. For **Normal** priority only, treat that
+/// transport-connected evidence as stronger and override the stale
+/// health to `None` so admission admits.
+///
+/// `transport_connected` is `Some(true)` only when an authoritative
+/// connected snapshot lists the peer. When there is no snapshot
+/// (`None`) or the snapshot omits the peer (`Some(false)`), the raw
+/// SWIM health is preserved so the `Suspect`/`Dead` drop still fires —
+/// we never *invent* connectivity. Bulk and Critical priorities always
+/// preserve the raw health unchanged (their admission rules are
+/// untouched by X0X-0074's transport-evidence refinement).
+///
+/// **Failure fallback:** overriding health does not weaken delivery
+/// guarantees. If the send later fails at the transport layer, the
+/// existing per-peer send timeout (`record_per_peer_timeout`) and
+/// adaptive cooling (`is_peer_currently_suppressed`) catch the real
+/// failure exactly as they would for any live peer.
+fn effective_health_for_admission(
+    priority: TopicPriority,
+    health: Option<PeerHealth>,
+    transport_connected: Option<bool>,
+) -> Option<PeerHealth> {
+    if priority == TopicPriority::Normal
+        && matches!(health, Some(PeerHealth::Suspect) | Some(PeerHealth::Dead))
+        && transport_connected == Some(true)
+    {
+        // Fresh transport liveness overrides stale SWIM suspicion for
+        // Normal traffic only; actual transport failure is still caught
+        // by the per-peer timeout / cooling paths downstream.
+        None
+    } else {
+        health
+    }
+}
 
 fn store_connected_peers_snapshot(
     snapshot: &StdRwLock<Option<HashSet<PeerId>>>,
@@ -4217,6 +4280,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // budget → the hard error.
         let priority = self.admission.registry().priority_for(&topic);
         let health = peer_health_from_snapshot(self.peer_health_snapshot.as_ref(), &peer);
+        // Normal: transport-connected overrides stale SWIM Suspect/Dead so
+        // admission admits; Bulk/Critical and missing/absent snapshot keep
+        // raw health (drop still fires). Read connected evidence once, no
+        // full-set clone — unlike the batched fanout path.
+        let transport_connected =
+            transport_connected_for_peer(self.connected_peers_snapshot.as_ref(), &peer);
+        let health = effective_health_for_admission(priority, health, transport_connected);
         let is_peer_cooled = self.is_peer_currently_suppressed(&topic, &peer).await;
         let admission_decision = self.admission.admit(&topic, &peer, health, is_peer_cooled);
         if let AdmissionDecision::Drop { reason } = admission_decision {
@@ -5009,20 +5079,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             connected_peers_from_snapshot(self.connected_peers_snapshot.as_ref());
         let mut admitted = Vec::with_capacity(peers.len());
         for peer in peers {
-            if let Some(connected) = connected_snapshot.as_ref() {
-                if !connected.contains(&peer) {
-                    debug!(
-                        peer_id = %peer,
-                        topic = %topic,
-                        op,
-                        priority = %priority,
-                        "PubSub admission skipped transport-disconnected peer send"
-                    );
-                    continue;
-                }
+            // Transport-connected evidence derived once from the batched
+            // snapshot clone (already fetched above for the skip check):
+            // Some(true)=connected, Some(false)=omitted, None=no snapshot.
+            let transport_connected = connected_snapshot.as_ref().map(|set| set.contains(&peer));
+            if let Some(false) = transport_connected {
+                debug!(
+                    peer_id = %peer,
+                    topic = %topic,
+                    op,
+                    priority = %priority,
+                    "PubSub admission skipped transport-disconnected peer send"
+                );
+                continue;
             }
 
             let health = peer_health_from_snapshot(self.peer_health_snapshot.as_ref(), &peer);
+            // Normal: transport-connected overrides stale SWIM Suspect/Dead
+            // so admission admits; Bulk/Critical and missing/absent snapshot
+            // keep raw health. Reuses the same `transport_connected` probe
+            // — no second snapshot read, no allocation.
+            let health = effective_health_for_admission(priority, health, transport_connected);
             let is_peer_cooled = cooled_set.contains(&peer);
             match self.admission.admit(topic, &peer, health, is_peer_cooled) {
                 AdmissionDecision::Admit => admitted.push(peer),
@@ -12922,5 +12999,338 @@ mod tests {
                 .expect("send task should not panic")
                 .expect("held control send should succeed");
         }
+    }
+
+    // ---- X0X-0074: transport-connected overrides stale SWIM Suspect/Dead
+    //      for Normal traffic only (fanout + single-peer send paths). Bulk
+    //      and Critical keep their drop; a missing or peer-absent connected
+    //      snapshot keeps the Suspect/Dead drop. The pure AdmissionControl
+    //      decision matrix is unchanged — the override lives in the send
+    //      paths via `effective_health_for_admission`, feeding `None` health
+    //      to `admit()` so it records an admission, never a drop. ----
+
+    /// Build a pubsub whose eager mesh is exactly `target`, with background
+    /// refresher tasks disabled so test-set health/connected snapshots stay
+    /// authoritative. Shared by the fanout-override regression tests.
+    async fn normal_override_pubsub(
+        local: PeerId,
+        target: PeerId,
+        topic: TopicId,
+    ) -> (Arc<RecordingTransport>, PlumtreePubSub<RecordingTransport>) {
+        let transport = RecordingTransport::new(local);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(target);
+        }
+        (transport, pubsub)
+    }
+
+    #[tokio::test]
+    async fn fanout_normal_suspect_connected_snapshot_overrides_drop_and_sends() {
+        // Normal + SWIM-Suspect, but the authenticated transport still lists
+        // the peer as connected: the fanout must treat that as stronger fresh
+        // evidence, override the stale health to None, and actually attempt
+        // the EAGER send. Before the override this dropped silently.
+        let local = test_peer_id(0);
+        let target = test_peer_id(2);
+        let topic = TopicId::new([74u8; 32]);
+        let (transport, pubsub) = normal_override_pubsub(local, target, topic).await;
+
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Suspect)]),
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"normal-suspect-connected"))
+            .await
+            .expect("publish completes");
+
+        assert!(
+            transport.send_count_to(target) >= 1,
+            "Normal+Suspect with a connected snapshot must still attempt the fanout send"
+        );
+        let stats = pubsub.admission().stats().snapshot();
+        assert!(
+            stats.admitted_normal >= 1,
+            "the connected override must record a Normal admission, not a drop"
+        );
+        assert_eq!(
+            stats.dropped_normal_peer_suspect, 0,
+            "transport-connected evidence overrides the stale Suspect drop for Normal"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_normal_dead_connected_snapshot_overrides_drop_and_sends() {
+        // Same override, Dead health: a peer the transport still holds
+        // connected is reachable on the wire even if a stale SWIM round
+        // declared it Dead. Normal traffic must fan out.
+        let local = test_peer_id(0);
+        let target = test_peer_id(3);
+        let topic = TopicId::new([75u8; 32]);
+        let (transport, pubsub) = normal_override_pubsub(local, target, topic).await;
+
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Dead)]),
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"normal-dead-connected"))
+            .await
+            .expect("publish completes");
+
+        assert!(
+            transport.send_count_to(target) >= 1,
+            "Normal+Dead with a connected snapshot must still attempt the fanout send"
+        );
+        let stats = pubsub.admission().stats().snapshot();
+        assert!(
+            stats.admitted_normal >= 1,
+            "the connected override must record a Normal admission, not a drop"
+        );
+        assert_eq!(
+            stats.dropped_normal_peer_dead, 0,
+            "transport-connected evidence overrides the stale Dead drop for Normal"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_normal_suspect_missing_connected_snapshot_still_drops() {
+        // No connected snapshot at all → the override never fires (it must
+        // never invent connectivity). Raw Suspect health reaches admission
+        // and drops, preserving the pre-fix behaviour.
+        let local = test_peer_id(0);
+        let target = test_peer_id(4);
+        let topic = TopicId::new([76u8; 32]);
+        let (transport, pubsub) = normal_override_pubsub(local, target, topic).await;
+
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Suspect)]),
+        );
+        // connected_peers_snapshot deliberately left at its initial None.
+
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"normal-suspect-no-snapshot"))
+            .await
+            .expect("publish completes");
+
+        assert_eq!(
+            transport.send_count_to(target),
+            0,
+            "Normal+Suspect with no connected snapshot must NOT fan out"
+        );
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_normal_peer_suspect, 1,
+            "missing snapshot preserves the Suspect drop at admission"
+        );
+        assert_eq!(
+            stats.admitted_normal, 0,
+            "no override means no Normal admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_normal_suspect_disconnected_snapshot_still_drops() {
+        // An authoritative snapshot that OMITS the peer → Some(false). The
+        // fanout skips it as transport-disconnected before admission is ever
+        // consulted, so there is no send and — distinct from the single-peer
+        // path — no Normal drop counter bumps.
+        let local = test_peer_id(0);
+        let target = test_peer_id(5);
+        let topic = TopicId::new([77u8; 32]);
+        let (transport, pubsub) = normal_override_pubsub(local, target, topic).await;
+
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Suspect)]),
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::new()),
+        );
+
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"normal-suspect-disconnected"))
+            .await
+            .expect("publish completes");
+
+        assert_eq!(
+            transport.send_count_to(target),
+            0,
+            "Normal+Suspect with the peer absent from the connected snapshot must NOT fan out"
+        );
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_normal_peer_suspect, 0,
+            "the fanout skips a transport-disconnected peer before admission, so the drop counter stays 0"
+        );
+        assert_eq!(stats.admitted_normal, 0, "no admission for a skipped peer");
+    }
+
+    #[tokio::test]
+    async fn fanout_bulk_suspect_connected_snapshot_still_drops() {
+        // The override is Normal-only. Bulk+Suspect must keep dropping even
+        // when the peer is transport-connected — guards against an overbroad
+        // implementation that would leak Bulk past its Suspect gate.
+        let local = test_peer_id(0);
+        let target = test_peer_id(6);
+        let topic = TopicId::new([78u8; 32]);
+        let (transport, pubsub) = normal_override_pubsub(local, target, topic).await;
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Bulk);
+
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Suspect)]),
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"bulk-suspect-connected"))
+            .await
+            .expect("publish completes");
+
+        assert_eq!(
+            transport.send_count_to(target),
+            0,
+            "Bulk+Suspect must drop even when transport-connected; the override is Normal-only"
+        );
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_bulk_peer_suspect, 1,
+            "Bulk preserves its Suspect drop regardless of connected evidence"
+        );
+        assert_eq!(stats.admitted_bulk, 0, "no Bulk admission under suspicion");
+    }
+
+    #[tokio::test]
+    async fn single_peer_normal_suspect_connected_snapshot_overrides_drop_and_sends() {
+        // The single-peer bounded path gets the same override as the fanout.
+        // send_to_peer_bounded consults the connected snapshot per-peer and
+        // feeds effective None health to admit() for Normal+connected.
+        let local = test_peer_id(0);
+        let target = test_peer_id(7);
+        let topic = TopicId::new([79u8; 32]);
+        let transport = RecordingTransport::new(local);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        // Seed an empty topic state so the claim path has a TopicState.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics.entry(topic).or_insert_with(TopicState::new);
+        }
+
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Suspect)]),
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"single-normal-suspect-connected"),
+                "EAGER",
+            )
+            .await
+            .expect("single-peer send completes");
+
+        assert!(
+            transport.send_count_to(target) >= 1,
+            "single-peer Normal+Suspect with a connected snapshot must override and send"
+        );
+        let stats = pubsub.admission().stats().snapshot();
+        assert!(
+            stats.admitted_normal >= 1,
+            "the connected override must record a Normal admission on the single-peer path"
+        );
+        assert_eq!(
+            stats.dropped_normal_peer_suspect, 0,
+            "no Suspect drop on the single-peer path when transport-connected"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_peer_normal_suspect_missing_connected_snapshot_still_drops() {
+        // Single-peer counterpart to the missing-snapshot fanout drop: with
+        // no connected snapshot the override does not fire. Unlike the
+        // fanout, the single-peer path has no pre-admission skip, so the
+        // raw Suspect reaches admission and bumps the drop counter.
+        let local = test_peer_id(0);
+        let target = test_peer_id(8);
+        let topic = TopicId::new([80u8; 32]);
+        let transport = RecordingTransport::new(local);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics.entry(topic).or_insert_with(TopicState::new);
+        }
+
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Suspect)]),
+        );
+        // connected_peers_snapshot deliberately left at its initial None.
+
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"single-normal-suspect-no-snapshot"),
+                "EAGER",
+            )
+            .await
+            .expect("single-peer send completes");
+
+        assert_eq!(
+            transport.send_count_to(target),
+            0,
+            "single-peer Normal+Suspect with no connected snapshot must NOT send"
+        );
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_normal_peer_suspect, 1,
+            "missing snapshot preserves the Suspect drop on the single-peer path"
+        );
+        assert_eq!(stats.admitted_normal, 0, "no override means no admission");
     }
 }

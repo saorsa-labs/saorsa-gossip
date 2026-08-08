@@ -152,6 +152,15 @@ const PEER_TIMEOUT_THRESHOLD: usize = 5;
 /// Initial sender-side suppression duration for a cooled peer.
 const PEER_SUPPRESSION_COOLDOWN: Duration = Duration::from_secs(120);
 
+/// Minimum gap between zero-fan-out WARN lines for the same topic (issue #32).
+///
+/// A black-holed publisher keeps publishing, so an unthrottled WARN would emit
+/// one line per message per topic — the field case in issue #32 published
+/// continuously across a group topic, a global fallback topic and per-recipient
+/// DM inbox topics at once. The counters are incremented on every occurrence
+/// regardless; only the log line is throttled.
+const ZERO_FANOUT_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Maximum repeated-offender suppression duration.
 const PEER_SUPPRESSION_BACKOFF_MAX: Duration = Duration::from_secs(1_800);
 
@@ -2565,6 +2574,10 @@ struct TopicState {
     /// #32). Counted per topic; surfaced via
     /// `PubSubStageStatsSnapshot::zero_fanout_publishes_by_topic`.
     zero_fanout_publishes: u64,
+    /// Last time this topic emitted a zero-fan-out WARN, for
+    /// `ZERO_FANOUT_WARN_INTERVAL` throttling. `None` until the first one, so
+    /// the first zero-fan-out publish on a topic always logs.
+    last_zero_fanout_warn: Option<Instant>,
 }
 
 impl TopicState {
@@ -2592,7 +2605,24 @@ impl TopicState {
             peer_cooling: HashMap::new(),
             last_opportunistic_graft: None,
             zero_fanout_publishes: 0,
+            last_zero_fanout_warn: None,
         }
+    }
+
+    /// Record a zero-fan-out publish and report whether the WARN is due.
+    ///
+    /// The counter always advances; the log line is throttled to one per
+    /// `ZERO_FANOUT_WARN_INTERVAL` so a continuously-publishing black-holed
+    /// node cannot flood the log (issue #32).
+    fn record_zero_fanout_publish_at(&mut self, now: Instant) -> bool {
+        self.zero_fanout_publishes = self.zero_fanout_publishes.saturating_add(1);
+        let due = self
+            .last_zero_fanout_warn
+            .is_none_or(|last| now.saturating_duration_since(last) >= ZERO_FANOUT_WARN_INTERVAL);
+        if due {
+            self.last_zero_fanout_warn = Some(now);
+        }
+        due
     }
 
     /// Mark this topic as having seen data-plane activity now.
@@ -2699,7 +2729,11 @@ impl TopicState {
     /// this floor a degraded node thrashes cooling until its own publishes
     /// fan out to zero peers while still returning `Ok(())`.
     fn cooling_floor_blocks_at(&self, peer: PeerId, now: Instant) -> bool {
-        !self.subscribers.is_empty()
+        // Live-subscriber check rather than `!subscribers.is_empty()`: a
+        // dropped subscription leaves a closed sender in the vector until
+        // `clean_cache` prunes it, which would otherwise keep the floor armed
+        // on a topic that has already reverted to forward-only.
+        self.has_live_subscribers()
             && self.eager_peers.contains(&peer)
             && self
                 .eager_peers
@@ -3020,8 +3054,10 @@ impl TopicState {
             } else {
                 // Issue #32 cooling floor: suppressing this peer must not
                 // empty the topic's eligible eager fan-out set. Recovery
-                // probes are exempt — a peer with a probe in flight is not
-                // in the eager set, so re-suppressing it cannot empty it.
+                // probes never reach this branch — they are handled above and
+                // re-suppress unconditionally. That cannot strand the topic: a
+                // floor peer is never suppressed, so its cooldown never
+                // expires and it is never claimed as a recovery probe.
                 let floor_blocks = self.cooling_floor_blocks_at(attempt.peer, now);
                 let cooling = self
                     .peer_cooling
@@ -4021,6 +4057,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     fn zero_fanout_publishes_by_topic(&self) -> BTreeMap<String, u64> {
         let Some(topics) = self.topics.try_read_all() else {
+            // Lock contention is most likely exactly when a node is degraded,
+            // i.e. when this breakdown matters most. Say so rather than
+            // returning an empty map that reads as "no zero-fan-out topics";
+            // the aggregate counter is unaffected.
+            debug!(
+                "zero_fanout_publishes_by_topic unavailable: topic map busy; \
+                 aggregate zero_fanout_publishes is still accurate"
+            );
             return BTreeMap::new();
         };
         topics
@@ -5343,18 +5387,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let zero_fanout = fanout == 0;
         if zero_fanout {
             self.stage_stats.record_zero_fanout_publish();
-            warn!(
-                topic = %topic,
-                msg_id = ?msg_id,
-                "local publish had zero eligible remote fan-out targets"
-            );
         }
 
         // Batch msg_id to pending_ihave
         let mut topics = self.topics.write_topic(&topic).await;
         if let Some(state) = topics.get_mut(&topic) {
-            if zero_fanout {
-                state.zero_fanout_publishes = state.zero_fanout_publishes.saturating_add(1);
+            if zero_fanout && state.record_zero_fanout_publish_at(Instant::now()) {
+                warn!(
+                    topic = %topic,
+                    msg_id = ?msg_id,
+                    zero_fanout_publishes = state.zero_fanout_publishes,
+                    warn_interval_secs = ZERO_FANOUT_WARN_INTERVAL.as_secs(),
+                    "local publish had zero eligible remote fan-out targets \
+                     (throttled; counter is cumulative for this topic)"
+                );
             }
             state.pending_ihave.push(msg_id);
 
@@ -7481,6 +7527,139 @@ mod tests {
             .expect("floor peer remains eligible");
         assert_eq!(fanout, 1);
         assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 0);
+    }
+
+    /// The floor exists to stop a node black-holing its OWN publishes, so it
+    /// is scoped to topics with a live local subscriber. A forward-only relay
+    /// topic must keep full cooling: the sender is not the origin, other paths
+    /// exist, and pinning an unhealthy peer there buys nothing. A dropped
+    /// subscription must revert the topic to forward-only immediately rather
+    /// than when `clean_cache` next prunes the closed sender.
+    #[test]
+    fn test_cooling_floor_is_scoped_to_live_local_subscribers() {
+        let mut state = TopicState::new();
+        let last_eager = test_peer_id(2);
+        let other_eager = test_peer_id(3);
+        state.eager_peers.insert(last_eager);
+        state.eager_peers.insert(other_eager);
+
+        let now = Instant::now();
+        let mut cooling = PeerCoolingState::new(now);
+        cooling.suppressed_until = Some(now + Duration::from_secs(60));
+        state.peer_cooling.insert(other_eager, cooling);
+
+        // Forward-only: no local subscriber, so cooling stays unrestricted
+        // even though suppressing `last_eager` empties the eligible set.
+        assert!(
+            !state.cooling_floor_blocks_at(last_eager, now),
+            "relay topics must not pin an unhealthy peer"
+        );
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.subscribers.push(tx);
+        assert!(
+            state.cooling_floor_blocks_at(last_eager, now),
+            "a locally subscribed topic must keep its last eligible eager peer"
+        );
+
+        // Closed senders linger in `subscribers` until `clean_cache` runs;
+        // the floor must not treat them as local interest.
+        drop(rx);
+        assert!(
+            !state.cooling_floor_blocks_at(last_eager, now),
+            "a dropped subscription must revert the topic to forward-only"
+        );
+    }
+
+    /// The zero-fan-out WARN is throttled, but the counters are the machine-
+    /// readable signal behind `GET /diagnostics/gossip`. Throttling the log
+    /// must never throttle the counters, or an operator sampling diagnostics
+    /// would under-count a black-holed publisher.
+    #[tokio::test]
+    async fn test_zero_fanout_counters_count_every_publish_despite_warn_throttle() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([0x35; 32]);
+        let _local_subscription = pubsub.subscribe_ready(topic).await;
+
+        for i in 0..3u8 {
+            let fanout = pubsub
+                .publish_local_with_fanout(topic, Bytes::copy_from_slice(&[i]))
+                .await
+                .expect("zero-fanout publish preserves Ok semantics");
+            assert_eq!(fanout, 0);
+        }
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(stats.zero_fanout_publishes, 3);
+        assert_eq!(
+            stats.zero_fanout_publishes_by_topic.get(&topic.to_string()),
+            Some(&3),
+            "every zero-fan-out publish must be counted, not just the logged one"
+        );
+    }
+
+    /// Only the first WARN in a `ZERO_FANOUT_WARN_INTERVAL` window is emitted.
+    /// A black-holed publisher publishes continuously, so an unthrottled WARN
+    /// floods the log on exactly the node an operator needs to read.
+    #[test]
+    fn test_zero_fanout_warn_is_throttled_per_interval() {
+        let mut state = TopicState::new();
+        let start = Instant::now();
+
+        assert!(
+            state.record_zero_fanout_publish_at(start),
+            "first zero-fan-out on a topic always logs"
+        );
+        assert!(
+            !state.record_zero_fanout_publish_at(start + Duration::from_secs(1)),
+            "a second publish inside the window must stay silent"
+        );
+        assert!(
+            state.record_zero_fanout_publish_at(start + ZERO_FANOUT_WARN_INTERVAL),
+            "the window reopens after ZERO_FANOUT_WARN_INTERVAL"
+        );
+        assert_eq!(
+            state.zero_fanout_publishes, 3,
+            "throttling the log must not throttle the counter"
+        );
+    }
+
+    /// The field case in issue #32 was not "no peers configured" — it was a
+    /// full eager set whose every member had been cooled. On a forward-only
+    /// topic (no floor) that must still surface as a zero-fan-out publish.
+    #[tokio::test]
+    async fn test_zero_fanout_counted_when_all_eager_peers_are_cooled() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([0x36; 32]);
+        let first = test_peer_id(2);
+        let second = test_peer_id(3);
+        pubsub
+            .initialize_topic_peers(topic, vec![first, second])
+            .await;
+
+        for peer in [first, second] {
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                pubsub
+                    .record_topic_send_results(topic, Vec::new(), vec![peer])
+                    .await;
+            }
+        }
+        assert_eq!(
+            pubsub.stage_stats().suppressed_peers.len(),
+            2,
+            "no live local subscriber, so no floor protects either peer"
+        );
+
+        let fanout = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"all-cooled"))
+            .await
+            .expect("publish still returns Ok");
+        assert_eq!(fanout, 0, "every eager peer was cooled");
+        assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 1);
     }
 
     #[tokio::test]

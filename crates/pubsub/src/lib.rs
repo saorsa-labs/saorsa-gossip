@@ -383,6 +383,22 @@ impl StageTimingStats {
     }
 }
 
+/// Observed fan-out outcome for a single local publish.
+///
+/// `attempted` counts peers that passed admission and dedup gating and
+/// received a send task; it does **not** guarantee delivery. `succeeded`
+/// counts peers from which a confirmed send was observed on the publish path
+/// (`detach_accounting = false`). The dispatcher forward path
+/// (`detach_accounting = true`) always returns `succeeded = 0` because
+/// outcomes are collected in a detached task after the call returns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FanoutCounts {
+    /// Number of peers the message was dispatched toward.
+    pub attempted: usize,
+    /// Number of those peers that confirmed receipt before this call returned.
+    pub succeeded: usize,
+}
+
 /// Per-stage timing counters for inbound PubSub message handling.
 #[derive(Debug, Default)]
 pub struct PubSubStageStats {
@@ -404,9 +420,16 @@ pub struct PubSubStageStats {
     outbound_budget_exhausted: AtomicU64,
     /// Local publishes whose eligible eager fan-out set was empty (issue
     /// #32): every eager peer was cooled/excluded, or the topic had no eager
-    /// peers at all. The publish still returns `Ok(())`, so this counter is
-    /// the loud signal that the message did not leave the node.
+    /// peers at all (`attempted == 0`). The publish still returns `Ok(())`,
+    /// so this counter is the loud signal that the message did not leave the
+    /// node.
     zero_fanout_publishes: AtomicU64,
+    /// Local publishes where at least one peer was attempted but every send
+    /// failed or timed out (`attempted > 0, succeeded == 0`). This is the
+    /// black-hole signature: the eager set contained peers but none of them
+    /// were reachable at dispatch time (e.g. "Peer not found" in the
+    /// transport). Distinct from `zero_fanout_publishes` (no attempt at all).
+    zero_succeeded_publishes: AtomicU64,
     suppressed_peers: Mutex<HashMap<SuppressedPeerKey, SuppressedPeerState>>,
     /// Lock-wait timing for `suppressed_peers` (issue #27 instrumentation).
     suppressed_peers_lock: StageTimingStats,
@@ -604,14 +627,19 @@ pub struct PubSubStageStatsSnapshot {
     /// Cumulative count of sends skipped before spawning because the peer had
     /// already consumed its outbound PubSub budget.
     pub outbound_budget_exhausted: u64,
-    /// Cumulative count of local publishes whose eligible eager fan-out set
-    /// was empty (issue #32). A non-zero value means publishes returned
-    /// `Ok(())` without the message leaving the node.
+    /// Cumulative count of local publishes where no peer was attempted
+    /// (`attempted == 0`). A non-zero value means the eager set was empty or
+    /// fully cooled — the message did not leave the node.
     pub zero_fanout_publishes: u64,
     /// Per-topic view of `zero_fanout_publishes`, keyed by topic id. Counts
     /// for idle-evicted topics remain visible in the aggregate
     /// `zero_fanout_publishes` only.
     pub zero_fanout_publishes_by_topic: BTreeMap<String, u64>,
+    /// Cumulative count of local publishes where at least one peer was
+    /// attempted but every send failed (`attempted > 0, succeeded == 0`).
+    /// This is the black-hole signature: peers exist in the eager set but
+    /// none were reachable at dispatch time.
+    pub zero_succeeded_publishes: u64,
     /// Peers currently cooled after repeated send-side timeouts.
     pub suppressed_peers: Vec<SuppressedPeerSnapshot>,
     /// Topic-indexed view of currently suppressed peers. Kept alongside the
@@ -1793,6 +1821,7 @@ impl PubSubStageStats {
             outbound_budget_exhausted: self.outbound_budget_exhausted.load(Ordering::Relaxed),
             zero_fanout_publishes: self.zero_fanout_publishes.load(Ordering::Relaxed),
             zero_fanout_publishes_by_topic: BTreeMap::new(),
+            zero_succeeded_publishes: self.zero_succeeded_publishes.load(Ordering::Relaxed),
             suppressed_peers: self.suppressed_peer_snapshots(),
             suppressed_peers_by_topic: BTreeMap::new(),
             suppression_cleanup_interval_ms: self
@@ -1857,6 +1886,11 @@ impl PubSubStageStats {
 
     fn record_zero_fanout_publish(&self) {
         self.zero_fanout_publishes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_zero_succeeded_publish(&self) {
+        self.zero_succeeded_publishes
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_peer_suppressed(
@@ -2742,6 +2776,79 @@ impl TopicState {
                 .all(|other| self.is_peer_suppressed_at(*other, now))
     }
 
+    /// Issue #32 eligibility-time guarantee: if this topic has live local
+    /// subscribers and every eager peer is currently suppressed, un-suppress
+    /// the least-bad one so the next publish has at least one delivery path.
+    ///
+    /// This handles the case where the floor peer (which `cooling_floor_blocks_at`
+    /// prevented from being suppressed) subsequently disconnects. After removal
+    /// by `set_topic_peers`, the remaining eager peers are all suppressed and
+    /// fan-out drops to zero permanently — the transition guard alone cannot
+    /// recover that state because it only fires during new timeout events.
+    ///
+    /// In the prune-on-suppress flow (`record_send_timeout_inner_at` calls
+    /// `prune_peer` when suppression fires), suppressed peers are moved from
+    /// eager to lazy. After the floor peer disconnects the eager set becomes
+    /// empty while the suppressed candidates live in lazy. This rescue therefore
+    /// searches both sets so that either topology is covered:
+    ///   • suppressed-and-still-eager (e.g. set manually in unit tests)
+    ///   • suppressed-and-pruned-to-lazy (the normal production path)
+    ///
+    /// Selection: shortest remaining suppression wins; break ties by best score.
+    /// The rescue is durable: once cleared, the peer behaves normally and will
+    /// re-cool naturally if it continues to time out. A rescued lazy peer is
+    /// promoted to eager so the immediately-following publish reaches it.
+    /// Returns the rescued peer id for logging; returns `None` when no rescue
+    /// is needed or possible.
+    fn rescue_suppressed_eager_peer_if_needed_at(&mut self, now: Instant) -> Option<PeerId> {
+        if !self.has_live_subscribers() {
+            return None;
+        }
+        // Any non-suppressed eager peer means the eligible set is not empty —
+        // no rescue needed.
+        if self
+            .eager_peers
+            .iter()
+            .any(|p| !self.is_peer_suppressed_at(*p, now))
+        {
+            return None;
+        }
+        // All eager peers are suppressed (or eager is empty). Search both
+        // eager and lazy for a suppressed candidate. Pick the one with the
+        // shortest remaining cooldown (earliest to recover), using score as a
+        // tiebreak.
+        let best = self
+            .eager_peers
+            .iter()
+            .chain(self.lazy_peers.iter())
+            .copied()
+            .filter(|p| self.is_peer_suppressed_at(*p, now))
+            .map(|peer| {
+                let remaining = self
+                    .peer_cooling
+                    .get(&peer)
+                    .and_then(|c| c.suppressed_until)
+                    .map(|until| until.saturating_duration_since(now))
+                    .unwrap_or(Duration::ZERO);
+                let score = self.peer_score_at(peer, now);
+                (peer, remaining, score)
+            })
+            .min_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.total_cmp(&a.2)))
+            .map(|(peer, _, _)| peer)?;
+
+        if let Some(cooling) = self.peer_cooling.get_mut(&best) {
+            cooling.suppressed_until = None;
+            cooling.recovery_probe_in_flight = false;
+            cooling.recovery_probe_id = None;
+        }
+        // If the peer was pruned to lazy on suppression, promote it to eager
+        // so the upcoming publish has a delivery target.
+        if self.lazy_peers.remove(&best) {
+            self.eager_peers.insert(best);
+        }
+        Some(best)
+    }
+
     fn can_graft_peer_at(&self, peer: PeerId, now: Instant) -> bool {
         self.peer_cooling
             .get(&peer)
@@ -3503,12 +3610,17 @@ pub trait PubSub: Send + Sync {
     /// Publish a message to a topic
     async fn publish(&self, topic: TopicId, data: Bytes) -> Result<()>;
 
-    /// Publish a message and return the number of remote fan-out attempts.
+    /// Publish a message and return fan-out outcome counts.
     ///
     /// Implementations that cannot observe fan-out return `None` after a
-    /// successful publish. PlumTree returns `Some(attempts)`, letting callers
-    /// distinguish a remote publish from a zero-peer no-op.
-    async fn publish_with_fanout(&self, topic: TopicId, data: Bytes) -> Result<Option<usize>> {
+    /// successful publish. PlumTree returns `Some(FanoutCounts)`, letting
+    /// callers distinguish a remote publish from a zero-peer no-op and
+    /// identify the black-hole signature (`attempted > 0, succeeded == 0`).
+    async fn publish_with_fanout(
+        &self,
+        topic: TopicId,
+        data: Bytes,
+    ) -> Result<Option<FanoutCounts>> {
         self.publish(topic, data).await.map(|()| None)
     }
 
@@ -5008,7 +5120,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
         detach_accounting: bool,
-    ) -> (Duration, usize) {
+    ) -> (Duration, FanoutCounts) {
         // X0X-0074: admission gate runs once per (topic, peer) before
         // we claim attempts. Dropped peers never enter the send
         // pipeline. Bulk admissions are reserved here and released
@@ -5026,7 +5138,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         };
         let admitted_count = admitted.len();
         if admitted_count == 0 {
-            return (Duration::ZERO, 0);
+            return (Duration::ZERO, FanoutCounts::default());
         }
         // X0X-0074: RAII guard releases Bulk admissions for the entire
         // admitted set exactly once on drop — covers no-claim, partial-
@@ -5052,10 +5164,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if claims.is_empty() {
             // No peers got attempts. Bulk reservations release when
             // `_bulk_guard` drops at function exit.
-            return (lock_wait, 0);
+            return (lock_wait, FanoutCounts::default());
         }
-        let fanout = claims.attempts().len();
-        let mut send_tasks = SendTaskSet::with_capacity(op, fanout);
+        let attempted = claims.attempts().len();
+        let mut send_tasks = SendTaskSet::with_capacity(op, attempted);
         let attempts = claims.attempts().to_vec();
         let permits = claims.take_permits();
         for (attempt, permit) in attempts.into_iter().zip(permits) {
@@ -5104,15 +5216,33 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let (sent, timed_out) = send_tasks.collect_results().await;
                 claims.record_results(sent, timed_out).await;
             });
+            // Outcomes are collected asynchronously — succeeded is not
+            // observable at this call site. Return 0 so callers know the
+            // count is unavailable rather than misleadingly optimistic.
+            (
+                lock_wait,
+                FanoutCounts {
+                    attempted,
+                    succeeded: 0,
+                },
+            )
         } else {
             // Publish path (and tests): await the fan-out so publish() retains
             // its established semantics (returns after sends are attempted).
+            // Outcomes are observable here, so succeeded is accurate.
             let (sent, timed_out) = send_tasks.collect_results().await;
+            let succeeded = sent.len();
             claims.record_results(sent, timed_out).await;
             // _bulk_guard drops here, releasing every Bulk admission exactly
             // once. No manual release call needed.
+            (
+                lock_wait,
+                FanoutCounts {
+                    attempted,
+                    succeeded,
+                },
+            )
         }
-        (lock_wait, fanout)
     }
 }
 
@@ -5317,8 +5447,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .map(|_| ())
     }
 
-    /// Publish a message and return its remote EAGER fan-out attempt count.
-    pub async fn publish_local_with_fanout(&self, topic: TopicId, payload: Bytes) -> Result<usize> {
+    /// Publish a message and return its remote EAGER fan-out counts.
+    pub async fn publish_local_with_fanout(
+        &self,
+        topic: TopicId,
+        payload: Bytes,
+    ) -> Result<FanoutCounts> {
         let msg_id = self.calculate_msg_id(&topic, &payload);
 
         let header = MessageHeader {
@@ -5351,6 +5485,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // detected as replays (defense-in-depth alongside msg_id dedup).
         let _ = state.is_payload_replay(&payload);
 
+        // Issue #32 eligibility-time guarantee: if all eager peers are
+        // suppressed, rescue the least-bad one before materialising the send
+        // list. This handles floor-peer disconnection (the transition guard
+        // inside record_topic_send_timeout cannot recover that state because
+        // no new timeout event fires after the peer is removed).
+        let now = Instant::now();
+        if let Some(rescued) = state.rescue_suppressed_eager_peer_if_needed_at(now) {
+            debug!(
+                peer_id = %LogPeerId::from(rescued),
+                topic = %LogTopicId::from(topic),
+                "publish: rescued suppressed eager peer to prevent zero fan-out after floor-peer disconnect"
+            );
+        }
+
         // Send EAGER to eager_peers
         let eager_peers: Vec<PeerId> = state.eager_peers.iter().copied().collect();
         drop(topics); // Release lock before network I/O
@@ -5368,13 +5516,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Ok(b) => b.into(),
             Err(e) => {
                 warn!(msg_id = ?msg_id, "EAGER serialize failed: {e}");
-                return Ok(0);
+                return Ok(FanoutCounts::default());
             }
         };
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Sending EAGER fan-out");
         // Publish path: await accounting (detach_accounting = false) so
-        // publish() returns only after its EAGER sends are attempted.
-        let (_, fanout) = self
+        // publish() returns only after its EAGER sends are attempted and
+        // outcomes are observable (succeeded is valid here).
+        let (_, counts) = self
             .parallel_send_to_peers(
                 topic,
                 eager_peers,
@@ -5384,21 +5533,31 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 false,
             )
             .await;
-        let zero_fanout = fanout == 0;
-        if zero_fanout {
+
+        // Update zero-delivery counters. Two distinct conditions:
+        //   attempted == 0 → no eligible peers (cooled / empty eager set).
+        //   attempted > 0, succeeded == 0 → black-hole: peers existed but
+        //                                    every send failed at dispatch.
+        // The WARN fires on either condition (succeeded == 0) so operators
+        // see it whether the problem is missing peers or unreachable ones.
+        if counts.attempted == 0 {
             self.stage_stats.record_zero_fanout_publish();
+        } else if counts.succeeded == 0 {
+            self.stage_stats.record_zero_succeeded_publish();
         }
 
         // Batch msg_id to pending_ihave
         let mut topics = self.topics.write_topic(&topic).await;
         if let Some(state) = topics.get_mut(&topic) {
-            if zero_fanout && state.record_zero_fanout_publish_at(Instant::now()) {
+            if counts.succeeded == 0 && state.record_zero_fanout_publish_at(Instant::now()) {
                 warn!(
                     topic = %topic,
                     msg_id = ?msg_id,
+                    attempted = counts.attempted,
+                    succeeded = counts.succeeded,
                     zero_fanout_publishes = state.zero_fanout_publishes,
                     warn_interval_secs = ZERO_FANOUT_WARN_INTERVAL.as_secs(),
-                    "local publish had zero eligible remote fan-out targets \
+                    "local publish had zero successful remote fan-out \
                      (throttled; counter is cumulative for this topic)"
                 );
             }
@@ -5416,7 +5575,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
         }
 
-        Ok(fanout)
+        Ok(counts)
     }
 
     /// Handle incoming EAGER message
@@ -6698,7 +6857,11 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
         self.publish_local(topic, data).await
     }
 
-    async fn publish_with_fanout(&self, topic: TopicId, data: Bytes) -> Result<Option<usize>> {
+    async fn publish_with_fanout(
+        &self,
+        topic: TopicId,
+        data: Bytes,
+    ) -> Result<Option<FanoutCounts>> {
         self.publish_local_with_fanout(topic, data).await.map(Some)
     }
 
@@ -7479,12 +7642,13 @@ mod tests {
         let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
         let topic = TopicId::new([0x32; 32]);
 
-        let fanout = pubsub
+        let counts = pubsub
             .publish_local_with_fanout(topic, Bytes::from_static(b"zero-fanout"))
             .await
             .expect("zero-fanout publish preserves Ok semantics");
 
-        assert_eq!(fanout, 0);
+        assert_eq!(counts.attempted, 0);
+        assert_eq!(counts.succeeded, 0);
         let stats = pubsub.stage_stats();
         assert_eq!(stats.zero_fanout_publishes, 1);
         assert_eq!(
@@ -7521,12 +7685,88 @@ mod tests {
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].peer_id, cooled_peer.to_string());
 
-        let fanout = pubsub
+        let counts = pubsub
             .publish_local_with_fanout(topic, Bytes::from_static(b"floor"))
             .await
             .expect("floor peer remains eligible");
-        assert_eq!(fanout, 1);
+        assert_eq!(counts.attempted, 1);
         assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 0);
+    }
+
+    /// Reviewer's empirical sequence (issue #32 REQUEST CHANGES): 3 eager
+    /// peers, mass-cool → floor saves the last one → the floor peer
+    /// disconnects → the remaining suppressed peers stay suppressed → fan-out
+    /// drops to 0 permanently.
+    ///
+    /// The eligibility-time rescue in `rescue_suppressed_eager_peer_if_needed_at`
+    /// catches this: at publish time, if all eager peers are suppressed but the
+    /// topic has live subscribers, the least-bad peer is un-suppressed so
+    /// fan-out is never zero while any connected peer exists.
+    #[tokio::test]
+    async fn test_cooling_floor_survives_floor_peer_disconnection() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([0x34; 32]);
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+        let floor_peer = test_peer_id(4);
+
+        let _local_subscription = pubsub.subscribe_ready(topic).await;
+        pubsub
+            .initialize_topic_peers(topic, vec![peer_a, peer_b, floor_peer])
+            .await;
+
+        // Suppress peer_a.
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![peer_a])
+                .await;
+        }
+        // Suppress peer_b.
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![peer_b])
+                .await;
+        }
+        // Drive floor_peer to the suppression threshold. The cooling floor
+        // blocks the final suppression because it would empty the eligible set.
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![floor_peer])
+                .await;
+        }
+
+        let suppressed = pubsub.stage_stats().suppressed_peers;
+        assert_eq!(suppressed.len(), 2, "floor peer must not be suppressed");
+        assert!(
+            suppressed.iter().any(|s| s.peer_id == peer_a.to_string()),
+            "peer_a must be suppressed"
+        );
+        assert!(
+            suppressed.iter().any(|s| s.peer_id == peer_b.to_string()),
+            "peer_b must be suppressed"
+        );
+
+        // Floor peer disconnects — set_topic_peers removes it from eager_peers
+        // and clears its cooling state, leaving peer_a and peer_b still
+        // suppressed. Without the eligibility-time rescue, fan-out is 0 forever.
+        pubsub.set_topic_peers(topic, vec![peer_a, peer_b]).await;
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"rescue"))
+            .await
+            .expect("publish returns Ok after floor-peer disconnect");
+        assert!(
+            counts.attempted >= 1,
+            "eligibility-time rescue must un-suppress at least one peer: attempted={}",
+            counts.attempted
+        );
+        assert_eq!(
+            pubsub.stage_stats().zero_fanout_publishes,
+            0,
+            "rescue must prevent the zero-fanout counter from incrementing"
+        );
     }
 
     /// The floor exists to stop a node black-holing its OWN publishes, so it
@@ -7584,11 +7824,12 @@ mod tests {
         let _local_subscription = pubsub.subscribe_ready(topic).await;
 
         for i in 0..3u8 {
-            let fanout = pubsub
+            let counts = pubsub
                 .publish_local_with_fanout(topic, Bytes::copy_from_slice(&[i]))
                 .await
                 .expect("zero-fanout publish preserves Ok semantics");
-            assert_eq!(fanout, 0);
+            assert_eq!(counts.attempted, 0);
+            assert_eq!(counts.succeeded, 0);
         }
 
         let stats = pubsub.stage_stats();
@@ -7654,12 +7895,55 @@ mod tests {
             "no live local subscriber, so no floor protects either peer"
         );
 
-        let fanout = pubsub
+        let counts = pubsub
             .publish_local_with_fanout(topic, Bytes::from_static(b"all-cooled"))
             .await
             .expect("publish still returns Ok");
-        assert_eq!(fanout, 0, "every eager peer was cooled");
+        assert_eq!(counts.attempted, 0, "every eager peer was cooled");
         assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 1);
+    }
+
+    /// The black-hole signature is `attempted > 0, succeeded == 0`: peers
+    /// exist in the eager set but every send fails at dispatch (e.g. "Peer
+    /// not found" in the transport). This is distinct from `attempted == 0`
+    /// (no eligible peers at all) and must be counted separately so operators
+    /// can distinguish "no peers" from "have peers but they're all unreachable".
+    #[tokio::test]
+    async fn test_fanout_succeeded_zero_when_peer_absent_from_transport() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([0x37; 32]);
+        let absent_peer = test_peer_id(2);
+
+        // Add the peer to the eager set but do NOT connect it in the
+        // transport — sends toward it will fail at dispatch.
+        pubsub
+            .initialize_topic_peers(topic, vec![absent_peer])
+            .await;
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"absent"))
+            .await
+            .expect("publish returns Ok even when sends fail");
+
+        // The peer was in the eager set and was attempted, but no send
+        // completed — this is the black-hole signature.
+        assert_eq!(counts.attempted, 1, "absent peer is still attempted");
+        assert_eq!(
+            counts.succeeded, 0,
+            "absent peer yields zero confirmed deliveries"
+        );
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(
+            stats.zero_fanout_publishes, 0,
+            "attempted>0 must not increment the no-eligible-peers counter"
+        );
+        assert_eq!(
+            stats.zero_succeeded_publishes, 1,
+            "attempted>0,succeeded=0 must increment the black-hole counter"
+        );
     }
 
     #[tokio::test]

@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.68] - 2026-08-08
+
+### Fixed
+
+- **PubSub — zero-fanout diagnostics and cooling-floor recovery (PR #33, issue #32).**
+
+  Two related defects in the PlumTree fan-out path are fixed:
+
+  *Cooling-floor rescue no longer strands at zero after the floor peer
+  disconnects.* The `cooling_floor_blocks_at` guard suppresses the
+  lazy-→-eager transition only while a floor peer is present. When that peer
+  was removed by `set_topic_peers`, `maintain_degree_at` tried to promote
+  replacements but could not — cooling peers fail `can_graft_peer_at` — so
+  `eager_peers` went empty permanently with no event to trigger recovery.
+  `rescue_suppressed_eager_peer_if_needed_at` now chains both `eager_peers`
+  and `lazy_peers` in its candidate search and promotes the winner from lazy
+  to eager when needed. The selection criterion (shortest remaining cooldown,
+  score as tiebreak) and the durability guarantee (rescue clears
+  `suppressed_until`; peer re-cools naturally) are unchanged.
+
+  *Fan-out outcomes are now reported with attempted vs. succeeded counts.*
+  `publish_with_fanout` previously returned `attempts().len()`, which counted
+  peers claimed by the FIFO gate but absent from the transport layer as
+  "attempted with zero delivery." The return type is now `FanoutCounts {
+  attempted, succeeded }`. `succeeded` is threaded through
+  `parallel_send_to_peers` by counting `sent` completions in the non-detached
+  path (detached publishes return `succeeded: 0` since outcomes are not
+  observable inline). Zero-delivery diagnostics fire on `succeeded == 0`
+  regardless of `attempted`, and two distinct counters distinguish the two
+  failure modes: `zero_fanout_publishes` (attempted == 0; cooling floor or
+  full suppression) and `zero_succeeded_publishes` (attempted > 0, succeeded
+  == 0; peers present in the eager set but absent from the transport).
+
+  Zero-fanout WARN is throttled to avoid log spam during transient
+  disconnections.
+
 ## [0.5.67] - 2026-07-15
 
 ### Changed

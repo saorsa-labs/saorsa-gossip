@@ -2396,6 +2396,33 @@ fn payload_zero_tail(payload: &Bytes) -> usize {
     payload.iter().rev().take_while(|b| **b == 0).count()
 }
 
+/// Zero-tail length above which a forwarded/replayed payload is treated as a
+/// zero-window corruption artifact (x0x #323): ant-quic reassembly gaps
+/// zero-fill in ~1448-byte windows, while a healthy ML-DSA-signed x0x frame
+/// ends in signature bytes with a near-zero tail. The gossip header signature
+/// does not cover the payload, so forwarding such a frame launders upstream
+/// corruption under this node's fresh signature. Forward and cache-replay
+/// egress drop instead; LOCAL DELIVERY IS NOT GATED — the application-layer
+/// payload signature remains the sole authority for delivery.
+const ZERO_TAIL_FORWARD_LIMIT: usize = 512;
+
+/// True when `payload` may be forwarded/replayed to peers; logs and returns
+/// false for suspect zero-tail frames (x0x #323 laundering guard).
+fn forwardable_payload(stage: &'static str, msg_id: &MessageIdType, payload: &Bytes) -> bool {
+    let zero_tail = payload_zero_tail(payload);
+    if zero_tail > ZERO_TAIL_FORWARD_LIMIT {
+        warn!(
+            stage,
+            msg_id = %msg_id_hex8(msg_id),
+            len = payload.len(),
+            zero_tail,
+            "dropping suspect zero-tail payload at forward egress (x0x #323 laundering guard)"
+        );
+        return false;
+    }
+    true
+}
+
 /// Short hex of a message-id prefix for `sg.payload.trace` lines.
 fn msg_id_hex8(msg_id: &MessageIdType) -> String {
     msg_id[..8].iter().map(|b| format!("{b:02x}")).collect()
@@ -5733,6 +5760,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         drop(topics); // Release lock
 
         let republish_started = Instant::now();
+        // x0x #323: do not launder suspect zero-tail payloads to peers. The
+        // message was already delivered locally above; only forwarding stops.
+        if let Some(payload) = message.payload.as_ref() {
+            if !forwardable_payload("eager_forward", &msg_id, payload) {
+                self.record_stage(PubSubStage::Republish, republish_started);
+                return Ok(());
+            }
+        }
         // Serialize once — the payload is the same for all peers
         let bytes: Bytes = match postcard::to_stdvec(&message) {
             Ok(bytes) => bytes.into(),
@@ -5910,6 +5945,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let republish_started = Instant::now();
         // Send EAGER with payloads
         for (msg_id, cached) in to_send {
+            if !forwardable_payload("iwant_serve", &msg_id, &cached.payload) {
+                continue;
+            }
             debug!(peer_id = %from, msg_id = ?msg_id, "Sending EAGER in response to IWANT");
             debug!(
                 target: "sg.payload.trace",
@@ -6021,6 +6059,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let republish_started = Instant::now();
                 // Send cached messages the peer is missing as EAGER
                 for cached in &messages_to_send {
+                    if !forwardable_payload(
+                        "anti_entropy_serve",
+                        &cached.header.msg_id,
+                        &cached.payload,
+                    ) {
+                        continue;
+                    }
                     debug!(
                         target: "sg.payload.trace",
                         stage = "anti_entropy_serve",
@@ -13952,5 +13997,44 @@ mod tests {
             "missing snapshot preserves the Suspect drop on the single-peer path"
         );
         assert_eq!(stats.admitted_normal, 0, "no override means no admission");
+    }
+}
+
+#[cfg(test)]
+mod zero_tail_forward_guard_tests {
+    use super::*;
+
+    fn frame(len: usize, zero_tail: usize) -> Bytes {
+        let mut v = vec![0xABu8; len - zero_tail];
+        v.extend(std::iter::repeat_n(0u8, zero_tail));
+        v.into()
+    }
+
+    /// Healthy signed frames end in signature bytes — tiny zero tails pass.
+    #[test]
+    fn healthy_and_boundary_frames_forward() {
+        let id = [7u8; 32];
+        assert!(forwardable_payload("test", &id, &frame(4096, 0)));
+        assert!(forwardable_payload("test", &id, &frame(4096, 16)));
+        assert!(forwardable_payload(
+            "test",
+            &id,
+            &frame(4096, ZERO_TAIL_FORWARD_LIMIT)
+        ));
+    }
+
+    /// A zero-window artifact (x0x #323: ~1448-byte zero fills) must not be
+    /// forwarded; the limit is far below one window so a single lost chunk
+    /// anywhere in the tail trips the guard.
+    #[test]
+    fn zero_window_frames_are_refused() {
+        let id = [7u8; 32];
+        assert!(!forwardable_payload(
+            "test",
+            &id,
+            &frame(4096, ZERO_TAIL_FORWARD_LIMIT + 1)
+        ));
+        assert!(!forwardable_payload("test", &id, &frame(4096, 1448)));
+        assert!(!forwardable_payload("test", &id, &frame(3000, 2896)));
     }
 }

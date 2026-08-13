@@ -2406,8 +2406,38 @@ fn payload_zero_tail(payload: &Bytes) -> usize {
 /// payload signature remains the sole authority for delivery.
 const ZERO_TAIL_FORWARD_LIMIT: usize = 512;
 
+/// Interior zero-run length that marks a payload as a reassembly-gap
+/// artifact. ant-quic zero-fills in ~1448-byte transport windows; ML-DSA
+/// signatures and key material are effectively random bytes, so a
+/// contiguous KiB-scale zero run inside a signed frame does not occur
+/// naturally. Field data (x0x #323, post-0.37.3): the dominant corruption
+/// form is interior windows with intact tails, invisible to the tail check.
+const ZERO_WINDOW_FORWARD_LIMIT: usize = 1024;
+
+/// Longest run of zero bytes anywhere in `payload`, capped early once it
+/// exceeds [`ZERO_WINDOW_FORWARD_LIMIT`] (no need to measure further).
+fn payload_longest_zero_run(payload: &Bytes) -> usize {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for b in payload.iter() {
+        if *b == 0 {
+            run += 1;
+            if run > longest {
+                longest = run;
+                if longest > ZERO_WINDOW_FORWARD_LIMIT {
+                    break;
+                }
+            }
+        } else {
+            run = 0;
+        }
+    }
+    longest
+}
+
 /// True when `payload` may be forwarded/replayed to peers; logs and returns
-/// false for suspect zero-tail frames (x0x #323 laundering guard).
+/// false for suspect frames (x0x #323 laundering guard): oversized zero
+/// tails (v1) or interior zero windows (v2).
 fn forwardable_payload(stage: &'static str, msg_id: &MessageIdType, payload: &Bytes) -> bool {
     let zero_tail = payload_zero_tail(payload);
     if zero_tail > ZERO_TAIL_FORWARD_LIMIT {
@@ -2417,6 +2447,17 @@ fn forwardable_payload(stage: &'static str, msg_id: &MessageIdType, payload: &By
             len = payload.len(),
             zero_tail,
             "dropping suspect zero-tail payload at forward egress (x0x #323 laundering guard)"
+        );
+        return false;
+    }
+    let zero_run = payload_longest_zero_run(payload);
+    if zero_run > ZERO_WINDOW_FORWARD_LIMIT {
+        warn!(
+            stage,
+            msg_id = %msg_id_hex8(msg_id),
+            len = payload.len(),
+            zero_run,
+            "dropping suspect interior-zero-window payload at forward egress (x0x #323 guard v2)"
         );
         return false;
     }
@@ -14020,6 +14061,40 @@ mod zero_tail_forward_guard_tests {
             "test",
             &id,
             &frame(4096, ZERO_TAIL_FORWARD_LIMIT)
+        ));
+    }
+
+    fn frame_with_interior_zeros(len: usize, at: usize, run: usize) -> Bytes {
+        let mut v = vec![0xABu8; len];
+        for b in v.iter_mut().skip(at).take(run) {
+            *b = 0;
+        }
+        v.into()
+    }
+
+    /// The dominant field form (x0x #323 post-0.37.3): interior zero windows
+    /// with intact tails. A ~1448-byte transport window anywhere in the
+    /// payload must refuse forwarding; KiB-scale runs cannot occur naturally
+    /// inside ML-DSA-signed frames.
+    #[test]
+    fn interior_zero_window_frames_are_refused() {
+        let id = [9u8; 32];
+        assert!(!forwardable_payload(
+            "test",
+            &id,
+            &frame_with_interior_zeros(6000, 1200, 1448)
+        ));
+        assert!(!forwardable_payload(
+            "test",
+            &id,
+            &frame_with_interior_zeros(6000, 0, ZERO_WINDOW_FORWARD_LIMIT + 1)
+        ));
+        // Boundary: exactly the limit passes (short legitimate zero spans in
+        // padding-ish payloads stay forwardable).
+        assert!(forwardable_payload(
+            "test",
+            &id,
+            &frame_with_interior_zeros(6000, 1200, ZERO_WINDOW_FORWARD_LIMIT)
         ));
     }
 

@@ -151,7 +151,7 @@ jobs:
         # `saorsa-gossip-workspace-hack` found / location searched: crates.io".
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-hakari
+          tool: cargo-hakari@0.9.38
 
       - name: Strip workspace-hack deps for publish
         # `cargo hakari remove-deps --yes` removes the workspace-hack dep

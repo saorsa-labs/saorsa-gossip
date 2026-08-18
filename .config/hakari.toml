@@ -1,3 +1,10 @@
+# Generated and verified with cargo-hakari 0.9.38 on Rust 1.88 (workspace
+# MSRV). `cargo hakari verify` needs Cargo new enough to resolve the
+# current graph (edition 2024 deps). Install the same hakari version so
+# verify matches this tree:
+#   cargo install cargo-hakari --version 0.9.38 --locked
+# Keep this pin in sync with the justfile (cargo-hakari-version), CI, the
+# release workflow, and .githooks/pre-commit.
 hakari-package = "saorsa-gossip-workspace-hack"
 dep-format-version = "4"
 resolver = "2"

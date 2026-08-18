@@ -41,6 +41,37 @@ check: fmt-check lint test doc
 
 quick-check: fmt-check lint test
 
+# ===== cargo-hakari (workspace-hack) =====
+
+# cargo-hakari version that generated saorsa-gossip-workspace-hack.
+# Keep in sync with .config/hakari.toml, .githooks/pre-commit, CI, and release.yml.
+cargo-hakari-version := "0.9.38"
+
+# Fail unless the installed cargo-hakari matches the pinned version.
+[private]
+hakari-pin-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v="$(cargo hakari --version 2>/dev/null | awk '{print $2}')"
+    if [ "$v" != "{{cargo-hakari-version}}" ]; then
+        echo "error: cargo-hakari ${v:-not installed} does not match pinned {{cargo-hakari-version}}" >&2
+        echo "install: cargo install cargo-hakari --version {{cargo-hakari-version}} --locked" >&2
+        exit 1
+    fi
+
+# Verify saorsa-gossip-workspace-hack matches the resolved feature graph.
+hakari-verify: hakari-pin-check
+    cargo hakari verify
+
+# Regenerate saorsa-gossip-workspace-hack after dependency changes that
+# alter feature unification.
+hakari-generate: hakari-pin-check
+    cargo hakari generate
+
+# Activate the shared git hooks for this clone (.githooks/pre-commit).
+hooks-install:
+    git config core.hooksPath .githooks
+
 # Per-crate LCOV coverage (uses scripts/coverage-per-crate.sh)
 coverage:
     bash scripts/coverage-per-crate.sh

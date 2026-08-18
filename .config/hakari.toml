@@ -1,3 +1,8 @@
+# Generated and verified with cargo-hakari 0.9.38 on the workspace MSRV
+# (rust-toolchain.toml: 1.88). Install the same hakari version so
+# `cargo hakari verify` matches this tree:
+#   cargo install cargo-hakari --version 0.9.38 --locked
+# Keep this pin in sync with the Makefile, CI, and release workflow.
 hakari-package = "saorsa-gossip-workspace-hack"
 dep-format-version = "4"
 resolver = "2"

@@ -286,8 +286,8 @@ impl MessageHeader {
 // re-serializes byte-identically so its existing signature keeps verifying.
 impl Serialize for MessageHeader {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq as _;
-        let mut seq = serializer.serialize_seq(Some(if self.version >= 2 { 7 } else { 6 }))?;
+        use serde::ser::SerializeTuple as _;
+        let mut seq = serializer.serialize_tuple(if self.version >= 2 { 7 } else { 6 })?;
         seq.serialize_element(&self.version)?;
         seq.serialize_element(&self.topic)?;
         seq.serialize_element(&self.msg_id)?;
@@ -346,7 +346,7 @@ impl<'de> Deserialize<'de> for MessageHeader {
             }
         }
 
-        deserializer.deserialize_seq(HeaderVisitor)
+        deserializer.deserialize_tuple(7, HeaderVisitor)
     }
 }
 
@@ -993,24 +993,63 @@ mod tests {
         );
     }
 
-    /// ADR-012 wire shapes: a v1 header round-trips with `payload_hash:
-    /// None` and re-serializes byte-identically (its existing signature
-    /// must keep verifying), and a v2 header round-trips with the sealed
-    /// hash — never decoding a v1 buffer into v2.
+    /// ADR-012 wire shapes, hardened against self-consistency: the v1 form
+    /// must be byte-identical to the DEPLOYED derive-based format (golden
+    /// reference), the deployed bytes decode through the new impl and
+    /// re-serialize identically (existing v1 signatures keep verifying),
+    /// a v2 header round-trips with the sealed hash, and a v1 buffer never
+    /// decodes into v2. An earlier version of this test only round-tripped
+    /// the new implementation against itself, so a whole-format shift (the
+    /// seq length prefix vs the struct form) passed green — the fleet break
+    /// this golden guard exists to make impossible.
     #[test]
     fn message_header_v1_and_v2_wire_shapes() {
+        // Golden reference: the exact six-field derive struct the deployed
+        /// v1 fleet serializes. Must stay derive-based and must never gain
+        /// the payload_hash field.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LegacyHeader {
+            version: u8,
+            topic: TopicId,
+            msg_id: [u8; 32],
+            kind: MessageKind,
+            hop: u8,
+            ttl: u8,
+        }
+
         let topic = TopicId::new([7u8; 32]);
         let mut v1 = MessageHeader::new(topic, MessageKind::Eager, 10);
         v1.msg_id = [9u8; 32];
+        let legacy = LegacyHeader {
+            version: 1,
+            topic: TopicId::new([7u8; 32]),
+            msg_id: [9u8; 32],
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
 
         let v1_bytes = postcard::to_stdvec(&v1).expect("v1 serialize");
-        // A v1 header is exactly the six legacy fields: no v2 tail byte.
-        let decoded: MessageHeader = postcard::from_bytes(&v1_bytes).expect("v1 decode");
+        let golden_bytes = postcard::to_stdvec(&legacy).expect("golden serialize");
+        assert_eq!(
+            v1_bytes,
+            golden_bytes,
+            "v1 header must serialize byte-identically to the deployed \
+             derive-based format (got {} bytes, want {} bytes)",
+            v1_bytes.len(),
+            golden_bytes.len()
+        );
+
+        // The deployed bytes (golden form) decode through the new impl…
+        let decoded: MessageHeader = postcard::from_bytes(&golden_bytes).expect("golden decode");
         assert_eq!(decoded.payload_hash, None, "v1 buffer decodes as v1");
+        assert_eq!(decoded.version, 1);
+        // …and re-serialize byte-identically: an existing v1 signature over
+        // these bytes keeps verifying through the new code.
         assert_eq!(
             postcard::to_stdvec(&decoded).expect("v1 re-serialize"),
-            v1_bytes,
-            "decoded v1 header re-serializes byte-identically"
+            golden_bytes,
+            "decoded v1 header re-serializes byte-identically to golden"
         );
 
         let payload = b"payload bytes";

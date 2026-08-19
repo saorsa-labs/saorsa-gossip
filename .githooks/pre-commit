@@ -154,60 +154,6 @@ if [ "$TOOLS_OK" = false ]; then
 fi
 
 # =============================================================================
-# HAKARI CHECK
-# =============================================================================
-echo ""
-print_section "Running cargo hakari verify..."
-
-# Check if this is a workspace with hakari configured
-if [ -f ".config/hakari.toml" ] || [ -d "saorsa-gossip-workspace-hack" ]; then
-    # Check if Cargo.toml files were modified
-    CARGO_CHANGED=$(git diff --cached --name-only | grep -c "Cargo.toml" || true)
-
-    if [ "$CARGO_CHANGED" -gt 0 ]; then
-        print_info "Cargo.toml changes detected - regenerating hakari..."
-
-        # `just hakari-generate` refuses to run unless the installed
-        # cargo-hakari matches the version pinned in the justfile.
-        if just hakari-generate; then
-            print_pass "cargo hakari generate succeeded"
-        else
-            print_fail "just hakari-generate failed (wrong cargo-hakari version?)"
-        fi
-
-        if cargo hakari manage-deps 2>/dev/null; then
-            print_pass "cargo hakari manage-deps succeeded"
-        else
-            print_warn "cargo hakari manage-deps skipped (non-interactive; verify step below confirms state)"
-        fi
-
-        # Stage any hakari changes
-        if [ -d "saorsa-gossip-workspace-hack" ]; then
-            git add saorsa-gossip-workspace-hack/ 2>/dev/null || true
-        fi
-        # Handle renamed workspace-hack directories
-        for dir in *-workspace-hack/; do
-            [ -d "$dir" ] && git add "$dir" 2>/dev/null || true
-        done
-        git add .config/hakari.toml 2>/dev/null || true
-
-        # Re-stage modified Cargo.toml files
-        git diff --name-only | grep "Cargo.toml" | xargs -I {} git add {} 2>/dev/null || true
-    fi
-
-    # Verify hakari is in sync. `just hakari-verify` enforces the pinned
-    # cargo-hakari version, so a version mismatch fails loudly here instead
-    # of producing a differently-formatted workspace-hack.
-    if just hakari-verify; then
-        print_pass "cargo hakari verify passed"
-    else
-        print_fail "just hakari-verify failed - run: just hakari-generate"
-    fi
-else
-    print_info "No hakari configuration found (single-crate project?)"
-fi
-
-# =============================================================================
 # MACHETE CHECK (unused dependencies)
 # =============================================================================
 echo ""

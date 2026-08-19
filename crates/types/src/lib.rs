@@ -189,7 +189,12 @@ impl MessageKind {
 
 /// Wire format header for control frames (ML-DSA signed)
 /// Format: ver:u8, topic:\[u8;32\], msg_id:\[u8;32\], kind:u8, hop:u8, ttl:u8
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// — v1, and exactly that. ADR-012 v2 appends
+/// `payload_hash: Option<[u8;32]>` after `ttl`; the tail is serialized only
+/// when `version >= 2`, so a v1 header re-serializes byte-identically (its
+/// existing signature must keep verifying) and a v1 buffer never misparses
+/// into v2.
+#[derive(Debug, Clone)]
 pub struct MessageHeader {
     /// Protocol version
     pub version: u8,
@@ -203,6 +208,10 @@ pub struct MessageHeader {
     pub hop: u8,
     /// Time-to-live
     pub ttl: u8,
+    /// ADR-012 v2: BLAKE3 of the payload bytes the header signature covers.
+    /// `None` for v1 headers (the header-only-signature era) and for
+    /// payload-less control frames it is `Some` of the empty-input hash.
+    pub payload_hash: Option<[u8; 32]>,
 }
 
 impl MessageHeader {
@@ -215,7 +224,20 @@ impl MessageHeader {
             kind,
             hop: 0,
             ttl,
+            payload_hash: None,
         }
+    }
+
+    /// ADR-012: stamp the payload-covering hash and bump the wire version
+    /// to 2. Payload-less control frames pass `None`; receivers hash
+    /// `payload.unwrap_or_default()` symmetrically, so the empty-input hash
+    /// is the canonical cover for "no payload".
+    pub fn seal_payload_hash(&mut self, payload: Option<&[u8]>) {
+        let hash = blake3::hash(payload.unwrap_or(&[]));
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(hash.as_bytes());
+        self.payload_hash = Some(bytes);
+        self.version = 2;
     }
 
     /// Calculate message ID from components
@@ -252,6 +274,79 @@ impl MessageHeader {
         }
         self.ttl -= 1;
         Ok(())
+    }
+}
+
+// ADR-012: manual, version-dispatched serde for the header. Postcard (and
+// any other self-describing-free format) serializes a struct as its field
+// sequence, so these seq-form impls are wire-identical to the previous
+// derive for the shared prefix. The v2 tail (`payload_hash`) is written only
+// when `version >= 2`, and read only then — a v1 buffer decodes with
+// `payload_hash: None` and never misparses into v2, and a decoded v1 header
+// re-serializes byte-identically so its existing signature keeps verifying.
+impl Serialize for MessageHeader {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple as _;
+        let mut seq = serializer.serialize_tuple(if self.version >= 2 { 7 } else { 6 })?;
+        seq.serialize_element(&self.version)?;
+        seq.serialize_element(&self.topic)?;
+        seq.serialize_element(&self.msg_id)?;
+        seq.serialize_element(&self.kind)?;
+        seq.serialize_element(&self.hop)?;
+        seq.serialize_element(&self.ttl)?;
+        if self.version >= 2 {
+            seq.serialize_element(&self.payload_hash)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageHeader {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct HeaderVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HeaderVisitor {
+            type Value = MessageHeader;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("MessageHeader wire fields")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<MessageHeader, A::Error> {
+                macro_rules! field {
+                    ($ty:ty) => {
+                        seq.next_element::<$ty>()?.ok_or_else(|| {
+                            <A::Error as serde::de::Error>::custom("truncated MessageHeader")
+                        })?
+                    };
+                }
+                let version = field!(u8);
+                let topic = field!(TopicId);
+                let msg_id = field!([u8; 32]);
+                let kind = field!(MessageKind);
+                let hop = field!(u8);
+                let ttl = field!(u8);
+                let payload_hash = if version >= 2 {
+                    field!(Option<[u8; 32]>)
+                } else {
+                    None
+                };
+                Ok(MessageHeader {
+                    version,
+                    topic,
+                    msg_id,
+                    kind,
+                    hop,
+                    ttl,
+                    payload_hash,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(7, HeaderVisitor)
     }
 }
 
@@ -896,6 +991,78 @@ mod tests {
             bytes1, bytes2,
             "signable_bytes should differ when seq differs"
         );
+    }
+
+    /// ADR-012 wire shapes, hardened against self-consistency: the v1 form
+    /// must be byte-identical to the DEPLOYED derive-based format (golden
+    /// reference), the deployed bytes decode through the new impl and
+    /// re-serialize identically (existing v1 signatures keep verifying),
+    /// a v2 header round-trips with the sealed hash, and a v1 buffer never
+    /// decodes into v2. An earlier version of this test only round-tripped
+    /// the new implementation against itself, so a whole-format shift (the
+    /// seq length prefix vs the struct form) passed green — the fleet break
+    /// this golden guard exists to make impossible.
+    #[test]
+    fn message_header_v1_and_v2_wire_shapes() {
+        // Golden reference: the exact six-field derive struct the deployed
+        /// v1 fleet serializes. Must stay derive-based and must never gain
+        /// the payload_hash field.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LegacyHeader {
+            version: u8,
+            topic: TopicId,
+            msg_id: [u8; 32],
+            kind: MessageKind,
+            hop: u8,
+            ttl: u8,
+        }
+
+        let topic = TopicId::new([7u8; 32]);
+        let mut v1 = MessageHeader::new(topic, MessageKind::Eager, 10);
+        v1.msg_id = [9u8; 32];
+        let legacy = LegacyHeader {
+            version: 1,
+            topic: TopicId::new([7u8; 32]),
+            msg_id: [9u8; 32],
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+
+        let v1_bytes = postcard::to_stdvec(&v1).expect("v1 serialize");
+        let golden_bytes = postcard::to_stdvec(&legacy).expect("golden serialize");
+        assert_eq!(
+            v1_bytes,
+            golden_bytes,
+            "v1 header must serialize byte-identically to the deployed \
+             derive-based format (got {} bytes, want {} bytes)",
+            v1_bytes.len(),
+            golden_bytes.len()
+        );
+
+        // The deployed bytes (golden form) decode through the new impl…
+        let decoded: MessageHeader = postcard::from_bytes(&golden_bytes).expect("golden decode");
+        assert_eq!(decoded.payload_hash, None, "v1 buffer decodes as v1");
+        assert_eq!(decoded.version, 1);
+        // …and re-serialize byte-identically: an existing v1 signature over
+        // these bytes keeps verifying through the new code.
+        assert_eq!(
+            postcard::to_stdvec(&decoded).expect("v1 re-serialize"),
+            golden_bytes,
+            "decoded v1 header re-serializes byte-identically to golden"
+        );
+
+        let payload = b"payload bytes";
+        v1.seal_payload_hash(Some(payload));
+        assert_eq!(v1.version, 2);
+        let sealed_hash = v1.payload_hash.expect("sealed");
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(blake3::hash(payload).as_bytes());
+        assert_eq!(sealed_hash, expected, "seal stamps blake3(payload)");
+
+        let v2_bytes = postcard::to_stdvec(&v1).expect("v2 serialize");
+        let decoded_v2: MessageHeader = postcard::from_bytes(&v2_bytes).expect("v2 decode");
+        assert_eq!(decoded_v2.payload_hash, Some(sealed_hash));
     }
 
     #[test]

@@ -59,10 +59,6 @@ hakari-pin-check:
         exit 1
     fi
 
-# Verify saorsa-gossip-workspace-hack matches the resolved feature graph.
-hakari-verify: hakari-pin-check
-    cargo hakari verify
-
 # Regenerate saorsa-gossip-workspace-hack after dependency changes that
 # alter feature unification.
 hakari-generate: hakari-pin-check

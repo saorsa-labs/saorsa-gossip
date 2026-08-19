@@ -241,6 +241,21 @@ pub struct PubSubCacheConfig {
     pub max_age: Duration,
 }
 
+/// ADR-012 policy for v1 (header-only-signed) messages on the receive path.
+///
+/// The migration window keeps v1 acceptance on by default; the flip to
+/// [`SignaturePolicy::RejectV1`] is data-driven off the fleet's measured
+/// v1-receipt rate ([`PlumtreePubSub::v1_receipt_count`]), not a date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SignaturePolicy {
+    /// Accept v1 messages; each receipt is counted as sunset telemetry.
+    #[default]
+    AcceptV1,
+    /// Reject v1 messages (scored by the caller like any invalid message)
+    /// once the measured v1-receipt rate justifies the sunset.
+    RejectV1,
+}
+
 impl Default for PubSubCacheConfig {
     fn default() -> Self {
         Self {
@@ -3931,6 +3946,13 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// thresholds are not yet wired into mesh-selection or admission
     /// decisions (that integration is X0X-0071b).
     peer_scoring: Arc<peer_scoring::PeerScoring>,
+    /// ADR-012: v1 (header-only-signed) acceptance policy for the
+    /// migration window.
+    signature_policy: StdRwLock<SignaturePolicy>,
+    /// ADR-012 sunset telemetry: total v1 messages received (accepted or
+    /// rejected). The fleet-level rate of this counter schedules the
+    /// [`SignaturePolicy::RejectV1`] flip.
+    v1_receipts: std::sync::atomic::AtomicU64,
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
@@ -4007,6 +4029,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             peer_health_oracle: Arc::new(StdRwLock::new(None)),
             admission: Arc::new(admission::AdmissionControl::new()),
             peer_scoring: Arc::new(peer_scoring::PeerScoring::new()),
+            signature_policy: StdRwLock::new(SignaturePolicy::AcceptV1),
+            v1_receipts: std::sync::atomic::AtomicU64::new(0),
         };
 
         if start_background_tasks {
@@ -4093,6 +4117,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 warn!("Unable to spawn PubSub peer-health snapshot refresher: {e}");
             }
         }
+    }
+
+    /// ADR-012: set the v1 signature policy (see [`SignaturePolicy`]).
+    pub fn set_signature_policy(&self, policy: SignaturePolicy) {
+        if let Ok(mut guard) = self.signature_policy.write() {
+            *guard = policy;
+        }
+    }
+
+    /// ADR-012: current v1 signature policy.
+    pub fn signature_policy(&self) -> SignaturePolicy {
+        self.signature_policy
+            .read()
+            .map(|guard| *guard)
+            .unwrap_or(SignaturePolicy::AcceptV1)
+    }
+
+    /// ADR-012: total v1 (header-only-signed) messages received since
+    /// startup — the sunset's flip metric.
+    pub fn v1_receipt_count(&self) -> u64 {
+        self.v1_receipts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn spawn_connected_peers_snapshot_refresher(&self) {
@@ -4469,9 +4514,53 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     fn verify_message_signature(&self, message: &GossipMessage) -> bool {
         let verify_started = Instant::now();
         let verified =
-            self.verify_signature(&message.header, &message.signature, &message.public_key);
+            self.verify_signature(&message.header, &message.signature, &message.public_key)
+                && self.verify_payload_covering_signature(message);
         self.record_stage(PubSubStage::Verify, verify_started);
         verified
+    }
+
+    /// ADR-012 v2 payload-covering check. For a v2 header
+    /// (`payload_hash: Some`) the received payload must hash to the sealed
+    /// header value — which the header signature already covers — so a
+    /// forwarder that swaps the payload after signing fails here and the
+    /// caller records it like any other invalid message. For a v1 header the
+    /// signature was header-only; the migration policy decides acceptance
+    /// and every v1 receipt is counted as sunset telemetry either way.
+    fn verify_payload_covering_signature(&self, message: &GossipMessage) -> bool {
+        match message.header.payload_hash {
+            Some(expected) => {
+                let actual = blake3::hash(message.payload.as_deref().unwrap_or(&[]));
+                if actual.as_bytes() == &expected[..] {
+                    true
+                } else {
+                    warn!(
+                        topic = ?message.header.topic,
+                        msg_id = ?message.header.msg_id,
+                        "Payload hash mismatch: forged or corrupted payload (ADR-012), dropping"
+                    );
+                    false
+                }
+            }
+            None => {
+                self.record_v1_receipt();
+                if self.signature_policy() == SignaturePolicy::RejectV1 {
+                    warn!(
+                        topic = ?message.header.topic,
+                        msg_id = ?message.header.msg_id,
+                        "v1 header-only-signed message rejected by policy (ADR-012)"
+                    );
+                    return false;
+                }
+                true
+            }
+        }
+    }
+
+    /// ADR-012 sunset telemetry: count a v1 (header-only-signed) receipt.
+    fn record_v1_receipt(&self) {
+        self.v1_receipts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn record_inbound_peer_activity_for_state(
@@ -5523,14 +5612,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ) -> Result<FanoutCounts> {
         let msg_id = self.calculate_msg_id(&topic, &payload);
 
-        let header = MessageHeader {
+        let mut header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
             hop: 0,
             ttl: 10,
         };
+        // ADR-012: the published payload is covered by the sealed header
+        // hash; the signature over the header now authenticates it.
+        header.seal_payload_hash(Some(&payload));
 
         let signature = self.sign_message(&header);
 
@@ -5897,26 +5990,30 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let republish_started = Instant::now();
             debug!(peer_id = %from, count = requested.len(), "Sending IWANT");
             // Create IWANT message
-            let iwant_header = MessageHeader {
+            let iwant_payload = match postcard::to_stdvec(&requested) {
+                Ok(payload) => Bytes::from(payload),
+                Err(e) => {
+                    self.record_stage(PubSubStage::Republish, republish_started);
+                    return Err(anyhow!("Serialization failed: {}", e));
+                }
+            };
+            // ADR-012: the IWANT payload (the requested msg ids) is covered
+            // by the header signature via the sealed payload hash.
+            let mut iwant_header = MessageHeader {
                 version: 1,
+                payload_hash: None,
                 topic,
                 msg_id: requested[0], // Use first ID as header
                 kind: MessageKind::IWant,
                 hop: 0,
                 ttl: 10,
             };
-            let iwant_header_clone = iwant_header.clone();
-            let payload = match postcard::to_stdvec(&requested) {
-                Ok(payload) => payload.into(),
-                Err(e) => {
-                    self.record_stage(PubSubStage::Republish, republish_started);
-                    return Err(anyhow!("Serialization failed: {}", e));
-                }
-            };
+            iwant_header.seal_payload_hash(Some(iwant_payload.as_ref()));
+            let iwant_signature = self.sign_message(&iwant_header);
             let iwant_msg = GossipMessage {
                 header: iwant_header,
-                payload: Some(payload),
-                signature: self.sign_message(&iwant_header_clone),
+                payload: Some(iwant_payload),
+                signature: iwant_signature,
                 public_key: self.signing_key.public_key().to_vec(),
             };
             let bytes = match postcard::to_stdvec(&iwant_msg) {
@@ -6140,23 +6237,26 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         count = ids_we_need.len(),
                         "Anti-entropy: requesting missing messages via IWANT"
                     );
-                    let iwant_header = MessageHeader {
+                    let iwant_payload: Bytes = postcard::to_stdvec(&ids_we_need)
+                        .map_err(|e| anyhow!("Serialization failed: {}", e))?
+                        .into();
+                    // ADR-012: the IWANT payload is covered by the sealed
+                    // header hash.
+                    let mut iwant_header = MessageHeader {
                         version: 1,
+                        payload_hash: None,
                         topic,
                         msg_id: ids_we_need[0],
                         kind: MessageKind::IWant,
                         hop: 0,
                         ttl: 10,
                     };
-                    let iwant_header_clone = iwant_header.clone();
+                    iwant_header.seal_payload_hash(Some(iwant_payload.as_ref()));
+                    let iwant_signature = self.sign_message(&iwant_header);
                     let iwant_msg = GossipMessage {
                         header: iwant_header,
-                        payload: Some(
-                            postcard::to_stdvec(&ids_we_need)
-                                .map_err(|e| anyhow!("Serialization failed: {}", e))?
-                                .into(),
-                        ),
-                        signature: self.sign_message(&iwant_header_clone),
+                        payload: Some(iwant_payload),
+                        signature: iwant_signature,
                         public_key: self.signing_key.public_key().to_vec(),
                     };
                     if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
@@ -6214,23 +6314,26 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         count = ids_to_request.len(),
                         "Anti-entropy response: sending IWANT for missing IDs"
                     );
-                    let iwant_header = MessageHeader {
+                    let iwant_payload: Bytes = postcard::to_stdvec(&ids_to_request)
+                        .map_err(|e| anyhow!("Serialization failed: {}", e))?
+                        .into();
+                    // ADR-012: the IWANT payload is covered by the sealed
+                    // header hash.
+                    let mut iwant_header = MessageHeader {
                         version: 1,
+                        payload_hash: None,
                         topic,
                         msg_id: ids_to_request[0],
                         kind: MessageKind::IWant,
                         hop: 0,
                         ttl: 10,
                     };
-                    let iwant_header_clone = iwant_header.clone();
+                    iwant_header.seal_payload_hash(Some(iwant_payload.as_ref()));
+                    let iwant_signature = self.sign_message(&iwant_header);
                     let iwant_msg = GossipMessage {
                         header: iwant_header,
-                        payload: Some(
-                            postcard::to_stdvec(&ids_to_request)
-                                .map_err(|e| anyhow!("Serialization failed: {}", e))?
-                                .into(),
-                        ),
-                        signature: self.sign_message(&iwant_header_clone),
+                        payload: Some(iwant_payload),
+                        signature: iwant_signature,
                         public_key: self.signing_key.public_key().to_vec(),
                     };
                     if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
@@ -6272,14 +6375,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let payload_bytes = postcard::to_stdvec(&ae_payload)
             .map_err(|e| anyhow!("Failed to serialize anti-entropy payload: {}", e))?;
 
-        let header = MessageHeader {
+        // ADR-012: the anti-entropy digest payload is covered by the sealed
+        // header hash.
+        let mut header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
             hop: 0,
             ttl: 1,
         };
+        header.seal_payload_hash(Some(&payload_bytes));
 
         let signature = self.sign_message(&header);
 
@@ -6383,16 +6490,25 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 continue;
             }
 
-            trace!(topic = ?topic_id, batch_size = batch.len(), peer_count = lazy_peers.len(), "Flushing IHAVE batch");
-
-            let ihave_header = MessageHeader {
+            let ihave_payload = match postcard::to_stdvec(&batch) {
+                Ok(bytes) => Bytes::from(bytes),
+                Err(e) => {
+                    warn!(topic = %LogTopicId::from(topic_id), "IHAVE batch serialize failed: {e}");
+                    continue;
+                }
+            };
+            // ADR-012: the IHAVE batch payload is covered by the sealed
+            // header hash.
+            let mut ihave_header = MessageHeader {
                 version: 1,
+                payload_hash: None,
                 topic: topic_id,
                 msg_id: batch[0],
                 kind: MessageKind::IHave,
                 hop: 0,
                 ttl: 10,
             };
+            ihave_header.seal_payload_hash(Some(ihave_payload.as_ref()));
 
             let signature = match postcard::to_stdvec(&ihave_header) {
                 Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
@@ -6402,17 +6518,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
 
-            let payload = match postcard::to_stdvec(&batch) {
-                Ok(bytes) => bytes.into(),
-                Err(e) => {
-                    warn!(topic = %LogTopicId::from(topic_id), "IHAVE batch serialize failed: {e}");
-                    continue;
-                }
-            };
-
             let ihave_msg = GossipMessage {
                 header: ihave_header,
-                payload: Some(payload),
+                payload: Some(ihave_payload),
                 signature,
                 public_key: signing_key.public_key().to_vec(),
             };
@@ -6705,14 +6813,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         }
                     };
 
-                    let header = MessageHeader {
+                    // ADR-012: the AE payload is covered by the sealed
+                    // header hash.
+                    let mut header = MessageHeader {
                         version: 1,
+                        payload_hash: None,
                         topic: topic_id,
                         msg_id: [0u8; 32],
                         kind: MessageKind::AntiEntropy,
                         hop: 0,
                         ttl: 1,
                     };
+                    let ae_payload_bytes: Bytes = payload_bytes.into();
+                    header.seal_payload_hash(Some(ae_payload_bytes.as_ref()));
 
                     let signature = match postcard::to_stdvec(&header) {
                         Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
@@ -6721,7 +6834,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
                     let message = GossipMessage {
                         header,
-                        payload: Some(payload_bytes.into()),
+                        payload: Some(ae_payload_bytes),
                         signature,
                         public_key: signing_key.public_key().to_vec(),
                     };
@@ -7178,6 +7291,7 @@ mod tests {
     ) -> GossipMessage {
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -7203,6 +7317,7 @@ mod tests {
     ) -> GossipMessage {
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id,
             kind,
@@ -7258,6 +7373,7 @@ mod tests {
         GossipMessage {
             header: MessageHeader {
                 version: 1,
+                payload_hash: None,
                 topic,
                 msg_id,
                 kind,
@@ -7283,6 +7399,7 @@ mod tests {
     fn test_header(topic: TopicId, msg_id: MessageIdType) -> MessageHeader {
         MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -8612,6 +8729,7 @@ mod tests {
         let msg_id = pubsub.calculate_msg_id(&topic, &payload);
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -8637,6 +8755,7 @@ mod tests {
         let bad_msg_id = pubsub.calculate_msg_id(&topic, &bad_payload);
         let bad_header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: bad_msg_id,
             kind: MessageKind::Eager,
@@ -8708,6 +8827,163 @@ mod tests {
         );
     }
 
+    /// ADR-012 validation: a v2 message whose payload is swapped after
+    /// signing — header and signature kept byte-for-byte — must fail the
+    /// receive-side verification and be scored as an invalid message.
+    /// Before the payload-covering check this exact attack passed
+    /// verification and was delivered as authentic (the bug the ADR closes).
+    #[tokio::test]
+    async fn adr012_swapped_payload_fails_receive_and_scores() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([81u8; 32]);
+        let forwarder = test_peer_id(2);
+
+        pubsub.initialize_topic_peers(topic, vec![forwarder]).await;
+
+        let payload = Bytes::from("authentic payload");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(&payload));
+        let signature = signing_key
+            .sign(&postcard::to_stdvec(&header).expect("serialize"))
+            .expect("sign");
+
+        // The attack: keep header + signature, replace the payload.
+        let swapped = GossipMessage {
+            header,
+            payload: Some(Bytes::from("swapped by forwarder")),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        assert!(
+            pubsub
+                .handle_eager(forwarder, topic, swapped)
+                .await
+                .is_err(),
+            "swapped payload must fail ADR-012 verification"
+        );
+
+        let snapshot = pubsub.stage_stats();
+        let row = snapshot
+            .peer_scores_v2
+            .iter()
+            .find(|r| r.peer_id == forwarder.to_string())
+            .expect("payload-swap peer scored");
+        assert!(
+            row.p4_invalid_messages >= 0.99,
+            "payload mismatch is scored like any invalid message (got {})",
+            row.p4_invalid_messages
+        );
+        assert_eq!(
+            pubsub.v1_receipt_count(),
+            0,
+            "a v2 message must not be counted as a v1 receipt"
+        );
+    }
+
+    /// ADR-012 migration window: a correctly-signed v1 (header-only)
+    /// message is accepted under the default policy and counted as
+    /// sunset telemetry.
+    #[tokio::test]
+    async fn adr012_v1_accepted_and_counted_under_accept_v1() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let topic = TopicId::new([82u8; 32]);
+        let old_peer = test_peer_id(2);
+
+        pubsub.initialize_topic_peers(topic, vec![old_peer]).await;
+
+        let payload = Bytes::from("v1 era payload");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        let header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let signature = signing_key
+            .sign(&postcard::to_stdvec(&header).expect("serialize"))
+            .expect("sign");
+        let v1_msg = GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        pubsub
+            .handle_eager(old_peer, topic, v1_msg)
+            .await
+            .expect("v1 message accepted under the default accept_v1 policy");
+        assert_eq!(
+            pubsub.v1_receipt_count(),
+            1,
+            "accepted v1 message is counted as sunset telemetry"
+        );
+    }
+
+    /// ADR-012 sunset: the same v1 message is rejected (and still counted)
+    /// once the policy flips to reject_v1.
+    #[tokio::test]
+    async fn adr012_v1_rejected_under_reject_v1() {
+        let peer_id = test_peer_id(1);
+        let transport = test_transport().await;
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        pubsub.set_signature_policy(SignaturePolicy::RejectV1);
+        let topic = TopicId::new([83u8; 32]);
+        let old_peer = test_peer_id(2);
+
+        pubsub.initialize_topic_peers(topic, vec![old_peer]).await;
+
+        let payload = Bytes::from("v1 era payload");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        let header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let signature = signing_key
+            .sign(&postcard::to_stdvec(&header).expect("serialize"))
+            .expect("sign");
+        let v1_msg = GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        assert!(
+            pubsub.handle_eager(old_peer, topic, v1_msg).await.is_err(),
+            "v1 message rejected under reject_v1"
+        );
+        assert_eq!(
+            pubsub.v1_receipt_count(),
+            1,
+            "rejected v1 message is still counted for the sunset metric"
+        );
+    }
     #[tokio::test]
     async fn test_outbound_budget_limits_duplicate_eager_sends_to_one_in_flight_per_peer() {
         let peer_id = test_peer_id(1);
@@ -10593,6 +10869,7 @@ mod tests {
 
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -10766,6 +11043,7 @@ mod tests {
         let msg_id = [99u8; 32];
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -11033,6 +11311,7 @@ mod tests {
             msg_id[..8].copy_from_slice(&(i as u64).to_le_bytes());
             let header = MessageHeader {
                 version: 1,
+                payload_hash: None,
                 topic,
                 msg_id,
                 kind: MessageKind::Eager,
@@ -11132,6 +11411,7 @@ mod tests {
             let state = topics.entry(topic).or_insert_with(TopicState::new);
             let header = MessageHeader {
                 version: 1,
+                payload_hash: None,
                 topic,
                 msg_id: known_msg_id,
                 kind: MessageKind::Eager,
@@ -11173,6 +11453,7 @@ mod tests {
         let topic = TopicId::new([1u8; 32]);
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::Eager,
@@ -11208,6 +11489,7 @@ mod tests {
         let topic = TopicId::new([1u8; 32]);
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: [1u8; 32],
             kind: MessageKind::Eager,
@@ -11254,6 +11536,7 @@ mod tests {
         // Verify by checking that sign_message produces non-empty signatures
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::Eager,
@@ -11395,6 +11678,7 @@ mod tests {
 
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -11442,6 +11726,7 @@ mod tests {
 
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -11482,6 +11767,7 @@ mod tests {
 
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -11520,6 +11806,7 @@ mod tests {
 
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -11556,6 +11843,7 @@ mod tests {
 
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -11856,6 +12144,7 @@ mod tests {
 
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -11930,6 +12219,7 @@ mod tests {
         let payload = Bytes::from("requested message");
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: unknown_msg_id,
             kind: MessageKind::Eager,
@@ -12929,6 +13219,7 @@ mod tests {
 
         let header1 = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: msg_id_1,
             kind: MessageKind::Eager,
@@ -12959,6 +13250,7 @@ mod tests {
 
         let header2 = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id: msg_id_2,
             kind: MessageKind::Eager,
@@ -13046,6 +13338,7 @@ mod tests {
 
         let header = MessageHeader {
             version: 1,
+            payload_hash: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,

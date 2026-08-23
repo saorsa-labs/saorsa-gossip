@@ -32,7 +32,7 @@ use crate::timing::{AdaptiveCoolingConfig, PerPeerRttTracker};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use lru::LruCache;
-use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
+use saorsa_gossip_transport::{is_peer_not_connected_error, GossipStreamType, GossipTransport};
 use saorsa_gossip_types::{
     AdmissionDecision, LogPeerId, LogTopicId, MessageHeader, MessageKind, PeerHealth,
     PeerHealthOracle, PeerId, TopicId, TopicPriority,
@@ -445,6 +445,13 @@ pub struct PubSubStageStats {
     /// were reachable at dispatch time (e.g. "Peer not found" in the
     /// transport). Distinct from `zero_fanout_publishes` (no attempt at all).
     zero_succeeded_publishes: AtomicU64,
+    /// Topic-set evictions after a definitive transport "peer not connected"
+    /// failure (x0x #380). Unlike timeouts these feed no cooling — the peer
+    /// simply leaves the topic's eager/lazy sets until the transport reports
+    /// it connected again. A persistently high rate means the peer-set
+    /// snapshot is stale relative to connection churn, not that peers are
+    /// slow.
+    peers_evicted_not_connected: AtomicU64,
     suppressed_peers: Mutex<HashMap<SuppressedPeerKey, SuppressedPeerState>>,
     /// Lock-wait timing for `suppressed_peers` (issue #27 instrumentation).
     suppressed_peers_lock: StageTimingStats,
@@ -655,6 +662,10 @@ pub struct PubSubStageStatsSnapshot {
     /// This is the black-hole signature: peers exist in the eager set but
     /// none were reachable at dispatch time.
     pub zero_succeeded_publishes: u64,
+    /// Topic-set evictions after a definitive transport "peer not connected"
+    /// failure (x0x #380) — eviction, not cooling; see
+    /// [`PubSubStageStats`] for the interpretation.
+    pub peers_evicted_not_connected: u64,
     /// Peers currently cooled after repeated send-side timeouts.
     pub suppressed_peers: Vec<SuppressedPeerSnapshot>,
     /// Topic-indexed view of currently suppressed peers. Kept alongside the
@@ -714,8 +725,17 @@ enum PubSubStage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerSendOutcome {
-    Sent { observed: Duration },
+    Sent {
+        observed: Duration,
+    },
     TimedOut,
+    /// The transport reported the peer as **not connected** — a definitive,
+    /// instant failure (x0x #380), unlike [`PeerSendOutcome::TimedOut`]
+    /// which means a live connection was too slow. Must not feed timeout
+    /// accounting, cooling, or outbound-budget pressure: the caller evicts
+    /// the peer from the topic's eager/lazy sets and the periodic
+    /// `set_topic_peers` refresh re-adds it once genuinely reconnected.
+    NotConnected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1253,6 +1273,7 @@ impl SendAttemptClaims {
         mut self,
         sent: Vec<PeerSendCompletion>,
         timed_out: Vec<PeerSendAttempt>,
+        not_connected: Vec<PeerSendAttempt>,
     ) {
         record_topic_send_attempt_results_for_state(
             &self.topics,
@@ -1261,6 +1282,7 @@ impl SendAttemptClaims {
             self.topic,
             sent,
             timed_out,
+            not_connected,
         )
         .await;
         self.armed = false;
@@ -1297,6 +1319,9 @@ impl Drop for SendAttemptClaims {
                         topic,
                         Vec::new(),
                         timed_out,
+                        // Dropped claims cannot carry classified evictions —
+                        // the send task was cancelled before completing.
+                        Vec::new(),
                     )
                     .await;
                 });
@@ -1363,14 +1388,24 @@ impl SendTaskSet {
             .push((attempt, AbortOnDropSendHandle::new(handle)));
     }
 
-    async fn collect_results(mut self) -> (Vec<PeerSendCompletion>, Vec<PeerSendAttempt>) {
+    async fn collect_results(
+        mut self,
+    ) -> (
+        Vec<PeerSendCompletion>,
+        Vec<PeerSendAttempt>,
+        Vec<PeerSendAttempt>,
+    ) {
         let mut sent = Vec::new();
         let mut timed_out = Vec::new();
+        // x0x #380: not-connected attempts are bucketed separately so they
+        // never reach the timeout/cooling accounting.
+        let mut not_connected = Vec::new();
         while let Some((attempt, handle)) = self.handles.pop() {
             match handle.join().await {
                 Ok(Ok(PeerSendOutcome::Sent { observed })) => {
                     sent.push(PeerSendCompletion { attempt, observed });
                 }
+                Ok(Ok(PeerSendOutcome::NotConnected)) => not_connected.push(attempt),
                 Ok(Ok(PeerSendOutcome::TimedOut) | Err(_)) => timed_out.push(attempt),
                 Err(e) => {
                     timed_out.extend(recovery_probe_timeout(attempt));
@@ -1383,8 +1418,18 @@ impl SendTaskSet {
                 }
             }
         }
-        (sent, timed_out)
+        (sent, timed_out, not_connected)
     }
+}
+
+/// Which topic sets a not-connected eviction actually removed the peer from
+/// (x0x #380) — carried into the EVICT debug line so a storm's evictions are
+/// distinguishable from ordinary GRAFT/PRUNE churn in the logs.
+#[derive(Debug, Clone, Copy, Default)]
+struct NotConnectedEviction {
+    eager: bool,
+    lazy: bool,
+    cooling: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1837,6 +1882,7 @@ impl PubSubStageStats {
             zero_fanout_publishes: self.zero_fanout_publishes.load(Ordering::Relaxed),
             zero_fanout_publishes_by_topic: BTreeMap::new(),
             zero_succeeded_publishes: self.zero_succeeded_publishes.load(Ordering::Relaxed),
+            peers_evicted_not_connected: self.peers_evicted_not_connected.load(Ordering::Relaxed),
             suppressed_peers: self.suppressed_peer_snapshots(),
             suppressed_peers_by_topic: BTreeMap::new(),
             suppression_cleanup_interval_ms: self
@@ -1891,6 +1937,11 @@ impl PubSubStageStats {
 
     fn record_per_peer_timeout(&self) {
         self.republish_per_peer_timeout
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_peer_evicted_not_connected(&self) {
+        self.peers_evicted_not_connected
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1992,7 +2043,7 @@ fn duration_to_ns(duration: Duration) -> u64 {
 }
 
 fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).ok().map_or(u64::MAX, |v| v)
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn deterministic_jitter(peer_id: PeerId, salt: &[u8], max: Duration) -> Duration {
@@ -2002,7 +2053,7 @@ fn deterministic_jitter(peer_id: PeerId, salt: &[u8], max: Duration) -> Duration
     let max_ms = u64::try_from(max.as_millis())
         .ok()
         .filter(|ms| *ms > 0)
-        .map_or(1, |ms| ms);
+        .unwrap_or(1);
     let mut input = Vec::with_capacity(peer_id.as_bytes().len() + salt.len());
     input.extend_from_slice(peer_id.as_bytes());
     input.extend_from_slice(salt);
@@ -3348,6 +3399,26 @@ impl TopicState {
         }
     }
 
+    /// Remove a transport-not-connected peer from eager, lazy, AND cooling
+    /// state (x0x #380).
+    ///
+    /// Unlike [`TopicState::prune_peer`] (eager → lazy, peer stays meshed),
+    /// the peer leaves both sets entirely: a peer with no live connection is
+    /// not a mesh member, and the periodic `set_topic_peers` /
+    /// connected-set refresh re-adds it the moment the transport reports it
+    /// connected again. Returns which sets the peer actually left, for the
+    /// eviction diagnostic.
+    fn evict_not_connected_peer(&mut self, peer: PeerId) -> NotConnectedEviction {
+        let eager = self.eager_peers.remove(&peer);
+        let lazy = self.lazy_peers.remove(&peer);
+        let cooling = self.peer_cooling.remove(&peer).is_some();
+        NotConnectedEviction {
+            eager,
+            lazy,
+            cooling,
+        }
+    }
+
     fn clear_disconnected_peer_cooling(&mut self, connected_set: &HashSet<PeerId>) -> Vec<PeerId> {
         let removed: Vec<PeerId> = self
             .peer_cooling
@@ -3517,8 +3588,18 @@ async fn record_topic_send_attempt_results_for_state(
     topic: TopicId,
     sent: Vec<PeerSendCompletion>,
     timed_out: Vec<PeerSendAttempt>,
+    not_connected: Vec<PeerSendAttempt>,
 ) {
     let now = Instant::now();
+
+    // x0x #380: transport-not-connected attempts are evictions, not
+    // timeouts. Settled before the topic-state lookup so the counter and
+    // suppression-diagnostic cleanup happen even if the topic entry has
+    // since disappeared.
+    for attempt in &not_connected {
+        stage_stats.clear_peer_suppression(topic, attempt.peer);
+        stage_stats.record_peer_evicted_not_connected();
+    }
     for completion in &sent {
         send_path
             .rtt_tracker
@@ -3552,6 +3633,18 @@ async fn record_topic_send_attempt_results_for_state(
                 "Peer cooling cleared after successful post-cooldown send"
             );
         }
+    }
+
+    for attempt in not_connected {
+        let evicted = state.evict_not_connected_peer(attempt.peer);
+        debug!(
+            peer_id = %LogPeerId::from(attempt.peer),
+            topic = ?topic,
+            eager = evicted.eager,
+            lazy = evicted.lazy,
+            cooling_cleared = evicted.cooling,
+            "EVICT: peer not connected at transport — removed from topic sets (x0x #380)"
+        );
     }
 
     for attempt in timed_out {
@@ -4620,6 +4713,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 observed: started.elapsed(),
             }),
             Ok(Err(e)) => {
+                // x0x #380: an unconnected peer is not a slow peer. Under
+                // connection churn the 1 s peer-set snapshot is stale by the
+                // time PlumTree sends, and the transport answers
+                // PeerNotFound instantly and definitively. Booking that as a
+                // timeout fed cooling, collapsed the eager mesh, and
+                // sustained the GRAFT/PRUNE storm — so classify it here and
+                // let the caller evict the peer instead.
+                if is_peer_not_connected_error(&e) {
+                    debug!(
+                        peer_id = %LogPeerId::from(peer),
+                        op,
+                        "{op} peer not connected at transport — evicting from topic sets"
+                    );
+                    return Ok(PeerSendOutcome::NotConnected);
+                }
                 warn!(
                     peer_id = %LogPeerId::from(peer),
                     op,
@@ -4804,22 +4912,40 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let result = match handle.join().await {
             Ok(Ok(PeerSendOutcome::Sent { observed })) => {
                 claims
-                    .record_results(vec![PeerSendCompletion { attempt, observed }], Vec::new())
+                    .record_results(
+                        vec![PeerSendCompletion { attempt, observed }],
+                        Vec::new(),
+                        Vec::new(),
+                    )
                     .await;
                 Ok(())
             }
             Ok(Ok(PeerSendOutcome::TimedOut)) => {
-                claims.record_results(Vec::new(), vec![attempt]).await;
+                claims
+                    .record_results(Vec::new(), vec![attempt], Vec::new())
+                    .await;
+                Ok(())
+            }
+            Ok(Ok(PeerSendOutcome::NotConnected)) => {
+                // x0x #380: eviction, booked below — never a timeout sample
+                // nor an Err for the caller to count as a send failure.
+                claims
+                    .record_results(Vec::new(), Vec::new(), vec![attempt])
+                    .await;
                 Ok(())
             }
             Ok(Err(e)) => {
                 let timed_out = recovery_probe_timeout(attempt);
-                claims.record_results(Vec::new(), timed_out).await;
+                claims
+                    .record_results(Vec::new(), timed_out, Vec::new())
+                    .await;
                 Err(e)
             }
             Err(e) => {
                 let timed_out = recovery_probe_timeout(attempt);
-                claims.record_results(Vec::new(), timed_out).await;
+                claims
+                    .record_results(Vec::new(), timed_out, Vec::new())
+                    .await;
                 warn!(
                     peer_id = %LogPeerId::from(attempt.peer),
                     op,
@@ -5215,6 +5341,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             topic,
             sent,
             timed_out,
+            // Callers of this helper pass plain attempt lists; a classified
+            // not-connected eviction never routes through it.
+            Vec::new(),
         )
         .await;
     }
@@ -5253,6 +5382,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             topic,
             sent,
             timed_out,
+            // Test helper: plain attempt lists, no classified evictions.
+            Vec::new(),
         )
         .await;
     }
@@ -5370,8 +5501,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // accounting completes. See docs/design/pubsub-fanout-backpressure.md.
             tokio::spawn(async move {
                 let _bulk_guard = _bulk_guard;
-                let (sent, timed_out) = send_tasks.collect_results().await;
-                claims.record_results(sent, timed_out).await;
+                let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
+                claims.record_results(sent, timed_out, not_connected).await;
             });
             // Outcomes are collected asynchronously — succeeded is not
             // observable at this call site. Return 0 so callers know the
@@ -5387,9 +5518,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // Publish path (and tests): await the fan-out so publish() retains
             // its established semantics (returns after sends are attempted).
             // Outcomes are observable here, so succeeded is accurate.
-            let (sent, timed_out) = send_tasks.collect_results().await;
+            let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
             let succeeded = sent.len();
-            claims.record_results(sent, timed_out).await;
+            claims.record_results(sent, timed_out, not_connected).await;
             // _bulk_guard drops here, releasing every Bulk admission exactly
             // once. No manual release call needed.
             (
@@ -6606,8 +6737,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     });
                     send_tasks.push(attempt, handle);
                 }
-                let (sent, timed_out) = send_tasks.collect_results().await;
-                claims.record_results(sent, timed_out).await;
+                let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
+                claims.record_results(sent, timed_out, not_connected).await;
             }
             // X0X-0074: release every Bulk admission reserved above,
             // exactly once. Covers no-claim, partial-claim, and panic
@@ -6921,20 +7052,37 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                     .record_results(
                                         vec![PeerSendCompletion { attempt, observed }],
                                         Vec::new(),
+                                        Vec::new(),
                                     )
                                     .await;
                             }
                             Ok(Ok(PeerSendOutcome::TimedOut)) => {
-                                claims.record_results(Vec::new(), vec![attempt]).await;
+                                claims
+                                    .record_results(Vec::new(), vec![attempt], Vec::new())
+                                    .await;
+                            }
+                            Ok(Ok(PeerSendOutcome::NotConnected)) => {
+                                // x0x #380: eviction, not a timeout sample.
+                                claims
+                                    .record_results(Vec::new(), Vec::new(), vec![attempt])
+                                    .await;
                             }
                             Ok(Err(_)) => {
                                 claims
-                                    .record_results(Vec::new(), recovery_probe_timeout(attempt))
+                                    .record_results(
+                                        Vec::new(),
+                                        recovery_probe_timeout(attempt),
+                                        Vec::new(),
+                                    )
                                     .await;
                             }
                             Err(e) => {
                                 claims
-                                    .record_results(Vec::new(), recovery_probe_timeout(attempt))
+                                    .record_results(
+                                        Vec::new(),
+                                        recovery_probe_timeout(attempt),
+                                        Vec::new(),
+                                    )
                                     .await;
                                 warn!(
                                     peer_id = %LogPeerId::from(attempt.peer),
@@ -7563,6 +7711,223 @@ mod tests {
         fn local_peer_id(&self) -> PeerId {
             self.local_peer
         }
+    }
+
+    /// What the transport reports on send — pins the x0x #380
+    /// classification matrix.
+    enum SendFailureMode {
+        /// ant-quic-style text wrap: `… Endpoint error: Peer not found …`
+        /// inside an `anyhow` chain, exactly what x0x's transport binding
+        /// produces today (the documented string-fallback path).
+        NotConnectedText,
+        /// The structured `TransportError::PeerNotConnected` variant sg's
+        /// own adapter emits.
+        NotConnectedVariant,
+        /// An error on a LIVE connection (e.g. reset mid-stream): must keep
+        /// the pre-#380 timeout/cooling behaviour.
+        LiveIoError,
+    }
+
+    struct FailingTransport {
+        local_peer: PeerId,
+        mode: SendFailureMode,
+        connected: Mutex<Vec<PeerId>>,
+    }
+
+    impl FailingTransport {
+        fn new(local_peer: PeerId, mode: SendFailureMode) -> Arc<Self> {
+            Arc::new(Self {
+                local_peer,
+                mode,
+                connected: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Pretend the phantom peer is transport-connected: under x0x #380
+        /// the peer-set SNAPSHOT still lists it (that staleness is the bug),
+        /// so the eviction must come from the send failure, not from the
+        /// periodic connected-set prune.
+        fn report_connected(&self, peers: Vec<PeerId>) {
+            *self.connected.lock().expect("connected lock") = peers;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for FailingTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(self.local_peer)
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            peer: PeerId,
+            _stream_type: GossipStreamType,
+            _data: Bytes,
+        ) -> Result<()> {
+            match self.mode {
+                SendFailureMode::NotConnectedText => Err(anyhow!(
+                    "send failed: Endpoint error: Peer not found: PeerId([0, 0, 0])"
+                )),
+                SendFailureMode::NotConnectedVariant => Err(
+                    saorsa_gossip_transport::GossipTransportError::PeerNotConnected {
+                        peer_id: peer,
+                    }
+                    .into(),
+                ),
+                SendFailureMode::LiveIoError => {
+                    Err(anyhow!("send failed: connection reset by peer"))
+                }
+            }
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+            Err(anyhow!("failing test transport does not receive"))
+        }
+
+        async fn connected_peer_ids(&self) -> Vec<PeerId> {
+            self.connected.lock().expect("connected lock").clone()
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.local_peer
+        }
+    }
+
+    /// Shared fixture: a topic whose eager set holds one peer that is one
+    /// timeout short of cooling, published to through a failing transport.
+    async fn publish_through_failing_transport(
+        mode: SendFailureMode,
+    ) -> (PlumtreePubSub<FailingTransport>, PeerId) {
+        let peer_id = test_peer_id(1);
+        let phantom = test_peer_id(2);
+        let transport = FailingTransport::new(peer_id, mode);
+        // The peer-set snapshot still lists the phantom as connected — the
+        // #380 staleness. Eviction must therefore come from the send
+        // failure, not the periodic prune.
+        transport.report_connected(vec![peer_id, phantom]);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(peer_id, transport, test_signing_key(), false);
+        let topic = TopicId::new([8u8; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            // One timeout short of the cooling threshold, so a single
+            // mis-booked failure flips the peer into `suppressed_peers`.
+            seed_subthreshold_cooling(state, phantom, Instant::now());
+        }
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"x0x-380-evict"))
+            .await
+            .expect("publish_local with a failing transport still returns Ok");
+        (pubsub, phantom)
+    }
+
+    #[tokio::test]
+    async fn not_connected_text_failure_evicts_peer_instead_of_cooling() {
+        // x0x #380: the peer-set snapshot is rebuilt once per second from
+        // ant-quic's connected set; under connection churn it is stale by
+        // the time PlumTree sends, and the transport answers PeerNotFound
+        // instantly and definitively. Booking that as a timeout fed cooling,
+        // collapsed the eager mesh, and sustained the GRAFT/PRUNE storm —
+        // so the failure must EVICT the peer with zero cooling side
+        // effects.
+        let (pubsub, phantom) =
+            publish_through_failing_transport(SendFailureMode::NotConnectedText).await;
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(
+            stats.peers_evicted_not_connected, 1,
+            "one not-connected send must evict exactly once"
+        );
+        assert_eq!(
+            stats.republish_per_peer_timeout, 0,
+            "not-connected is not a timeout sample"
+        );
+        assert!(
+            stats.suppressed_peers.is_empty(),
+            "an evicted peer must not appear in suppressed_peers even one              timeout short of the threshold"
+        );
+        // Black-hole accounting is unchanged: attempted > 0, succeeded == 0.
+        assert_eq!(stats.zero_succeeded_publishes, 1);
+
+        let topic = TopicId::new([8u8; 32]);
+        let mut topics = pubsub.topics.write_topic(&topic).await;
+        let state = topics
+            .get_mut(&topic)
+            .expect("topic state survives eviction");
+        assert!(
+            !state.eager_peers.contains(&phantom),
+            "eviction removes the peer from EAGER"
+        );
+        assert!(
+            !state.lazy_peers.contains(&phantom),
+            "eviction removes the peer from LAZY too — an unconnected peer              is not a mesh member (unlike PRUNE, which only demotes)"
+        );
+        assert!(
+            !state.peer_cooling.contains_key(&phantom),
+            "eviction clears pending cooling state"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_connected_variant_failure_evicts_peer_instead_of_cooling() {
+        // Same contract via the structured variant sg's own adapter emits —
+        // proves the classifier does not depend on the string fallback.
+        let (pubsub, _phantom) =
+            publish_through_failing_transport(SendFailureMode::NotConnectedVariant).await;
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(stats.peers_evicted_not_connected, 1);
+        assert_eq!(stats.republish_per_peer_timeout, 0);
+        assert!(stats.suppressed_peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_connection_error_still_feeds_cooling_as_before() {
+        // An error on a LIVE connection is a genuinely degraded peer: the
+        // pre-#380 behaviour (timeout sample → cooling) must survive, or
+        // eviction would mask slow/reset links. Seeded one timeout short of
+        // the threshold, the single failed send must complete the cooldown.
+        let (pubsub, phantom) =
+            publish_through_failing_transport(SendFailureMode::LiveIoError).await;
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(
+            stats.peers_evicted_not_connected, 0,
+            "a live-connection error is not an eviction"
+        );
+        assert_eq!(
+            stats.suppressed_peers.len(),
+            1,
+            "the final timeout sample must flip the peer into cooling"
+        );
+        assert!(
+            stats
+                .suppressed_peers
+                .iter()
+                .any(|s| s.peer_id == phantom.to_string()),
+            "the cooled peer is the send target"
+        );
+
+        let topic = TopicId::new([8u8; 32]);
+        let mut topics = pubsub.topics.write_topic(&topic).await;
+        let state = topics.get_mut(&topic).expect("topic state");
+        assert!(
+            state.peer_cooling.contains_key(&phantom),
+            "cooling state recorded as before #380"
+        );
     }
 
     #[async_trait::async_trait]
@@ -10928,7 +11293,13 @@ mod tests {
     #[tokio::test]
     async fn test_iwant_graft() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport().await;
+        // RecordingTransport, not the real adapter: this test grafts a peer
+        // with no live connection and asserts it STAYS grafted after the
+        // IWANT repair send. Since x0x #380 a not-connected repair send
+        // evicts the peer from the mesh (correctly — an unconnected peer is
+        // not a mesh member), so the graft semantics are tested against a
+        // transport where the send succeeds.
+        let transport = RecordingTransport::new(peer_id);
         let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
         let topic = TopicId::new([1u8; 32]);
         let from_peer = test_peer_id(2);
@@ -10971,7 +11342,9 @@ mod tests {
     #[tokio::test]
     async fn test_iwant_graft_respects_max_eager_degree() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport().await;
+        // RecordingTransport for the same #380 reason as test_iwant_graft:
+        // the degree cap is measured after a successful repair send.
+        let transport = RecordingTransport::new(peer_id);
         let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
         let topic = TopicId::new([10u8; 32]);
         let from_peer = test_peer_id(240);

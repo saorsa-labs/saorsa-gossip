@@ -141,7 +141,7 @@ impl TransportError {
     }
 }
 
-/// Classify an `anyhow::Error` returned by [`GossipTransport::send_to_peer`]
+/// Classify an `anyhow::Error` returned by `GossipTransport::send_to_peer`
 /// as a definitive peer-not-connected failure.
 ///
 /// Same contract as [`TransportError::is_peer_not_connected`]: a structured

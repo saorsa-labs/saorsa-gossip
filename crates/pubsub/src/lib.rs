@@ -3198,59 +3198,6 @@ impl TopicState {
         self.record_send_timeout_inner_at(attempt, now, Some(cooling_config), health)
     }
 
-    fn record_critical_gate_overflow_with_context_at(
-        &mut self,
-        attempt: PeerSendAttempt,
-        now: Instant,
-        health: Option<PeerHealth>,
-        cooling_config: AdaptiveCoolingConfig,
-    ) -> PeerTimeoutOutcome {
-        if attempt.kind == SendAttemptKind::Normal {
-            self.peer_scores
-                .entry(attempt.peer)
-                .or_insert_with(|| PeerScore::new_at(now))
-                .record_outbound_send_timeout_at(now);
-        }
-
-        let cooling = self
-            .peer_cooling
-            .entry(attempt.peer)
-            .or_insert_with(|| PeerCoolingState::new(now));
-        if cooling.is_suppressed_at(now) {
-            return PeerTimeoutOutcome::default();
-        }
-
-        let cooldown = if matches!(health, Some(PeerHealth::Dead)) {
-            cooling.dead_cooldown(cooling_config)
-        } else {
-            cooling.next_adaptive_cooldown(cooling_config)
-        };
-        let suppressed_until = now + cooldown;
-        cooling.cooldown = cooldown;
-        cooling.suppressed_until = Some(suppressed_until);
-        cooling.last_suppressed_at = Some(now);
-        cooling.last_suppression_timeout_count = OUTBOUND_CRITICAL_QUEUE_PER_PEER;
-        cooling.recovery_probe_in_flight = false;
-        cooling.recovery_probe_id = None;
-        cooling.timeout_window_started = now;
-        cooling.timeout_count = 0;
-
-        self.peer_scores
-            .entry(attempt.peer)
-            .or_insert_with(|| PeerScore::new_at(now))
-            .record_cooling_event_at(now);
-        let demoted = self.prune_peer(attempt.peer);
-        PeerTimeoutOutcome {
-            suppression: Some(PeerSuppressionEvent {
-                suppressed_until,
-                recent_timeout_count: OUTBOUND_CRITICAL_QUEUE_PER_PEER,
-                cooldown,
-                demoted,
-            }),
-            request_indirect_probe: false,
-        }
-    }
-
     fn record_send_timeout_inner_at(
         &mut self,
         attempt: PeerSendAttempt,
@@ -5204,36 +5151,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         attempt: PeerSendAttempt,
         now: Instant,
     ) {
+        // x0x #380 round 2: a full per-peer Critical FIFO is LOCAL sender
+        // saturation — this node's pipeline to that peer is not draining —
+        // not evidence the PEER is unhealthy. Booking it as a suppression
+        // event cooled and demoted the peer (30-60 s), shrinking the eager
+        // set, feeding GRAFT/PRUNE churn, and generating more sends and more
+        // pressure: the storm's engine once phantom peers were evicted
+        // (0.5.72). Keep the saturation counters and the X0X-0074d hard-error
+        // admission stat; touch no peer cooling state.
+        let _ = (state, now);
         claim_context.stage_stats.record_outbound_budget_exhausted();
-        let health = peer_health_from_snapshot(
-            claim_context.send_path.peer_health_snapshot.as_ref(),
-            &attempt.peer,
+        debug!(
+            peer_id = %LogPeerId::from(attempt.peer),
+            topic = %LogTopicId::from(claim_context.topic),
+            op = claim_context.op,
+            class = claim_context.send_class.label(),
+            "Critical gate overflow — local saturation, message shed, peer state untouched"
         );
-        let event = state.record_critical_gate_overflow_with_context_at(
-            attempt,
-            now,
-            health,
-            claim_context.send_path.cooling_config,
-        );
-        if let Some(event) = event.suppression {
-            claim_context.stage_stats.record_peer_suppressed(
-                claim_context.topic,
-                attempt.peer,
-                event.suppressed_until,
-                event.recent_timeout_count,
-                event.cooldown,
-            );
-            warn!(
-                peer_id = %LogPeerId::from(attempt.peer),
-                topic = %LogTopicId::from(claim_context.topic),
-                op = claim_context.op,
-                class = claim_context.send_class.label(),
-                cooldown_ms = duration_millis_u64(event.cooldown),
-                recent_timeout_count = event.recent_timeout_count,
-                demoted = event.demoted,
-                "Peer cooled after Critical gate saturation"
-            );
-        }
     }
 
     fn record_outbound_budget_pressure_for_state(
@@ -5242,48 +5176,26 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         attempt: PeerSendAttempt,
         now: Instant,
     ) {
+        // x0x #380 round 2: a failed `try_acquire` means THIS node's single
+        // in-flight data permit for the peer is busy — the transport send is
+        // slow (stream backpressure), which is a property of the sender's
+        // pipeline, not of the peer. It was booked as a full send-timeout
+        // sample ("Peer cooled after repeated PubSub outbound budget
+        // pressure", 2,901× per 5k log lines on a fresh 0.5.72 daemon),
+        // cooling healthy peers 30-60 s, collapsing the eager set, and
+        // self-sustaining the storm. Now: count it, shed the message exactly
+        // as before, and leave every piece of peer cooling/suppression
+        // state untouched. Cooling remains reserved for per-peer send
+        // timeouts and IO errors on an ACQUIRED send (and not-connected is
+        // eviction since 0.5.72).
+        let _ = (state, now);
         claim_context.stage_stats.record_outbound_budget_exhausted();
-        let health = peer_health_from_snapshot(
-            claim_context.send_path.peer_health_snapshot.as_ref(),
-            &attempt.peer,
-        );
-        let outcome = state.record_send_timeout_with_context_at(
-            attempt,
-            now,
-            health,
-            claim_context.send_path.cooling_config,
-        );
-        if outcome.request_indirect_probe {
-            spawn_indirect_probe_request(&claim_context.send_path.peer_health_oracle, attempt.peer);
-        }
-        if let Some(event) = outcome.suppression {
-            claim_context.stage_stats.record_peer_suppressed(
-                claim_context.topic,
-                attempt.peer,
-                event.suppressed_until,
-                event.recent_timeout_count,
-                event.cooldown,
-            );
-            if event.demoted {
-                claim_context.stage_stats.record_prune();
-            }
-            warn!(
-                peer_id = %LogPeerId::from(attempt.peer),
-                topic = %LogTopicId::from(claim_context.topic),
-                op = claim_context.op,
-                class = claim_context.send_class.label(),
-                cooldown_ms = duration_millis_u64(event.cooldown),
-                recent_timeout_count = event.recent_timeout_count,
-                demoted = event.demoted,
-                "Peer cooled after repeated PubSub outbound budget pressure"
-            );
-        }
-        trace!(
-            peer_id = %attempt.peer,
-            topic = ?claim_context.topic,
+        debug!(
+            peer_id = %LogPeerId::from(attempt.peer),
+            topic = %LogTopicId::from(claim_context.topic),
             op = claim_context.op,
             class = claim_context.send_class.label(),
-            "{} send skipped: peer outbound PubSub budget exhausted",
+            "{} send shed: outbound budget exhausted — local saturation, peer state untouched",
             claim_context.op
         );
     }
@@ -9412,12 +9324,16 @@ mod tests {
             stats.outbound_budget_exhausted, PEER_TIMEOUT_THRESHOLD as u64,
             "budget skips should be visible in diagnostics"
         );
-        assert_eq!(
-            stats.suppressed_peers.len(),
-            1,
-            "repeated budget pressure should feed slow-peer cooling"
+        // x0x #380 round 2: this block used to assert that repeated budget
+        // pressure "feeds slow-peer cooling" (suppressed_peers.len() == 1) —
+        // that expectation WAS the bug. The duplicate attempts were shed by
+        // THIS sender's single in-flight permit (local saturation); the one
+        // send that did acquire the permit completed successfully. Nothing
+        // here is peer evidence, so nothing may be suppressed.
+        assert!(
+            stats.suppressed_peers.is_empty(),
+            "budget saturation must not cool the peer — the acquired send succeeded"
         );
-        assert_eq!(stats.suppressed_peers[0].peer_id, slow_peer.to_string());
     }
 
     /// Regression: the dispatcher EAGER-forward path must not pin its worker
@@ -9547,6 +9463,129 @@ mod tests {
         assert_eq!(
             pubsub.stage_stats().outbound_budget_exhausted,
             PEER_TIMEOUT_THRESHOLD as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_never_cools_the_peer() {
+        // x0x #380 round 2: N consecutive budget-exhausted attempts mean the
+        // SENDER's single in-flight data permit is busy — local saturation.
+        // The old code booked each as a send-timeout sample, so
+        // PEER_TIMEOUT_THRESHOLD exhausted attempts cooled a perfectly
+        // healthy peer for 30-60 s and demoted it out of the eager mesh,
+        // which is the storm's engine. Now: the counter advances, the
+        // message is shed, and every piece of peer state stays untouched.
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([78u8; 32]);
+        let slow_peer = test_peer_id(2);
+        pubsub.initialize_topic_peers(topic, vec![slow_peer]).await;
+
+        // One attempt holds the single data permit (blocked in the
+        // transport); the remaining THRESHOLD+1 attempts all exhaust.
+        let n_attempts = PEER_TIMEOUT_THRESHOLD + 2;
+        let send_pubsub = Arc::clone(&pubsub);
+        let send = tokio::spawn(async move {
+            send_pubsub
+                .parallel_send_to_peers(
+                    topic,
+                    vec![slow_peer; n_attempts],
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"budget-saturation"),
+                    "EAGER",
+                    false,
+                )
+                .await;
+        });
+        // Let the first send start, then release it so the fan-out finishes.
+        transport.release_sends(1);
+        tokio::time::timeout(Duration::from_millis(500), send)
+            .await
+            .expect("fan-out should finish once the in-flight send completes")
+            .expect("send task should not panic");
+
+        let stats = pubsub.stage_stats();
+        // (c) the saturation counter still counts every exhausted attempt.
+        assert_eq!(
+            stats.outbound_budget_exhausted,
+            (PEER_TIMEOUT_THRESHOLD + 1) as u64,
+            "every try_acquire failure must still count as local saturation"
+        );
+        // (a) no suppression/cooling state was created or advanced.
+        assert!(
+            stats.suppressed_peers.is_empty(),
+            "budget exhaustion is not a peer fault — nothing may be suppressed"
+        );
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            assert!(
+                !state.peer_cooling.contains_key(&slow_peer),
+                "no cooling entry may exist for a budget-exhausted peer"
+            );
+            assert!(
+                state.eager_peers.contains(&slow_peer),
+                "the peer stays eager-eligible — no demotion for saturation"
+            );
+        }
+        // (a, cont.) eager-eligible in practice: the very next claim for the
+        // peer succeeds (permit now free, no cooldown in the way).
+        let (claims, _) = pubsub
+            .claim_topic_send_attempts(topic, vec![slow_peer], "EAGER")
+            .await;
+        assert_eq!(
+            claims.attempts().len(),
+            1,
+            "a budget-exhausted peer must be immediately claimable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_send_timeout_on_acquired_permit_still_cools() {
+        // x0x #380 round 2, the complement of
+        // budget_exhaustion_never_cools_the_peer: a send that genuinely
+        // timed out on an ACQUIRED permit IS peer evidence and must keep
+        // cooling exactly as before — the saturation fix may not mask
+        // actually-degraded links. Seeded one timeout short of the
+        // threshold, the single timed-out attempt must complete the
+        // cooldown.
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(peer_id, transport, test_signing_key(), false);
+        let topic = TopicId::new([79u8; 32]);
+        let slow_peer = test_peer_id(2);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            seed_subthreshold_cooling(state, slow_peer, Instant::now());
+        }
+
+        // The real TimedOut accounting path (identical to what
+        // send_to_peer_with_timeout's timeout arm reaches via
+        // record_results).
+        pubsub
+            .record_topic_send_results(topic, Vec::new(), vec![slow_peer])
+            .await;
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(
+            stats.suppressed_peers.len(),
+            1,
+            "a real timeout on an acquired permit must still cool the peer"
+        );
+        assert!(
+            stats
+                .suppressed_peers
+                .iter()
+                .any(|s| s.peer_id == slow_peer.to_string()),
+            "the cooled peer is the timed-out send target"
         );
     }
 
@@ -14000,11 +14039,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_x0x_0074d_gate_overflow_immediately_cools_peer() {
-        // A full Critical FIFO is already threshold-equivalent pressure. The
-        // first claim past the bound should cool the peer/topic immediately so
-        // follow-up Critical claims are skipped by cooling instead of emitting
-        // repeated X0X-0074d overflow WARNs.
+    async fn test_x0x_0074d_gate_overflow_is_local_saturation_not_peer_cooling() {
+        // x0x #380 round 2: this test used to assert that a full Critical
+        // FIFO "immediately cools" the peer — that expectation WAS the bug.
+        // A full FIFO means this SENDER's serialized pipeline to the peer is
+        // not draining (slow transport sends); booking it against the peer
+        // cooled healthy peers 30-60 s, collapsed the eager set, and fed the
+        // GRAFT/PRUNE storm. The contract now: the overflow still records
+        // the X0X-0074d hard-error admission stat and the
+        // outbound_budget_exhausted saturation counter, but creates NO
+        // suppression/cooling state — so the peer is immediately claimable
+        // again once the gate drains.
         let peer_id = test_peer_id(1);
         let target = test_peer_id(2);
         let transport = RecordingTransport::new(peer_id);
@@ -14041,31 +14086,61 @@ mod tests {
         {
             let topics = pubsub.topics.read_topic(&topic).await;
             let state = topics.get(&topic).expect("topic exists");
-            assert!(state.is_peer_suppressed_at(target, Instant::now()));
+            assert!(
+                !state.is_peer_suppressed_at(target, Instant::now()),
+                "gate overflow is sender saturation — it must not suppress the peer"
+            );
+            assert!(
+                !state.peer_cooling.contains_key(&target),
+                "gate overflow must not create cooling state"
+            );
+            assert!(
+                state.eager_peers.contains(&target),
+                "the peer stays meshed and eager-eligible"
+            );
         }
 
-        let (cooled, _) = pubsub
+        // The gate is still full, so the next claim overflows AGAIN — another
+        // hard error + saturation count, still zero cooling skips (the old
+        // behaviour skipped this claim via the cooling it had just created).
+        let (still_not_cooled, _) = pubsub
             .claim_topic_send_attempts(topic, vec![target], "EAGER")
             .await;
-        assert!(cooled.is_empty());
+        assert!(still_not_cooled.is_empty());
 
-        // Counter split (0.5.67): FIFO gate overflow is genuine overload and
-        // must STILL record the hard error — never the benign no-target
-        // counter (that one is reserved for transport-disconnected targets).
+        // Counter split (0.5.67) preserved: FIFO gate overflow is genuine
+        // overload and STILL records the hard error — never the benign
+        // no-target counter — and now exactly one per overflowing claim.
         let stats = pubsub.admission().stats().snapshot();
         assert_eq!(
-            stats.dropped_critical_hard_error, 1,
-            "Critical FIFO gate overflow must keep recording the hard error"
+            stats.dropped_critical_hard_error, 2,
+            "each overflowing Critical claim keeps recording the hard error"
         );
         assert_eq!(
-            stats.dropped_critical_cooling, 1,
-            "the post-overflow claim is skipped by the immediate cooling"
+            stats.dropped_critical_cooling, 0,
+            "no claim is ever skipped by cooling — budget saturation is not a peer fault"
         );
         assert_eq!(
             stats.dropped_critical_no_target, 0,
             "gate overflow must not be misclassified as a no-target skip"
         );
+        assert_eq!(
+            pubsub.stage_stats().outbound_budget_exhausted,
+            2,
+            "the saturation counter keeps counting every overflow"
+        );
+
+        // Once the gate drains the peer is IMMEDIATELY claimable again —
+        // no 30-60 s cooldown stands between a full FIFO and recovery.
         drop(held);
+        let (recovered, _) = pubsub
+            .claim_topic_send_attempts(topic, vec![target], "EAGER")
+            .await;
+        assert_eq!(
+            recovered.attempts().len(),
+            1,
+            "after the gate drains the peer is claimable with no cooldown"
+        );
     }
 
     #[tokio::test]

@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **PubSub — transport "peer not connected" failures evict instead of cooling
+  (x0x #380).** x0x rebuilds every topic's peer set once per second from a
+  snapshot of ant-quic's connected peers; under connection churn
+  (generation replacements at ~800/h in the prod fleet) the snapshot is stale
+  by the time PlumTree sends, and the transport answers `PeerNotFound` —
+  instant and definitive. `send_to_peer_with_timeout` booked that `Err` like
+  a slow peer, feeding per-peer timeout accounting → 30–60 s cooldowns →
+  eager-set collapse → GRAFT/PRUNE thrash (`outbound_budget_exhausted`
+  climbing ~25k/10 min on a fresh daemon).
+
+  - `TransportError::PeerNotConnected { peer_id }` variant, emitted by
+    sg's own adapter on the not-connected and failed-reconnect paths;
+    `TransportError::is_peer_not_connected()` plus
+    `is_peer_not_connected_error(&anyhow::Error)` classify with the
+    structured variant first and a documented sentinel-text fallback
+    ("peer not found" / "not connected" / "no cached address") so x0x's
+    current string-wrapping binding classifies with no x0x change.
+  - A classified failure now returns `PeerSendOutcome::NotConnected` and
+    removes the peer from that topic's eager AND lazy sets and clears its
+    cooling state — no timeout sample, no suppression, no budget pressure.
+    The periodic `set_topic_peers` refresh re-adds the peer as soon as it
+    is genuinely connected again.
+  - New counter `peers_evicted_not_connected` on
+    `PubSubStageStatsSnapshot` (x0x `/diagnostics/gossip` passes it
+    through).
+  - Timeouts and IO errors on a **live** connection keep the existing
+    cooling behaviour unchanged.
+
 ## [0.5.68] - 2026-08-08
 
 ### Fixed

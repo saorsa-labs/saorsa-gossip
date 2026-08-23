@@ -95,6 +95,65 @@ pub enum TransportError {
         #[source]
         source: anyhow::Error,
     },
+
+    /// The peer has no live transport connection.
+    ///
+    /// Definitive and instant — e.g. ant-quic's `EndpointError::PeerNotFound`
+    /// after a connection-generation replacement — as opposed to a timeout on
+    /// a live connection. PubSub uses this classification to evict the peer
+    /// from its topic sets instead of feeding per-peer timeout accounting and
+    /// cooling (x0x #380): the periodic `set_topic_peers` refresh re-adds the
+    /// peer as soon as the transport reports it connected again.
+    #[error("Peer {peer_id} is not connected")]
+    PeerNotConnected {
+        /// The peer that has no live connection.
+        peer_id: PeerId,
+    },
+}
+
+/// Display substrings that identify a definitive "not connected" failure in
+/// error text produced by transports that wrap their underlying endpoint
+/// error as a string (x0x's ant-quic binding surfaces
+/// `… Endpoint error: Peer not found: PeerId(…)` inside `SendFailed` /
+/// `Other`). Kept as a documented fallback so classification works before
+/// those bindings migrate to [`TransportError::PeerNotConnected`] (x0x #380).
+const NOT_CONNECTED_SENTINELS: [&str; 3] = ["peer not found", "not connected", "no cached address"];
+
+impl TransportError {
+    /// Whether this error definitively reports that the target peer has no
+    /// live transport connection.
+    ///
+    /// Primary signal: the [`TransportError::PeerNotConnected`] variant.
+    /// Fallback: sentinel substrings over the rendered error — thiserror's
+    /// `#[error("… {source}")]` folds the whole source chain into the
+    /// message, so one `contains` covers wrapped endpoint errors.
+    ///
+    /// x0x #380: an unconnected peer is not a slow peer. An instant
+    /// `PeerNotFound` must evict the peer from PubSub topic sets; booking it
+    /// as a timeout fed cooling, collapsed the eager mesh, and sustained the
+    /// GRAFT/PRUNE storm under connection churn.
+    pub fn is_peer_not_connected(&self) -> bool {
+        if matches!(self, TransportError::PeerNotConnected { .. }) {
+            return true;
+        }
+        let rendered = self.to_string().to_lowercase();
+        NOT_CONNECTED_SENTINELS.iter().any(|s| rendered.contains(s))
+    }
+}
+
+/// Classify an `anyhow::Error` returned by [`GossipTransport::send_to_peer`]
+/// as a definitive peer-not-connected failure.
+///
+/// Same contract as [`TransportError::is_peer_not_connected`]: a structured
+/// `TransportError::PeerNotConnected` when the transport emits one, else the
+/// documented sentinel-text fallback over the full anyhow chain (`{:#}`
+/// renders every cause).
+pub fn is_peer_not_connected_error(err: &anyhow::Error) -> bool {
+    if let Some(transport_error) = err.downcast_ref::<TransportError>() {
+        return transport_error.is_peer_not_connected();
+    }
+    let rendered = format!("{err:#}").to_lowercase();
+    NOT_CONNECTED_SENTINELS.iter().any(|s| rendered.contains(s))
 }
 
 impl From<anyhow::Error> for TransportError {
@@ -106,6 +165,73 @@ impl From<anyhow::Error> for TransportError {
 impl From<std::io::Error> for TransportError {
     fn from(err: std::io::Error) -> Self {
         TransportError::Other { source: err.into() }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+mod not_connected_classification_tests {
+    use super::*;
+    use anyhow::anyhow;
+
+    /// x0x #380: classification is load-bearing — a false positive cools
+    /// nothing (harmless), but a false negative re-opens the cooling storm.
+    /// Pin both directions for the variant, the sentinel fallback, and
+    /// non-sentinel errors.
+    #[test]
+    fn variant_classifies_as_not_connected() {
+        let err = TransportError::PeerNotConnected {
+            peer_id: PeerId::new([1; 32]),
+        };
+        assert!(err.is_peer_not_connected());
+    }
+
+    #[test]
+    fn ant_quic_peer_not_found_text_classifies_via_fallback() {
+        // The shape x0x's transport binding produces today: ant-quic's
+        // EndpointError wrapped into SendFailed's anyhow source, folded
+        // into the rendered message by thiserror.
+        let err = TransportError::SendFailed {
+            peer_id: PeerId::new([2; 32]),
+            source: anyhow!("send failed: Endpoint error: Peer not found: PeerId([9, 9])"),
+        };
+        assert!(err.is_peer_not_connected());
+    }
+
+    #[test]
+    fn anyhow_wrapped_not_connected_text_classifies_via_fallback() {
+        let err: anyhow::Error = TransportError::SendFailed {
+            peer_id: PeerId::new([3; 32]),
+            source: anyhow!("Endpoint error: Peer not found: PeerId([9, 9])"),
+        }
+        .into();
+        assert!(is_peer_not_connected_error(&err));
+    }
+
+    #[test]
+    fn adapter_not_connected_text_classifies_via_fallback() {
+        // sg's own pre-#380 wording for the no-address path.
+        let err = TransportError::Other {
+            source: anyhow!("Peer ab12 not connected and no cached address is available"),
+        };
+        assert!(err.is_peer_not_connected());
+    }
+
+    #[test]
+    fn live_connection_errors_do_not_classify() {
+        let live = TransportError::SendFailed {
+            peer_id: PeerId::new([4; 32]),
+            source: anyhow!("send failed: connection reset by peer"),
+        };
+        assert!(!live.is_peer_not_connected());
+
+        let timeout = TransportError::Timeout {
+            operation: "send_to_peer".to_string(),
+        };
+        assert!(!timeout.is_peer_not_connected());
+
+        let anyhow_live: anyhow::Error = anyhow!("send failed: connection reset by peer");
+        assert!(!is_peer_not_connected_error(&anyhow_live));
     }
 }
 

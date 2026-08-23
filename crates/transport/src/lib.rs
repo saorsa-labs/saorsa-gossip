@@ -36,7 +36,10 @@ mod udp_transport_adapter;
 #[cfg(feature = "test-helpers")]
 pub mod testing;
 
-pub use error::{TransportError as GossipTransportError, TransportResult as GossipTransportResult};
+pub use error::{
+    is_peer_not_connected_error, TransportError as GossipTransportError,
+    TransportResult as GossipTransportResult,
+};
 pub use udp_transport_adapter::{UdpTransportAdapter, UdpTransportAdapterConfig};
 
 // Deprecated aliases for backward compatibility

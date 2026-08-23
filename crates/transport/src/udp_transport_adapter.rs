@@ -944,13 +944,14 @@ impl GossipTransport for UdpTransportAdapter {
                         LogPeerId::from(peer),
                         err
                     );
-                    return Err(err);
+                    // x0x #380: the reconnect could not re-establish the
+                    // connection, so the peer is definitively not connected.
+                    return Err(TransportError::PeerNotConnected { peer_id: peer }.into());
                 }
             } else {
-                return Err(anyhow!(
-                    "Peer {} not connected and no cached address is available",
-                    LogPeerId::from(peer)
-                ));
+                // x0x #380: definitive not-connected — classify so PubSub
+                // evicts instead of cooling the peer.
+                return Err(TransportError::PeerNotConnected { peer_id: peer }.into());
             }
         }
 
@@ -991,7 +992,8 @@ impl GossipTransport for UdpTransportAdapter {
                     LogPeerId::from(peer),
                     err
                 );
-                return Err(err);
+                // x0x #380: definitive not-connected after the retry path.
+                return Err(TransportError::PeerNotConnected { peer_id: peer }.into());
             }
             match tokio::time::timeout(self.config.send_timeout, self.node.send(&ant_peer_id, &buf))
                 .await

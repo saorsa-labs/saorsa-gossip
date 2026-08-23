@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.72] - 2026-08-23
+
 ### Fixed
 
 - **PubSub — transport "peer not connected" failures evict instead of cooling

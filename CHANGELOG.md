@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **PubSub — outbound-budget exhaustion is local saturation, not a peer fault
+  (x0x #380, round 2).** With `OUTBOUND_{CRITICAL,BEST_EFFORT}_DATA_PERMITS_PER_PEER = 1`,
+  a failed per-peer `try_acquire` means the sender's single in-flight data
+  permit is busy (slow transport send). It was booked as a full send-timeout
+  sample: "Peer cooled after repeated PubSub outbound budget pressure"
+  (2,901× per 5k log lines on a fresh 0.5.72 daemon) cooled healthy peers
+  30–60 s and demoted them out of the eager mesh — the storm's remaining
+  engine once phantom peers were evicted (0.5.72).
+
+  - `record_outbound_budget_pressure_for_state` and
+    `record_critical_gate_overflow_for_state` no longer create or advance any
+    suppression/cooling/demotion state and no longer record timeout samples.
+    They keep their counters (`outbound_budget_exhausted`, the X0X-0074d
+    hard-error admission stat) and shed/queue messages exactly as before;
+    the WARN lines are now debug-level saturation notes.
+  - Cooling is now ONLY: per-peer send timeouts and IO errors on an
+    *acquired* send. Not-connected → eviction (0.5.72) unchanged.
+  - Control-send audit: `OutboundSendClass::for_op` maps only `EAGER` to
+    Data; IHAVE/IWANT/ANTI_ENTROPY (and GRAFT/PRUNE, which piggyback on
+    IHAVE/IWANT payloads) use the separate 2-permit control lane and never
+    touch the data-permit path or the Critical FIFO gate — no starvation
+    path found.
+  - Tests: budget exhaustion leaves `suppressed_peers`/cooling empty and the
+    peer immediately claimable while `outbound_budget_exhausted` still
+    counts (new); a genuine timeout on an acquired permit still cools
+    (new); the gate-overflow and duplicate-EAGER tests that *asserted*
+    cooling-on-pressure were updated to the new contract with the rationale.
+
 ## [0.5.72] - 2026-08-23
 
 ### Fixed

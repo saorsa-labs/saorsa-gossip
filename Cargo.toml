@@ -25,6 +25,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/saorsa-labs/saorsa-gossip"
 
 [workspace.dependencies]
+serde_json = "1"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

@@ -324,8 +324,8 @@ struct OutboundTopicMeter {
     bytes: [AtomicU64; 4],
 }
 
-/// x0x #380: bounded per-topic outbound meters. Topics beyond
-/// [`OUTBOUND_TOPIC_METER_CAP`] are not inserted (counted in
+/// x0x #380: bounded per-topic outbound meters. Topics beyond the fixed cap
+/// (see `OUTBOUND_TOPIC_METER_CAP`) are not inserted (counted in
 /// `topics_uncounted`) so a topic flood cannot grow the map unboundedly.
 #[derive(Debug, Default)]
 struct OutboundTopicMeters {
@@ -805,8 +805,8 @@ pub struct PubSubStageStatsSnapshot {
     /// Inbound PubSub wire classes and local PRUNE/GRAFT tree transitions.
     pub message_kinds: PubSubMessageKindStatsSnapshot,
     /// x0x #380: cumulative outbound wire sends per topic, split by kind.
-    /// Bounded at [`OUTBOUND_TOPIC_METER_CAP`] topics; a busy-node snapshot
-    /// lists only tracked topics.
+    /// Bounded at a fixed topic cap (1,024); a busy-node snapshot lists only
+    /// tracked topics.
     pub outbound_by_topic: BTreeMap<String, OutboundTopicMeterSnapshot>,
     /// x0x #380: cumulative outbound msgs+bytes per wire kind (all topics).
     pub outbound_by_kind: BTreeMap<String, OutboundKindMeterSnapshot>,

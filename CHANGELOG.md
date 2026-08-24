@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-topic / per-kind outbound metering (x0x #380, instrumentation only — no
+  behaviour change).** Before rate-capping the ~104 EAGER/s an idle daemon
+  emits, we must see where the bytes go. `PubSubStageStatsSnapshot` now
+  carries:
+  - `outbound_by_topic`: topic → per-kind {msgs, bytes} wire-send counters
+    (eager / ihave / iwant / anti_entropy), bounded at 1,024 topics — beyond
+    that new topics are not tracked (aggregate kind counters remain exact).
+    GRAFT/PRUNE are deliberately absent as outbound kinds: they are local
+    tree transitions (already in `message_kinds`); PlumTree piggybacks tree
+    repair on IHAVE/IWANT.
+  - `outbound_by_kind`: aggregate msgs+bytes per wire kind.
+  - `outbound_publish_origin`: EAGER publish traffic split local (publish_local)
+    vs relay (forward / republish / anti-entropy serve of others' cached
+    messages) — the rate-cap decision input.
+  x0x `/diagnostics/gossip` passes the snapshot through automatically.
+
+## [Unreleased]
+
 ## [0.5.73] - 2026-08-23
 
 ### Fixed

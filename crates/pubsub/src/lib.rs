@@ -266,6 +266,171 @@ impl Default for PubSubCacheConfig {
     }
 }
 
+/// x0x #380: cap on distinct topics tracked in [`OutboundTopicMeters`]. The
+/// map exists to answer "WHERE do the outbound bytes go" on a live node;
+/// beyond this many active topics the per-topic question is better answered
+/// by the aggregate kind counters, and unbounded growth would itself be the
+/// memory leak class this instrumentation is diagnosing.
+const OUTBOUND_TOPIC_METER_CAP: usize = 1024;
+
+/// x0x #380: outbound wire kinds that carry per-topic payloads. GRAFT/PRUNE
+/// are deliberately absent: they are LOCAL tree transitions (already counted
+/// in [`PubSubMessageKindStats`]), not outbound wire messages — PlumTree
+/// piggybacks tree repair on IHAVE/IWANT exchanges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundWireKind {
+    Eager,
+    Ihave,
+    Iwant,
+    AntiEntropy,
+}
+
+impl OutboundWireKind {
+    const ALL: [Self; 4] = [Self::Eager, Self::Ihave, Self::Iwant, Self::AntiEntropy];
+
+    fn from_op(op: &'static str) -> Self {
+        match op {
+            "EAGER" => Self::Eager,
+            "IHAVE" => Self::Ihave,
+            "IWANT" => Self::Iwant,
+            _ => Self::AntiEntropy,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Eager => "eager",
+            Self::Ihave => "ihave",
+            Self::Iwant => "iwant",
+            Self::AntiEntropy => "anti_entropy",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Eager => 0,
+            Self::Ihave => 1,
+            Self::Iwant => 2,
+            Self::AntiEntropy => 3,
+        }
+    }
+}
+
+/// x0x #380: per-topic outbound wire-send counters. `Relaxed` fetch_add on
+/// the send path; no allocation beyond the one map entry per topic.
+#[derive(Debug, Default)]
+struct OutboundTopicMeter {
+    msgs: [AtomicU64; 4],
+    bytes: [AtomicU64; 4],
+}
+
+/// x0x #380: bounded per-topic outbound meters. Topics beyond
+/// [`OUTBOUND_TOPIC_METER_CAP`] are not inserted (counted in
+/// `topics_uncounted`) so a topic flood cannot grow the map unboundedly.
+#[derive(Debug, Default)]
+struct OutboundTopicMeters {
+    topics: Mutex<std::collections::HashMap<TopicId, OutboundTopicMeter>>,
+    topics_uncounted: AtomicU64,
+}
+
+impl OutboundTopicMeters {
+    fn record(&self, topic: TopicId, kind: OutboundWireKind, bytes_len: usize, msgs: usize) {
+        let mut guard = match self.topics.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let meter = match guard.get_mut(&topic) {
+            Some(meter) => meter,
+            None => {
+                if guard.len() >= OUTBOUND_TOPIC_METER_CAP {
+                    drop(guard);
+                    self.topics_uncounted.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                guard.entry(topic).or_default()
+            }
+        };
+        let idx = kind.index();
+        meter.msgs[idx].fetch_add(msgs as u64, Ordering::Relaxed);
+        meter.bytes[idx].fetch_add(msgs as u64 * bytes_len as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> BTreeMap<String, OutboundTopicMeterSnapshot> {
+        let guard = match self.topics.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .iter()
+            .map(|(topic, meter)| {
+                let kind_snapshot = |idx: usize, label: &'static str| OutboundKindMeterSnapshot {
+                    label,
+                    msgs: meter.msgs[idx].load(Ordering::Relaxed),
+                    bytes: meter.bytes[idx].load(Ordering::Relaxed),
+                };
+                (
+                    topic.to_string(),
+                    OutboundTopicMeterSnapshot {
+                        eager: kind_snapshot(0, "eager"),
+                        ihave: kind_snapshot(1, "ihave"),
+                        iwant: kind_snapshot(2, "iwant"),
+                        anti_entropy: kind_snapshot(3, "anti_entropy"),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// x0x #380: JSON-friendly per-kind {msgs, bytes} pair.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutboundKindMeterSnapshot {
+    /// Wire kind label (eager / ihave / iwant / anti_entropy).
+    pub label: &'static str,
+    /// Cumulative wire sends of this kind.
+    pub msgs: u64,
+    /// Cumulative wire bytes of this kind (sends × serialized message size).
+    pub bytes: u64,
+}
+
+/// x0x #380: JSON-friendly per-topic outbound meter.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutboundTopicMeterSnapshot {
+    /// EAGER wire sends attributed to this topic.
+    pub eager: OutboundKindMeterSnapshot,
+    /// IHAVE wire sends attributed to this topic.
+    pub ihave: OutboundKindMeterSnapshot,
+    /// IWANT wire sends attributed to this topic.
+    pub iwant: OutboundKindMeterSnapshot,
+    /// Anti-entropy wire sends attributed to this topic.
+    pub anti_entropy: OutboundKindMeterSnapshot,
+}
+
+/// x0x #380: EAGER publish-traffic split by origin — the rate-cap decision
+/// input. `local` = locally-originated publishes; `relay` = forward /
+/// republish / anti-entropy serve of OTHERS' cached messages. Control kinds
+/// (IHAVE/IWANT/anti-entropy requests) are not publishes and are excluded.
+#[derive(Debug, Default)]
+struct OutboundPublishOriginMeters {
+    local_msgs: AtomicU64,
+    local_bytes: AtomicU64,
+    relay_msgs: AtomicU64,
+    relay_bytes: AtomicU64,
+}
+
+/// x0x #380: JSON-friendly origin split.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OutboundPublishOriginSnapshot {
+    /// Locally-originated publish messages (one per publish_local call).
+    pub local_msgs: u64,
+    /// Payload bytes of locally-originated publishes.
+    pub local_bytes: u64,
+    /// Forward/republish/serve events of others' cached messages.
+    pub relay_msgs: u64,
+    /// Payload bytes of relayed messages.
+    pub relay_bytes: u64,
+}
+
 /// Counters for inbound PubSub wire classes plus local PlumTree tree changes.
 #[derive(Debug, Default)]
 pub struct PubSubMessageKindStats {
@@ -455,6 +620,14 @@ pub struct PubSubStageStats {
     suppressed_peers: Mutex<HashMap<SuppressedPeerKey, SuppressedPeerState>>,
     /// Lock-wait timing for `suppressed_peers` (issue #27 instrumentation).
     suppressed_peers_lock: StageTimingStats,
+    /// x0x #380: per-topic outbound wire meters (bounded, see
+    /// [`OutboundTopicMeters`]).
+    outbound_by_topic: OutboundTopicMeters,
+    /// x0x #380: aggregate outbound wire msgs+bytes per kind.
+    outbound_kind_msgs: [AtomicU64; 4],
+    outbound_kind_bytes: [AtomicU64; 4],
+    /// x0x #380: EAGER publish traffic split local vs relay.
+    outbound_publish_origin: OutboundPublishOriginMeters,
     suppression_cleanup: SuppressionCleanupStats,
 }
 
@@ -631,6 +804,15 @@ pub struct CacheStatsSnapshot {
 pub struct PubSubStageStatsSnapshot {
     /// Inbound PubSub wire classes and local PRUNE/GRAFT tree transitions.
     pub message_kinds: PubSubMessageKindStatsSnapshot,
+    /// x0x #380: cumulative outbound wire sends per topic, split by kind.
+    /// Bounded at [`OUTBOUND_TOPIC_METER_CAP`] topics; a busy-node snapshot
+    /// lists only tracked topics.
+    pub outbound_by_topic: BTreeMap<String, OutboundTopicMeterSnapshot>,
+    /// x0x #380: cumulative outbound msgs+bytes per wire kind (all topics).
+    pub outbound_by_kind: BTreeMap<String, OutboundKindMeterSnapshot>,
+    /// x0x #380: EAGER publish-traffic split by origin (local vs relay) —
+    /// the rate-cap decision input.
+    pub outbound_publish_origin: OutboundPublishOriginSnapshot,
     /// Wire-envelope and control-payload decode time.
     pub decode: StageTimingStatsSnapshot,
     /// ML-DSA-65 signature verification time.
@@ -1871,6 +2053,39 @@ impl PubSubStageStats {
     fn snapshot(&self) -> PubSubStageStatsSnapshot {
         PubSubStageStatsSnapshot {
             message_kinds: self.message_kinds.snapshot(),
+            outbound_by_topic: self.outbound_by_topic.snapshot(),
+            outbound_by_kind: OutboundWireKind::ALL
+                .iter()
+                .map(|kind| {
+                    let idx = kind.index();
+                    (
+                        kind.label().to_string(),
+                        OutboundKindMeterSnapshot {
+                            label: kind.label(),
+                            msgs: self.outbound_kind_msgs[idx].load(Ordering::Relaxed),
+                            bytes: self.outbound_kind_bytes[idx].load(Ordering::Relaxed),
+                        },
+                    )
+                })
+                .collect(),
+            outbound_publish_origin: OutboundPublishOriginSnapshot {
+                local_msgs: self
+                    .outbound_publish_origin
+                    .local_msgs
+                    .load(Ordering::Relaxed),
+                local_bytes: self
+                    .outbound_publish_origin
+                    .local_bytes
+                    .load(Ordering::Relaxed),
+                relay_msgs: self
+                    .outbound_publish_origin
+                    .relay_msgs
+                    .load(Ordering::Relaxed),
+                relay_bytes: self
+                    .outbound_publish_origin
+                    .relay_bytes
+                    .load(Ordering::Relaxed),
+            },
             decode: self.decode.snapshot(),
             verify: self.verify.snapshot(),
             dedupe_lock_acquire: self.dedupe_lock_acquire.snapshot(),
@@ -1938,6 +2153,36 @@ impl PubSubStageStats {
     fn record_per_peer_timeout(&self) {
         self.republish_per_peer_timeout
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// x0x #380: record outbound wire sends for one fan-out call. `msgs` is
+    /// the number of per-peer sends attempted with a message of `bytes_len`
+    /// serialized bytes. Instrumentation only — no behaviour change.
+    fn record_outbound(&self, topic: TopicId, op: &'static str, bytes_len: usize, msgs: usize) {
+        let kind = OutboundWireKind::from_op(op);
+        let idx = kind.index();
+        self.outbound_kind_msgs[idx].fetch_add(msgs as u64, Ordering::Relaxed);
+        self.outbound_kind_bytes[idx].fetch_add(msgs as u64 * bytes_len as u64, Ordering::Relaxed);
+        self.outbound_by_topic.record(topic, kind, bytes_len, msgs);
+    }
+
+    /// x0x #380: record one publish-class message by origin. `local` marks a
+    /// locally-originated publish; everything else (forward, republish,
+    /// anti-entropy serve of cached messages) is relay traffic.
+    fn record_publish_origin(&self, local: bool, bytes_len: usize, msgs: usize) {
+        let (msgs_counter, bytes_counter) = if local {
+            (
+                &self.outbound_publish_origin.local_msgs,
+                &self.outbound_publish_origin.local_bytes,
+            )
+        } else {
+            (
+                &self.outbound_publish_origin.relay_msgs,
+                &self.outbound_publish_origin.relay_bytes,
+            )
+        };
+        msgs_counter.fetch_add(msgs as u64, Ordering::Relaxed);
+        bytes_counter.fetch_add(msgs as u64 * bytes_len as u64, Ordering::Relaxed);
     }
 
     fn record_peer_evicted_not_connected(&self) {
@@ -4831,6 +5076,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             return Ok(());
         };
 
+        // x0x #380: outbound demand metering — this bounded path carries
+        // exactly one claimed per-peer send. Instrumentation only.
+        self.stage_stats.record_outbound(topic, op, bytes.len(), 1);
         let transport = Arc::clone(&self.transport);
         let stage_stats = Arc::clone(&self.stage_stats);
         let rtt_tracker = Arc::clone(&self.peer_rtt_tracker);
@@ -5367,6 +5615,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             return (lock_wait, FanoutCounts::default());
         }
         let attempted = claims.attempts().len();
+        // x0x #380: outbound demand metering — one wire send per claimed
+        // attempt at `bytes.len()` serialized size. Instrumentation only.
+        self.stage_stats
+            .record_outbound(topic, op, bytes.len(), attempted);
         let mut send_tasks = SendTaskSet::with_capacity(op, attempted);
         let attempts = claims.attempts().to_vec();
         let permits = claims.take_permits();
@@ -5724,6 +5976,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         };
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Sending EAGER fan-out");
+        // x0x #380: origin metering — this fan-out carries a LOCALLY
+        // originated publish (the rate-cap baseline). Instrumentation only.
+        self.stage_stats.record_publish_origin(true, bytes.len(), 1);
         // Publish path: await accounting (detach_accounting = false) so
         // publish() returns only after its EAGER sends are attempted and
         // outcomes are observable (succeeded is valid here).
@@ -5958,6 +6213,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // X0X-0007: parallel send with per-peer timeout — was a sequential
         // `for peer { send.await }` which made one slow peer pin the entire
         // dispatcher (X0X-0006: 73% of dispatcher wall-clock).
+        // x0x #380: origin metering — this fan-out RELAYS another node's
+        // cached message (the rate-capped class). Instrumentation only.
+        self.stage_stats
+            .record_publish_origin(false, bytes.len(), 1);
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Forwarding EAGER");
         // Dispatcher forward path: detach accounting (detach_accounting =
         // true) so a slow peer cannot pin this worker for its full timeout
@@ -6261,6 +6520,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         public_key: self.signing_key.public_key().to_vec(),
                     };
                     if let Ok(bytes) = postcard::to_stdvec(&eager_msg) {
+                        // x0x #380: origin metering — serving a cached
+                        // (others') message on request is relay traffic.
+                        self.stage_stats
+                            .record_publish_origin(false, bytes.len(), 1);
                         let _ = self
                             .send_to_peer_bounded(
                                 topic,
@@ -6626,6 +6889,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // `parallel_send_to_peers` so a panicked recovery-probe task can
             // still be associated with the peer and re-suppressed.
             if !claims.is_empty() {
+                // x0x #380: outbound demand metering for the IHAVE flush
+                // lane. Instrumentation only.
+                stage_stats.record_outbound(
+                    topic_id,
+                    "IHAVE",
+                    bytes.len(),
+                    claims.attempts().len(),
+                );
                 let mut send_tasks = SendTaskSet::with_capacity("IHAVE", claims.attempts().len());
                 let attempts = claims.attempts().to_vec();
                 let permits = claims.take_permits();
@@ -6941,6 +7212,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             continue;
                         };
                         let bytes: Bytes = bytes.into();
+                        // x0x #380: outbound demand metering — one claimed
+                        // anti-entropy wire send. Instrumentation only.
+                        stage_stats.record_outbound(topic_id, "ANTI_ENTROPY", bytes.len(), 1);
                         let send_transport = Arc::clone(&transport);
                         let send_stage_stats = Arc::clone(&stage_stats);
                         let send_rtt_tracker = Arc::clone(&send_path.rtt_tracker);
@@ -7970,6 +8244,125 @@ mod tests {
         assert!(
             pubsub.stage_stats().suppressed_peers.is_empty(),
             "unsubscribe should clear per-topic suppression diagnostics"
+        );
+    }
+
+    /// x0x #380: outbound demand metering — a locally-originated publish
+    /// must move the per-kind / per-topic wire counters AND the origin split
+    /// (`local`), and the snapshot must serialise (x0x /diagnostics/gossip
+    /// passes it through automatically).
+    #[tokio::test]
+    async fn outbound_metering_counts_local_publish_and_serialises() {
+        let peer_id = test_peer_id(1);
+        let eager = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(peer_id, transport, test_signing_key(), false);
+        let topic = TopicId::new([21u8; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(eager);
+        }
+
+        pubsub
+            .publish_local(topic, Bytes::from_static(b"meter-me"))
+            .await
+            .expect("publish succeeds against the recording transport");
+
+        let snapshot = pubsub.stage_stats();
+        let eager_meter = snapshot
+            .outbound_by_kind
+            .get("eager")
+            .expect("eager kind meter present");
+        assert!(
+            eager_meter.msgs >= 1 && eager_meter.bytes > 0,
+            "local publish must count eager wire sends, got {eager_meter:?}"
+        );
+        let topic_meter = snapshot
+            .outbound_by_topic
+            .get(&topic.to_string())
+            .expect("per-topic meter present for the published topic");
+        assert!(
+            topic_meter.eager.msgs >= 1 && topic_meter.eager.bytes > 0,
+            "per-topic eager meter must move, got {topic_meter:?}"
+        );
+        assert_eq!(
+            snapshot.outbound_publish_origin.local_msgs, 1,
+            "one locally-originated publish"
+        );
+        assert!(
+            snapshot.outbound_publish_origin.local_bytes > 0,
+            "local origin bytes counted"
+        );
+        assert_eq!(
+            snapshot.outbound_publish_origin.relay_msgs, 0,
+            "nothing relayed in this fixture"
+        );
+
+        // The snapshot must serialise — x0x's /diagnostics/gossip passes
+        // PubSubStageStatsSnapshot straight through to JSON.
+        let json = serde_json::to_value(&snapshot).expect("snapshot serialises");
+        assert!(
+            json.get("outbound_by_topic").is_some()
+                && json.get("outbound_by_kind").is_some()
+                && json.get("outbound_publish_origin").is_some(),
+            "metering fields present in serialised snapshot"
+        );
+    }
+
+    /// x0x #380: forwarding another node's message must land in the RELAY
+    /// half of the origin split — the rate-cap decision hinges on telling
+    /// local demand apart from amplified relay traffic (an idle daemon
+    /// sending ~104 EAGER/s is relay, not local publishes).
+    #[tokio::test]
+    async fn outbound_metering_counts_relay_forward() {
+        let peer_id = test_peer_id(1);
+        let from_peer = test_peer_id(2);
+        let eager = test_peer_id(3);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(peer_id, transport, test_signing_key(), false);
+        let topic = TopicId::new([22u8; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            // `from_peer` sent the message; `eager` is the forward target.
+            state.eager_peers.insert(from_peer);
+            state.eager_peers.insert(eager);
+        }
+
+        let sender_key = test_signing_key();
+        let payload = Bytes::from_static(b"relayed-payload");
+        let eager_msg = signed_eager_message(&sender_key, topic, [77u8; 32], payload);
+        let bytes: Bytes = postcard::to_stdvec(&eager_msg)
+            .expect("eager message serialises")
+            .into();
+        pubsub
+            .handle_message(from_peer, bytes)
+            .await
+            .expect("inbound eager handled");
+
+        let snapshot = pubsub.stage_stats();
+        assert_eq!(
+            snapshot.outbound_publish_origin.relay_msgs, 1,
+            "forwarding another node's message is relay traffic"
+        );
+        assert!(
+            snapshot.outbound_publish_origin.relay_bytes > 0,
+            "relay bytes counted"
+        );
+        assert_eq!(
+            snapshot.outbound_publish_origin.local_msgs, 0,
+            "no local publish in this fixture"
+        );
+        let eager_meter = snapshot
+            .outbound_by_kind
+            .get("eager")
+            .expect("eager kind meter present");
+        assert!(
+            eager_meter.msgs >= 1,
+            "the forward fan-out counts as eager wire sends"
         );
     }
 

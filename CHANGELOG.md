@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.75] - 2026-08-27
+
+### Added
+
+- **Per-topic validation hook (storm control).** `ValidationAction`
+  (`ForwardAndDeliver` / `DeliverOnly` / `Drop`) +
+  `PlumtreePubSub::set_topic_validator` / `clear_topic_validator`. The
+  validator runs in `handle_eager` after signature verification and
+  payload-replay detection, before subscriber delivery and every
+  outbound consequence. `Drop` retains the msg-id in the dedupe cache
+  (PlumTree PRUNE/GRAFT coherence) and marks the payload never-serveable
+  — IWANT service and anti-entropy reconciliation refuse to retransmit
+  it. `DeliverOnly` keeps local delivery while withholding the eager
+  forward and pending IHAVE. Metering: `validator_dropped` /
+  `validator_deliver_only` (global + by-topic) in
+  `PubSubStageStatsSnapshot`.
+
 ## [0.5.74] - 2026-08-24
 
 ### Added

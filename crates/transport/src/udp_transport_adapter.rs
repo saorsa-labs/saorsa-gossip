@@ -145,6 +145,7 @@ struct AuthenticatedSessions {
         (
             ant_quic::high_level::Connection,
             crate::AuthenticatedSession,
+            Instant,
         ),
     >,
 }
@@ -918,6 +919,11 @@ impl GossipTransport for UdpTransportAdapter {
         }
         self.connected_peers.write().await.clear();
         self.bootstrap_peer_ids.write().await.clear();
+        self.authenticated_sessions
+            .lock()
+            .map_err(|_| anyhow!("session registry poisoned"))?
+            .peers
+            .clear();
         Ok(())
     }
 
@@ -931,19 +937,37 @@ impl GossipTransport for UdpTransportAdapter {
             return None;
         }
         let mut sessions = self.authenticated_sessions.lock().ok()?;
-        if let Some((previous, token)) = sessions.peers.get(&peer) {
-            if previous.stable_id() == connection.stable_id() {
-                return Some(*token);
-            }
-        } else if sessions.peers.len() >= self.config.max_peers {
+        if self.config.max_peers == 0 {
             return None;
         }
-        sessions.next = sessions.next.checked_add(1)?;
+        if let Some((previous, token, last_used)) = sessions.peers.get_mut(&peer) {
+            if previous.stable_id() == connection.stable_id() {
+                *last_used = Instant::now();
+                return Some(*token);
+            }
+        }
+        let next = sessions.next.checked_add(1)?;
+        // Match connected_peers' LRU convention. Eviction retires the token:
+        // re-admitting even the same live connection gets a fresh generation.
+        sessions
+            .peers
+            .retain(|_, (connection, _, _)| connection.close_reason().is_none());
+        if sessions.peers.len() >= self.config.max_peers && !sessions.peers.contains_key(&peer) {
+            let oldest = sessions
+                .peers
+                .iter()
+                .min_by_key(|(_, (_, _, last_used))| *last_used)
+                .map(|(peer, _)| *peer)?;
+            sessions.peers.remove(&oldest);
+        }
+        sessions.next = next;
         let session = crate::AuthenticatedSession {
             peer,
             generation: sessions.next,
         };
-        sessions.peers.insert(peer, (connection, session));
+        sessions
+            .peers
+            .insert(peer, (connection, session, Instant::now()));
         Some(session)
     }
 
@@ -973,7 +997,7 @@ impl GossipTransport for UdpTransportAdapter {
                     .peers
                     .get(&peer)
                     .is_some_and(
-                        |(pinned, token)| pinned.stable_id() == connection.stable_id()
+                        |(pinned, token, _)| pinned.stable_id() == connection.stable_id()
                             && *token == session
                     ),
                 "session changed before queue admission"
@@ -1728,6 +1752,72 @@ mod tests {
         let result2: Result<()> = GossipTransport::close(&transport).await;
         assert!(result1.is_ok());
         assert!(result2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn authenticated_sessions_rotate_lru_without_resurrecting_tokens() {
+        let mut config = UdpTransportAdapterConfig::new("127.0.0.1:0".parse().unwrap(), vec![]);
+        config.max_peers = 2;
+        let mut sender = UdpTransportAdapter::with_config(config, None)
+            .await
+            .unwrap();
+        let mut receivers = Vec::new();
+        for _ in 0..3 {
+            let receiver = UdpTransportAdapter::new("127.0.0.1:0".parse().unwrap(), vec![])
+                .await
+                .unwrap();
+            let address = SocketAddr::new(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+                receiver.node().local_addr().unwrap().port(),
+            );
+            GossipTransport::dial(&sender, receiver.peer_id(), address)
+                .await
+                .unwrap();
+            receivers.push(receiver);
+        }
+        let a = receivers[0].peer_id();
+        let b = receivers[1].peer_id();
+        let c = receivers[2].peer_id();
+        let first_a = sender.authenticated_session(a).unwrap();
+        let first_b = sender.authenticated_session(b).unwrap();
+        // A lookup refreshes recency without changing its generation.
+        assert_eq!(sender.authenticated_session(a), Some(first_a));
+        let first_c = sender.authenticated_session(c).unwrap();
+        {
+            let sessions = sender.authenticated_sessions.lock().unwrap();
+            assert_eq!(sessions.peers.len(), 2);
+            assert!(sessions.peers.contains_key(&a));
+            assert!(!sessions.peers.contains_key(&b));
+        }
+        assert!(first_c.generation > first_b.generation);
+        let next_b = sender.authenticated_session(b).unwrap();
+        assert!(next_b.generation > first_c.generation);
+        assert_ne!(next_b, first_b);
+        assert_eq!(sender.authenticated_sessions.lock().unwrap().peers.len(), 2);
+        // An old grant cannot authorize a re-admitted connection.
+        assert!(sender
+            .send_to_peer_guarded(
+                b,
+                GossipStreamType::PubSub,
+                Arc::new(move |session| {
+                    anyhow::ensure!(session == first_b, "stale grant");
+                    Ok(Bytes::from_static(b"must not send"))
+                })
+            )
+            .await
+            .is_err());
+        sender.config.max_peers = 0;
+        assert!(sender.authenticated_session(a).is_none());
+        GossipTransport::close(&sender).await.unwrap();
+        assert!(sender
+            .authenticated_sessions
+            .lock()
+            .unwrap()
+            .peers
+            .is_empty());
+        for receiver in receivers {
+            GossipTransport::close(&receiver).await.unwrap();
+        }
     }
 
     #[tokio::test]

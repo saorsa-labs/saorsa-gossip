@@ -7,8 +7,9 @@ and [x0x #517](https://github.com/saorsa-labs/x0x/issues/517).
 
 ## Audited receiver and topic scope
 
-The audited receiver is x0x v0.30.1, commit
-`506b064101bb105617d75117b5fcace47e34accc`, with pubsub/types 0.5.66.
+The audited receiver is x0x v0.30.1, annotated tag object
+`506b064101bb105617d75117b5fcace47e34accc`, resolving to commit
+`e0c25098af781028093abdc8cbbb37e152217266`, with pubsub/types 0.5.66.
 Only these Signed KV families may be explicitly registered:
 
 | Family | Exact registration | Audited receive/apply path at that x0x commit |
@@ -26,8 +27,9 @@ It never interprets a relay identity as a writer or grants ownership.
 
 `SignedKvTopic::new` requires one exact topic, a positive verifier revision and a
 bounded roster of known application authors. It verifies the complete x0x V2
-wire layout, ML-DSA-65 signature, key/author derivation, topic binding and byte
-limit. The returned `VerifiedInner` binds the full envelope hash, author and
+wire layout, ML-DSA-65 signature, key/author derivation, exact parsed topic
+equality and byte limit. Parsed topic equality is **not** an unambiguous
+cryptographic topic binding; see the H1 limitation below. The returned `VerifiedInner` binds the full envelope hash, author and
 verifier revision. Local publication and EAGER admission run this verifier before
 cache/seen mutation. Cache entries retain the metadata, and every cache serve and
 transit conversion revalidates the actual bytes against current policy.
@@ -39,6 +41,39 @@ traffic. Bare publishing remains v2. The fixed adapter admits no unsigned x0x V1
 other inner versions, unknown authors, raw payload exemption or arbitrary callback
 that merely asserts a payload is safe.
 
+## H1: inherited signed-topic ambiguity — HOLD remains
+
+The x0x V2 signing preimage concatenates two variable-length fields without
+signing their boundary. `T/state-sync || P` and `T || /state-sync || P` produce
+identical signing bytes. Changing only the unsigned topic-length field can
+therefore move a signed state request into a delta envelope with the same
+verified author. This applies to the required prefix-related topic pair even
+when both topics are registered correctly. The envelope digest changes, so
+neither digest caching nor outer-ID dedup establishes the missing topic binding.
+Author authentication alone does not authenticate the parsed topic/payload pair.
+
+A unilateral length prefix in this library's verifier would reject all envelopes
+signed by the pinned x0x v0.30.1 implementation; updating only our test signer
+would hide that interoperability break. A second accepted preimage or fallback
+to the old preimage would retain the ambiguity. Prefix-topic registration bans
+would prevent the required delta/state-sync pair, and filtering a payload suffix
+would neither authenticate arbitrary topic boundaries nor prove application
+acceptance. Those are not safe substitutes for a coordinated, versioned canonical
+signing format in the consumer and its audited receive/apply path.
+
+The regression `legacy_inner_topic_boundary_ambiguity_requires_coordinated_wire_fix`
+reproduces the existing signature-preserving reframe and separately proves that
+including the topic length distinguishes those preimages and rejects the reframe.
+It also proves the changed preimage rejects the original legacy signature. This
+is an executable limitation witness, **not** a claim that legacy V2 is unambiguous.
+
+This disposition preserves ADR-013's authentic legacy interoperability requirement
+without silently weakening its independent topic-authentication acceptance gate.
+H1 remains a review/enablement blocker pending a coordinated consumer protocol
+repair or explicit engineering acceptance of the narrower guarantee. The ADRs
+remain immutable; this document does not accept residual topic ambiguity on the
+operator's behalf. The facility stays disabled by default and the PR stays draft.
+
 ## Policy and transport integration
 
 1. Explicitly initialize `ModernFloors` once on trusted durable storage. On normal
@@ -46,6 +81,14 @@ that merely asserts a payload is safe.
    journal disables legacy grants; normal v2 service continues. Floor additions
    are checksummed append-only records, fsynced before success. Runtime demotion
    and floor reset are absent. Protect the journal against external replacement.
+   Admission checks file mtime and length and reuses the decoded floor set when
+   unchanged. Changed journals are read once with metadata checks before and after
+   decoding; corrupt, missing, changing or in-process rolled-back journals fail
+   closed. This is a trusted-storage cache, not protection against an attacker
+   restoring both bytes and timestamps. A valid record-aligned rollback while the
+   process is stopped cannot be detected by this journal format. Absent, expired
+   or session-mismatched grants are rejected before filesystem access; encountered
+   expired grants are removed while their revision tombstones remain.
 2. Register each exact Signed delta and state-sync topic separately. Replacing a
    verifier requires a higher revision and invalidates its grants/variant cache.
 3. The operator/application issues a `LegacyGrant` with adjacent authenticated
@@ -72,7 +115,11 @@ allowing stale queued frames to inherit a new connection's grant.
 
 The UDP adapter implements guarded **egress** using a pinned authenticated QUIC
 connection. It retains the previous connection while assigning monotonic session
-generations so a reused connection pointer cannot resurrect a grant. It preserves
+generations so a reused connection pointer cannot resurrect a grant. The bounded
+session registry refreshes recency on lookup and evicts the least recently used
+identity at capacity, pruning closed connections on insertion. An evicted identity
+gets a fresh generation even if its QUIC connection is still live, so it requires
+a fresh grant. Closing the adapter clears retained connections. It preserves
 existing send semaphore, per-peer queue and timeout limits. After stream allocation
 and all waits, it rechecks session and invokes the policy admission callback. It
 never reconnects/retries already-selected v1 bytes on another session. Bytes for
@@ -81,7 +128,7 @@ recall them. Other transport implementations default to denying guarded sends.
 
 ## Forwarding, control and cache behavior
 
-An internal transport wrapper covers every existing PubSub egress call, including
+An internal transport wrapper covers every `PlumtreePubSub` egress call, including
 local EAGER, detached EAGER fanout, IWANT and AntiEntropy cache serves, direct
 IHAVE/IWANT/AntiEntropy, scheduled IHAVE flushes and scheduled AntiEntropy sends.
 It retains the existing concurrency, cooling, admission and timeout machinery.
@@ -116,8 +163,10 @@ payload verification remains mandatory, and unsupported outer layouts fail.
 | Cached response bytes | 16 MiB/second globally on registered topics, including crypto/header accounting |
 | Converted serialized variants | 4 MiB globally, separate from existing per-topic cache |
 | Floor journal | 65,536 identities; bounded reads; malformed records fail closed |
-| UDP session identities | Configured `max_peers` per process; reconnect generations increase |
+| UDP session identities | Configured `max_peers` resident entries with LRU eviction; reconnect/re-admission generations increase |
 
+EAGER verifies the outer signature and checks the seen set before inner ML-DSA
+verification, then verifies the inner envelope before any new seen/cache entry.
 Verification under the policy mutex bounds concurrent inner verification to one
 per PubSub policy object. These conservative numeric limits and the cost below
 need Senior assessment for the consuming workload. No deadline is increased.
@@ -173,7 +222,8 @@ payloads to two recorded peers. An initial debug-build run on David's Mac measur
 | Registered, one legacy recipient | 1,812 ms | 50 | 538,700 bytes |
 
 The enabled cost comes from independent inner verification, policy checks and,
-for legacy recipients, conversion signatures and durable floor reads. This is a
+for legacy recipients, conversion signatures and durable floor metadata checks (full reads only on
+change). The measurements above predate the floor cache. This is a
 small debug fixture using a recording transport, not network throughput or mixed
 historical recovery latency. `/usr/bin/time` over Cargo includes compiler/test
 process memory and is not a runtime peak-memory claim. No performance acceptance

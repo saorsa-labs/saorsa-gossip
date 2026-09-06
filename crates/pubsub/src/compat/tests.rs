@@ -90,17 +90,15 @@ impl GossipTransport for RecordingTransport {
         _: GossipStreamType,
         admit: saorsa_gossip_transport::SessionAdmission,
     ) -> Result<()> {
-        let session = self
-            .authenticated_session(peer)
-            .ok_or_else(|| anyhow!("disconnected"))?;
         if self.block.load(Ordering::SeqCst) {
             self.entered.notify_one();
             self.release.notified().await;
         }
-        ensure!(
-            GossipTransport::authenticated_session(self, peer) == Some(session),
-            "reconnected"
-        );
+        // Exercise the policy's own generation check, independently of the
+        // UDP adapter's additional pinned-connection rejection.
+        let session = self
+            .authenticated_session(peer)
+            .ok_or_else(|| anyhow!("disconnected"))?;
         let bytes = admit(session)?;
         self.sent.lock().unwrap().push((peer, bytes));
         self.entered.notify_one();
@@ -1048,4 +1046,171 @@ async fn migration_cost_and_variant_cache_bounds() {
         }
         println!("migration_cost mode={mode} publishes=50 recipients=2 elapsed_us={} variant_signatures={} variant_cache_bytes={}",elapsed.as_micros(),s.stats.variant_signatures,s.variant_bytes);
     }
+}
+
+#[tokio::test]
+async fn outer_authentication_and_dedup_precede_inner_verification() {
+    let author = MlDsaKeyPair::generate().unwrap();
+    let (pubsub, transport) = node(&author);
+    let policy = pubsub.legacy_migration();
+    let floor = FloorFixture::new();
+    floor.install(policy);
+    let topic = register(policy, &author);
+    let session = transport.connect(author.peer_id(), 1);
+    policy
+        .grant(grant(author.peer_id(), topic, 1), session)
+        .unwrap();
+    let valid = message(
+        &author,
+        topic,
+        MessageKind::Eager,
+        inner(&author, "fixture/kv", b"authenticated"),
+        1,
+        91,
+    );
+    let mut bad_outer = valid.clone();
+    bad_outer.signature[0] ^= 1;
+    assert!(pubsub
+        .handle_authenticated_message(session, wire(&bad_outer))
+        .await
+        .is_err());
+    assert_eq!(policy.state.lock().unwrap().inner_verifications, 0);
+    pubsub
+        .handle_authenticated_message(session, wire(&valid))
+        .await
+        .unwrap();
+    assert_eq!(policy.state.lock().unwrap().inner_verifications, 1);
+    let mut duplicate = valid.clone();
+    let mut bytes = duplicate.payload.unwrap().to_vec();
+    *bytes.last_mut().unwrap() ^= 1;
+    duplicate.payload = Some(bytes.into()); // v1 outer remains valid, inner is invalid
+    pubsub
+        .handle_authenticated_message(session, wire(&duplicate))
+        .await
+        .unwrap();
+    assert_eq!(policy.state.lock().unwrap().inner_verifications, 1);
+    assert_eq!(policy.stats().unwrap().invalid_inner, 0);
+    // The same bad inner under a fresh, correctly signed outer ID is checked.
+    let fresh = message(
+        &author,
+        topic,
+        MessageKind::Eager,
+        duplicate.payload.unwrap(),
+        1,
+        92,
+    );
+    assert!(pubsub
+        .handle_authenticated_message(session, wire(&fresh))
+        .await
+        .is_err());
+    assert_eq!(policy.state.lock().unwrap().inner_verifications, 2);
+    assert_eq!(policy.stats().unwrap().invalid_inner, 1);
+    let mut topics = pubsub.topics.write_topic(&topic).await;
+    assert!(!topics.get_mut(&topic).unwrap().has_message(&[92; 32]));
+}
+
+#[test]
+fn floor_cache_reloads_only_changed_journals_and_fails_closed() {
+    let fixture = FloorFixture::new();
+    let mut floors = ModernFloors::initialize(&fixture.path).unwrap();
+    let peer = PeerId::new([61; 32]);
+    assert_eq!(floors.reloads, 1);
+    for _ in 0..100 {
+        floors.refresh().unwrap();
+    }
+    assert_eq!(floors.reloads, 1);
+    let mut external = ModernFloors::open(&fixture.path).unwrap();
+    external.require_v2(peer).unwrap();
+    floors.refresh().unwrap();
+    assert!(floors.peers.contains(&peer));
+    assert_eq!(floors.reloads, 2);
+    for _ in 0..100 {
+        floors.refresh().unwrap();
+    }
+    assert_eq!(floors.reloads, 2);
+    // Same-length valid replacement must also trigger refresh and detect rollback.
+    let replacement = PeerId::new([62; 32]);
+    let mut bytes = b"SG-FLOORS-1\n".to_vec();
+    bytes.extend_from_slice(replacement.as_bytes());
+    bytes.extend_from_slice(blake3::hash(replacement.as_bytes()).as_bytes());
+    std::fs::write(&fixture.path, bytes).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fixture.path)
+        .unwrap();
+    file.set_modified(floors.stamp.unwrap().modified + Duration::from_secs(2))
+        .unwrap();
+    assert!(floors
+        .refresh()
+        .unwrap_err()
+        .to_string()
+        .contains("rolled back"));
+    assert!(floors.peers.contains(&peer));
+    drop(file);
+    std::fs::remove_file(&fixture.path).unwrap();
+    assert!(floors.refresh().is_err());
+}
+
+#[test]
+fn expired_and_absent_grants_skip_floor_io_but_preserve_tombstones() {
+    let author = MlDsaKeyPair::generate().unwrap();
+    let policy = LegacyMigration::default();
+    let topic = register(&policy, &author);
+    let fixture = FloorFixture::new();
+    fixture.install(&policy);
+    let session = AuthenticatedSession {
+        peer: author.peer_id(),
+        generation: 1,
+    };
+    policy
+        .grant(grant(session.peer, topic, 1), session)
+        .unwrap();
+    std::fs::remove_file(&fixture.path).unwrap();
+    let mut s = policy.state.lock().unwrap();
+    s.grants.get_mut(&(session.peer, topic)).unwrap().deadline = Instant::now();
+    assert!(!LegacyMigration::permitted(&mut s, topic, session));
+    assert!(!s.grants.contains_key(&(session.peer, topic)));
+    assert_eq!(s.revisions.get(&(session.peer, topic)), Some(&1));
+    assert_eq!(s.stats.expired_grants, 1);
+    assert!(!s.floor_failed, "expired grant must not reach floor IO");
+    assert!(!LegacyMigration::permitted(&mut s, topic, session));
+    assert_eq!(s.stats.expired_grants, 1);
+    assert!(!s.floor_failed, "absent grant must not reach floor IO");
+}
+
+#[test]
+fn legacy_inner_topic_boundary_ambiguity_requires_coordinated_wire_fix() {
+    let key = MlDsaKeyPair::generate().unwrap();
+    let delta = SignedKvTopic::new("T", SignedKvFamily::Delta, 1, [key.peer_id()]).unwrap();
+    let sync = SignedKvTopic::new("T", SignedKvFamily::StateSync, 1, [key.peer_id()]).unwrap();
+    let original = inner(&key, "T/state-sync", b"request");
+    let mut reframed = original.to_vec();
+    let topic_length_offset = 33 + 2 + key.public_key().len() + 2 + 3309;
+    reframed[topic_length_offset..topic_length_offset + 2].copy_from_slice(&1u16.to_be_bytes());
+    let original_proof = sync.verify(&original).unwrap();
+    let reframed_proof = delta.verify(&reframed).unwrap();
+    assert_eq!(original_proof.author, reframed_proof.author);
+    assert_ne!(original_proof.digest, reframed_proof.digest);
+
+    // A coordinated length-prefixed signing format would distinguish these
+    // boundaries, but neither signature is valid under that changed preimage.
+    let mut rest = &original[33..];
+    let public_key = take_field(&mut rest).unwrap();
+    let signature = take_field(&mut rest).unwrap();
+    let topic = take_field(&mut rest).unwrap();
+    let canonical = |topic: &[u8], payload: &[u8]| {
+        let mut preimage = b"x0x-msg-v2".to_vec();
+        preimage.extend_from_slice(key.peer_id().as_bytes());
+        preimage.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        preimage.extend_from_slice(topic);
+        preimage.extend_from_slice(payload);
+        preimage
+    };
+    let signed_sync = canonical(topic, rest);
+    let signed_delta = canonical(b"T", b"/state-syncrequest");
+    assert_ne!(signed_sync, signed_delta);
+    assert!(!MlDsaKeyPair::verify(public_key, &signed_sync, signature).unwrap());
+    let canonical_signature = key.sign(&signed_sync).unwrap();
+    assert!(MlDsaKeyPair::verify(public_key, &signed_sync, &canonical_signature).unwrap());
+    assert!(!MlDsaKeyPair::verify(public_key, &signed_delta, &canonical_signature).unwrap());
 }

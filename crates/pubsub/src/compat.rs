@@ -190,6 +190,26 @@ struct BoundGrant {
 pub struct ModernFloors {
     path: PathBuf,
     peers: HashSet<PeerId>,
+    stamp: Option<FloorStamp>,
+    #[cfg(test)]
+    reloads: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FloorStamp {
+    modified: SystemTime,
+    len: u64,
+}
+
+impl FloorStamp {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        ensure!(metadata.is_file(), "floor journal is not a file");
+        Ok(Self {
+            modified: metadata.modified()?,
+            len: metadata.len(),
+        })
+    }
 }
 
 impl ModernFloors {
@@ -226,9 +246,15 @@ impl ModernFloors {
     /// Load a pre-existing floor journal. Missing, partial and corrupt records deny grants.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let bytes = Self::read_bounded(&path)?;
-        let peers = Self::decode(&bytes)?;
-        Ok(Self { path, peers })
+        let mut floors = Self {
+            path,
+            peers: HashSet::new(),
+            stamp: None,
+            #[cfg(test)]
+            reloads: 0,
+        };
+        floors.refresh()?;
+        Ok(floors)
     }
 
     fn read_bounded(path: &Path) -> Result<Vec<u8>> {
@@ -258,9 +284,22 @@ impl ModernFloors {
     }
 
     fn refresh(&mut self) -> Result<()> {
+        let stamp = FloorStamp::read(&self.path)?;
+        if self.stamp == Some(stamp) {
+            return Ok(());
+        }
         let disk = Self::decode(&Self::read_bounded(&self.path)?)?;
+        ensure!(
+            FloorStamp::read(&self.path)? == stamp,
+            "floor journal changed during read"
+        );
         ensure!(self.peers.is_subset(&disk), "floor journal rolled back");
         self.peers = disk;
+        self.stamp = Some(stamp);
+        #[cfg(test)]
+        {
+            self.reloads += 1;
+        }
         Ok(())
     }
 
@@ -274,6 +313,8 @@ impl ModernFloors {
         let mut file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
         let mut record = peer.as_bytes().to_vec();
         record.extend_from_slice(blake3::hash(peer.as_bytes()).as_bytes());
+        // Do not bless a concurrent external append without decoding it.
+        self.stamp = None;
         file.write_all(&record)?;
         file.sync_all()?;
         self.peers.insert(peer);
@@ -299,6 +340,8 @@ struct State {
     variants: HashMap<([u8; 32], u8), Bytes>,
     variant_bytes: usize,
     stats: MigrationStats,
+    #[cfg(test)]
+    inner_verifications: usize,
 }
 
 /// Bounded aggregate counters; no peer labels or payloads are logged.
@@ -533,6 +576,10 @@ impl LegacyMigration {
             return Ok(None);
         };
         let result = policy.verify(payload);
+        #[cfg(test)]
+        {
+            s.inner_verifications += 1;
+        }
         if result.is_err() {
             s.stats.invalid_inner = s.stats.invalid_inner.saturating_add(1);
         }
@@ -568,15 +615,11 @@ impl LegacyMigration {
             .get(&(session.peer, topic))
             .is_some_and(|g| Instant::now() >= g.deadline || SystemTime::now() >= g.grant.expires)
         {
+            s.grants.remove(&(session.peer, topic));
             s.stats.expired_grants = s.stats.expired_grants.saturating_add(1);
         }
         let valid = !s.reject_v1
             && Self::check_clock(s).is_ok()
-            && Self::check_floors(s).is_ok()
-            && !s
-                .floors
-                .as_ref()
-                .is_some_and(|f| f.peers.contains(&session.peer))
             && s.grants.get(&(session.peer, topic)).is_some_and(|g| {
                 g.session == session
                     && Instant::now() < g.deadline
@@ -584,7 +627,12 @@ impl LegacyMigration {
                     && s.topics
                         .get(&topic)
                         .is_some_and(|p| p.revision == g.grant.verifier_revision)
-            });
+            })
+            && Self::check_floors(s).is_ok()
+            && !s
+                .floors
+                .as_ref()
+                .is_some_and(|f| f.peers.contains(&session.peer));
         if !valid {
             s.stats.denied_legacy = s.stats.denied_legacy.saturating_add(1);
         }

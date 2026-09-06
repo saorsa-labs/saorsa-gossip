@@ -6449,13 +6449,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             message.header.topic == topic && message.header.kind == MessageKind::Eager,
             "EAGER header mismatch"
         );
-        let inner_proof = self.transport.migration.verify_inner(
-            topic,
-            message
-                .payload
-                .as_deref()
-                .ok_or_else(|| anyhow!("EAGER missing payload"))?,
-        )?;
         let msg_id = message.header.msg_id;
 
         if !self.verify_message_signature(&message) {
@@ -6471,6 +6464,40 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
+        // Check for duplicate
+        if let Some(state) = topics
+            .get_mut(&topic)
+            .filter(|state| state.has_message(&msg_id))
+        {
+            state.touch();
+            Self::record_inbound_peer_activity_for_state(
+                self.stage_stats.as_ref(),
+                topic,
+                from,
+                state,
+                Instant::now(),
+                message.header.kind,
+            );
+            // PRUNE: move sender from eager to lazy
+            if state.prune_peer(from) {
+                self.stage_stats.record_prune();
+                // X0X-0071 P3b: a prune bumps the (topic, peer) delivery
+                // deficit — sticky across a later re-graft.
+                self.peer_scoring.record_mesh_pruned(topic, from);
+            }
+            self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+            return Ok(());
+        }
+
+        // Authenticate the outer frame and suppress duplicates before inner ML-DSA work.
+        // Keep failed inner proofs out of both the seen set and topic cache.
+        let inner_proof = self.transport.migration.verify_inner(
+            topic,
+            message
+                .payload
+                .as_deref()
+                .ok_or_else(|| anyhow!("EAGER missing payload"))?,
+        )?;
         let state = topics
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
@@ -6483,19 +6510,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Instant::now(),
             message.header.kind,
         );
-
-        // Check for duplicate
-        if state.has_message(&msg_id) {
-            // PRUNE: move sender from eager to lazy
-            if state.prune_peer(from) {
-                self.stage_stats.record_prune();
-                // X0X-0071 P3b: a prune bumps the (topic, peer) delivery
-                // deficit — sticky across a later re-graft.
-                self.peer_scoring.record_mesh_pruned(topic, from);
-            }
-            self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
-            return Ok(());
-        }
 
         // New message - add to cache
         let payload = match message.payload.clone() {
@@ -6706,6 +6720,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
+        let registered = self.transport.migration.registered(topic);
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
@@ -6729,8 +6744,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
 
             // Bound outstanding recovery work on audited migration topics.
-            if self.transport.migration.registered(topic) && state.outstanding_iwants.len() >= 1024
-            {
+            if registered && state.outstanding_iwants.len() >= 1024 {
                 break;
             }
             // Request it

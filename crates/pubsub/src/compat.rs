@@ -24,10 +24,14 @@ const MAX_CONTROL_BYTES: usize = 1 + 2 + MAX_CONTROL_IDS * 32;
 const MAX_CONTROL_WORK: usize = 4096;
 const MAX_VARIANT_BYTES: usize = 4 * 1024 * 1024;
 
-/// The only legacy receiver admitted by this implementation's adapter audit.
-pub const AUDITED_RECEIVER: &str = "x0x/0.30.1;saorsa-gossip-pubsub/0.5.66";
+/// Required receiver profile: the audited outer adapter plus inner V3 support.
+///
+/// This is a pairing requirement, not an existing x0x release identifier. Stock
+/// x0x 0.30.1 cannot consume V3; its paired signer/decoder must be audited before
+/// enabling grants. The old receiver identifier is deliberately ineligible.
+pub const AUDITED_RECEIVER: &str = "x0x/0.30.1+signed-kv-inner-v3;saorsa-gossip-pubsub/0.5.66";
 
-/// Reviewed Signed KV topic family. Both require the x0x V2 inner envelope.
+/// Reviewed Signed KV topic family. Both require the topic-bound V3 inner envelope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignedKvFamily {
     /// The concrete KV store delta topic chosen by the consuming application.
@@ -95,8 +99,8 @@ impl SignedKvTopic {
             "inner envelope exceeds bound"
         );
         ensure!(
-            bytes.first() == Some(&2),
-            "only signed x0x V2 envelopes are eligible"
+            bytes.first() == Some(&3),
+            "only topic-bound V3 inner envelopes are eligible"
         );
         let author_bytes: [u8; 32] = bytes
             .get(1..33)
@@ -116,9 +120,14 @@ impl SignedKvTopic {
             author.as_bytes() == &author_bytes && self.authors.contains(&author),
             "unknown or mismatched inner author"
         );
-        let mut signed = Vec::with_capacity(10 + 32 + topic.len() + rest.len());
-        signed.extend_from_slice(b"x0x-msg-v2");
+        // V3 signs the canonical wire topic length. Never fall back to the
+        // ambiguous V2 preimage, even for an otherwise valid rostered author.
+        let topic_len = u16::try_from(topic.len())?;
+        let mut signed =
+            Vec::with_capacity(b"x0x-msg-v3".len() + 32 + 2 + topic.len() + rest.len());
+        signed.extend_from_slice(b"x0x-msg-v3");
         signed.extend_from_slice(&author_bytes);
+        signed.extend_from_slice(&topic_len.to_be_bytes());
         signed.extend_from_slice(topic);
         signed.extend_from_slice(rest);
         ensure!(

@@ -7,9 +7,11 @@ and [x0x #517](https://github.com/saorsa-labs/x0x/issues/517).
 
 ## Audited receiver and topic scope
 
-The audited receiver is x0x v0.30.1, annotated tag object
+The historical receive/apply audit used x0x v0.30.1, annotated tag object
 `506b064101bb105617d75117b5fcace47e34accc`, resolving to commit
 `e0c25098af781028093abdc8cbbb37e152217266`, with pubsub/types 0.5.66.
+That stock application cannot consume the new inner V3 layout. A paired x0x
+signer/decoder change and receive/apply audit are required before enablement.
 Only these Signed KV families may be explicitly registered:
 
 | Family | Exact registration | Audited receive/apply path at that x0x commit |
@@ -18,18 +20,18 @@ Only these Signed KV families may be explicitly registered:
 | State request | `<same concrete topic>/state-sync` | Same verified delivery path, then `src/kv/sync.rs` state-request responder (138–171); full-state response is published on the base delta topic |
 
 `decode_for_delivery` discards failed signed-envelope verification before the
-subscriber receives data. The signature binds `x0x-msg-v2 || AgentId || topic ||
-payload`; the key must derive the claimed AgentId. The Signed store's merge path
+subscriber receives data. Its legacy signature covers `x0x-msg-v2 || AgentId || topic ||
+payload` with an ambiguous topic/payload boundary; this facility rejects it.
+The key must derive the claimed AgentId. The Signed store's merge path
 checks the verified writer against its anchored owner and rejects anonymous and
 unauthorized writers. State requests cause bounded recovery work, not an ownership
 change. The new PubSub verifier is independent of that application authorization.
 It never interprets a relay identity as a writer or grants ownership.
 
 `SignedKvTopic::new` requires one exact topic, a positive verifier revision and a
-bounded roster of known application authors. It verifies the complete x0x V2
-wire layout, ML-DSA-65 signature, key/author derivation, exact parsed topic
-equality and byte limit. Parsed topic equality is **not** an unambiguous
-cryptographic topic binding; see the H1 limitation below. The returned `VerifiedInner` binds the full envelope hash, author and
+bounded roster of known application authors. It verifies the complete inner V3
+wire layout, ML-DSA-65 signature, key/author derivation, cryptographic topic
+binding, exact topic equality and byte limit. The returned `VerifiedInner` binds the full envelope hash, author and
 verifier revision. Local publication and EAGER admission run this verifier before
 cache/seen mutation. Cache entries retain the metadata, and every cache serve and
 transit conversion revalidates the actual bytes against current policy.
@@ -37,42 +39,63 @@ transit conversion revalidates the actual bytes against current policy.
 The trusted caller must establish that this is a Signed KV store using the
 reviewed handlers before registering it. This API is not a wire-level capability
 claim. No topics, authors, receiver versions or grants are inferred from network
-traffic. Bare publishing remains v2. The fixed adapter admits no unsigned x0x V1,
-other inner versions, unknown authors, raw payload exemption or arbitrary callback
+traffic. Bare publishing remains outer v2. The fixed adapter admits no unsigned x0x V1,
+ambiguous signed V2, other inner versions, unknown authors, raw payload exemption or arbitrary callback
 that merely asserts a payload is safe.
 
-## H1: inherited signed-topic ambiguity — HOLD remains
+## H1 wire fix: canonical inner V3 and required x0x pairing
 
-The x0x V2 signing preimage concatenates two variable-length fields without
-signing their boundary. `T/state-sync || P` and `T || /state-sync || P` produce
-identical signing bytes. Changing only the unsigned topic-length field can
-therefore move a signed state request into a delta envelope with the same
-verified author. This applies to the required prefix-related topic pair even
-when both topics are registered correctly. The envelope digest changes, so
-neither digest caching nor outer-ID dedup establishes the missing topic binding.
-Author authentication alone does not authenticate the parsed topic/payload pair.
+H1 is closed in the gossip verifier by accepting **only inner version 3** with
+this canonical ML-DSA-65 signing preimage (lengths count bytes, not characters):
 
-A unilateral length prefix in this library's verifier would reject all envelopes
-signed by the pinned x0x v0.30.1 implementation; updating only our test signer
-would hide that interoperability break. A second accepted preimage or fallback
-to the old preimage would retain the ambiguity. Prefix-topic registration bans
-would prevent the required delta/state-sync pair, and filtering a payload suffix
-would neither authenticate arbitrary topic boundaries nor prove application
-acceptance. Those are not safe substitutes for a coordinated, versioned canonical
-signing format in the consumer and its audited receive/apply path.
+```text
+"x0x-msg-v3" || author[32] || topic_len:u16be || topic[topic_len] || payload[remaining]
+```
 
-The regression `legacy_inner_topic_boundary_ambiguity_requires_coordinated_wire_fix`
-reproduces the existing signature-preserving reframe and separately proves that
-including the topic length distinguishes those preimages and rejects the reframe.
-It also proves the changed preimage rejects the original legacy signature. This
-is an executable limitation witness, **not** a claim that legacy V2 is unambiguous.
+The complete inner wire layout is:
 
-This disposition preserves ADR-013's authentic legacy interoperability requirement
-without silently weakening its independent topic-authentication acceptance gate.
-H1 remains a review/enablement blocker pending a coordinated consumer protocol
-repair or explicit engineering acceptance of the narrower guarantee. The ADRs
-remain immutable; this document does not accept residual topic ambiguity on the
-operator's behalf. The facility stays disabled by default and the PR stays draft.
+```text
+0x03 || author[32] || key_len:u16be || key[key_len]
+     || signature_len:u16be || signature[signature_len]
+     || topic_len:u16be || topic[topic_len] || payload[remaining]
+```
+
+The key and signature lengths must be exactly 1952 and 3309. The fixed domain
+separates V3 signatures from V2; the signed topic length fixes the boundary even
+for `T` and `T/state-sync`. Payload occupies the remainder, so it needs no second
+length. Any future trailing field requires a new canonical layout that also
+length-prefixes the payload. Both the verifier and fixture signer include the topic length. There is
+no V2 fallback or dual-accept path, including for a valid known author's signature.
+Changing a V2 envelope's version byte to 3 does not make its signature valid.
+Outer gossip versions 1 and 2, their signatures and legacy predicates are unchanged.
+
+**Pairing requirement, not deployed compatibility:** stock x0x v0.30.1 signs and
+verifies the ambiguous V2 preimage and will not consume this layout. Its
+`src/gossip/pubsub.rs::build_signing_payload` is shared by publication and
+`verify_signature`; both need V3 domain/length encoding, plus a V3 encoder,
+strict decoder and version dispatch in `decode_auto`/`decode_for_delivery`.
+Reserve inner version `0x03` for this layout in the paired x0x implementation.
+The paired receive/apply path must retain key/author, Signed ownership and
+state-request checks. This patch does not change x0x or certify that pairing.
+Previously cached V2 data must be re-signed by its author; a relay cannot relabel
+or translate its inner signature. The facility stays disabled pending that work.
+
+`AUDITED_RECEIVER` now requires the profile
+`x0x/0.30.1+signed-kv-inner-v3;saorsa-gossip-pubsub/0.5.66`. This is an explicit
+operator assertion of the required patched profile, **not an existing release or
+a completed audit**. The old stock receiver string is rejected at grant issuance.
+Do not issue grants until the paired implementation and authentic receive/apply
+tests have been reviewed. Advance existing verifier revisions and issue fresh
+session-bound grants when integrating the pairing; no capability is inferred.
+
+`inner_v3_rejects_topic_boundary_rewrites` changes only the topic length in both
+directions, for the delta/state-sync pair and an arbitrary UTF-8 prefix pair.
+Original messages verify; every rewritten boundary fails signature verification.
+Correctly signed payloads starting with the suffix still verify.
+`inner_v3_rejects_legacy_signatures_and_version_relabeling` rejects original V2,
+V2 relabeled as V3 and unsupported versions. The receiver-profile regression
+rejects grants naming the stock V2 receiver. H1 is not an accepted residual.
+The PR stays draft; coordinated x0x integration and release gates remain open.
 
 ## Policy and transport integration
 
@@ -204,6 +227,10 @@ cargo test -p saorsa-gossip-transport@0.5.75 --all-features --lib --locked --off
 The lock and dependency provenance include the current pubsub `tempfile` test
 dependency and Windows-only `windows-sys 0.61.2` dependency.
 
+The published legacy crates exercise the **outer** decoder/relay/control format;
+they do not establish stock x0x application acceptance of inner V3. The V3 signer
+in these tests is a fixture for the required paired consumer.
+
 The tests cover direct traffic both ways, modern/modern/old and old/modern/modern
 forward conversion, modern/original-old/modern forwarding, control handlers,
 cache serves, wrong signer, invalid/unknown inner author, malformed/oversized
@@ -223,13 +250,13 @@ payloads to two recorded peers. An initial debug-build run on David's Mac measur
 
 The enabled cost comes from independent inner verification, policy checks and,
 for legacy recipients, conversion signatures and durable floor metadata checks (full reads only on
-change). The measurements above predate the floor cache. This is a
+change). The measurements above predate the floor cache and inner V3. This is a
 small debug fixture using a recording transport, not network throughput or mixed
 historical recovery latency. `/usr/bin/time` over Cargo includes compiler/test
 process memory and is not a runtime peak-memory claim. No performance acceptance
 is claimed from it.
 
-Full x0x receive/apply tests, authentic v0.30.1 historical/live/unauthorized-write
-binary phases, and the unchanged ten-run convergence release recipe remain
+Full paired-x0x receive/apply tests, authentic historical/live/unauthorized-write
+binary phases (including explicit stock V2 rejection), and the unchanged ten-run convergence release recipe remain
 required after consumer integration. This phase runs no live daemon, release
 binary gate, deployment, x0x dependency bump, merge or tag.

@@ -125,12 +125,13 @@ fn register(policy: &LegacyMigration, key: &MlDsaKeyPair) -> TopicId {
     topic
 }
 fn inner(key: &MlDsaKeyPair, name: &str, payload: &[u8]) -> Bytes {
-    let mut signable = b"x0x-msg-v2".to_vec();
+    let mut signable = b"x0x-msg-v3".to_vec();
     signable.extend_from_slice(key.peer_id().as_bytes());
+    signable.extend_from_slice(&u16::try_from(name.len()).unwrap().to_be_bytes());
     signable.extend_from_slice(name.as_bytes());
     signable.extend_from_slice(payload);
     let sig = key.sign(&signable).unwrap();
-    let mut out = vec![2];
+    let mut out = vec![3];
     out.extend_from_slice(key.peer_id().as_bytes());
     for part in [key.public_key(), &sig, name.as_bytes()] {
         out.extend_from_slice(&(part.len() as u16).to_be_bytes());
@@ -985,9 +986,9 @@ async fn state_sync_scope_raw_defaults_bounds_and_modern_relay_conversion() {
     wrong_author[1] ^= 1;
     assert!(p.verify_inner(base, &wrong_author).is_err());
     let mut wrong_version = valid.to_vec();
-    wrong_version[0] = 3;
+    wrong_version[0] = 2;
     assert!(p.verify_inner(base, &wrong_version).is_err());
-    assert!(p.verify_inner(base, &vec![2; MAX_INNER_BYTES + 1]).is_err());
+    assert!(p.verify_inner(base, &vec![3; MAX_INNER_BYTES + 1]).is_err());
     assert!(p.admit_cache_serve(base, 16 * 1024 * 1024).is_ok());
     assert!(p.admit_cache_serve(base, 1).is_err());
     {
@@ -1179,38 +1180,100 @@ fn expired_and_absent_grants_skip_floor_io_but_preserve_tombstones() {
 }
 
 #[test]
-fn legacy_inner_topic_boundary_ambiguity_requires_coordinated_wire_fix() {
+fn inner_v3_rejects_topic_boundary_rewrites() {
     let key = MlDsaKeyPair::generate().unwrap();
-    let delta = SignedKvTopic::new("T", SignedKvFamily::Delta, 1, [key.peer_id()]).unwrap();
-    let sync = SignedKvTopic::new("T", SignedKvFamily::StateSync, 1, [key.peer_id()]).unwrap();
-    let original = inner(&key, "T/state-sync", b"request");
-    let mut reframed = original.to_vec();
-    let topic_length_offset = 33 + 2 + key.public_key().len() + 2 + 3309;
-    reframed[topic_length_offset..topic_length_offset + 2].copy_from_slice(&1u16.to_be_bytes());
-    let original_proof = sync.verify(&original).unwrap();
-    let reframed_proof = delta.verify(&reframed).unwrap();
-    assert_eq!(original_proof.author, reframed_proof.author);
-    assert_ne!(original_proof.digest, reframed_proof.digest);
+    // Exercise both the mandated family pair and an arbitrary UTF-8 prefix.
+    for (short, long, suffix) in [
+        ("T", "T/state-sync", "/state-sync"),
+        ("é", "é/other", "/other"),
+    ] {
+        let short_policy =
+            SignedKvTopic::new(short, SignedKvFamily::Delta, 1, [key.peer_id()]).unwrap();
+        let long_policy = if long == "T/state-sync" {
+            SignedKvTopic::new(short, SignedKvFamily::StateSync, 1, [key.peer_id()]).unwrap()
+        } else {
+            SignedKvTopic::new(long, SignedKvFamily::Delta, 1, [key.peer_id()]).unwrap()
+        };
+        let short_payload = [suffix.as_bytes(), b"request"].concat();
+        let long_wire = inner(&key, long, b"request");
+        let short_wire = inner(&key, short, &short_payload);
+        assert_eq!(
+            long_policy.verify(&long_wire).unwrap().author,
+            key.peer_id()
+        );
+        // Payload prefixes remain legal when signed under their actual topic.
+        assert_eq!(
+            short_policy.verify(&short_wire).unwrap().author,
+            key.peer_id()
+        );
+        let offset = 33 + 2 + key.public_key().len() + 2 + 3309;
+        for (wire, target, policy) in [
+            (long_wire, short, &short_policy),
+            (short_wire, long, &long_policy),
+        ] {
+            let mut reframed = wire.to_vec();
+            reframed[offset..offset + 2]
+                .copy_from_slice(&u16::try_from(target.len()).unwrap().to_be_bytes());
+            assert_eq!(
+                policy.verify(&reframed).unwrap_err().to_string(),
+                "invalid inner signature"
+            );
+        }
+    }
+}
 
-    // A coordinated length-prefixed signing format would distinguish these
-    // boundaries, but neither signature is valid under that changed preimage.
-    let mut rest = &original[33..];
-    let public_key = take_field(&mut rest).unwrap();
-    let signature = take_field(&mut rest).unwrap();
-    let topic = take_field(&mut rest).unwrap();
-    let canonical = |topic: &[u8], payload: &[u8]| {
-        let mut preimage = b"x0x-msg-v2".to_vec();
-        preimage.extend_from_slice(key.peer_id().as_bytes());
-        preimage.extend_from_slice(&(topic.len() as u16).to_be_bytes());
-        preimage.extend_from_slice(topic);
-        preimage.extend_from_slice(payload);
-        preimage
+#[test]
+fn inner_v3_rejects_legacy_signatures_and_version_relabeling() {
+    let key = MlDsaKeyPair::generate().unwrap();
+    let policy = SignedKvTopic::new("T", SignedKvFamily::Delta, 1, [key.peer_id()]).unwrap();
+    // Independently construct a stock x0x V2 signature; changing its envelope
+    // version must not make it eligible under the V3 verifier.
+    let mut preimage = b"x0x-msg-v2".to_vec();
+    preimage.extend_from_slice(key.peer_id().as_bytes());
+    preimage.extend_from_slice(b"Tpayload");
+    let sig = key.sign(&preimage).unwrap();
+    let mut legacy = vec![2];
+    legacy.extend_from_slice(key.peer_id().as_bytes());
+    for part in [key.public_key(), &sig, b"T"] {
+        legacy.extend_from_slice(&u16::try_from(part.len()).unwrap().to_be_bytes());
+        legacy.extend_from_slice(part);
+    }
+    legacy.extend_from_slice(b"payload");
+    assert!(policy
+        .verify(&legacy)
+        .unwrap_err()
+        .to_string()
+        .contains("only topic-bound V3"));
+    legacy[0] = 3;
+    assert_eq!(
+        policy.verify(&legacy).unwrap_err().to_string(),
+        "invalid inner signature"
+    );
+    let valid = inner(&key, "T", b"payload");
+    assert!(policy.verify(&valid).is_ok());
+    for version in [0, 1, 2, 4, 255] {
+        let mut relabeled = valid.to_vec();
+        relabeled[0] = version;
+        assert!(policy.verify(&relabeled).is_err());
+    }
+}
+
+#[test]
+fn stock_v2_receiver_profile_cannot_receive_a_grant() {
+    let key = MlDsaKeyPair::generate().unwrap();
+    let policy = LegacyMigration::default();
+    let fixture = FloorFixture::new();
+    fixture.install(&policy);
+    let topic = register(&policy, &key);
+    let peer = MlDsaKeyPair::generate().unwrap().peer_id();
+    let session = AuthenticatedSession {
+        peer,
+        generation: 1,
     };
-    let signed_sync = canonical(topic, rest);
-    let signed_delta = canonical(b"T", b"/state-syncrequest");
-    assert_ne!(signed_sync, signed_delta);
-    assert!(!MlDsaKeyPair::verify(public_key, &signed_sync, signature).unwrap());
-    let canonical_signature = key.sign(&signed_sync).unwrap();
-    assert!(MlDsaKeyPair::verify(public_key, &signed_sync, &canonical_signature).unwrap());
-    assert!(!MlDsaKeyPair::verify(public_key, &signed_delta, &canonical_signature).unwrap());
+    let mut old_grant = grant(peer, topic, 1);
+    old_grant.receiver = "x0x/0.30.1;saorsa-gossip-pubsub/0.5.66".into();
+    assert_eq!(
+        policy.grant(old_grant, session).unwrap_err().to_string(),
+        "unaudited receiver"
+    );
 }

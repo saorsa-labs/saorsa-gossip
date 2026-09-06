@@ -111,6 +111,9 @@ impl UdpTransportAdapterConfig {
 /// Uses the ant-quic Node API for symmetric P2P networking with NAT traversal.
 /// All nodes can both connect to peers and accept connections.
 pub struct UdpTransportAdapter {
+    /// Holding the previous connection prevents stable-id address reuse; each
+    /// replacement gets a monotonic process-local generation, never a pointer token.
+    authenticated_sessions: std::sync::Mutex<AuthenticatedSessions>,
     /// The underlying ant-quic P2P node
     node: Arc<Node>,
     /// Incoming message channel (bounded for backpressure)
@@ -132,6 +135,18 @@ pub struct UdpTransportAdapter {
     send_semaphore: Arc<Semaphore>,
     /// Serialize sends per peer to avoid exhausting per-connection stream budgets.
     peer_send_locks: Arc<RwLock<HashMap<GossipPeerId, Arc<Mutex<()>>>>>,
+}
+
+#[derive(Default)]
+struct AuthenticatedSessions {
+    next: u64,
+    peers: HashMap<
+        GossipPeerId,
+        (
+            ant_quic::high_level::Connection,
+            crate::AuthenticatedSession,
+        ),
+    >,
 }
 
 impl UdpTransportAdapter {
@@ -210,6 +225,7 @@ impl UdpTransportAdapter {
         let (recv_tx, recv_rx) = mpsc::channel(config.channel_capacity);
 
         let transport = Self {
+            authenticated_sessions: std::sync::Mutex::new(AuthenticatedSessions::default()),
             node: Arc::new(node),
             recv_tx,
             recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
@@ -902,6 +918,89 @@ impl GossipTransport for UdpTransportAdapter {
         }
         self.connected_peers.write().await.clear();
         self.bootstrap_peer_ids.write().await.clear();
+        Ok(())
+    }
+
+    fn authenticated_session(&self, peer: GossipPeerId) -> Option<crate::AuthenticatedSession> {
+        let connection = self
+            .node
+            .inner_endpoint()
+            .get_quic_connection(&gossip_peer_id_to_ant(&peer))
+            .ok()??;
+        if connection.close_reason().is_some() {
+            return None;
+        }
+        let mut sessions = self.authenticated_sessions.lock().ok()?;
+        if let Some((previous, token)) = sessions.peers.get(&peer) {
+            if previous.stable_id() == connection.stable_id() {
+                return Some(*token);
+            }
+        } else if sessions.peers.len() >= self.config.max_peers {
+            return None;
+        }
+        sessions.next = sessions.next.checked_add(1)?;
+        let session = crate::AuthenticatedSession {
+            peer,
+            generation: sessions.next,
+        };
+        sessions.peers.insert(peer, (connection, session));
+        Some(session)
+    }
+
+    async fn send_to_peer_guarded(
+        &self,
+        peer: GossipPeerId,
+        stream_type: GossipStreamType,
+        admit: crate::SessionAdmission,
+    ) -> Result<()> {
+        // Pin the authenticated connection before queueing. Never reconnect or
+        // retry legacy bytes: a new connection needs a new roster/session grant.
+        let connection = self
+            .node
+            .inner_endpoint()
+            .get_quic_connection(&gossip_peer_id_to_ant(&peer))?
+            .ok_or_else(|| anyhow!("authenticated session unavailable"))?;
+        let session = self
+            .authenticated_session(peer)
+            .ok_or_else(|| anyhow!("authenticated session unavailable"))?;
+        {
+            let sessions = self
+                .authenticated_sessions
+                .lock()
+                .map_err(|_| anyhow!("session registry poisoned"))?;
+            anyhow::ensure!(
+                sessions
+                    .peers
+                    .get(&peer)
+                    .is_some_and(
+                        |(pinned, token)| pinned.stable_id() == connection.stable_id()
+                            && *token == session
+                    ),
+                "session changed before queue admission"
+            );
+        }
+        let _send_permit = self
+            .send_semaphore
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("send semaphore closed"))?;
+        let peer_lock = self.peer_send_lock(peer).await;
+        let _peer_guard = peer_lock.lock().await;
+        tokio::time::timeout(self.config.send_timeout, async {
+            let mut send = connection.open_uni().await?;
+            anyhow::ensure!(
+                self.authenticated_session(peer) == Some(session),
+                "authenticated session changed while queued"
+            );
+            let data = admit(session)?;
+            let mut framed = Vec::with_capacity(1 + data.len());
+            framed.push(stream_type.to_byte());
+            framed.extend_from_slice(&data);
+            send.write_all(&framed).await?;
+            send.finish()?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
         Ok(())
     }
 
@@ -1629,6 +1728,79 @@ mod tests {
         let result2: Result<()> = GossipTransport::close(&transport).await;
         assert!(result1.is_ok());
         assert!(result2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn guarded_send_uses_authenticated_connection_and_rechecks_admission() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let receiver = UdpTransportAdapter::new("127.0.0.1:0".parse().unwrap(), vec![])
+            .await
+            .unwrap();
+        let sender = Arc::new(
+            UdpTransportAdapter::new("127.0.0.1:0".parse().unwrap(), vec![])
+                .await
+                .unwrap(),
+        );
+        let peer = receiver.peer_id();
+        assert!(sender.authenticated_session(peer).is_none());
+        let listen_port = receiver.node().local_addr().unwrap().port();
+        let dial_addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), listen_port);
+        GossipTransport::dial(sender.as_ref(), peer, dial_addr)
+            .await
+            .unwrap();
+        let session = sender.authenticated_session(peer).unwrap();
+        let payload = Bytes::from_static(b"session-bound fixture");
+        let expected = payload.clone();
+        sender
+            .send_to_peer_guarded(
+                peer,
+                GossipStreamType::PubSub,
+                Arc::new(move |observed| {
+                    anyhow::ensure!(observed == session, "wrong session");
+                    Ok(payload.clone())
+                }),
+            )
+            .await
+            .unwrap();
+        let (from, stream, received) = tokio::time::timeout(
+            Duration::from_secs(5),
+            GossipTransport::receive_message(&receiver),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(from, sender.peer_id());
+        assert_eq!(stream, GossipStreamType::PubSub);
+        assert_eq!(received, expected);
+        let permit = sender
+            .send_semaphore
+            .acquire_many(sender.config.max_inflight_sends as u32)
+            .await
+            .unwrap();
+        let revoked = Arc::new(AtomicBool::new(false));
+        let canceled = Arc::clone(&revoked);
+        let queued_sender = Arc::clone(&sender);
+        let task = tokio::spawn(async move {
+            queued_sender
+                .send_to_peer_guarded(
+                    peer,
+                    GossipStreamType::PubSub,
+                    Arc::new(move |_| {
+                        anyhow::ensure!(
+                            !canceled.load(Ordering::SeqCst),
+                            "revoked before transport admission"
+                        );
+                        Ok(Bytes::from_static(b"must not be sent"))
+                    }),
+                )
+                .await
+        });
+        revoked.store(true, Ordering::SeqCst);
+        drop(permit);
+        assert!(task.await.unwrap().is_err());
+        GossipTransport::close(sender.as_ref()).await.unwrap();
+        assert!(sender.authenticated_session(peer).is_none());
+        GossipTransport::close(&receiver).await.unwrap();
     }
 
     // ==========================================================================

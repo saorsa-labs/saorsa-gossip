@@ -187,10 +187,12 @@
       "saorsa-gossip-workspace-hack",
       "serde",
       "serde_json",
+      "tempfile",
       "tokio",
       "tokio-test",
       "tokio-util",
-      "tracing"
+      "tracing",
+      "windows-sys 0.61.2"
     ]
   },
   {

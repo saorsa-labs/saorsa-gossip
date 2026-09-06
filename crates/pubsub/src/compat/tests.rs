@@ -502,6 +502,30 @@ async fn queued_revocation_expiry_reconnect_and_reject_v1_fail_closed() {
 }
 
 #[test]
+fn durable_floor_basename_initialization_and_restart() {
+    // Reserve a unique basename in the current directory without changing the
+    // process-wide cwd. TempPath retains cleanup ownership after unlinking.
+    let journal = tempfile::Builder::new()
+        .prefix("gossip-compat-floors-")
+        .tempfile_in(".")
+        .unwrap()
+        .into_temp_path();
+    std::fs::remove_file(&journal).unwrap();
+    let basename = Path::new(journal.file_name().unwrap());
+    assert_eq!(basename.parent(), Some(Path::new("")));
+
+    let mut floors = ModernFloors::initialize(basename).unwrap();
+    let peer = PeerId::new([24; 32]);
+    floors.require_v2(peer).unwrap();
+    drop(floors);
+    assert!(ModernFloors::open(basename).unwrap().peers.contains(&peer));
+
+    let persisted = std::fs::read(basename).unwrap();
+    assert!(ModernFloors::initialize(basename).is_err());
+    assert_eq!(std::fs::read(basename).unwrap(), persisted);
+}
+
+#[test]
 fn durable_floor_restart_corruption_rollback_and_grant_defaults() {
     let key = MlDsaKeyPair::generate().unwrap();
     let peer = PeerId::new([22; 32]);

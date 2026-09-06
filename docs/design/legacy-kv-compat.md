@@ -143,6 +143,18 @@ See [dependency provenance](fixtures/legacy-compat-dependencies.json) and
 ignored per existing repository policy. To reproduce this dependency resolution,
 copy the lock fixture to the root `Cargo.lock` and use `--locked`.
 
+From a clean checkout, with the dependencies already cached locally:
+
+```sh
+cp docs/design/fixtures/legacy-compat.Cargo.lock Cargo.lock
+cargo metadata --locked --offline --format-version 1 > /tmp/legacy-compat-metadata.json
+cargo test -p saorsa-gossip-pubsub@0.5.75 --all-features --locked --offline
+cargo test -p saorsa-gossip-transport@0.5.75 --all-features --lib --locked --offline
+```
+
+The lock and dependency provenance include the current pubsub `tempfile` test
+dependency and Windows-only `windows-sys 0.61.2` dependency.
+
 The tests cover direct traffic both ways, modern/modern/old and old/modern/modern
 forward conversion, modern/original-old/modern forwarding, control handlers,
 cache serves, wrong signer, invalid/unknown inner author, malformed/oversized

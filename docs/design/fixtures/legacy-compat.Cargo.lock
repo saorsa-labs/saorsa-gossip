@@ -3212,10 +3212,12 @@ dependencies = [
  "saorsa-gossip-workspace-hack",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-test",
  "tokio-util",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

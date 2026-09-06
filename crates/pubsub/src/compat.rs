@@ -212,6 +212,12 @@ impl ModernFloors {
         drop(file);
         #[cfg(not(windows))]
         if let Some(parent) = path.parent() {
+            // A basename has an empty parent, which denotes the current directory.
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
             std::fs::File::open(parent)?.sync_all()?;
         }
         Self::open(path)

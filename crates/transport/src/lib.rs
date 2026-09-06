@@ -282,6 +282,22 @@ impl GossipStreamType {
     }
 }
 
+/// Authenticated, process-local connection identity. A reconnect must get a new
+/// generation. Consumers must retain the token from the receive connection;
+/// looking up the current session after dequeue is not receive provenance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedSession {
+    /// Identity established by the transport's peer authentication.
+    pub peer: PeerId,
+    /// Unique connection generation for this process lifetime.
+    pub generation: u64,
+}
+
+/// Admission callback evaluated after transport queues and stream allocation,
+/// immediately before admitting bytes to that exact authenticated connection.
+pub type SessionAdmission =
+    std::sync::Arc<dyn Fn(AuthenticatedSession) -> Result<bytes::Bytes> + Send + Sync>;
+
 /// QUIC transport trait for dial/listen operations
 #[async_trait::async_trait]
 pub trait GossipTransport: Send + Sync {
@@ -305,6 +321,23 @@ pub trait GossipTransport: Send + Sync {
         stream_type: GossipStreamType,
         data: bytes::Bytes,
     ) -> Result<()>;
+
+    /// Current authenticated connection token, if the implementation can prove it.
+    fn authenticated_session(&self, _peer: PeerId) -> Option<AuthenticatedSession> {
+        None
+    }
+
+    /// Send on one pinned authenticated session. Implementations must evaluate
+    /// admission after all queue waits and may not reconnect/retry the returned
+    /// bytes on another session. The default deliberately disables legacy sends.
+    async fn send_to_peer_guarded(
+        &self,
+        _peer: PeerId,
+        _stream_type: GossipStreamType,
+        _admit: SessionAdmission,
+    ) -> Result<()> {
+        anyhow::bail!("transport does not support authenticated session admission")
+    }
 
     /// Receive a message from any peer on any stream
     async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)>;
@@ -347,6 +380,19 @@ impl<T: GossipTransport + ?Sized> GossipTransport for std::sync::Arc<T> {
         data: bytes::Bytes,
     ) -> Result<()> {
         (**self).send_to_peer(peer, stream_type, data).await
+    }
+
+    fn authenticated_session(&self, peer: PeerId) -> Option<AuthenticatedSession> {
+        (**self).authenticated_session(peer)
+    }
+
+    async fn send_to_peer_guarded(
+        &self,
+        peer: PeerId,
+        stream: GossipStreamType,
+        admit: SessionAdmission,
+    ) -> Result<()> {
+        (**self).send_to_peer_guarded(peer, stream, admit).await
     }
 
     async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)> {

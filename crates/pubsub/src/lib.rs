@@ -25,9 +25,11 @@
 //! cooldowns decay after successful sends.
 
 pub mod admission;
+pub mod compat;
 pub mod peer_scoring;
 pub mod timing;
 
+use crate::compat::PolicyTransport;
 use crate::timing::{AdaptiveCoolingConfig, PerPeerRttTracker};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -2827,6 +2829,7 @@ struct CachedMessage {
     /// for dedupe (PRUNE/GRAFT coherence) but must never leave this node
     /// — IWANT service and anti-entropy reconciliation refuse to serve it.
     dropped: bool,
+    inner_proof: Option<compat::VerifiedInner>,
 }
 
 /// Number of trailing zero bytes in a payload — corruption discriminator for
@@ -3136,6 +3139,12 @@ struct TopicState {
 }
 
 impl TopicState {
+    fn set_inner_proof(&mut self, msg_id: MessageIdType, proof: Option<compat::VerifiedInner>) {
+        if let Some(entry) = self.message_cache.lru.get_mut(&msg_id) {
+            entry.message.inner_proof = proof;
+        }
+    }
+
     #[cfg(test)]
     fn new() -> Self {
         Self::with_cache_config(PubSubCacheConfig::default())
@@ -3234,6 +3243,7 @@ impl TopicState {
             payload,
             header,
             dropped: false,
+            inner_proof: None,
         };
         self.message_cache.insert(msg_id, cached);
         self.touch();
@@ -4341,7 +4351,7 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// Epoch for message IDs (system time in seconds)
     epoch_start: std::time::SystemTime,
     /// Transport layer for sending messages
-    transport: Arc<T>,
+    transport: Arc<PolicyTransport<T>>,
     /// ML-DSA key pair for signing messages
     signing_key: Arc<saorsa_gossip_identity::MlDsaKeyPair>,
     /// Low-overhead timing counters for inbound PubSub processing stages.
@@ -4400,6 +4410,163 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
+    /// Trusted local migration configuration; disabled until explicitly registered
+    /// and granted. A grant cannot override ADR-012 RejectV1.
+    pub fn legacy_migration(&self) -> &Arc<compat::LegacyMigration> {
+        &self.transport.migration
+    }
+
+    /// Receive a frame with its authenticated connection provenance. The caller
+    /// must carry this token from the actual receive connection, not look it up
+    /// after dequeue. Legacy frames on registered topics require this entry point.
+    pub async fn handle_authenticated_message(
+        &self,
+        session: saorsa_gossip_transport::AuthenticatedSession,
+        data: Bytes,
+    ) -> Result<()> {
+        self.dispatch_message(session.peer, Some(session), data)
+            .await
+    }
+
+    async fn dispatch_message(
+        &self,
+        from: PeerId,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+        data: Bytes,
+    ) -> Result<()> {
+        if let Some(session) = session {
+            anyhow::ensure!(
+                session.peer == from && self.transport.authenticated_session(from) == Some(session),
+                "stale authenticated receive session"
+            );
+        }
+        // Bound registered migration frames before allocating their envelopes.
+        if let Ok((header, _)) = postcard::take_from_bytes::<MessageHeader>(&data) {
+            if self.transport.migration.registered(header.topic) {
+                anyhow::ensure!(
+                    data.len() <= 1024 * 1024 + 6000,
+                    "migration frame exceeds byte limit"
+                );
+            }
+        }
+        // Deserialize the GossipMessage
+        let decode_started = Instant::now();
+        let decoded: std::result::Result<(GossipMessage, &[u8]), _> =
+            postcard::take_from_bytes(&data);
+        self.record_stage(PubSubStage::Decode, decode_started);
+        let message = match decoded {
+            Ok((message, trailing)) => {
+                anyhow::ensure!(
+                    !self.transport.migration.registered(message.header.topic)
+                        || trailing.is_empty(),
+                    "trailing migration frame bytes"
+                );
+                message
+            }
+            Err(e) => {
+                self.stage_stats.record_decode_failed();
+                return Err(anyhow!("Failed to deserialize PubSub message: {}", e));
+            }
+        };
+
+        let topic_id = message.header.topic;
+        let msg_kind = message.header.kind;
+        self.stage_stats.record_message_kind(msg_kind);
+
+        debug!(
+            msg_kind = ?msg_kind,
+            peer_id = %from,
+            topic = ?topic_id,
+            "Handling incoming PubSub message"
+        );
+
+        // Route to appropriate handler based on message kind
+        // Only handle pubsub-specific message kinds (Eager, IHave, IWant)
+        match msg_kind {
+            MessageKind::Eager => {
+                self.handle_eager_admitted(from, topic_id, message, session)
+                    .await
+            }
+            MessageKind::IHave => {
+                if !self.verify_message_signature(&message) {
+                    warn!(peer_id = %LogPeerId::from(from), "IHAVE: invalid signature, dropping");
+                    return Err(anyhow!("Invalid signature on IHAVE message"));
+                }
+                self.transport.migration.ingress(from, session, &message)?;
+                self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
+                    .await;
+                // IHAVE payload contains Vec<MessageIdType>
+                if let Some(payload) = &message.payload {
+                    let decode_started = Instant::now();
+                    let decoded: std::result::Result<Vec<MessageIdType>, _> =
+                        postcard::from_bytes(payload);
+                    self.record_stage(PubSubStage::Decode, decode_started);
+                    let msg_ids = match decoded {
+                        Ok(msg_ids) => msg_ids,
+                        Err(e) => {
+                            self.stage_stats.record_decode_failed();
+                            return Err(anyhow!("Failed to deserialize IHAVE payload: {}", e));
+                        }
+                    };
+                    self.handle_ihave_admitted(from, topic_id, msg_ids).await
+                } else {
+                    self.stage_stats.record_decode_failed();
+                    Err(anyhow!("IHAVE message missing payload"))
+                }
+            }
+            MessageKind::IWant => {
+                if !self.verify_message_signature(&message) {
+                    warn!(peer_id = %LogPeerId::from(from), "IWANT: invalid signature, dropping");
+                    return Err(anyhow!("Invalid signature on IWANT message"));
+                }
+                self.transport.migration.ingress(from, session, &message)?;
+                self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
+                    .await;
+                // IWANT payload contains Vec<MessageIdType>
+                if let Some(payload) = &message.payload {
+                    let decode_started = Instant::now();
+                    let decoded: std::result::Result<Vec<MessageIdType>, _> =
+                        postcard::from_bytes(payload);
+                    self.record_stage(PubSubStage::Decode, decode_started);
+                    let msg_ids = match decoded {
+                        Ok(msg_ids) => msg_ids,
+                        Err(e) => {
+                            self.stage_stats.record_decode_failed();
+                            return Err(anyhow!("Failed to deserialize IWANT payload: {}", e));
+                        }
+                    };
+                    self.handle_iwant_admitted(from, topic_id, msg_ids).await
+                } else {
+                    self.stage_stats.record_decode_failed();
+                    Err(anyhow!("IWANT message missing payload"))
+                }
+            }
+            MessageKind::AntiEntropy => {
+                self.handle_anti_entropy_admitted(from, topic_id, message, session)
+                    .await
+            }
+            // Other message kinds (Ping, Ack, Find, Presence, Shuffle) are not handled by PubSub
+            _ => {
+                self.transport.migration.ingress(from, session, &message)?;
+                if self.verify_message_signature(&message) {
+                    self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
+                        .await;
+                } else {
+                    warn!(
+                        peer_id = %LogPeerId::from(from),
+                        msg_kind = ?msg_kind,
+                        "PubSub received non-pubsub message kind with invalid signature; cooling not reset"
+                    );
+                }
+                warn!(
+                    "PubSub received non-pubsub message kind {:?}, ignoring",
+                    msg_kind
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Create a new Plumtree pub/sub instance
     ///
     /// # Arguments
@@ -4455,12 +4622,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         start_background_tasks: bool,
         cache_config: PubSubCacheConfig,
     ) -> Self {
+        let signing_key = Arc::new(signing_key);
+        let transport = Arc::new(PolicyTransport::new(transport, Arc::clone(&signing_key)));
         let pubsub = Self {
             topics: Arc::new(ShardedTopicMap::new()),
             peer_id,
             epoch_start: std::time::SystemTime::UNIX_EPOCH,
             transport,
-            signing_key: Arc::new(signing_key),
+            signing_key,
             stage_stats: Arc::new(PubSubStageStats::default()),
             peer_score_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
             topic_cache_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
@@ -4566,6 +4735,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     /// ADR-012: set the v1 signature policy (see [`SignaturePolicy`]).
     pub fn set_signature_policy(&self, policy: SignaturePolicy) {
+        self.transport.migration.set_signature_policy(policy);
         if let Ok(mut guard) = self.signature_policy.write() {
             *guard = policy;
         }
@@ -4958,6 +5128,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     fn verify_message_signature(&self, message: &GossipMessage) -> bool {
         let verify_started = Instant::now();
+        if !matches!(
+            (message.header.version, message.header.payload_hash),
+            (1, None) | (2, Some(_))
+        ) {
+            return false;
+        }
         let verified =
             self.verify_signature(&message.header, &message.signature, &message.public_key)
                 && self.verify_payload_covering_signature(message);
@@ -4979,6 +5155,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 if actual.as_bytes() == &expected[..] {
                     true
                 } else {
+                    self.transport.migration.record_payload_mismatch();
                     warn!(
                         topic = ?message.header.topic,
                         msg_id = ?message.header.msg_id,
@@ -5049,7 +5226,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     }
 
     async fn send_to_peer_with_timeout(
-        transport: Arc<T>,
+        transport: Arc<PolicyTransport<T>>,
         stage_stats: Arc<PubSubStageStats>,
         rtt_tracker: Arc<PerPeerRttTracker>,
         peer: PeerId,
@@ -6065,6 +6242,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         payload: Bytes,
     ) -> Result<FanoutCounts> {
+        let inner_proof = self.transport.migration.verify_inner(topic, &payload)?;
         let msg_id = self.calculate_msg_id(&topic, &payload);
 
         let mut header = MessageHeader {
@@ -6096,6 +6274,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         // Add to cache
         state.cache_message(msg_id, payload.clone(), header);
+        state.set_inner_proof(msg_id, inner_proof);
 
         // Seed the replay cache so network echoes of our own publish are
         // detected as replays (defense-in-depth alongside msg_id dedup).
@@ -6252,6 +6431,24 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         message: GossipMessage,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self.transport.migration.registered(topic),
+            "registered topic requires authenticated dispatch"
+        );
+        self.handle_eager_admitted(from, topic, message, None).await
+    }
+
+    async fn handle_eager_admitted(
+        &self,
+        from: PeerId,
+        topic: TopicId,
+        message: GossipMessage,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            message.header.topic == topic && message.header.kind == MessageKind::Eager,
+            "EAGER header mismatch"
+        );
         let msg_id = message.header.msg_id;
 
         if !self.verify_message_signature(&message) {
@@ -6262,10 +6459,45 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             return Err(anyhow!("Invalid signature"));
         }
 
+        self.transport.migration.ingress(from, session, &message)?;
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
+        // Check for duplicate
+        if let Some(state) = topics
+            .get_mut(&topic)
+            .filter(|state| state.has_message(&msg_id))
+        {
+            state.touch();
+            Self::record_inbound_peer_activity_for_state(
+                self.stage_stats.as_ref(),
+                topic,
+                from,
+                state,
+                Instant::now(),
+                message.header.kind,
+            );
+            // PRUNE: move sender from eager to lazy
+            if state.prune_peer(from) {
+                self.stage_stats.record_prune();
+                // X0X-0071 P3b: a prune bumps the (topic, peer) delivery
+                // deficit — sticky across a later re-graft.
+                self.peer_scoring.record_mesh_pruned(topic, from);
+            }
+            self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+            return Ok(());
+        }
+
+        // Authenticate the outer frame and suppress duplicates before inner ML-DSA work.
+        // Keep failed inner proofs out of both the seen set and topic cache.
+        let inner_proof = self.transport.migration.verify_inner(
+            topic,
+            message
+                .payload
+                .as_deref()
+                .ok_or_else(|| anyhow!("EAGER missing payload"))?,
+        )?;
         let state = topics
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
@@ -6278,19 +6510,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Instant::now(),
             message.header.kind,
         );
-
-        // Check for duplicate
-        if state.has_message(&msg_id) {
-            // PRUNE: move sender from eager to lazy
-            if state.prune_peer(from) {
-                self.stage_stats.record_prune();
-                // X0X-0071 P3b: a prune bumps the (topic, peer) delivery
-                // deficit — sticky across a later re-graft.
-                self.peer_scoring.record_mesh_pruned(topic, from);
-            }
-            self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
-            return Ok(());
-        }
 
         // New message - add to cache
         let payload = match message.payload.clone() {
@@ -6309,6 +6528,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             zero_tail = payload_zero_tail(&payload),
         );
         state.cache_message(msg_id, payload.clone(), message.header.clone());
+        state.set_inner_proof(msg_id, inner_proof);
 
         // Update peer score for the sender
         state
@@ -6487,6 +6707,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self.transport.migration.registered(topic),
+            "registered control requires authenticated dispatch"
+        );
+        self.handle_ihave_admitted(from, topic, msg_ids).await
+    }
+
+    async fn handle_ihave_admitted(
+        &self,
+        from: PeerId,
+        topic: TopicId,
+        msg_ids: Vec<MessageIdType>,
+    ) -> Result<()> {
+        let registered = self.transport.migration.registered(topic);
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
@@ -6509,6 +6743,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 continue;
             }
 
+            // Bound outstanding recovery work on audited migration topics.
+            if registered && state.outstanding_iwants.len() >= 1024 {
+                break;
+            }
             // Request it
             requested.push(msg_id);
             state
@@ -6580,6 +6818,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self.transport.migration.registered(topic),
+            "registered control requires authenticated dispatch"
+        );
+        self.handle_iwant_admitted(from, topic, msg_ids).await
+    }
+
+    async fn handle_iwant_admitted(
+        &self,
+        from: PeerId,
+        topic: TopicId,
+        msg_ids: Vec<MessageIdType>,
+    ) -> Result<()> {
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
@@ -6629,6 +6880,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let republish_started = Instant::now();
         // Send EAGER with payloads
         for (msg_id, cached) in to_send {
+            self.transport.migration.admit_cache_serve(
+                topic,
+                cached.payload.len()
+                    + MESSAGE_CRYPTO_OVERHEAD_BYTES
+                    + MESSAGE_HEADER_OVERHEAD_BYTES,
+            )?;
             if !forwardable_payload("iwant_serve", &msg_id, &cached.payload) {
                 continue;
             }
@@ -6672,16 +6929,29 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ///
     /// Processes `AntiEntropyPayload::Digest` and `AntiEntropyPayload::Response`
     /// messages for set reconciliation after network partitions.
+    #[cfg(test)]
     async fn handle_anti_entropy(
         &self,
         from: PeerId,
         topic: TopicId,
         message: GossipMessage,
     ) -> Result<()> {
+        self.handle_anti_entropy_admitted(from, topic, message, None)
+            .await
+    }
+
+    async fn handle_anti_entropy_admitted(
+        &self,
+        from: PeerId,
+        topic: TopicId,
+        message: GossipMessage,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+    ) -> Result<()> {
         if !self.verify_message_signature(&message) {
             warn!(peer_id = %LogPeerId::from(from), "Anti-entropy: invalid signature, dropping");
             return Err(anyhow!("Invalid signature on anti-entropy message"));
         }
+        self.transport.migration.ingress(from, session, &message)?;
         self.record_verified_inbound_from_peer(topic, from, message.header.kind)
             .await;
 
@@ -6730,7 +7000,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // node, even during partition recovery — reconciliation must
                 // not resurrect what the validator suppressed.
                 let mut messages_to_send = Vec::new();
-                for id in our_ids.difference(&their_ids) {
+                let serve_limit = if self.transport.migration.registered(topic) {
+                    32
+                } else {
+                    usize::MAX
+                };
+                for id in our_ids.difference(&their_ids).take(serve_limit) {
                     if let Some(cached) = state.get_message(id) {
                         if cached.dropped {
                             debug!(msg_id = ?id, "anti-entropy: refusing to serve validator-dropped message");
@@ -6750,6 +7025,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let republish_started = Instant::now();
                 // Send cached messages the peer is missing as EAGER
                 for cached in &messages_to_send {
+                    self.transport.migration.admit_cache_serve(
+                        topic,
+                        cached.payload.len()
+                            + MESSAGE_CRYPTO_OVERHEAD_BYTES
+                            + MESSAGE_HEADER_OVERHEAD_BYTES,
+                    )?;
                     if !forwardable_payload(
                         "anti_entropy_serve",
                         &cached.header.msg_id,
@@ -6918,7 +7199,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     async fn send_anti_entropy_digest(&self, topic: TopicId, peer: PeerId) -> Result<()> {
         let topics = self.topics.read_topic(&topic).await;
         let msg_ids = if let Some(state) = topics.get(&topic) {
-            state.cached_message_ids()
+            let mut ids = state.cached_message_ids();
+            if self.transport.migration.registered(topic) {
+                ids.truncate(1024);
+            }
+            ids
         } else {
             return Ok(());
         };
@@ -7013,7 +7298,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     async fn flush_ihave_batches(
         topics: &Arc<ShardedTopicMap>,
-        transport: &Arc<T>,
+        transport: &Arc<PolicyTransport<T>>,
         signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
         stage_stats: &Arc<PubSubStageStats>,
         outbound_budgets: &Arc<PeerOutboundBudgets>,
@@ -7332,7 +7617,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let mut work: Vec<(TopicId, PeerId, Vec<MessageIdType>)> = Vec::new();
                 for shard in &topics_guard {
                     for (topic_id, state) in shard.iter() {
-                        let msg_ids = state.cached_message_ids();
+                        let mut msg_ids = state.cached_message_ids();
+                        if transport.migration.registered(*topic_id) {
+                            msg_ids.truncate(1024);
+                        }
                         if msg_ids.is_empty() {
                             continue;
                         }
@@ -7698,105 +7986,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
     }
 
     async fn handle_message(&self, from: PeerId, data: Bytes) -> Result<()> {
-        // Deserialize the GossipMessage
-        let decode_started = Instant::now();
-        let decoded: std::result::Result<GossipMessage, _> = postcard::from_bytes(&data);
-        self.record_stage(PubSubStage::Decode, decode_started);
-        let message = match decoded {
-            Ok(message) => message,
-            Err(e) => {
-                self.stage_stats.record_decode_failed();
-                return Err(anyhow!("Failed to deserialize PubSub message: {}", e));
-            }
-        };
-
-        let topic_id = message.header.topic;
-        let msg_kind = message.header.kind;
-        self.stage_stats.record_message_kind(msg_kind);
-
-        debug!(
-            msg_kind = ?msg_kind,
-            peer_id = %from,
-            topic = ?topic_id,
-            "Handling incoming PubSub message"
-        );
-
-        // Route to appropriate handler based on message kind
-        // Only handle pubsub-specific message kinds (Eager, IHave, IWant)
-        match msg_kind {
-            MessageKind::Eager => self.handle_eager(from, topic_id, message).await,
-            MessageKind::IHave => {
-                if !self.verify_message_signature(&message) {
-                    warn!(peer_id = %LogPeerId::from(from), "IHAVE: invalid signature, dropping");
-                    return Err(anyhow!("Invalid signature on IHAVE message"));
-                }
-                self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
-                    .await;
-                // IHAVE payload contains Vec<MessageIdType>
-                if let Some(payload) = &message.payload {
-                    let decode_started = Instant::now();
-                    let decoded: std::result::Result<Vec<MessageIdType>, _> =
-                        postcard::from_bytes(payload);
-                    self.record_stage(PubSubStage::Decode, decode_started);
-                    let msg_ids = match decoded {
-                        Ok(msg_ids) => msg_ids,
-                        Err(e) => {
-                            self.stage_stats.record_decode_failed();
-                            return Err(anyhow!("Failed to deserialize IHAVE payload: {}", e));
-                        }
-                    };
-                    self.handle_ihave(from, topic_id, msg_ids).await
-                } else {
-                    self.stage_stats.record_decode_failed();
-                    Err(anyhow!("IHAVE message missing payload"))
-                }
-            }
-            MessageKind::IWant => {
-                if !self.verify_message_signature(&message) {
-                    warn!(peer_id = %LogPeerId::from(from), "IWANT: invalid signature, dropping");
-                    return Err(anyhow!("Invalid signature on IWANT message"));
-                }
-                self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
-                    .await;
-                // IWANT payload contains Vec<MessageIdType>
-                if let Some(payload) = &message.payload {
-                    let decode_started = Instant::now();
-                    let decoded: std::result::Result<Vec<MessageIdType>, _> =
-                        postcard::from_bytes(payload);
-                    self.record_stage(PubSubStage::Decode, decode_started);
-                    let msg_ids = match decoded {
-                        Ok(msg_ids) => msg_ids,
-                        Err(e) => {
-                            self.stage_stats.record_decode_failed();
-                            return Err(anyhow!("Failed to deserialize IWANT payload: {}", e));
-                        }
-                    };
-                    self.handle_iwant(from, topic_id, msg_ids).await
-                } else {
-                    self.stage_stats.record_decode_failed();
-                    Err(anyhow!("IWANT message missing payload"))
-                }
-            }
-            MessageKind::AntiEntropy => self.handle_anti_entropy(from, topic_id, message).await,
-            // Other message kinds (Ping, Ack, Find, Presence, Shuffle) are not handled by PubSub
-            _ => {
-                if self.verify_message_signature(&message) {
-                    self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
-                        .await;
-                } else {
-                    warn!(
-                        peer_id = %LogPeerId::from(from),
-                        msg_kind = ?msg_kind,
-                        "PubSub received non-pubsub message kind with invalid signature; cooling not reset"
-                    );
-                }
-                warn!(
-                    "PubSub received non-pubsub message kind {:?}, ignoring",
-                    msg_kind
-                );
-                Ok(())
-            }
-        }
+        self.dispatch_message(from, None, data).await
     }
 
     async fn trigger_anti_entropy(&self, topic: TopicId) -> Result<()> {
@@ -8002,6 +8192,7 @@ mod tests {
             payload: Bytes::from(vec![0u8; payload_len]),
             header: test_header(topic, msg_id),
             dropped: false,
+            inner_proof: None,
         }
     }
 
@@ -10435,7 +10626,10 @@ mod tests {
 
         PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
             &topics,
-            &transport,
+            &Arc::new(PolicyTransport::new(
+                Arc::clone(&transport),
+                Arc::clone(&signing_key),
+            )),
             &signing_key,
             &stage_stats,
             &outbound_budgets,
@@ -11761,7 +11955,10 @@ mod tests {
         }
 
         let flush_topics = Arc::clone(&topics);
-        let flush_transport = Arc::clone(&transport);
+        let flush_transport = Arc::new(PolicyTransport::new(
+            Arc::clone(&transport),
+            Arc::clone(&signing_key),
+        ));
         let flush_signing_key = Arc::clone(&signing_key);
         let flush_stage_stats = Arc::new(PubSubStageStats::default());
         let flush_outbound_budgets = Arc::new(PeerOutboundBudgets::default());
@@ -11836,7 +12033,10 @@ mod tests {
         }
 
         let flush_topics = Arc::clone(&topics);
-        let flush_transport = Arc::clone(&transport);
+        let flush_transport = Arc::new(PolicyTransport::new(
+            Arc::clone(&transport),
+            Arc::clone(&signing_key),
+        ));
         let flush_signing_key = Arc::clone(&signing_key);
         let flush_stage_stats = Arc::clone(&stage_stats);
         let flush_outbound_budgets = Arc::new(PeerOutboundBudgets::default());

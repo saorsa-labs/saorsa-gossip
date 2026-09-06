@@ -40,7 +40,10 @@ anyhow = "1.0"
 saorsa-pqc = "0.5"
 
 # QUIC transport
-ant-quic = "0.27.26"
+# Temporary draft pin: consumes merged ant-quic #271.
+# Mode (i) registry publishing requires an ant-quic release containing this commit.
+# TODO(G1): stack ant-quic #272 (recv_with_generation) when ready; currently HOLD.
+ant-quic = { git = "https://github.com/saorsa-labs/ant-quic", rev = "c3ca46adef666e83750ec4bae160deb8c5b61094" }
 
 # Shared transport layer
 

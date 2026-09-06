@@ -128,7 +128,7 @@ The PR stays draft; coordinated x0x integration and release gates remain open.
    the token is still current. The original `handle_message` entry point denies
    registered legacy ingress and registered controls lacking session provenance.
 
-**Consumer integration prerequisite:** ant-quic 0.27.48 `Node::recv` and the
+**Consumer integration prerequisite:** ant-quic 0.27.49 `Node::recv` and the
 existing `GossipTransport::receive_message` return `(PeerId, bytes)` without the
 receive connection generation. This patch does not fabricate a generation for
 that API. Consumers using it must add authenticated receive-session propagation

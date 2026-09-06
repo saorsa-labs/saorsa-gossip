@@ -1,0 +1,17 @@
+[package]
+name = "saorsa-gossip-legacy-compat-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Repository-only published 0.5.66 compatibility witnesses"
+
+[dependencies]
+legacy-pubsub = { package = "saorsa-gossip-pubsub", version = "=0.5.66" }
+legacy-types = { package = "saorsa-gossip-types", version = "=0.5.66" }
+legacy-transport = { package = "saorsa-gossip-transport", version = "=0.5.66" }
+legacy-identity = { package = "saorsa-gossip-identity", version = "=0.5.66" }
+saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }
+
+[lints]
+workspace = true

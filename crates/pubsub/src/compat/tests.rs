@@ -1,5 +1,8 @@
 use super::*;
 use crate::{AntiEntropyPayload, MessageHeader, PlumtreePubSub, PubSub};
+use saorsa_gossip_legacy_compat_fixture::{
+    legacy_identity, legacy_pubsub, legacy_transport, legacy_types,
+};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 

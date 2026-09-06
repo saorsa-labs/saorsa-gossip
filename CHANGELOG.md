@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.76] - Unreleased
+
+### Added
+
+- **Disabled-by-default Signed KV legacy compatibility (#48, ADR-013).**
+  An explicit opt-in migration facility supports registered Signed KV topics
+  with bounded, expiring peer/session grants, durable anti-downgrade floors,
+  and guarded legacy egress. Normal publication remains v2; `RejectV1` and
+  v2 payload verification remain enforced. Accepted ADR-012 is unchanged.
+- **Inner V3 authentication binds topic boundaries.** The signed bytes include
+  `topic_len:u16be` before the canonical topic and payload, preventing a valid
+  signature from being reinterpreted across topic/payload boundaries. A paired
+  consumer must produce and verify inner V3; stock legacy application acceptance
+  is not established by the outer-wire compatibility tests.
+
+### Release preparation
+
+- Bump the workspace and internal dependency requirements to 0.5.76, including
+  the compatibility lock/provenance fixtures and reproduction commands.
+  Published 0.5.75 (2026-08-27) predates #48 and does not contain this facility.
+  This entry prepares a future release; it does not record publication.
+
 ## [0.5.75] - 2026-08-27
 
 ### Added

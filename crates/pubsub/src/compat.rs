@@ -197,12 +197,20 @@ impl ModernFloors {
     pub fn initialize(path: impl AsRef<Path>) -> Result<Self> {
         use std::io::Write;
         let path = path.as_ref();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Windows cannot use the Unix directory-fsync path below. Write-through
+            // also flushes NTFS metadata changes associated with the journal write.
+            options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_WRITE_THROUGH);
+        }
+        let mut file = options.open(path)?;
         file.write_all(b"SG-FLOORS-1\n")?;
         file.sync_all()?;
+        drop(file);
+        #[cfg(not(windows))]
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }

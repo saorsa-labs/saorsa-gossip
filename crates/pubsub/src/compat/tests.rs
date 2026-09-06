@@ -1,29 +1,27 @@
 use super::*;
 use crate::{AntiEntropyPayload, MessageHeader, PlumtreePubSub, PubSub};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
-static NEXT: AtomicU64 = AtomicU64::new(1);
-
-struct FloorFixture(PathBuf);
+struct FloorFixture {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
 impl FloorFixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "gossip-compat-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        Self(path)
+        let dir = tempfile::Builder::new()
+            .prefix("gossip-compat-")
+            .tempdir()
+            .unwrap();
+        Self {
+            path: dir.path().join("floors"),
+            _dir: dir,
+        }
     }
     fn install(&self, policy: &LegacyMigration) {
         policy
-            .install_floors(ModernFloors::initialize(&self.0).unwrap())
+            .install_floors(ModernFloors::initialize(&self.path).unwrap())
             .unwrap();
-    }
-}
-impl Drop for FloorFixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -517,11 +515,14 @@ fn durable_floor_restart_corruption_rollback_and_grant_defaults() {
     let fixture = FloorFixture::new();
     fixture.install(&policy);
     policy.require_v2(peer).unwrap();
+    let persisted = std::fs::read(&fixture.path).unwrap();
+    assert!(ModernFloors::initialize(&fixture.path).is_err());
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), persisted);
     assert!(policy.grant(grant(peer, topic, 1), session).is_err());
     let restarted = LegacyMigration::default();
     register(&restarted, &key);
     restarted
-        .install_floors(ModernFloors::open(&fixture.0).unwrap())
+        .install_floors(ModernFloors::open(&fixture.path).unwrap())
         .unwrap();
     assert!(restarted.grant(grant(peer, topic, 2), session).is_err());
     let another = PeerId::new([23; 32]);
@@ -538,10 +539,10 @@ fn durable_floor_restart_corruption_rollback_and_grant_defaults() {
         topic,
         another_session
     ));
-    std::fs::write(&fixture.0, b"SG-FLOORS-1\n").unwrap();
+    std::fs::write(&fixture.path, b"SG-FLOORS-1\n").unwrap();
     assert!(restarted.require_v2(another).is_err());
-    std::fs::write(&fixture.0, b"corrupt").unwrap();
-    assert!(ModernFloors::open(&fixture.0).is_err());
+    std::fs::write(&fixture.path, b"corrupt").unwrap();
+    assert!(ModernFloors::open(&fixture.path).is_err());
 }
 
 #[tokio::test]

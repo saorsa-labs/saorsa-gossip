@@ -26,6 +26,9 @@ tracing = { workspace = true }
 blake3 = { workspace = true }
 saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-workspace-hack" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 # Exact published legacy parser and handlers for ADR-013 compatibility witnesses.
 legacy-pubsub = { package = "saorsa-gossip-pubsub", version = "=0.5.66" }
@@ -35,6 +38,7 @@ legacy-identity = { package = "saorsa-gossip-identity", version = "=0.5.66" }
 serde_json = { workspace = true }
 proptest = { workspace = true }
 tokio-test = { workspace = true }
+tempfile = "3"
 saorsa-gossip-transport = { workspace = true, features = ["test-helpers"] }
 criterion = { workspace = true }
 

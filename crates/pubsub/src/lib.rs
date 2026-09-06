@@ -3101,6 +3101,8 @@ fn estimate_message_bytes(message: &CachedMessage) -> usize {
 struct TopicState {
     /// Spanning tree peers (forward EAGER)
     eager_peers: HashSet<PeerId>,
+    /// Instance-configured maximum; always nonzero (zero selects stock bounds).
+    max_eager_degree: usize,
     /// Non-tree peers (send IHAVE only)
     lazy_peers: HashSet<PeerId>,
     /// Message cache: msg_id -> cached message
@@ -3153,6 +3155,7 @@ impl TopicState {
     fn with_cache_config(cache_config: PubSubCacheConfig) -> Self {
         Self {
             eager_peers: HashSet::new(),
+            max_eager_degree: MAX_EAGER_DEGREE,
             lazy_peers: HashSet::new(),
             message_cache: BoundedMessageCache::new(
                 cache_config.max_messages_per_topic,
@@ -3387,8 +3390,15 @@ impl TopicState {
         }
         // If the peer was pruned to lazy on suppression, promote it to eager
         // so the upcoming publish has a delivery target.
-        if self.lazy_peers.remove(&best) {
-            self.eager_peers.insert(best);
+        if self.lazy_peers.contains(&best) {
+            // All existing eager peers are suppressed. Make room before rescue
+            // so even this last-delivery-path promotion respects the ceiling.
+            if self.eager_peers.len() >= self.max_eager_degree {
+                if let Some((worst, _)) = self.scored_eager_peers_at(now).first().copied() {
+                    self.prune_peer(worst);
+                }
+            }
+            self.graft_peer_at(best, now);
         }
         Some(best)
     }
@@ -3800,6 +3810,9 @@ impl TopicState {
         }
     }
     fn graft_peer_at(&mut self, peer: PeerId, now: Instant) -> bool {
+        if self.eager_peers.len() >= self.max_eager_degree {
+            return false;
+        }
         if !self.can_graft_peer_at(peer, now) {
             debug!(peer_id = %peer, "GRAFT skipped: peer is cooling after send timeouts");
             return false;
@@ -3822,7 +3835,7 @@ impl TopicState {
         true
     }
 
-    /// Maintain eager peer degree (6-12) using score-based selection
+    /// Maintain eager peer degree using score-based selection (stock: 6-12)
     ///
     /// Promotes the highest-scoring lazy peers when below minimum degree,
     /// and demotes the lowest-scoring eager peers when above maximum degree.
@@ -3836,9 +3849,9 @@ impl TopicState {
         let mut pruned = 0;
         let mut grafted = 0;
 
-        if self.eager_peers.len() > MAX_EAGER_DEGREE {
+        if self.eager_peers.len() > self.max_eager_degree {
             // Demote lowest-scoring eager peers.
-            let to_demote = self.eager_peers.len() - MAX_EAGER_DEGREE;
+            let to_demote = self.eager_peers.len() - self.max_eager_degree;
             let peers: Vec<PeerId> = self
                 .scored_eager_peers_at(now)
                 .iter()
@@ -3852,9 +3865,11 @@ impl TopicState {
             }
         }
 
-        if self.eager_peers.len() < MIN_EAGER_DEGREE && !self.lazy_peers.is_empty() {
+        if self.eager_peers.len() < MIN_EAGER_DEGREE.min(self.max_eager_degree)
+            && !self.lazy_peers.is_empty()
+        {
             // Promote highest-scoring lazy peers.
-            let to_promote = MIN_EAGER_DEGREE - self.eager_peers.len();
+            let to_promote = MIN_EAGER_DEGREE.min(self.max_eager_degree) - self.eager_peers.len();
             let scored_lazy = self.scored_lazy_peers_at(now);
             let mut peers: Vec<PeerId> = scored_lazy
                 .iter()
@@ -3888,8 +3903,8 @@ impl TopicState {
     }
 
     fn opportunistic_graft_at(&mut self, now: Instant) -> (usize, usize) {
-        if self.eager_peers.len() < MIN_EAGER_DEGREE
-            || self.eager_peers.len() > MAX_EAGER_DEGREE
+        if self.eager_peers.len() < MIN_EAGER_DEGREE.min(self.max_eager_degree)
+            || self.eager_peers.len() > self.max_eager_degree
             || self.lazy_peers.is_empty()
         {
             return (0, 0);
@@ -4235,6 +4250,9 @@ pub trait PubSub: Send + Sync {
 const TOPIC_SHARD_COUNT: usize = 32;
 
 struct ShardedTopicMap {
+    /// Changed only while every shard is write-locked; read during topic creation
+    /// while the topic shard is locked, including asynchronous subscriptions.
+    max_eager_degree: AtomicUsize,
     shards: Box<[RwLock<HashMap<TopicId, TopicState>>]>,
 }
 
@@ -4249,7 +4267,17 @@ impl ShardedTopicMap {
             .map(|_| RwLock::new(HashMap::new()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Self { shards }
+        Self {
+            max_eager_degree: AtomicUsize::new(MAX_EAGER_DEGREE),
+            shards,
+        }
+    }
+
+    /// Caller holds the topic shard lock so creation serializes with config updates.
+    fn new_topic_state(&self, cache_config: PubSubCacheConfig) -> TopicState {
+        let mut state = TopicState::with_cache_config(cache_config);
+        state.max_eager_degree = self.max_eager_degree.load(Ordering::Relaxed);
+        state
     }
 
     /// Shard index for `topic` — fold first 8 bytes of the BLAKE3-derived
@@ -4801,7 +4829,38 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     }
 
     fn new_topic_state(&self) -> TopicState {
-        TopicState::with_cache_config(self.cache_config)
+        self.topics.new_topic_state(self.cache_config)
+    }
+
+    /// Set this instance's eager mesh ceiling for existing and future topics.
+    ///
+    /// Leaf callers should pass their configured degree `D`; Full callers should
+    /// leave the default or pass `0` to retain stock 6-12 bounds. Nonzero values
+    /// replace the maximum, with promotion targeting `min(6, D)`.
+    ///
+    /// Updates and rebalances all topics under their write locks, including state
+    /// shared with the background maintainer. Call before starting traffic when
+    /// possible: recipient lists already selected by an in-flight send are not
+    /// recalled. Lazy repair traffic is still served independently of mesh degree.
+    pub async fn set_eager_degree_ceiling(&self, degree: usize) {
+        let maximum = if degree == 0 {
+            MAX_EAGER_DEGREE
+        } else {
+            degree
+        };
+        let mut shards = self.topics.write_all().await;
+        self.topics
+            .max_eager_degree
+            .store(maximum, Ordering::Relaxed);
+        let now = Instant::now();
+        for shard in shards.iter_mut() {
+            for state in shard.values_mut() {
+                state.max_eager_degree = maximum;
+                let (pruned, grafted) = state.maintain_degree_at(now);
+                self.stage_stats.record_prunes(pruned);
+                self.stage_stats.record_grafts(grafted);
+            }
+        }
     }
 
     /// Snapshot per-stage timings for inbound PubSub message handling.
@@ -7946,7 +8005,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
             let mut topics_guard = topics.write_topic(&topic).await;
             let state = topics_guard
                 .entry(topic)
-                .or_insert_with(|| TopicState::with_cache_config(cache_config));
+                .or_insert_with(|| topics.new_topic_state(cache_config));
             state.touch();
             state.subscribers.push(tx);
         });
@@ -7959,7 +8018,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
         let mut topics_guard = self.topics.write_topic(&topic).await;
         let state = topics_guard
             .entry(topic)
-            .or_insert_with(|| TopicState::with_cache_config(self.cache_config));
+            .or_insert_with(|| self.new_topic_state());
         state.touch();
         state.subscribers.push(tx);
         rx
@@ -8017,6 +8076,8 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    mod eager_degree_ceiling;
+
     use super::*;
     use saorsa_gossip_transport::UdpTransportAdapter;
     use std::net::SocketAddr;

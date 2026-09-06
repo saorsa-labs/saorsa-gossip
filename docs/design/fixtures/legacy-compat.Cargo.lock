@@ -3109,6 +3109,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "saorsa-gossip-legacy-compat-fixture"
+version = "0.5.76"
+dependencies = [
+ "saorsa-gossip-identity 0.5.66",
+ "saorsa-gossip-pubsub 0.5.66",
+ "saorsa-gossip-transport 0.5.66",
+ "saorsa-gossip-types 0.5.66",
+ "saorsa-gossip-workspace-hack",
+]
+
+[[package]]
 name = "saorsa-gossip-membership"
 version = "0.5.67"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3201,13 +3212,10 @@ dependencies = [
  "lru",
  "postcard",
  "proptest",
- "saorsa-gossip-identity 0.5.66",
  "saorsa-gossip-identity 0.5.76",
+ "saorsa-gossip-legacy-compat-fixture",
  "saorsa-gossip-membership 0.5.76",
- "saorsa-gossip-pubsub 0.5.66",
- "saorsa-gossip-transport 0.5.66",
  "saorsa-gossip-transport 0.5.76",
- "saorsa-gossip-types 0.5.66",
  "saorsa-gossip-types 0.5.76",
  "saorsa-gossip-workspace-hack",
  "serde",

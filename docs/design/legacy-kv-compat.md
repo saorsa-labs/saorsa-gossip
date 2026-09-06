@@ -205,7 +205,9 @@ remain necessary; successful inner verification is not write authorization.
 
 ## Reproducible evidence and limits
 
-Dev dependencies pin the **published** pubsub/types/identity/transport 0.5.66.
+The repository-only `saorsa-gossip-legacy-compat-fixture` pins the **published**
+pubsub/types/identity/transport 0.5.66. Pubsub uses it as a path-only dev
+dependency, omitted from the normalized registry package manifest.
 Tests invoke the real legacy decoder and real IHAVE/IWANT/AntiEntropy handlers.
 The resolved old membership dependency is 0.5.67; this is recorded, not attributed
 to the historical executable. Current workspace crates are 0.5.76. Published
@@ -225,8 +227,9 @@ cargo test -p saorsa-gossip-pubsub@0.5.76 --all-features --locked --offline
 cargo test -p saorsa-gossip-transport@0.5.76 --all-features --lib --locked --offline
 ```
 
-The lock and dependency provenance include the current pubsub `tempfile` test
-dependency and Windows-only `windows-sys 0.61.2` dependency.
+The lock and dependency provenance include the non-publishable legacy fixture,
+the current pubsub `tempfile` test dependency, and the Windows-only
+`windows-sys 0.61.2` dependency.
 
 The published legacy crates exercise the **outer** decoder/relay/control format;
 they do not establish stock x0x application acceptance of inner V3. The V3 signer

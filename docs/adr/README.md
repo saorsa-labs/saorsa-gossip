@@ -32,6 +32,7 @@ Saorsa Gossip is a **post-quantum secure, fully decentralized gossip overlay net
 | [ADR-008](ADR-008-stream-multiplexing.md) | QUIC Stream Multiplexing Design | Accepted | 2025-12-24 |
 | [ADR-009](ADR-009-peer-scoring.md) | Peer Scoring Architecture | Accepted | 2025-12-24 |
 | [ADR-010](ADR-010-deterministic-simulator.md) | Deterministic Network Simulator | **Retired** | 2026-01-16 |
+| [ADR-013](ADR-013-explicit-legacy-gossip-egress.md) | Explicit Legacy Gossip Egress During the Payload-Signature Migration | Accepted | 2026-09-06 |
 
 ## Architecture Layers
 

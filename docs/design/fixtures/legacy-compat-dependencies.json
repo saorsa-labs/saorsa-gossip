@@ -90,19 +90,30 @@
   },
   {
     "name": "saorsa-gossip-identity",
-    "version": "0.5.75",
+    "version": "0.5.76",
     "dependencies": [
       "anyhow",
       "blake3",
       "postcard",
       "proptest",
-      "saorsa-gossip-types 0.5.75",
+      "saorsa-gossip-types 0.5.76",
       "saorsa-gossip-workspace-hack",
       "saorsa-pqc",
       "serde",
       "tempfile",
       "tokio",
       "tokio-test"
+    ]
+  },
+  {
+    "name": "saorsa-gossip-legacy-compat-fixture",
+    "version": "0.5.76",
+    "dependencies": [
+      "saorsa-gossip-identity 0.5.66",
+      "saorsa-gossip-pubsub 0.5.66",
+      "saorsa-gossip-transport 0.5.66",
+      "saorsa-gossip-types 0.5.66",
+      "saorsa-gossip-workspace-hack"
     ]
   },
   {
@@ -125,7 +136,7 @@
   },
   {
     "name": "saorsa-gossip-membership",
-    "version": "0.5.75",
+    "version": "0.5.76",
     "dependencies": [
       "anyhow",
       "async-trait",
@@ -133,8 +144,8 @@
       "postcard",
       "proptest",
       "rand 0.8.8",
-      "saorsa-gossip-transport 0.5.75",
-      "saorsa-gossip-types 0.5.75",
+      "saorsa-gossip-transport 0.5.76",
+      "saorsa-gossip-types 0.5.76",
       "saorsa-gossip-workspace-hack",
       "serde",
       "tokio",
@@ -166,7 +177,7 @@
   },
   {
     "name": "saorsa-gossip-pubsub",
-    "version": "0.5.75",
+    "version": "0.5.76",
     "dependencies": [
       "anyhow",
       "async-trait",
@@ -176,14 +187,11 @@
       "lru",
       "postcard",
       "proptest",
-      "saorsa-gossip-identity 0.5.66",
-      "saorsa-gossip-identity 0.5.75",
-      "saorsa-gossip-membership 0.5.75",
-      "saorsa-gossip-pubsub 0.5.66",
-      "saorsa-gossip-transport 0.5.66",
-      "saorsa-gossip-transport 0.5.75",
-      "saorsa-gossip-types 0.5.66",
-      "saorsa-gossip-types 0.5.75",
+      "saorsa-gossip-identity 0.5.76",
+      "saorsa-gossip-legacy-compat-fixture",
+      "saorsa-gossip-membership 0.5.76",
+      "saorsa-gossip-transport 0.5.76",
+      "saorsa-gossip-types 0.5.76",
       "saorsa-gossip-workspace-hack",
       "serde",
       "serde_json",
@@ -219,7 +227,7 @@
   },
   {
     "name": "saorsa-gossip-transport",
-    "version": "0.5.75",
+    "version": "0.5.76",
     "dependencies": [
       "ant-quic",
       "anyhow",
@@ -229,8 +237,8 @@
       "futures",
       "postcard",
       "proptest",
-      "saorsa-gossip-transport 0.5.75",
-      "saorsa-gossip-types 0.5.75",
+      "saorsa-gossip-transport 0.5.76",
+      "saorsa-gossip-types 0.5.76",
       "saorsa-gossip-workspace-hack",
       "serde",
       "thiserror 2.0.20",
@@ -260,7 +268,7 @@
   },
   {
     "name": "saorsa-gossip-types",
-    "version": "0.5.75",
+    "version": "0.5.76",
     "dependencies": [
       "anyhow",
       "async-trait",

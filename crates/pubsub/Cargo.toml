@@ -30,11 +30,9 @@ saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-wo
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-# Exact published legacy parser and handlers for ADR-013 compatibility witnesses.
-legacy-pubsub = { package = "saorsa-gossip-pubsub", version = "=0.5.66" }
-legacy-types = { package = "saorsa-gossip-types", version = "=0.5.66" }
-legacy-transport = { package = "saorsa-gossip-transport", version = "=0.5.66" }
-legacy-identity = { package = "saorsa-gossip-identity", version = "=0.5.66" }
+# Repository-only ADR-013 witnesses against the actual published legacy code.
+# No version: Cargo omits this path-only dev dependency from registry packages.
+saorsa-gossip-legacy-compat-fixture = { path = "../../test-support/legacy-compat" }
 serde_json = { workspace = true }
 proptest = { workspace = true }
 tokio-test = { workspace = true }

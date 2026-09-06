@@ -1,10 +1,11 @@
 # ADR-013: Explicit Legacy Gossip Egress During the Payload-Signature Migration
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-05
-- **Decision owners:** David Irvine (proposed; acceptance pending)
+- **Decision owners:** David Irvine
+- **Acceptance:** David Accept locked 2026-09-06 via Jarvis; disabled-by-default grants, with compatibility implementation to follow separately
 - **Reviewers:** saorsa-gossip and consuming-application maintainers (pending)
-- **Supersedes:** If accepted, the mixed-version migration scope of [ADR-012](ADR-012-payload-covering-gossip-signature.md); its v2 signature and payload-verification requirements remain in force
+- **Supersedes:** The mixed-version migration scope of [ADR-012](ADR-012-payload-covering-gossip-signature.md); its v2 signature and payload-verification requirements remain in force
 - **Superseded by:** none
 - **Related:** [saorsa-gossip #46](https://github.com/saorsa-labs/saorsa-gossip/issues/46), [x0x #517](https://github.com/saorsa-labs/x0x/issues/517), [ADR-001](ADR-001-protocol-layering.md), [ADR-002](ADR-002-post-quantum-cryptography.md), [ADR-008](ADR-008-stream-multiplexing.md)
 
@@ -118,11 +119,11 @@ payloads. Application authorization remains a separate obligation.
 5. **Explicit per-peer, per-topic compatibility using independently verified
    application envelopes and relay re-enveloping.** Selected for the first
    migration implementation, with the restrictions below. No generic unsafe
-   payload exception is part of this proposal.
+   payload exception is part of this decision.
 
 ## Decision
 
-If accepted, implement option 5 as an opt-in migration facility. This document
+Implement option 5 as an opt-in migration facility. This document
 does not authorize deployment or mark that facility implemented. It supersedes
 only ADR-012's incomplete mixed-version scope: its v2 cryptographic requirements
 and data-driven receive-policy sunset remain in force. Accepted ADR-012 remains
@@ -263,7 +264,7 @@ is an explicit design failure, not a reason to disable authentication.
 Inner application signatures do not protect IHAVE/IWANT/AntiEntropy payloads.
 The old endpoint still has v1's weaker control-payload guarantee, and a permitted
 malicious peer can cause bounded extra recovery work or withhold data. This
-proposal accepts that migration availability risk only within the scoped
+decision accepts that migration availability risk only within the scoped
 boundary; it cannot promise bare-gossip end-to-end payload protection through
 an unchanged old hop. There is no new global claim that every received message
 has v2 integrity while legacy receipt remains enabled.
@@ -284,7 +285,7 @@ private keys or unbounded peer-label cardinality.
 Use ADR-012's measured v1 traffic for the sunset, augmented with grant inventory
 and offline supported-peer inventory: silence from a disconnected legacy peer
 is not evidence that it upgraded. Removing legacy grants and flipping the default
-receive policy require human fleet/support review. This proposal does not choose
+receive policy require human fleet/support review. This decision does not choose
 an unsupported calendar cut-off or permit permanent unreviewed exceptions.
 
 ## Consequences
@@ -318,13 +319,12 @@ an unsupported calendar cut-off or permit permanent unreviewed exceptions.
 - ADR-001 dissemination and ADR-008 transport boundaries remain; no new central
   broker, transport channel fallback or membership wire migration is introduced.
 - ADR-002's post-quantum signing choice and ADR-012's v2 verification remain.
-- Human acceptance must confirm this initial topic/version scope, the legacy
-  control/replay/outer-ID availability risks and ownership of grant issuance and
-  sunset review. Bounded resource use does not bound adversarial convergence delay.
-  Maintainers must name the operational owners before enablement; an AI-authored
-  Proposed document is not that acceptance. Numeric resource limits and adapter
-  API shape belong in the reviewed implementation with measured evidence, not
-  guessed values in this ADR.
+- David's acceptance covers this initial topic/version scope and the legacy
+  control/replay/outer-ID availability risks. Bounded resource use does not bound
+  adversarial convergence delay. Maintainers must name the operational owners of
+  grant issuance and sunset review before enablement. Numeric resource limits and
+  adapter API shape belong in the reviewed implementation with measured evidence,
+  not guessed values in this ADR.
 
 ## Validation
 
@@ -379,7 +379,8 @@ dependency tree and artifact proposed for release:
 ## Notes for AI-assisted work
 
 Prepared from pinned source inspection and an offline signed-wire witness.
-Independent agent review informs the draft; it is not human engineering approval.
-No fallback, release, deployment or acceptance is performed by this document.
-AI tools must not mark it Accepted without human review. Accepted ADRs remain
+Independent agent review informed the draft; it was not human engineering approval.
+Human acceptance is recorded above under David's 2026-09-06 lock via Jarvis.
+No fallback, release or deployment is performed by this document.
+AI tools must not mark ADRs Accepted without human review. Accepted ADRs remain
 immutable; future changes create a superseding ADR rather than editing ADR-012.

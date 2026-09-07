@@ -261,6 +261,24 @@ impl<T: Hash + Eq + Clone> OrSet<T> {
             self.changelog_floor = self.changelog_floor.max(min_version);
         }
     }
+
+    /// Return the greatest retained sequence number issued by `peer`.
+    ///
+    /// Both visible element tags and removal tombstones are retained state;
+    /// changelog compaction does not discard either set. `None` means this
+    /// peer has no retained tag. This reports observed state only: callers
+    /// remain responsible for allocator exhaustion and reservations that were
+    /// never inserted into the set.
+    #[must_use]
+    pub fn max_retained_sequence_for_peer(&self, peer: &PeerId) -> Option<u64> {
+        self.elements
+            .values()
+            .chain(self.tombstones.values())
+            .flat_map(HashSet::iter)
+            .filter(|(tag_peer, _)| tag_peer == peer)
+            .map(|(_, sequence)| *sequence)
+            .max()
+    }
 }
 
 impl<T: Hash + Eq + Clone> Default for OrSet<T> {
@@ -961,6 +979,119 @@ mod tests {
         assert!(!delta.added.contains_key("old"));
         assert!(delta.added.contains_key("new"));
         assert_eq!(delta.version, set.version());
+    }
+
+    #[test]
+    fn test_max_retained_sequence_empty_other_peer_and_zero() {
+        let mut set = OrSet::new();
+        let local = peer(1);
+        let foreign = peer(2);
+
+        assert_eq!(set.max_retained_sequence_for_peer(&local), None);
+        set.add("foreign".to_string(), (foreign, 7)).unwrap();
+        assert_eq!(set.max_retained_sequence_for_peer(&local), None);
+        set.add("zero".to_string(), (local, 0)).unwrap();
+        assert_eq!(set.max_retained_sequence_for_peer(&local), Some(0));
+    }
+
+    #[test]
+    fn test_max_retained_sequence_is_peer_scoped_and_order_independent() {
+        let local = peer(1);
+        let foreign = peer(2);
+        let mut first = OrSet::new();
+        first.add("local-high".to_string(), (local, 100)).unwrap();
+        first
+            .add("foreign-max".to_string(), (foreign, u64::MAX))
+            .unwrap();
+        first.add("local-low".to_string(), (local, 3)).unwrap();
+
+        let mut second = OrSet::new();
+        second.add("local-low".to_string(), (local, 3)).unwrap();
+        second
+            .add("foreign-max".to_string(), (foreign, u64::MAX))
+            .unwrap();
+        second.add("local-high".to_string(), (local, 100)).unwrap();
+
+        assert_eq!(first.max_retained_sequence_for_peer(&local), Some(100));
+        assert_eq!(second.max_retained_sequence_for_peer(&local), Some(100));
+    }
+
+    #[test]
+    fn test_max_retained_sequence_survives_remove_and_compaction() {
+        let local = peer(1);
+        let mut set = OrSet::new();
+        set.add("removed".to_string(), (local, 100)).unwrap();
+        set.remove(&"removed".to_string()).unwrap();
+        assert!(!set.contains(&"removed".to_string()));
+        assert_eq!(set.max_retained_sequence_for_peer(&local), Some(100));
+
+        set.compact(0);
+        assert!(set.delta(0).is_none());
+        assert_eq!(set.max_retained_sequence_for_peer(&local), Some(100));
+    }
+
+    #[test]
+    fn test_max_retained_sequence_merges_live_and_removed_tags() {
+        let local = peer(1);
+        let mut removed_source = OrSet::new();
+        removed_source
+            .add("removed".to_string(), (local, 9))
+            .unwrap();
+        removed_source.remove(&"removed".to_string()).unwrap();
+
+        let mut live_source = OrSet::new();
+        live_source.add("live".to_string(), (local, 12)).unwrap();
+
+        let mut removed_then_live = removed_source.clone();
+        removed_then_live.merge_state(&live_source).unwrap();
+        let mut live_then_removed = live_source.clone();
+        live_then_removed.merge_state(&removed_source).unwrap();
+
+        assert_eq!(
+            removed_then_live.max_retained_sequence_for_peer(&local),
+            Some(12)
+        );
+        assert_eq!(
+            live_then_removed.max_retained_sequence_for_peer(&local),
+            Some(12)
+        );
+
+        let mut lower = OrSet::new();
+        lower.add("lower".to_string(), (local, 4)).unwrap();
+        removed_then_live.merge_state(&lower).unwrap();
+        assert_eq!(
+            removed_then_live.max_retained_sequence_for_peer(&local),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn test_max_retained_sequence_survives_serde_after_remove_and_compact() {
+        let local = peer(1);
+        let foreign = peer(2);
+        let mut set = OrSet::new();
+        set.add("removed".to_string(), (local, 44)).unwrap();
+        set.remove(&"removed".to_string()).unwrap();
+        set.add("foreign".to_string(), (foreign, 55)).unwrap();
+        set.compact(0);
+
+        let encoded = postcard::to_stdvec(&set).unwrap();
+        let restored: OrSet<String> = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(restored.max_retained_sequence_for_peer(&local), Some(44));
+        assert_eq!(restored.max_retained_sequence_for_peer(&foreign), Some(55));
+    }
+
+    #[test]
+    fn test_max_retained_sequence_preserves_max_without_foreign_poisoning() {
+        let local = peer(1);
+        let foreign = peer(2);
+        let mut set = OrSet::new();
+        set.add("local-max".to_string(), (local, u64::MAX)).unwrap();
+        set.add("foreign-max".to_string(), (foreign, u64::MAX))
+            .unwrap();
+
+        assert_eq!(set.max_retained_sequence_for_peer(&local), Some(u64::MAX));
+        assert_eq!(set.max_retained_sequence_for_peer(&foreign), Some(u64::MAX));
     }
 
     // Anti-Entropy Manager Tests

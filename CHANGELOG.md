@@ -21,14 +21,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and their IWANT pulls the cached copy (bounded at
   `MAX_IHAVE_BATCH_SIZE` outstanding entries).
   - After `2 × PER_PEER_REPUBLISH_TIMEOUT` a single-shot retry replays
-  the identical serialized EAGER message to the current eager set
-  through the normal admission/claim/bounded-send pipeline (Critical
-  FIFO gate semantics intact). A second zero-delivery outcome is
-  terminal.
+  the identical serialized EAGER message through the normal
+  admission/claim/bounded-send pipeline (Critical FIFO gate semantics
+  intact). A second zero-delivery outcome is terminal. The retry
+  EXCLUDES peers that already pulled the message via the self-IHAVE →
+  IWANT path (a duplicate EAGER would run the receiver's
+  duplicate-EAGER PRUNE against the publisher); when every eager
+  target has pulled, the retry is skipped and counted as recovered by
+  pull. Retry outcomes never sample peer-suppression bookkeeping
+  (timeouts observed by a retry after a known-starved window must not
+  double-count toward `PEER_TIMEOUT_THRESHOLD`); only successful
+  deliveries are recorded. Bulk admissions in the retry are released
+  via the same RAII guard as the primary fan-out.
   New counters on `PubSubStageStatsSnapshot`:
   `stranded_publish_ihave_queued`,
+  `stranded_publishes_recovered_by_pull`,
   `stranded_publishes_recovered_by_retry`,
-  `stranded_publish_retry_failed`.
+  `stranded_publish_retry_failed`,
+  `stranded_publish_cache_miss`. They satisfy
+  `ihave_queued == cache_miss + recovered_by_pull +
+  recovered_by_retry + retry_failed`.
 
 ## [0.5.76] - Unreleased
 

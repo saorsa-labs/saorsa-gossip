@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.77] - 2026-09-11
+
 ### Fixed
 
 - **Stranded local publishes now have a pull path and a bounded retry
@@ -48,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ihave_queued == cache_miss + recovered_by_pull +
   recovered_by_retry + retry_failed`.
 
-## [0.5.76] - Unreleased
+## [0.5.76] - 2026-09-06
 
 ### Added
 

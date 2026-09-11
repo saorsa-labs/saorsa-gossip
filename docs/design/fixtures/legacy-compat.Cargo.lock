@@ -2972,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-coordinator"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "ant-quic",
  "anyhow",
@@ -2980,11 +2980,11 @@ dependencies = [
  "clap",
  "hex",
  "saorsa-gossip-coordinator",
- "saorsa-gossip-identity 0.5.76",
- "saorsa-gossip-membership 0.5.76",
- "saorsa-gossip-pubsub 0.5.76",
- "saorsa-gossip-transport 0.5.76",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-identity 0.5.77",
+ "saorsa-gossip-membership 0.5.77",
+ "saorsa-gossip-pubsub 0.5.77",
+ "saorsa-gossip-transport 0.5.77",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "saorsa-pqc",
  "self_update",
@@ -2996,7 +2996,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "ant-quic",
  "anyhow",
@@ -3006,14 +3006,14 @@ dependencies = [
  "saorsa-gossip-coordinator",
  "saorsa-gossip-crdt-sync",
  "saorsa-gossip-groups",
- "saorsa-gossip-identity 0.5.76",
- "saorsa-gossip-membership 0.5.76",
+ "saorsa-gossip-identity 0.5.77",
+ "saorsa-gossip-membership 0.5.77",
  "saorsa-gossip-presence",
- "saorsa-gossip-pubsub 0.5.76",
+ "saorsa-gossip-pubsub 0.5.77",
  "saorsa-gossip-rendezvous",
  "saorsa-gossip-runtime",
- "saorsa-gossip-transport 0.5.76",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-transport 0.5.77",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "saorsa-pqc",
  "self_update",
@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-coordinator"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "ant-quic",
  "anyhow",
@@ -3037,7 +3037,7 @@ dependencies = [
  "postcard",
  "proptest",
  "rand 0.8.8",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "saorsa-pqc",
  "serde",
@@ -3050,13 +3050,13 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-crdt-sync"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "anyhow",
  "blake3",
  "proptest",
- "saorsa-gossip-transport 0.5.76",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-transport 0.5.77",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "serde",
  "tokio",
@@ -3065,12 +3065,12 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-groups"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "anyhow",
  "blake3",
  "proptest",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "saorsa-pqc",
  "serde",
@@ -3093,13 +3093,13 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-identity"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "anyhow",
  "blake3",
  "postcard",
  "proptest",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "saorsa-pqc",
  "serde",
@@ -3110,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-legacy-compat-fixture"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "saorsa-gossip-identity 0.5.66",
  "saorsa-gossip-pubsub 0.5.66",
@@ -3139,7 +3139,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-membership"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3147,8 +3147,8 @@ dependencies = [
  "postcard",
  "proptest",
  "rand 0.8.8",
- "saorsa-gossip-transport 0.5.76",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-transport 0.5.77",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "serde",
  "tokio",
@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-presence"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3168,9 +3168,9 @@ dependencies = [
  "proptest",
  "rand 0.8.8",
  "saorsa-gossip-groups",
- "saorsa-gossip-identity 0.5.76",
- "saorsa-gossip-transport 0.5.76",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-identity 0.5.77",
+ "saorsa-gossip-transport 0.5.77",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "saorsa-pqc",
  "serde",
@@ -3202,7 +3202,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-pubsub"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3212,11 +3212,11 @@ dependencies = [
  "lru",
  "postcard",
  "proptest",
- "saorsa-gossip-identity 0.5.76",
+ "saorsa-gossip-identity 0.5.77",
  "saorsa-gossip-legacy-compat-fixture",
- "saorsa-gossip-membership 0.5.76",
- "saorsa-gossip-transport 0.5.76",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-membership 0.5.77",
+ "saorsa-gossip-transport 0.5.77",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "serde",
  "serde_json",
@@ -3230,14 +3230,14 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-rendezvous"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "anyhow",
  "blake3",
  "bytes",
  "ciborium",
  "proptest",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "saorsa-pqc",
  "serde",
@@ -3247,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-runtime"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3257,13 +3257,13 @@ dependencies = [
  "rand 0.8.8",
  "saorsa-gossip-coordinator",
  "saorsa-gossip-groups",
- "saorsa-gossip-identity 0.5.76",
- "saorsa-gossip-membership 0.5.76",
+ "saorsa-gossip-identity 0.5.77",
+ "saorsa-gossip-membership 0.5.77",
  "saorsa-gossip-presence",
- "saorsa-gossip-pubsub 0.5.76",
+ "saorsa-gossip-pubsub 0.5.77",
  "saorsa-gossip-rendezvous",
- "saorsa-gossip-transport 0.5.76",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-transport 0.5.77",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "serde",
  "tokio",
@@ -3294,7 +3294,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-transport"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "ant-quic",
  "anyhow",
@@ -3304,8 +3304,8 @@ dependencies = [
  "futures",
  "postcard",
  "proptest",
- "saorsa-gossip-transport 0.5.76",
- "saorsa-gossip-types 0.5.76",
+ "saorsa-gossip-transport 0.5.77",
+ "saorsa-gossip-types 0.5.77",
  "saorsa-gossip-workspace-hack",
  "serde",
  "thiserror 2.0.20",
@@ -3335,7 +3335,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-gossip-types"
-version = "0.5.76"
+version = "0.5.77"
 dependencies = [
  "anyhow",
  "async-trait",

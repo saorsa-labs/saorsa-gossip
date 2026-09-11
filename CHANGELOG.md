@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stranded local publishes now have a pull path and a bounded retry
+  (x0x #613, #611, #336).** A local publish whose EAGER fan-out attempted
+  ≥1 peer but succeeded at none (`attempted > 0, succeeded == 0`) used to
+  return `Ok` and rely on the pending-IHAVE flush for recovery — but that
+  flush advertises to lazy members only, and an all-eager topic has none,
+  so the cached message had structurally no delivery path until the 30 s
+  anti-entropy sweep. Two mitigations, no wire-format change:
+  - The publish now queues a self-IHAVE for the attempted peers; the
+  100 ms flush advertises the id to them regardless of lazy membership,
+  and their IWANT pulls the cached copy (bounded at
+  `MAX_IHAVE_BATCH_SIZE` outstanding entries).
+  - After `2 × PER_PEER_REPUBLISH_TIMEOUT` a single-shot retry replays
+  the identical serialized EAGER message through the normal
+  admission/claim/bounded-send pipeline (Critical FIFO gate semantics
+  intact). A second zero-delivery outcome is terminal. The retry
+  EXCLUDES peers that already pulled the message via the self-IHAVE →
+  IWANT path — `served` is marked only after the IWANT reply send
+  succeeds, so a timed-out reply never looks like a completed pull (a
+  duplicate EAGER would run the receiver's duplicate-EAGER PRUNE
+  against the publisher); when every eager target has pulled, the
+  retry is skipped and counted as recovered by pull. Retry outcomes
+  never sample peer-suppression bookkeeping (timeouts observed by a
+  retry after a known-starved window must not double-count toward
+  `PEER_TIMEOUT_THRESHOLD`); only successful deliveries are recorded.
+  RecoveryProbe-kind attempts claimed by the retry (a peer whose
+  suppression expired during the delay) are the exception: their
+  outcomes are re-booked so the probe's in-flight marker is released —
+  a probe timeout re-suppresses with backoff and does not feed the
+  threshold window. Bulk admissions in the retry are released via the
+  same RAII guard as the primary fan-out.
+  New counters on `PubSubStageStatsSnapshot`:
+  `stranded_publish_ihave_queued`,
+  `stranded_publishes_recovered_by_pull`,
+  `stranded_publishes_recovered_by_retry`,
+  `stranded_publish_retry_failed`,
+  `stranded_publish_cache_miss`. They satisfy
+  `ihave_queued == cache_miss + recovered_by_pull +
+  recovered_by_retry + retry_failed`.
+
 ## [0.5.76] - Unreleased
 
 ### Added

@@ -3382,6 +3382,14 @@ impl TopicState {
             return;
         }
         if self.stranded_ihave.len() >= MAX_IHAVE_BATCH_SIZE {
+            // Cap eviction drops the OLDEST entry, losing its targets and
+            // `served` bookkeeping. Acceptable (PR #54 r3 review item 3):
+            // the cap is only reached with >1024 distinct stranded ids
+            // inside one ~5 s retry window — extreme outage pressure — and
+            // the worst case for the evicted id is that its retry targets
+            // the full eager set, re-sending an EAGER a pulled peer's
+            // receiver will dedupe-and-PRUNE once. A bounded map beats an
+            // unbounded one under that pressure.
             let overflow = self.stranded_ihave.len() - MAX_IHAVE_BATCH_SIZE + 1;
             let _ = self.stranded_ihave.drain(..overflow);
         }
@@ -7185,6 +7193,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         let mut to_send = Vec::new();
         let mut requester_has_cached_message = false;
+        // x0x #613 (PR #54 r3 item 2): pull-path completion is tracked for
+        // stranded ids, but `served` is marked only AFTER the reply send
+        // succeeds — a timed-out IWANT reply must not exclude the peer
+        // from the bounded retry. The emptiness probe keeps the common
+        // (non-stranded) IWANT path lock-only.
+        let track_served = !state.stranded_ihave.is_empty();
 
         for msg_id in msg_ids {
             if let Some(cached) = state.get_message(&msg_id) {
@@ -7196,10 +7210,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 to_send.push((msg_id, cached));
                 requester_has_cached_message = true;
-                // x0x #613 (PR #54 review item 1): track pull-path
-                // completion for stranded ids so the bounded retry never
-                // duplicates a delivery this serve is about to make.
-                state.record_stranded_ihave_served(&msg_id, from);
             } else {
                 // Routine under loss/churn: a peer requests a message we no
                 // longer cache (evicted) or never received. Not a fault —
@@ -7225,6 +7235,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         drop(topics); // Release lock
 
         let republish_started = Instant::now();
+        // Ids whose IWANT reply send succeeded — marked served after the
+        // loop (or before an error return) so a stranded retry never
+        // treats a failed reply as a completed pull.
+        let mut served_ids: Vec<MessageIdType> = Vec::new();
+        let mut send_err: Option<anyhow::Error> = None;
         // Send EAGER with payloads
         for (msg_id, cached) in to_send {
             self.transport.migration.admit_cache_serve(
@@ -7255,6 +7270,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let bytes = match postcard::to_stdvec(&_message) {
                 Ok(bytes) => bytes,
                 Err(e) => {
+                    self.mark_stranded_ihave_served(topic, from, &served_ids)
+                        .await;
                     self.record_stage(PubSubStage::Republish, republish_started);
                     return Err(anyhow!("Serialization failed: {}", e));
                 }
@@ -7262,16 +7279,48 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let send_result = self
                 .send_to_peer_bounded(topic, from, GossipStreamType::PubSub, bytes.into(), "EAGER")
                 .await;
-            if let Err(e) = send_result {
-                self.record_stage(PubSubStage::Republish, republish_started);
-                return Err(e);
+            match send_result {
+                Ok(()) => {
+                    if track_served {
+                        served_ids.push(msg_id);
+                    }
+                }
+                Err(e) => {
+                    send_err = Some(e);
+                    break;
+                }
             }
         }
+        self.mark_stranded_ihave_served(topic, from, &served_ids)
+            .await;
         self.record_stage(PubSubStage::Republish, republish_started);
+        if let Some(e) = send_err {
+            return Err(e);
+        }
 
         Ok(())
     }
 
+    /// x0x #613 (PR #54 r3 item 2): mark stranded ids as pull-served for
+    /// `from` — called by the IWANT serve path with the ids whose reply
+    /// sends actually succeeded. No-op for empty inputs or ids no longer
+    /// stranded.
+    async fn mark_stranded_ihave_served(
+        &self,
+        topic: TopicId,
+        from: PeerId,
+        msg_ids: &[MessageIdType],
+    ) {
+        if msg_ids.is_empty() {
+            return;
+        }
+        let mut topics = self.topics.write_topic(&topic).await;
+        if let Some(state) = topics.get_mut(&topic) {
+            for msg_id in msg_ids {
+                state.record_stranded_ihave_served(msg_id, from);
+            }
+        }
+    }
     /// Handle incoming anti-entropy message
     ///
     /// Processes `AntiEntropyPayload::Digest` and `AntiEntropyPayload::Response`
@@ -7854,11 +7903,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ///
     /// Maintainer decision (PR #54 review item 3): retry outcomes feed the
     /// stranded counters ONLY — they never sample peer-suppression
-    /// bookkeeping. Timeouts and not-connected failures observed by the
-    /// retry are dropped (a retry after a known-starved window must not
-    /// double-count that starvation toward `PEER_TIMEOUT_THRESHOLD`);
-    /// successful deliveries are still booked (RTT samples and
-    /// cooling-clears are positive evidence, not suppression).
+    /// bookkeeping. Normal-kind timeouts and not-connected failures
+    /// observed by the retry are dropped (a retry after a known-starved
+    /// window must not double-count that starvation toward
+    /// `PEER_TIMEOUT_THRESHOLD`); successful deliveries are still booked
+    /// (RTT samples and cooling-clears are positive evidence, not
+    /// suppression). EXCEPTION (r3 review item 1): RecoveryProbe-kind
+    /// attempts ARE re-booked — the claim set `recovery_probe_in_flight`
+    /// for the peer, and a dropped probe outcome would leave that flag set
+    /// forever, permanently blocking `claim_send_attempt_at` for the
+    /// peer/topic. A probe timeout re-suppresses with backoff (it does not
+    /// feed the `PEER_TIMEOUT_THRESHOLD` window), which is the correct
+    /// probe outcome; a probe not-connected failure books the #380
+    /// eviction.
     ///
     /// Terminal outcomes, exactly one per stranded publish:
     /// `stranded_publish_cache_miss` (message/topic gone),
@@ -7989,14 +8046,31 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             bytes,
             "EAGER",
         );
-        let (sent, _timed_out, _not_connected) = send_tasks.collect_results().await;
+        let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
         let succeeded = sent.len();
-        // Maintainer decision (review item 3): record deliveries ONLY.
-        // Dropping the timeout/not-connected lists keeps the retry out of
-        // suppression sampling and eviction; the empty lists also disarm
-        // the claims' Drop path, whose deferred RecoveryProbe accounting
-        // would otherwise re-book probes as timed out.
-        claims.record_results(sent, Vec::new(), Vec::new()).await;
+        // Maintainer decision (review item 3): Normal-kind retry timeouts
+        // and not-connected failures are dropped — the retry must not
+        // double-count a known-starved window toward
+        // PEER_TIMEOUT_THRESHOLD. RecoveryProbe-kind attempts (claimed when
+        // a peer's suppression expired during the delay) are re-booked
+        // (r3 review item 1): a probe timeout re-suppresses with backoff
+        // without feeding the threshold window, a probe not-connected
+        // failure books the #380 eviction, and either outcome releases
+        // `recovery_probe_in_flight` — dropping it would permanently block
+        // `claim_send_attempt_at` for the peer/topic.
+        let probe_timed_out: Vec<PeerSendAttempt> = timed_out
+            .iter()
+            .copied()
+            .flat_map(recovery_probe_timeout)
+            .collect();
+        let probe_not_connected: Vec<PeerSendAttempt> = not_connected
+            .iter()
+            .copied()
+            .flat_map(recovery_probe_timeout)
+            .collect();
+        claims
+            .record_results(sent, probe_timed_out, probe_not_connected)
+            .await;
 
         if succeeded > 0 {
             info!(
@@ -9954,7 +10028,7 @@ mod tests {
     /// attempted peers, have the real 100 ms flusher deliver that IHAVE
     /// once the transport heals, and answer an IWANT from the attempted
     /// peer out of the cache.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stranded_publish_self_ihave_reaches_attempted_peers_and_iwant_serves_cache() {
         let peer_id = test_peer_id(1);
         let transport = ToggleTransport::new(peer_id);
@@ -10364,6 +10438,98 @@ mod tests {
             transport.attempt_count(),
             2,
             "retry is single-shot: no third attempt"
+        );
+    }
+
+    /// x0x #613 (PR #54 r3 review item 1): a retry RecoveryProbe attempt
+    /// must have its outcome re-booked. The peer's suppression expires
+    /// during the 5 s delay, so the retry claims a recovery probe
+    /// (`recovery_probe_in_flight = true`) and that probe send times out.
+    /// Recording the probe outcome releases the in-flight marker (with
+    /// backoff re-suppression, which does not feed
+    /// `PEER_TIMEOUT_THRESHOLD`); dropping it — the r2 implementation —
+    /// left the flag set forever and `claim_send_attempt_at` returned None
+    /// for the peer/topic permanently.
+    #[tokio::test(start_paused = true)]
+    async fn stranded_publish_retry_probe_timeout_releases_in_flight_marker() {
+        let peer_id = test_peer_id(1);
+        // hang_budget = 2: the publish fan-out send AND the retry's probe
+        // send both hang until their per-peer budgets cut them.
+        let transport = ToggleTransport::with_hang_budget(peer_id, 2);
+        transport.set_failing(false);
+        let eager = test_peer_id(2);
+        transport.report_connected(vec![peer_id, eager]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x66; 32]);
+        pubsub.initialize_topic_peers(topic, vec![eager]).await;
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"probe-release"))
+            .await
+            .expect("publish returns Ok");
+        assert_eq!((counts.attempted, counts.succeeded), (1, 0));
+
+        // The peer's suppression expires during the retry delay — the
+        // retry's claim will hand out a RecoveryProbe attempt.
+        {
+            let now = Instant::now();
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            let mut cooling = PeerCoolingState::new(now);
+            cooling.suppressed_until = Some(now - Duration::from_millis(1));
+            state.peer_cooling.insert(eager, cooling);
+            assert!(state.eager_peers.contains(&eager));
+        }
+
+        // The retry fires; its probe hangs and times out; nothing is
+        // delivered → retry_failed. The probe outcome must be recorded.
+        let deadline = tokio::time::Instant::now()
+            + STRANDED_PUBLISH_RETRY_DELAY
+            + PER_PEER_REPUBLISH_TIMEOUT
+            + Duration::from_secs(2);
+        loop {
+            if pubsub.stage_stats().stranded_publish_retry_failed == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "retry probe must time out and record the terminal counter"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // The in-flight marker is released and the peer re-suppressed with
+        // backoff — NOT stuck in recovery_probe state.
+        let later = {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            let cooling = state
+                .peer_cooling
+                .get(&eager)
+                .expect("probe timeout re-suppresses the peer");
+            assert!(
+                !cooling.recovery_probe_in_flight,
+                "retry probe timeout must release the in-flight marker"
+            );
+            let until = cooling
+                .suppressed_until
+                .expect("re-suppressed with backoff");
+            assert!(until > Instant::now(), "backoff cooldown is in the future");
+            until + Duration::from_secs(1)
+        };
+
+        // After the backoff expires the peer is claimable again — the r2
+        // defect returned None here forever.
+        let mut topics = pubsub.topics.write_topic(&topic).await;
+        let state = topics.get_mut(&topic).expect("topic state");
+        assert!(
+            state.claim_send_attempt_at(eager, later).is_some(),
+            "peer must be claimable again after the probe outcome is booked"
         );
     }
 

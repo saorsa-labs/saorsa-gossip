@@ -25,14 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admission/claim/bounded-send pipeline (Critical FIFO gate semantics
   intact). A second zero-delivery outcome is terminal. The retry
   EXCLUDES peers that already pulled the message via the self-IHAVE →
-  IWANT path (a duplicate EAGER would run the receiver's
-  duplicate-EAGER PRUNE against the publisher); when every eager
-  target has pulled, the retry is skipped and counted as recovered by
-  pull. Retry outcomes never sample peer-suppression bookkeeping
-  (timeouts observed by a retry after a known-starved window must not
-  double-count toward `PEER_TIMEOUT_THRESHOLD`); only successful
-  deliveries are recorded. Bulk admissions in the retry are released
-  via the same RAII guard as the primary fan-out.
+  IWANT path — `served` is marked only after the IWANT reply send
+  succeeds, so a timed-out reply never looks like a completed pull (a
+  duplicate EAGER would run the receiver's duplicate-EAGER PRUNE
+  against the publisher); when every eager target has pulled, the
+  retry is skipped and counted as recovered by pull. Retry outcomes
+  never sample peer-suppression bookkeeping (timeouts observed by a
+  retry after a known-starved window must not double-count toward
+  `PEER_TIMEOUT_THRESHOLD`); only successful deliveries are recorded.
+  RecoveryProbe-kind attempts claimed by the retry (a peer whose
+  suppression expired during the delay) are the exception: their
+  outcomes are re-booked so the probe's in-flight marker is released —
+  a probe timeout re-suppresses with backoff and does not feed the
+  threshold window. Bulk admissions in the retry are released via the
+  same RAII guard as the primary fan-out.
   New counters on `PubSubStageStatsSnapshot`:
   `stranded_publish_ihave_queued`,
   `stranded_publishes_recovered_by_pull`,

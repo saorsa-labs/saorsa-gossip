@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stranded local publishes now have a pull path and a bounded retry
+  (x0x #613, #611, #336).** A local publish whose EAGER fan-out attempted
+  ≥1 peer but succeeded at none (`attempted > 0, succeeded == 0`) used to
+  return `Ok` and rely on the pending-IHAVE flush for recovery — but that
+  flush advertises to lazy members only, and an all-eager topic has none,
+  so the cached message had structurally no delivery path until the 30 s
+  anti-entropy sweep. Two mitigations, no wire-format change:
+  - The publish now queues a self-IHAVE for the attempted peers; the
+  100 ms flush advertises the id to them regardless of lazy membership,
+  and their IWANT pulls the cached copy (bounded at
+  `MAX_IHAVE_BATCH_SIZE` outstanding entries).
+  - After `2 × PER_PEER_REPUBLISH_TIMEOUT` a single-shot retry replays
+  the identical serialized EAGER message to the current eager set
+  through the normal admission/claim/bounded-send pipeline (Critical
+  FIFO gate semantics intact). A second zero-delivery outcome is
+  terminal.
+  New counters on `PubSubStageStatsSnapshot`:
+  `stranded_publish_ihave_queued`,
+  `stranded_publishes_recovered_by_retry`,
+  `stranded_publish_retry_failed`.
+
 ## [0.5.76] - Unreleased
 
 ### Added

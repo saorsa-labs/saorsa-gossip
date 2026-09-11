@@ -145,6 +145,13 @@ const MAX_EAGER_DEGREE: usize = 12;
 /// real signal at 2500 ms each).
 const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(2500);
 
+/// Delay before the bounded single-shot retry of a stranded local publish
+/// (x0x #613: `attempted > 0, succeeded == 0`). Two full per-peer budgets
+/// give every timed-out fan-out send room to complete (or fail
+/// definitively) before the retry re-enters the eager pipeline, so the
+/// retry observes the post-timeout state rather than racing it.
+const STRANDED_PUBLISH_RETRY_DELAY: Duration = PER_PEER_REPUBLISH_TIMEOUT.saturating_mul(2);
+
 /// Rolling window for send-side slow-peer detection.
 const PEER_TIMEOUT_WINDOW: Duration = Duration::from_secs(30);
 
@@ -733,6 +740,20 @@ pub struct PubSubStageStats {
     /// were reachable at dispatch time (e.g. "Peer not found" in the
     /// transport). Distinct from `zero_fanout_publishes` (no attempt at all).
     zero_succeeded_publishes: AtomicU64,
+    /// x0x #613: stranded publishes (`attempted > 0, succeeded == 0`) for
+    /// which a self-IHAVE to the attempted peers was queued for the next
+    /// flush — the stranded-publish pull path that restores delivery on
+    /// all-eager topics, where the regular IHAVE flush (lazy members only)
+    /// would advertise nothing.
+    stranded_publish_ihave_queued: AtomicU64,
+    /// x0x #613: stranded publishes recovered by the bounded single-shot
+    /// retry — the retry delivered the cached message to at least one
+    /// eager peer.
+    stranded_publishes_recovered_by_retry: AtomicU64,
+    /// x0x #613: stranded publishes whose bounded single-shot retry also
+    /// delivered to zero peers. Terminal: no third attempt is made;
+    /// anti-entropy remains the last resort.
+    stranded_publish_retry_failed: AtomicU64,
     /// Topic-set evictions after a definitive transport "peer not connected"
     /// failure (x0x #380). Unlike timeouts these feed no cooling — the peer
     /// simply leaves the topic's eager/lazy sets until the transport reports
@@ -970,6 +991,18 @@ pub struct PubSubStageStatsSnapshot {
     /// This is the black-hole signature: peers exist in the eager set but
     /// none were reachable at dispatch time.
     pub zero_succeeded_publishes: u64,
+    /// x0x #613: stranded publishes for which a self-IHAVE to the attempted
+    /// peers was queued for the next flush (see
+    /// `stranded_publish_ihave_queued` on [`PubSubStageStats`]). The pull
+    /// path for messages whose eager fan-out reached no peer on an
+    /// all-eager topic.
+    pub stranded_publish_ihave_queued: u64,
+    /// x0x #613: stranded publishes recovered by the bounded single-shot
+    /// retry (the retry reached ≥1 eager peer).
+    pub stranded_publishes_recovered_by_retry: u64,
+    /// x0x #613: stranded publishes whose bounded single-shot retry also
+    /// failed to deliver. Terminal — no third attempt is made.
+    pub stranded_publish_retry_failed: u64,
     /// Topic-set evictions after a definitive transport "peer not connected"
     /// failure (x0x #380) — eviction, not cooling; see
     /// [`PubSubStageStats`] for the interpretation.
@@ -1495,6 +1528,18 @@ struct SendPathContext {
     /// publish path so background IHAVE flush + anti-entropy operations
     /// can filter through the same gate before claiming attempts.
     admission: Arc<admission::AdmissionControl>,
+}
+
+/// Context bundle for the detached stranded-publish retry (x0x #613): the
+/// Arc handles [`PlumtreePubSub::retry_stranded_publish`] needs beyond
+/// [`SendPathContext`], moved into the retry task so it can run after the
+/// publish call has already returned.
+struct StrandedRetryContext<T: GossipTransport + 'static> {
+    topics: Arc<ShardedTopicMap>,
+    transport: Arc<PolicyTransport<T>>,
+    stage_stats: Arc<PubSubStageStats>,
+    outbound_budgets: Arc<PeerOutboundBudgets>,
+    send_path: SendPathContext,
 }
 
 struct SendClaimContext<'a> {
@@ -2225,6 +2270,15 @@ impl PubSubStageStats {
             zero_fanout_publishes_by_topic: BTreeMap::new(),
             zero_succeeded_publishes: self.zero_succeeded_publishes.load(Ordering::Relaxed),
             peers_evicted_not_connected: self.peers_evicted_not_connected.load(Ordering::Relaxed),
+            stranded_publish_ihave_queued: self
+                .stranded_publish_ihave_queued
+                .load(Ordering::Relaxed),
+            stranded_publishes_recovered_by_retry: self
+                .stranded_publishes_recovered_by_retry
+                .load(Ordering::Relaxed),
+            stranded_publish_retry_failed: self
+                .stranded_publish_retry_failed
+                .load(Ordering::Relaxed),
             suppressed_peers: self.suppressed_peer_snapshots(),
             suppressed_peers_by_topic: BTreeMap::new(),
             suppression_cleanup_interval_ms: self
@@ -2328,6 +2382,21 @@ impl PubSubStageStats {
 
     fn record_zero_succeeded_publish(&self) {
         self.zero_succeeded_publishes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_stranded_publish_ihave_queued(&self) {
+        self.stranded_publish_ihave_queued
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_stranded_publish_recovered_by_retry(&self) {
+        self.stranded_publishes_recovered_by_retry
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_stranded_publish_retry_failed(&self) {
+        self.stranded_publish_retry_failed
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3103,6 +3172,15 @@ struct TopicState {
     eager_peers: HashSet<PeerId>,
     /// Instance-configured maximum; always nonzero (zero selects stock bounds).
     max_eager_degree: usize,
+    /// Stranded-publish self-IHAVE targets (x0x #613): message ids whose
+    /// local EAGER fan-out was attempted at ≥1 peer but succeeded at none.
+    /// The regular flush advertises `pending_ihave` to lazy members only —
+    /// empty on an all-eager topic — so these ids carry the peers that must
+    /// still receive an IHAVE at the next flush, restoring the pull path
+    /// (peer IWANT → cached EAGER serve). Bounded to `MAX_IHAVE_BATCH_SIZE`
+    /// entries; each entry is consumed by the flush that drains its id from
+    /// `pending_ihave`.
+    stranded_ihave: Vec<(MessageIdType, Vec<PeerId>)>,
     /// Non-tree peers (send IHAVE only)
     lazy_peers: HashSet<PeerId>,
     /// Message cache: msg_id -> cached message
@@ -3163,6 +3241,7 @@ impl TopicState {
                 cache_config.max_age,
             ),
             pending_ihave: Vec::new(),
+            stranded_ihave: Vec::new(),
             outstanding_iwants: HashMap::new(),
             peer_scores: HashMap::new(),
             subscribers: Vec::new(),
@@ -3232,6 +3311,57 @@ impl TopicState {
         self.message_cache.contains(msg_id)
     }
 
+    /// Queue a self-IHAVE for a stranded publish (x0x #613): `peers` were
+    /// attempted by the EAGER fan-out but none received the message. The
+    /// next flush advertises `msg_id` to them regardless of lazy membership,
+    /// so their IWANT can pull the cached copy. Bounded: at most
+    /// `MAX_IHAVE_BATCH_SIZE` outstanding entries; when the bound is hit the
+    /// oldest entry is dropped (its `pending_ihave` id has long since been
+    /// flushed or superseded under a sustained outage).
+    fn queue_stranded_ihave(&mut self, msg_id: MessageIdType, peers: &[PeerId]) {
+        if peers.is_empty() {
+            return;
+        }
+        if let Some((_, targets)) = self.stranded_ihave.iter_mut().find(|(id, _)| *id == msg_id) {
+            for peer in peers.iter().copied() {
+                if !targets.contains(&peer) {
+                    targets.push(peer);
+                }
+            }
+            return;
+        }
+        if self.stranded_ihave.len() >= MAX_IHAVE_BATCH_SIZE {
+            let overflow = self.stranded_ihave.len() - MAX_IHAVE_BATCH_SIZE + 1;
+            let _ = self.stranded_ihave.drain(..overflow);
+        }
+        self.stranded_ihave.push((msg_id, peers.to_vec()));
+    }
+
+    /// Take the stranded-publish IHAVE targets whose ids are in `batch` —
+    /// consumed by the flush that drains those ids from `pending_ihave`.
+    /// Targets for ids outside `batch` stay queued for a later flush.
+    /// Returns a deduplicated peer list.
+    fn take_stranded_ihave_for(&mut self, batch: &[MessageIdType]) -> Vec<PeerId> {
+        if self.stranded_ihave.is_empty() {
+            return Vec::new();
+        }
+        let mut targets: Vec<PeerId> = Vec::new();
+        let mut retained: Vec<(MessageIdType, Vec<PeerId>)> =
+            Vec::with_capacity(self.stranded_ihave.len());
+        for (id, peers) in self.stranded_ihave.drain(..) {
+            if batch.contains(&id) {
+                for peer in peers {
+                    if !targets.contains(&peer) {
+                        targets.push(peer);
+                    }
+                }
+            } else {
+                retained.push((id, peers));
+            }
+        }
+        self.stranded_ihave = retained;
+        targets
+    }
     /// Add message to cache
     fn cache_message(&mut self, msg_id: MessageIdType, payload: Bytes, header: MessageHeader) {
         debug!(
@@ -5964,7 +6094,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
         detach_accounting: bool,
-    ) -> (Duration, FanoutCounts) {
+    ) -> (Duration, FanoutCounts, Vec<PeerId>) {
         // X0X-0074: admission gate runs once per (topic, peer) before
         // we claim attempts. Dropped peers never enter the send
         // pipeline. Bulk admissions are reserved here and released
@@ -5982,7 +6112,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         };
         let admitted_count = admitted.len();
         if admitted_count == 0 {
-            return (Duration::ZERO, FanoutCounts::default());
+            return (Duration::ZERO, FanoutCounts::default(), Vec::new());
         }
         // X0X-0074: RAII guard releases Bulk admissions for the entire
         // admitted set exactly once on drop — covers no-claim, partial-
@@ -6008,7 +6138,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if claims.is_empty() {
             // No peers got attempts. Bulk reservations release when
             // `_bulk_guard` drops at function exit.
-            return (lock_wait, FanoutCounts::default());
+            return (lock_wait, FanoutCounts::default(), Vec::new());
         }
         let attempted = claims.attempts().len();
         // x0x #380: outbound demand metering — one wire send per claimed
@@ -6017,6 +6147,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .record_outbound(topic, op, bytes.len(), attempted);
         let mut send_tasks = SendTaskSet::with_capacity(op, attempted);
         let attempts = claims.attempts().to_vec();
+        // x0x #613: the attempted peer list is returned to the caller so a
+        // stranded publish (`attempted > 0, succeeded == 0`) can retain
+        // exactly the peers the pull path (self-IHAVE) must target.
+        let attempted_peers: Vec<PeerId> = attempts.iter().map(|a| a.peer).collect();
         let permits = claims.take_permits();
         for (attempt, permit) in attempts.into_iter().zip(permits) {
             let transport = Arc::clone(&self.transport);
@@ -6073,6 +6207,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     attempted,
                     succeeded: 0,
                 },
+                attempted_peers,
             )
         } else {
             // Publish path (and tests): await the fan-out so publish() retains
@@ -6089,6 +6224,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     attempted,
                     succeeded,
                 },
+                attempted_peers,
             )
         }
     }
@@ -6373,6 +6509,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 return Ok(FanoutCounts::default());
             }
         };
+        // x0x #613: retain the serialized wire bytes for the bounded
+        // single-shot stranded retry (below). A `Bytes` clone is a
+        // refcount bump; it is only consumed when the fan-out strands.
+        let retry_bytes = bytes.clone();
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Sending EAGER fan-out");
         // x0x #380: origin metering — this fan-out carries a LOCALLY
         // originated publish (the rate-cap baseline). Instrumentation only.
@@ -6380,7 +6520,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Publish path: await accounting (detach_accounting = false) so
         // publish() returns only after its EAGER sends are attempted and
         // outcomes are observable (succeeded is valid here).
-        let (_, counts) = self
+        let (_, counts, attempted_peers) = self
             .parallel_send_to_peers(
                 topic,
                 eager_peers,
@@ -6403,6 +6543,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             self.stage_stats.record_zero_succeeded_publish();
         }
 
+        // x0x #613: stranded publish — peers were attempted but none
+        // received the message. Two bounded recovery paths apply below: a
+        // self-IHAVE to the attempted peers (restores the pull path on
+        // all-eager topics, where the pending_ihave batch above is
+        // structurally inert because the flush only targets lazy members)
+        // and a single delayed retry of the cached wire bytes.
+        let stranded = counts.attempted > 0 && counts.succeeded == 0;
         // Batch msg_id to pending_ihave
         let mut topics = self.topics.write_topic(&topic).await;
         if let Some(state) = topics.get_mut(&topic) {
@@ -6420,6 +6567,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
             state.pending_ihave.push(msg_id);
 
+            // x0x #613 mitigation 1: queue a self-IHAVE to the attempted
+            // peers so the 100 ms flush advertises this id regardless of
+            // lazy membership. The receivers' IWANT then pulls the cached
+            // copy — the pull path this topic otherwise lacks when every
+            // member is eager.
+            if stranded {
+                state.queue_stranded_ihave(msg_id, &attempted_peers);
+                self.stage_stats.record_stranded_publish_ihave_queued();
+            }
+
             // Deliver to local subscribers
             debug!(
                 target: "sg.payload.trace",
@@ -6430,6 +6587,26 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             );
             let data = (self.peer_id, payload);
             state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
+        }
+
+        // x0x #613 mitigation 2: bounded single-shot retry. After two full
+        // per-peer budgets, retry the cached message once to the current
+        // eager set. A second zero-delivery outcome is terminal
+        // (`stranded_publish_retry_failed`); there is no retry loop. The
+        // publish call's own contract (Ok + counts) is unchanged — the
+        // retry runs detached, like the forward path's accounting task.
+        if stranded {
+            let retry_ctx = StrandedRetryContext {
+                topics: Arc::clone(&self.topics),
+                transport: Arc::clone(&self.transport),
+                stage_stats: Arc::clone(&self.stage_stats),
+                outbound_budgets: Arc::clone(&self.outbound_budgets),
+                send_path: self.send_path_context(),
+            };
+            tokio::spawn(async move {
+                time::sleep(STRANDED_PUBLISH_RETRY_DELAY).await;
+                Self::retry_stranded_publish(&retry_ctx, topic, msg_id, retry_bytes).await;
+            });
         }
 
         Ok(counts)
@@ -7378,16 +7555,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         .drain(..state.pending_ihave.len().min(MAX_IHAVE_BATCH_SIZE))
                         .collect();
 
-                    let lazy_peers: Vec<PeerId> = state.lazy_peers.iter().copied().collect();
-                    work.push((*topic_id, batch, lazy_peers));
+                    // x0x #613: stranded-publish pull path. The regular
+                    // flush advertises only to lazy members; merge in the
+                    // direct targets queued for this batch (the peers the
+                    // stranded EAGER fan-out attempted) so an all-eager
+                    // topic still advertises — otherwise the cached
+                    // message would have no pull path at all.
+                    let mut ihave_targets = state.take_stranded_ihave_for(&batch);
+                    for peer in state.lazy_peers.iter().copied() {
+                        if !ihave_targets.contains(&peer) {
+                            ihave_targets.push(peer);
+                        }
+                    }
+                    work.push((*topic_id, batch, ihave_targets));
                 }
             }
 
             work
         };
 
-        for (topic_id, batch, lazy_peers) in work {
-            if lazy_peers.is_empty() {
+        for (topic_id, batch, ihave_targets) in work {
+            if ihave_targets.is_empty() {
                 continue;
             }
 
@@ -7447,7 +7635,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     continue;
                 };
                 let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
-                    send_path, state, &topic_id, lazy_peers, "IHAVE", now,
+                    send_path,
+                    state,
+                    &topic_id,
+                    ihave_targets,
+                    "IHAVE",
+                    now,
                 );
                 if admitted.is_empty() {
                     release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
@@ -7523,6 +7716,157 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // paths uniformly via the explicit list rather than relying
             // on per-completion release.
             release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+        }
+    }
+
+    /// x0x #613 mitigation 2: bounded single-shot retry for a stranded
+    /// local publish (`attempted > 0, succeeded == 0`).
+    ///
+    /// Runs detached from [`publish_local_with_fanout`](Self::publish_local_with_fanout)
+    /// after [`STRANDED_PUBLISH_RETRY_DELAY`] (two full per-peer budgets).
+    /// Re-reads the CURRENT eager set (mesh membership may have changed
+    /// during the delay), re-checks the cache, and replays the identical
+    /// serialized EAGER message through the same admission → claim →
+    /// bounded-send pipeline as a fresh publish, Critical FIFO gate
+    /// semantics included (X0X-0074d). Terminal outcomes: ≥1 delivery →
+    /// `stranded_publishes_recovered_by_retry`; zero deliveries →
+    /// `stranded_publish_retry_failed`. The message is never retried again.
+    async fn retry_stranded_publish(
+        ctx: &StrandedRetryContext<T>,
+        topic: TopicId,
+        msg_id: MessageIdType,
+        bytes: Bytes,
+    ) {
+        // Re-validate under the topic lock: the cached message must still
+        // be present, and the eager set is re-read at retry time.
+        let eager_peers: Vec<PeerId> = {
+            let topics_guard = ctx.topics.write_topic(&topic).await;
+            let Some(state) = topics_guard.get(&topic) else {
+                return;
+            };
+            if !state.has_message(&msg_id) {
+                debug!(
+                    msg_id = ?msg_id,
+                    "stranded publish retry skipped: message no longer cached"
+                );
+                return;
+            }
+            state.eager_peers.iter().copied().collect()
+        };
+
+        if eager_peers.is_empty() {
+            // The mesh emptied during the delay (e.g. every peer evicted
+            // as not-connected). Terminal: no delivery path, no third
+            // attempt.
+            debug!(msg_id = ?msg_id, "stranded publish retry: eager set empty");
+            ctx.stage_stats.record_stranded_publish_retry_failed();
+            return;
+        }
+
+        let (attempts, permits, bulk_admitted) = {
+            let now = Instant::now();
+            let mut topics_guard = ctx.topics.write_topic(&topic).await;
+            let Some(state) = topics_guard.get_mut(&topic) else {
+                return;
+            };
+            let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
+                &ctx.send_path,
+                state,
+                &topic,
+                eager_peers,
+                "EAGER",
+                now,
+            );
+            if admitted.is_empty() {
+                release_bulk_admissions_free(&ctx.send_path.admission, &bulk_admitted);
+                ctx.stage_stats.record_stranded_publish_retry_failed();
+                return;
+            }
+            let claim_context = SendClaimContext {
+                stage_stats: ctx.stage_stats.as_ref(),
+                outbound_budgets: &ctx.outbound_budgets,
+                send_path: &ctx.send_path,
+                topic,
+                op: "EAGER",
+                send_class: OutboundSendClass::for_op("EAGER"),
+                priority: ctx.send_path.admission.registry().priority_for(&topic),
+            };
+            let (attempts, permits, _skips) =
+                Self::claim_topic_send_attempts_for_state(&claim_context, state, admitted, now);
+            (attempts, permits, bulk_admitted)
+        };
+        let mut claims = SendAttemptClaims::new(
+            topic,
+            attempts,
+            permits,
+            Arc::clone(&ctx.topics),
+            Arc::clone(&ctx.stage_stats),
+            ctx.send_path.clone(),
+        );
+
+        if claims.is_empty() {
+            release_bulk_admissions_free(&ctx.send_path.admission, &bulk_admitted);
+            ctx.stage_stats.record_stranded_publish_retry_failed();
+            return;
+        }
+
+        // x0x #380: outbound demand metering — instrumentation only.
+        ctx.stage_stats
+            .record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
+        let mut send_tasks = SendTaskSet::with_capacity("EAGER", claims.attempts().len());
+        let attempts = claims.attempts().to_vec();
+        let permits = claims.take_permits();
+        for (attempt, permit) in attempts.into_iter().zip(permits) {
+            let transport = Arc::clone(&ctx.transport);
+            let bytes = bytes.clone();
+            let stage_stats = Arc::clone(&ctx.stage_stats);
+            let rtt_tracker = Arc::clone(&ctx.send_path.rtt_tracker);
+            let handle = tokio::spawn(async move {
+                let mut permit = permit;
+                // X0X-0074d: Critical sends wait FIFO for the peer's
+                // single in-flight slot here, inside the detached task —
+                // no-op for Normal/Bulk.
+                let gate_wait_timeout =
+                    rtt_tracker.adaptive_timeout(&attempt.peer, PER_PEER_REPUBLISH_TIMEOUT);
+                if !permit.engage_critical_gate(gate_wait_timeout).await {
+                    stage_stats.record_per_peer_timeout();
+                    return Ok(PeerSendOutcome::TimedOut);
+                }
+                Self::send_to_peer_with_timeout(
+                    transport,
+                    stage_stats,
+                    rtt_tracker,
+                    attempt.peer,
+                    GossipStreamType::PubSub,
+                    bytes,
+                    "EAGER",
+                )
+                .await
+            });
+            send_tasks.push(attempt, handle);
+        }
+        let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
+        let succeeded = sent.len();
+        claims.record_results(sent, timed_out, not_connected).await;
+        // X0X-0074: release every Bulk admission reserved above, exactly
+        // once (mirrors the IHAVE flush's release discipline).
+        release_bulk_admissions_free(&ctx.send_path.admission, &bulk_admitted);
+
+        if succeeded > 0 {
+            info!(
+                topic = %LogTopicId::from(topic),
+                msg_id = ?msg_id,
+                succeeded,
+                "stranded publish recovered by bounded retry"
+            );
+            ctx.stage_stats.record_stranded_publish_recovered_by_retry();
+        } else {
+            warn!(
+                topic = %LogTopicId::from(topic),
+                msg_id = ?msg_id,
+                "stranded publish retry failed — terminal (no further retries; anti-entropy remains)"
+            );
+            ctx.stage_stats.record_stranded_publish_retry_failed();
         }
     }
 
@@ -9320,6 +9664,378 @@ mod tests {
         assert_eq!(
             stats.zero_succeeded_publishes, 1,
             "attempted>0,succeeded=0 must increment the black-hole counter"
+        );
+    }
+
+    use std::sync::atomic::AtomicBool;
+
+    /// Transport whose `send_to_peer` fails while `failing` is set and
+    /// records every successful send (peer, stream type, full wire bytes)
+    /// once flipped to succeeding. A failure is a live-connection error
+    /// (no #380 eviction, sub-threshold cooling) and a success is instant —
+    /// the x0x #613 stranded-publish shape: a transient fan-out outage
+    /// followed by a healthy pull path, without multi-second timeouts.
+    struct ToggleTransport {
+        local_peer: PeerId,
+        failing: Arc<AtomicBool>,
+        connected: Mutex<Vec<PeerId>>,
+        sent: Mutex<Vec<(PeerId, GossipStreamType, Vec<u8>)>>,
+        attempts: AtomicUsize,
+    }
+
+    impl ToggleTransport {
+        fn new(local_peer: PeerId) -> Arc<Self> {
+            Arc::new(Self {
+                local_peer,
+                failing: Arc::new(AtomicBool::new(true)),
+                connected: Mutex::new(Vec::new()),
+                sent: Mutex::new(Vec::new()),
+                attempts: AtomicUsize::new(0),
+            })
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.failing.store(failing, Ordering::SeqCst);
+        }
+
+        fn report_connected(&self, peers: Vec<PeerId>) {
+            *self.connected.lock().expect("connected lock") = peers;
+        }
+
+        fn sent_records(&self) -> Vec<(PeerId, GossipStreamType, Vec<u8>)> {
+            self.sent.lock().expect("sent lock").clone()
+        }
+
+        fn attempt_count(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for ToggleTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(self.local_peer)
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            peer: PeerId,
+            _stream_type: GossipStreamType,
+            _data: Bytes,
+        ) -> Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.failing.load(Ordering::SeqCst) {
+                Err(anyhow!("send failed: connection reset by peer"))
+            } else {
+                self.sent
+                    .lock()
+                    .expect("sent lock")
+                    .push((peer, _stream_type, _data.to_vec()));
+                Ok(())
+            }
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+            Err(anyhow!("toggle test transport does not receive"))
+        }
+
+        async fn connected_peer_ids(&self) -> Vec<PeerId> {
+            self.connected.lock().expect("connected lock").clone()
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.local_peer
+        }
+    }
+
+    /// Decode a captured wire send into its [`GossipMessage`].
+    fn decode_gossip_message(data: &[u8]) -> Option<GossipMessage> {
+        postcard::from_bytes(data).ok()
+    }
+
+    /// The message ids advertised by a captured IHAVE wire send.
+    fn ihave_advertised_ids(data: &[u8]) -> Vec<MessageIdType> {
+        decode_gossip_message(data)
+            .filter(|m| m.header.kind == MessageKind::IHave)
+            .and_then(|m| m.payload)
+            .and_then(|payload| postcard::from_bytes(&payload).ok())
+            .unwrap_or_default()
+    }
+
+    /// x0x #613 (a): an all-eager topic whose every EAGER send fails must
+    /// still return `Ok`, count the black-hole, queue a self-IHAVE to the
+    /// attempted peers, have the real 100 ms flusher deliver that IHAVE
+    /// once the transport heals, and answer an IWANT from the attempted
+    /// peer out of the cache.
+    #[tokio::test]
+    async fn stranded_publish_self_ihave_reaches_attempted_peers_and_iwant_serves_cache() {
+        let peer_id = test_peer_id(1);
+        let transport = ToggleTransport::new(peer_id);
+        let eager = test_peer_id(2);
+        transport.report_connected(vec![peer_id, eager]);
+        // Background tasks ON: the real IHAVE flusher drives the delivery.
+        let pubsub = PlumtreePubSub::new(peer_id, Arc::clone(&transport), test_signing_key());
+        let topic = TopicId::new([0x61; 32]);
+        pubsub.initialize_topic_peers(topic, vec![eager]).await;
+
+        // All-eager topic: no lazy members, so the regular flush path
+        // alone would advertise nothing.
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert!(state.eager_peers.contains(&eager));
+            assert!(state.lazy_peers.is_empty());
+        }
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"x0x-613"))
+            .await
+            .expect("publish returns Ok even when every send fails");
+        assert_eq!(counts.attempted, 1, "eager peer was attempted");
+        assert_eq!(counts.succeeded, 0, "but nothing was delivered");
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(stats.zero_succeeded_publishes, 1);
+        assert_eq!(stats.stranded_publish_ihave_queued, 1);
+
+        let msg_id = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            state
+                .message_cache
+                .peek_lru_message_id()
+                .expect("message is cached")
+        };
+
+        // The stranded self-IHAVE targets exactly the attempted peers.
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            let targets = state
+                .stranded_ihave
+                .iter()
+                .find(|(id, _)| *id == msg_id)
+                .map(|(_, peers)| peers.clone())
+                .unwrap_or_default();
+            assert_eq!(targets, vec![eager], "IHAVE must target the attempted peer");
+        }
+
+        // Heal the transport; the real flusher must now advertise the
+        // stranded id to the attempted (eager) peer.
+        transport.set_failing(false);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let delivered = transport.sent_records().iter().any(|(peer, _, data)| {
+                *peer == eager && ihave_advertised_ids(data).contains(&msg_id)
+            });
+            if delivered {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the 100 ms IHAVE flusher must advertise the stranded id to the attempted peer"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The receivers' IWANT is answered from the cache with an EAGER
+        // copy of the stranded payload.
+        pubsub
+            .handle_iwant(eager, topic, vec![msg_id])
+            .await
+            .expect("IWANT served");
+        let served = transport.sent_records().iter().any(|(peer, _, data)| {
+            *peer == eager
+                && decode_gossip_message(data).is_some_and(|m| {
+                    m.header.kind == MessageKind::Eager
+                        && m.payload.as_deref() == Some(&b"x0x-613"[..])
+                })
+        });
+        assert!(
+            served,
+            "IWANT from the attempted peer must be answered from cache"
+        );
+    }
+
+    /// x0x #613 (b): first fan-out zero-success, transport heals, the
+    /// bounded retry delivers — recovered counter increments and each
+    /// peer receives exactly one copy (no duplicate delivery).
+    #[tokio::test(start_paused = true)]
+    async fn stranded_publish_retry_recovers_message_exactly_once() {
+        let peer_id = test_peer_id(1);
+        let transport = ToggleTransport::new(peer_id);
+        let (a, b) = (test_peer_id(2), test_peer_id(3));
+        transport.report_connected(vec![peer_id, a, b]);
+        // Background tasks OFF: isolate the retry path from the flusher.
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x62; 32]);
+        pubsub.initialize_topic_peers(topic, vec![a, b]).await;
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"retry-once"))
+            .await
+            .expect("publish returns Ok");
+        assert_eq!((counts.attempted, counts.succeeded), (2, 0));
+
+        // Heal before the retry delay elapses (paused clock: the poll
+        // sleep below advances straight past the delay).
+        transport.set_failing(false);
+        let deadline =
+            tokio::time::Instant::now() + STRANDED_PUBLISH_RETRY_DELAY + Duration::from_secs(2);
+        loop {
+            if pubsub.stage_stats().stranded_publishes_recovered_by_retry == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "bounded retry must fire after STRANDED_PUBLISH_RETRY_DELAY and succeed"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let stats = pubsub.stage_stats();
+        assert_eq!(stats.stranded_publishes_recovered_by_retry, 1);
+        assert_eq!(stats.stranded_publish_retry_failed, 0);
+
+        // Exactly-once delivery: each attempted eager peer holds exactly
+        // one EAGER copy of the payload after the retry.
+        let records = transport.sent_records();
+        for peer in [a, b] {
+            let deliveries = records
+                .iter()
+                .filter(|(p, _, data)| {
+                    *p == peer
+                        && decode_gossip_message(data).is_some_and(|m| {
+                            m.header.kind == MessageKind::Eager
+                                && m.payload.as_deref() == Some(&b"retry-once"[..])
+                        })
+                })
+                .count();
+            assert_eq!(
+                deliveries, 1,
+                "peer must receive exactly one copy after the retry"
+            );
+        }
+    }
+
+    /// x0x #613 (c): `attempted == 0` (no eligible peers) is NOT a
+    /// stranded publish — no self-IHAVE queueing, no retry. The legacy
+    /// pending_ihave batch and zero_fanout counter are unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn zero_attempted_publish_never_queues_stranded_recovery() {
+        let peer_id = test_peer_id(1);
+        let transport = ToggleTransport::new(peer_id);
+        transport.report_connected(vec![peer_id]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x63; 32]);
+
+        // Fresh topic, no eager peers at all → attempted == 0.
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"no-peers"))
+            .await
+            .expect("publish returns Ok");
+        assert_eq!(counts.attempted, 0);
+        assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 1);
+
+        // Advance well past the retry delay: nothing may fire.
+        tokio::time::sleep(STRANDED_PUBLISH_RETRY_DELAY + Duration::from_secs(1)).await;
+        let stats = pubsub.stage_stats();
+        assert_eq!(stats.stranded_publish_ihave_queued, 0);
+        assert_eq!(stats.stranded_publishes_recovered_by_retry, 0);
+        assert_eq!(stats.stranded_publish_retry_failed, 0);
+        assert_eq!(transport.attempt_count(), 0, "no send was ever attempted");
+
+        let msg_id = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            let id = state
+                .message_cache
+                .peek_lru_message_id()
+                .expect("message is cached");
+            assert!(
+                state.stranded_ihave.is_empty(),
+                "attempted == 0 must not queue a stranded self-IHAVE"
+            );
+            assert!(
+                state.pending_ihave.contains(&id),
+                "legacy pending_ihave batching is unchanged"
+            );
+            id
+        };
+        let _ = msg_id;
+    }
+
+    /// x0x #613 (d): the retry fires once, fails, records
+    /// `stranded_publish_retry_failed`, and never fires again.
+    #[tokio::test(start_paused = true)]
+    async fn stranded_publish_retry_failure_is_terminal() {
+        let peer_id = test_peer_id(1);
+        let transport = ToggleTransport::new(peer_id);
+        let eager = test_peer_id(2);
+        transport.report_connected(vec![peer_id, eager]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x64; 32]);
+        pubsub.initialize_topic_peers(topic, vec![eager]).await;
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"terminal"))
+            .await
+            .expect("publish returns Ok");
+        assert_eq!((counts.attempted, counts.succeeded), (1, 0));
+
+        // Transport stays broken: the retry must fire and fail once.
+        let deadline =
+            tokio::time::Instant::now() + STRANDED_PUBLISH_RETRY_DELAY + Duration::from_secs(2);
+        loop {
+            if pubsub.stage_stats().stranded_publish_retry_failed == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "bounded retry must fire once after the delay"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            pubsub.stage_stats().stranded_publishes_recovered_by_retry,
+            0
+        );
+
+        // One initial fan-out send + one retry send. Nothing more.
+        assert_eq!(transport.attempt_count(), 2);
+
+        // No third attempt, ever.
+        tokio::time::sleep(STRANDED_PUBLISH_RETRY_DELAY.saturating_mul(3)).await;
+        assert_eq!(
+            transport.attempt_count(),
+            2,
+            "retry is single-shot: no third attempt"
         );
     }
 

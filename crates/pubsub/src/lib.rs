@@ -717,6 +717,10 @@ pub struct PubSubStageStats {
     verify: StageTimingStats,
     dedupe_lock_acquire: StageTimingStats,
     dedupe_check: StageTimingStats,
+    /// x0x #674: inbound EAGER frames dropped as msg-id duplicates BEFORE
+    /// the ML-DSA-65 verify. These frames still run the duplicate-EAGER
+    /// PRUNE handling but never reach `verify_message_signature`.
+    eager_duplicate_dropped_pre_verify: AtomicU64,
     eager_fanout: StageTimingStats,
     republish: StageTimingStats,
     /// Per-peer EAGER/IHAVE sends that hit `PER_PEER_REPUBLISH_TIMEOUT`.
@@ -981,6 +985,10 @@ pub struct PubSubStageStatsSnapshot {
     pub dedupe_lock_acquire: StageTimingStatsSnapshot,
     /// Time spent under the per-topic lock for dedupe/cache/bookkeeping.
     pub dedupe_check: StageTimingStatsSnapshot,
+    /// x0x #674: cumulative inbound EAGER frames dropped as msg-id
+    /// duplicates before the ML-DSA-65 verify (the cache is the verify
+    /// memo). Distinct from `verify.count`, which they never touch.
+    pub eager_duplicate_dropped_pre_verify: u64,
     /// Time spent delivering accepted messages to local PlumTree subscribers.
     pub eager_fanout: StageTimingStatsSnapshot,
     /// Time spent re-publishing/forwarding messages to remote peers.
@@ -2283,6 +2291,9 @@ impl PubSubStageStats {
             verify: self.verify.snapshot(),
             dedupe_lock_acquire: self.dedupe_lock_acquire.snapshot(),
             dedupe_check: self.dedupe_check.snapshot(),
+            eager_duplicate_dropped_pre_verify: self
+                .eager_duplicate_dropped_pre_verify
+                .load(Ordering::Relaxed),
             eager_fanout: self.eager_fanout.snapshot(),
             republish: self.republish.snapshot(),
             republish_per_peer_timeout: self.republish_per_peer_timeout.load(Ordering::Relaxed),
@@ -2507,6 +2518,11 @@ impl PubSubStageStats {
 
     fn record_prunes(&self, count: usize) {
         self.message_kinds.record_prunes(count);
+    }
+
+    fn record_eager_duplicate_dropped_pre_verify(&self) {
+        self.eager_duplicate_dropped_pre_verify
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_grafts(&self, count: usize) {
@@ -6772,10 +6788,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     /// Handle incoming EAGER gossip message.
     ///
-    /// Verifies the signature, dedupes by msg-id, runs payload-replay
-    /// detection, then applies the topic's storm-control validator (if
-    /// registered) before delivering to local subscribers and forwarding
-    /// through the eager mesh.
+    /// Dedupes by msg-id BEFORE the ML-DSA-65 signature verify (x0x #674:
+    /// the bounded cache is the verify memo), verifies the signature of
+    /// first arrivals, runs payload-replay detection, then applies the
+    /// topic's storm-control validator (if registered) before delivering
+    /// to local subscribers and forwarding through the eager mesh.
     pub async fn handle_eager(
         &self,
         from: PeerId,
@@ -6802,6 +6819,75 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         );
         let msg_id = message.header.msg_id;
 
+        // x0x #674 (Design B): dedup BEFORE the ML-DSA-65 verify. The
+        // bounded, TTL'd msg_id cache is the verify memo — a cached msg_id
+        // was verified when the message was first admitted, so a duplicate
+        // arrival (including an IWANT repair response, which returns as an
+        // EAGER frame carrying the original msg_id) is dropped without
+        // paying the verify. On a bootstrap that is ~28% of inbound EAGER.
+        //
+        // Scope: unregistered topics only. On a legacy-compat registered
+        // topic the `migration.ingress` authorization gate must keep
+        // seeing EVERY arrival — including duplicates (a v2-required
+        // adjacency sending a legacy frame is rejected even when its
+        // msg_id is cached) — so those topics keep the original
+        // verify-first ordering below. x0x registers no topics, so all
+        // production traffic takes the fast path.
+        //
+        // Safety of deciding on an unverified msg_id claim:
+        // - A cache entry only exists for a message that previously passed
+        //   `verify_message_signature`, and msg_id commits to the
+        //   publisher's peer_id and payload (`calculate_msg_id`), so a
+        //   forged frame can only ever *hit* an existing entry — it can
+        //   never seed an entry, and it cannot suppress a genuine message
+        //   (the genuine copy is already cached and delivered).
+        // - Every effect below is keyed on `from`, which the transport
+        //   has already authenticated, and only penalises that sender:
+        //   `prune_peer(from)` demotes the peer that claimed a msg_id we
+        //   already hold. An attacker cannot use this to prune a
+        //   *legitimate* eager peer — the prune lands on whoever sent the
+        //   frame. A legitimate peer relaying a genuine duplicate hits
+        //   exactly the prune it hits today on the verified path (a
+        //   duplicate's outer signature is the publisher's, not the
+        //   relay's, so verification never identified the relay anyway).
+        // - Peer-benefiting bookkeeping is withheld from the unverified
+        //   frame: `record_inbound_peer_activity_for_state` (recency
+        //   score, mesh-side cooling clear, send-side suppression clear)
+        //   still runs only for verified receipts, so a peer cannot farm
+        //   recency or clear its own cooling with cheap forged frames.
+        // - A late duplicate arriving after the cache TTL evicted the
+        //   entry falls through to the normal verify-and-admit path.
+        if !self.transport.migration.registered(topic) {
+            let lock_started = Instant::now();
+            let mut topics = self.topics.write_topic(&topic).await;
+            self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
+            let dedupe_started = Instant::now();
+            // Check for duplicate
+            if let Some(state) = topics
+                .get_mut(&topic)
+                .filter(|state| state.has_message(&msg_id))
+            {
+                state.touch();
+                // PRUNE: move sender from eager to lazy
+                if state.prune_peer(from) {
+                    self.stage_stats.record_prune();
+                    // X0X-0071 P3b: a prune bumps the (topic, peer) delivery
+                    // deficit — sticky across a later re-graft.
+                    self.peer_scoring.record_mesh_pruned(topic, from);
+                }
+                self.stage_stats.record_eager_duplicate_dropped_pre_verify();
+                self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+                return Ok(());
+            }
+            // The pre-verify cache miss is a sub-microsecond lookup and is
+            // left unrecorded: `DedupeCheck` continues to measure exactly
+            // the under-lock bookkeeping below, one observation per
+            // handled message.
+            // Release the topic lock before the ML-DSA-65 verify — the
+            // per-topic critical section stays short (issue #27 contention
+            // instrumentation) and the verify is pure CPU with no await.
+        }
+
         if !self.verify_message_signature(&message) {
             warn!(peer_id = %LogPeerId::from(from), msg_id = ?msg_id, "Invalid signature, dropping");
             // X0X-0071 P4: a bad signature is the canonical invalid-message
@@ -6815,7 +6901,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
-        // Check for duplicate
+        // Re-check under the lock: a concurrent arrival of the same msg_id
+        // may have been admitted while this frame was verifying. This is
+        // the original duplicate branch, now reachable only post-verify —
+        // the frame is authenticated here, so the verified-activity
+        // bookkeeping applies alongside the PRUNE.
         if let Some(state) = topics
             .get_mut(&topic)
             .filter(|state| state.has_message(&msg_id))
@@ -9538,6 +9628,181 @@ mod tests {
         assert_eq!(stats.prune, 1);
         assert_eq!(stats.graft, 2);
         assert_eq!(stats.decode_failed, 0);
+    }
+
+    /// x0x #674 (Design B): the bounded msg-id cache is the verify memo.
+    /// A duplicate EAGER — including an IWANT repair response, which
+    /// returns as an EAGER frame carrying the original msg_id — must be
+    /// dropped by the dedup check BEFORE the ML-DSA-65 verify. The first
+    /// arrival verifies exactly once; the second arrival never reaches
+    /// `verify_message_signature`, still counts as inbound EAGER, delivers
+    /// to subscribers exactly once, and still runs the duplicate-EAGER
+    /// PRUNE against its sender.
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_eager_is_dropped_before_verify() {
+        let peer_id = test_peer_id(1);
+        let first_peer = test_peer_id(2);
+        let dup_peer = test_peer_id(3);
+        let transport = RecordingTransport::new(peer_id);
+        let sender_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([31u8; 32]);
+        let mut rx = pubsub.subscribe_ready(topic).await;
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(first_peer);
+            state.eager_peers.insert(dup_peer);
+        }
+
+        let payload = Bytes::from_static(b"dedup-before-verify");
+        let msg = signed_eager_message(&sender_key, topic, [44u8; 32], payload.clone());
+        let bytes: Bytes = postcard::to_stdvec(&msg)
+            .expect("eager message serializes")
+            .into();
+
+        pubsub
+            .handle_message(first_peer, bytes.clone())
+            .await
+            .expect("first eager admitted");
+        let first = pubsub.stage_stats();
+        assert_eq!(first.verify.count, 1, "the first arrival pays the verify");
+        assert_eq!(
+            first.eager_duplicate_dropped_pre_verify, 0,
+            "a novel msg_id is not a duplicate"
+        );
+
+        pubsub
+            .handle_message(dup_peer, bytes)
+            .await
+            .expect("duplicate eager dropped");
+        let second = pubsub.stage_stats();
+        assert_eq!(
+            second.verify.count, 1,
+            "the duplicate is dropped by the msg-id cache without any verify"
+        );
+        assert_eq!(
+            second.eager_duplicate_dropped_pre_verify, 1,
+            "the duplicate is counted where it is dropped"
+        );
+        assert_eq!(
+            second.message_kinds.eager, 2,
+            "both arrivals still count as inbound EAGER"
+        );
+
+        // Exactly one subscriber delivery — from the first, verified copy.
+        let (delivered_from, delivered_payload) = rx
+            .try_recv()
+            .expect("the first copy is delivered to the subscriber");
+        assert_eq!(delivered_from, first_peer);
+        assert_eq!(delivered_payload, payload);
+        assert!(
+            rx.try_recv().is_err(),
+            "the duplicate must not be re-delivered"
+        );
+
+        // Existing duplicate-EAGER handling is preserved: the duplicate
+        // sender is PRUNED to lazy; the first sender stays eager.
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state exists");
+            assert!(
+                state.eager_peers.contains(&first_peer),
+                "the first sender stays eager"
+            );
+            assert!(
+                !state.eager_peers.contains(&dup_peer),
+                "the duplicate sender is pruned from eager"
+            );
+            assert!(
+                state.lazy_peers.contains(&dup_peer),
+                "the duplicate sender is demoted to lazy"
+            );
+        }
+    }
+
+    /// x0x #674 safety: an UNVERIFIED duplicate EAGER — a forged frame
+    /// claiming a msg_id already in the cache — can only penalise its own
+    /// transport-authenticated sender. It must never prune a different
+    /// legitimate eager peer: the legitimate peer delivered the genuine
+    /// first copy and stays eager, while the forger is demoted to lazy
+    /// and its frame is never verified.
+    #[tokio::test(start_paused = true)]
+    async fn forged_duplicate_eager_prunes_only_its_sender() {
+        let peer_id = test_peer_id(1);
+        let legit_peer = test_peer_id(2);
+        let attacker = test_peer_id(3);
+        let transport = RecordingTransport::new(peer_id);
+        let sender_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([32u8; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(legit_peer);
+            state.eager_peers.insert(attacker);
+        }
+
+        // The genuine first copy from the legitimate eager peer.
+        let payload = Bytes::from_static(b"genuine-first-copy");
+        let msg = signed_eager_message(&sender_key, topic, [45u8; 32], payload);
+        let bytes: Bytes = postcard::to_stdvec(&msg)
+            .expect("eager message serializes")
+            .into();
+        pubsub
+            .handle_message(legit_peer, bytes)
+            .await
+            .expect("genuine first copy admitted");
+        assert_eq!(pubsub.stage_stats().verify.count, 1);
+
+        // The forged duplicate: same msg_id, corrupted publisher
+        // signature — the frame cannot authenticate. If the dedup check
+        // ran after the verify this would be an Err (invalid signature);
+        // dropped pre-verify it is an Ok duplicate-drop that demotes only
+        // the sender.
+        let mut forged = msg;
+        forged.signature[0] ^= 1;
+        let forged_bytes: Bytes = postcard::to_stdvec(&forged)
+            .expect("forged eager serializes")
+            .into();
+        pubsub
+            .handle_message(attacker, forged_bytes)
+            .await
+            .expect("forged duplicate dropped as a duplicate, not an error");
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(
+            stats.verify.count, 1,
+            "the forged frame never reaches the verify"
+        );
+        assert_eq!(stats.eager_duplicate_dropped_pre_verify, 1);
+
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state exists");
+            assert!(
+                state.eager_peers.contains(&legit_peer),
+                "an unverified duplicate cannot prune a legitimate eager peer"
+            );
+            assert!(
+                !state.eager_peers.contains(&attacker),
+                "the forger itself is demoted from eager"
+            );
+            assert!(
+                state.lazy_peers.contains(&attacker),
+                "the forger is demoted to lazy"
+            );
+        }
     }
 
     #[tokio::test]
@@ -13075,10 +13340,12 @@ mod tests {
         let stats = pubsub.stage_stats();
         assert_eq!(stats.decode.count, 1);
         assert_eq!(stats.verify.count, 1);
-        // Issue #27: count is 2 — one for the dedupe path, one for the
+        // Issue #27: count is 3 — one for the pre-verify dedup fast path,
+        // one for the post-verify dedupe/cache re-acquire (x0x #674
+        // releases the lock across the ML-DSA verify), and one for the
         // send-claim path inside parallel_send_to_peers. Previously the
         // send-claim lock-wait was invisibly charged to Republish.
-        assert_eq!(stats.dedupe_lock_acquire.count, 2);
+        assert_eq!(stats.dedupe_lock_acquire.count, 3);
         assert_eq!(stats.dedupe_check.count, 1);
         assert_eq!(stats.eager_fanout.count, 1);
         assert_eq!(stats.republish.count, 1);
@@ -13152,8 +13419,9 @@ mod tests {
     /// `parallel_send_to_peers` → `claim_topic_send_attempts` was charged to
     /// the `Republish` stage instead of `DedupeLockAcquire`. This test
     /// verifies that after a single inbound EAGER message, the
-    /// `DedupeLockAcquire` count is 2 (dedupe + send-claim) and the
-    /// `Republish` time excludes the send-claim lock-wait.
+    /// `DedupeLockAcquire` count is 3 (pre-verify dedup + post-verify
+    /// dedupe/cache + send-claim) and the `Republish` time excludes the
+    /// send-claim lock-wait.
     #[tokio::test]
     async fn republish_excludes_send_claim_lock_wait() {
         let peer_id = test_peer_id(1);
@@ -13187,10 +13455,12 @@ mod tests {
 
         let stats = pubsub.stage_stats();
 
-        // DedupeLockAcquire fires twice: once for dedupe/cache, once for
-        // the send-claim inside parallel_send_to_peers.
+        // DedupeLockAcquire fires three times: the pre-verify dedup fast
+        // path, the post-verify dedupe/cache re-acquire (x0x #674: the
+        // lock is released across the ML-DSA verify), and the send-claim
+        // inside parallel_send_to_peers.
         assert_eq!(
-            stats.dedupe_lock_acquire.count, 2,
+            stats.dedupe_lock_acquire.count, 3,
             "dedupe_lock_acquire must include the send-claim lock-wait (issue #27)"
         );
 

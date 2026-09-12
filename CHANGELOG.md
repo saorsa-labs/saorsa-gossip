@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **PlumTree now dedupes inbound EAGER before the ML-DSA-65 verify
+  (x0x #674, Design B).** `handle_eager_admitted` consulted the bounded
+  msg-id cache four lines AFTER the signature verify, so every duplicate
+  EAGER arrival — including IWANT repair responses, which return as EAGER
+  frames carrying the original msg_id — paid a full ML-DSA-65 verify and
+  was then dropped. On a measured bootstrap, 28.4% of inbound EAGER
+  frames were such duplicates (~5.9% of daemon CPU). The cache is now
+  consulted first; a frame whose msg_id is already cached is dropped
+  without verifying, still runs the duplicate-EAGER PRUNE against its
+  (transport-authenticated) sender, and is counted by the new
+  `PubSubStageStatsSnapshot::eager_duplicate_dropped_pre_verify` counter.
+  No wire/format change. Safety: msg_id commits to the publisher's
+  peer_id and payload and a cache entry only exists for a
+  previously-verified message, so a forged frame can only hit an existing
+  entry and cannot suppress a genuine message; all duplicate-branch
+  effects key on the authenticated sender and only penalise it — an
+  unverified duplicate can never prune a different legitimate eager peer.
+  Peer-benefiting bookkeeping (recency score, mesh-cooling and
+  send-suppression clears via `record_inbound_peer_activity_for_state`)
+  still runs only for verified receipts, so forged duplicates cannot
+  farm recency or clear cooling. A late duplicate after cache TTL
+  eviction still falls through to the normal verify path. The topic lock
+  is now released across the verify (short critical section, issue #27)
+  and re-checked after it, so concurrent first deliveries of the same
+  msg_id keep today's post-verify duplicate handling.
+
+
 ## [0.5.77] - 2026-09-11
 
 ### Fixed

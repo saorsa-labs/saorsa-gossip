@@ -6,11 +6,11 @@ these pins to the current workspace version would invalidate those witnesses.
 
 Pubsub uses this fixture through a path-only dev dependency without a version.
 Cargo removes that dependency when normalizing the registry manifest, so the
-packaged graph contains only the current 0.5.77 internal dependencies. The
+packaged graph contains only the current 0.5.78 internal dependencies. The
 compatibility tests are repository tests; run them from this workspace:
 
 ```sh
-cargo test -p saorsa-gossip-pubsub@0.5.77 --lib compat::tests
+cargo test -p saorsa-gossip-pubsub@0.5.78 --lib compat::tests
 ```
 
 The fixture is not a release artifact. Exclude it along with workspace-hack

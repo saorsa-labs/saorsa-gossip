@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.78] - 2026-09-12
+
 ### Changed
 
 - **PlumTree now dedupes inbound EAGER before the ML-DSA-65 verify

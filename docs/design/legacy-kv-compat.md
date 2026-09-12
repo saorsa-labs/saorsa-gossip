@@ -210,7 +210,7 @@ pubsub/types/identity/transport 0.5.66. Pubsub uses it as a path-only dev
 dependency, omitted from the normalized registry package manifest.
 Tests invoke the real legacy decoder and real IHAVE/IWANT/AntiEntropy handlers.
 The resolved old membership dependency is 0.5.67; this is recorded, not attributed
-to the historical executable. Current workspace crates are 0.5.77. Published
+to the historical executable. Current workspace crates are 0.5.78. Published
 0.5.75 predates #48 and does not contain this compatibility facility.
 
 See [dependency provenance](fixtures/legacy-compat-dependencies.json) and
@@ -223,8 +223,8 @@ From a clean checkout, with the dependencies already cached locally:
 ```sh
 cp docs/design/fixtures/legacy-compat.Cargo.lock Cargo.lock
 cargo metadata --locked --offline --format-version 1 > /tmp/legacy-compat-metadata.json
-cargo test -p saorsa-gossip-pubsub@0.5.77 --all-features --locked --offline
-cargo test -p saorsa-gossip-transport@0.5.77 --all-features --lib --locked --offline
+cargo test -p saorsa-gossip-pubsub@0.5.78 --all-features --locked --offline
+cargo test -p saorsa-gossip-transport@0.5.78 --all-features --lib --locked --offline
 ```
 
 The lock and dependency provenance include the non-publishable legacy fixture,

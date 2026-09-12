@@ -410,6 +410,15 @@ pub enum ValidationAction {
     /// marked never-serveable — IWANT service and anti-entropy
     /// reconciliation will not retransmit it outward.
     Drop,
+    /// #59 (x0x #674 C2): deliver locally, cache and keep serveable,
+    /// WITHHOLD the eager re-publish, but still announce the msg_id via
+    /// IHAVE — to the lazy set as usual AND to every peer whose eager
+    /// send was withheld. A relayed message costs one IHAVE per withheld
+    /// peer instead of a full EAGER frame; a peer that missed the eager
+    /// tree pulls the cached payload on IWANT. Unlike `Drop` the cached
+    /// copy stays serveable; unlike `DeliverOnly` the msg-id is still
+    /// announced, so subscribers behind this node keep a pull path.
+    LazyForward,
 }
 
 /// Application-supplied per-topic validator. Called in `handle_eager`
@@ -436,6 +445,7 @@ pub struct OutboundKindMeterSnapshot {
 struct ValidatorMeters {
     dropped: AtomicU64,
     deliver_only: AtomicU64,
+    lazy_forward: AtomicU64,
     by_topic: Mutex<std::collections::HashMap<TopicId, ValidatorTopicMeter>>,
 }
 
@@ -443,6 +453,7 @@ struct ValidatorMeters {
 struct ValidatorTopicMeter {
     dropped: AtomicU64,
     deliver_only: AtomicU64,
+    lazy_forward: AtomicU64,
 }
 
 impl std::fmt::Debug for ValidatorMeters {
@@ -450,15 +461,17 @@ impl std::fmt::Debug for ValidatorMeters {
         f.debug_struct("ValidatorMeters")
             .field("dropped", &self.dropped.load(Ordering::Relaxed))
             .field("deliver_only", &self.deliver_only.load(Ordering::Relaxed))
+            .field("lazy_forward", &self.lazy_forward.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
 
 impl ValidatorMeters {
     fn record(&self, topic: TopicId, action: ValidationAction) {
-        let (dropped, deliver_only) = match action {
-            ValidationAction::Drop => (true, false),
-            ValidationAction::DeliverOnly => (false, true),
+        let (dropped, deliver_only, lazy_forward) = match action {
+            ValidationAction::Drop => (true, false, false),
+            ValidationAction::DeliverOnly => (false, true, false),
+            ValidationAction::LazyForward => (false, false, true),
             ValidationAction::ForwardAndDeliver => return,
         };
         let mut guard = match self.by_topic.lock() {
@@ -474,6 +487,10 @@ impl ValidatorMeters {
             meter.deliver_only.fetch_add(1, Ordering::Relaxed);
             self.deliver_only.fetch_add(1, Ordering::Relaxed);
         }
+        if lazy_forward {
+            meter.lazy_forward.fetch_add(1, Ordering::Relaxed);
+            self.lazy_forward.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn snapshot(&self) -> ValidatorMeterSnapshot {
@@ -484,6 +501,7 @@ impl ValidatorMeters {
         ValidatorMeterSnapshot {
             dropped: self.dropped.load(Ordering::Relaxed),
             deliver_only: self.deliver_only.load(Ordering::Relaxed),
+            lazy_forward: self.lazy_forward.load(Ordering::Relaxed),
             by_topic: guard
                 .iter()
                 .map(|(topic, meter)| {
@@ -492,6 +510,7 @@ impl ValidatorMeters {
                         ValidatorTopicMeterSnapshot {
                             dropped: meter.dropped.load(Ordering::Relaxed),
                             deliver_only: meter.deliver_only.load(Ordering::Relaxed),
+                            lazy_forward: meter.lazy_forward.load(Ordering::Relaxed),
                         },
                     )
                 })
@@ -508,6 +527,9 @@ pub struct ValidatorMeterSnapshot {
     pub dropped: u64,
     /// Messages delivered locally but withheld from forwarding.
     pub deliver_only: u64,
+    /// #59: messages delivered locally, withheld from eager re-publish,
+    /// and announced via IHAVE instead (`ValidationAction::LazyForward`).
+    pub lazy_forward: u64,
     /// Per-topic breakdown (topic name → counters).
     pub by_topic: std::collections::BTreeMap<String, ValidatorTopicMeterSnapshot>,
 }
@@ -519,6 +541,8 @@ pub struct ValidatorTopicMeterSnapshot {
     pub dropped: u64,
     /// Messages delivered locally but withheld from forwarding on this topic.
     pub deliver_only: u64,
+    /// #59: `ValidationAction::LazyForward` verdicts on this topic.
+    pub lazy_forward: u64,
 }
 
 /// x0x #380: JSON-friendly per-topic outbound meter.
@@ -771,6 +795,10 @@ pub struct PubSubStageStats {
     /// stranded_publishes_recovered_by_retry +
     /// stranded_publish_retry_failed`.
     stranded_publish_cache_miss: AtomicU64,
+    /// #59: cumulative eager peers whose EAGER re-publish a
+    /// `ValidationAction::LazyForward` verdict withheld — the IHAVE
+    /// announce fan-out that replaces those eager sends.
+    lazy_ihave_withheld_peers: AtomicU64,
     /// Topic-set evictions after a definitive transport "peer not connected"
     /// failure (x0x #380). Unlike timeouts these feed no cooling — the peer
     /// simply leaves the topic's eager/lazy sets until the transport reports
@@ -1032,6 +1060,10 @@ pub struct PubSubStageStatsSnapshot {
     /// longer cached. See the counter-sum invariant on
     /// [`PubSubStageStats`].
     pub stranded_publish_cache_miss: u64,
+    /// #59: cumulative eager peers whose EAGER re-publish a
+    /// `ValidationAction::LazyForward` verdict withheld, advertised to
+    /// via IHAVE instead (the announce fan-out).
+    pub lazy_ihave_withheld_peers: u64,
     /// Topic-set evictions after a definitive transport "peer not connected"
     /// failure (x0x #380) — eviction, not cooling; see
     /// [`PubSubStageStats`] for the interpretation.
@@ -2315,6 +2347,7 @@ impl PubSubStageStats {
                 .stranded_publishes_recovered_by_pull
                 .load(Ordering::Relaxed),
             stranded_publish_cache_miss: self.stranded_publish_cache_miss.load(Ordering::Relaxed),
+            lazy_ihave_withheld_peers: self.lazy_ihave_withheld_peers.load(Ordering::Relaxed),
             suppressed_peers: self.suppressed_peer_snapshots(),
             suppressed_peers_by_topic: BTreeMap::new(),
             suppression_cleanup_interval_ms: self
@@ -2424,6 +2457,13 @@ impl PubSubStageStats {
     fn record_stranded_publish_ihave_queued(&self) {
         self.stranded_publish_ihave_queued
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// #59: count the eager peers a `LazyForward` verdict withheld (and
+    /// queued as direct IHAVE announce targets).
+    fn record_lazy_ihave_withheld_peers(&self, peers: usize) {
+        self.lazy_ihave_withheld_peers
+            .fetch_add(peers as u64, Ordering::Relaxed);
     }
 
     fn record_stranded_publish_recovered_by_retry(&self) {
@@ -3233,6 +3273,20 @@ struct StrandedIhaveEntry {
     served: Vec<PeerId>,
 }
 
+/// One LazyForward verdict's withheld-eager announce bookkeeping (#59):
+/// the peers whose EAGER re-publish the verdict withheld become direct
+/// IHAVE targets at the next flush, restoring the pull path the withheld
+/// fan-out removed.
+struct LazyWithheldEntry {
+    msg_id: MessageIdType,
+    /// Eager peers whose re-publish was withheld by the verdict — the
+    /// direct IHAVE announce targets.
+    targets: Vec<PeerId>,
+    /// Targets that already pulled this id via IWANT before the flush
+    /// consumed the entry — excluded from re-advertising.
+    served: Vec<PeerId>,
+}
+
 struct TopicState {
     /// Spanning tree peers (forward EAGER)
     eager_peers: HashSet<PeerId>,
@@ -3248,6 +3302,16 @@ struct TopicState {
     /// owns the message's stranded lifecycle; the list is capped at
     /// `MAX_IHAVE_BATCH_SIZE` entries regardless.
     stranded_ihave: Vec<StrandedIhaveEntry>,
+    /// LazyForward withheld-eager announce state (#59): msg_ids whose
+    /// eager re-publish a `ValidationAction::LazyForward` verdict
+    /// withheld. The flush merges these targets into the IHAVE fan-out
+    /// and consumes the entries (lossy, same as `pending_ihave` — a
+    /// missed advertisement is re-covered by the peer's own gossip and
+    /// finally by anti-entropy). Deliberately separate from
+    /// `stranded_ihave`: that path's bounded retry re-sends cached EAGER
+    /// wire bytes, which is exactly what a LazyForward verdict withholds.
+    /// Capped at `MAX_IHAVE_BATCH_SIZE` entries.
+    lazy_withheld: Vec<LazyWithheldEntry>,
     /// Non-tree peers (send IHAVE only)
     lazy_peers: HashSet<PeerId>,
     /// Message cache: msg_id -> cached message
@@ -3309,6 +3373,7 @@ impl TopicState {
             ),
             pending_ihave: Vec::new(),
             stranded_ihave: Vec::new(),
+            lazy_withheld: Vec::new(),
             outstanding_iwants: HashMap::new(),
             peer_scores: HashMap::new(),
             subscribers: Vec::new(),
@@ -3463,6 +3528,69 @@ impl TopicState {
                 }
             }
         }
+        targets
+    }
+
+    /// Queue the withheld eager peers of a LazyForward verdict (#59) as
+    /// direct IHAVE announce targets for `msg_id`. Same bounding policy
+    /// as `queue_stranded_ihave`: at most `MAX_IHAVE_BATCH_SIZE`
+    /// outstanding entries, oldest evicted under sustained pressure.
+    fn queue_lazy_withheld(&mut self, msg_id: MessageIdType, peers: &[PeerId]) {
+        if peers.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.lazy_withheld.iter_mut().find(|e| e.msg_id == msg_id) {
+            for peer in peers.iter().copied() {
+                if !entry.targets.contains(&peer) {
+                    entry.targets.push(peer);
+                }
+            }
+            return;
+        }
+        if self.lazy_withheld.len() >= MAX_IHAVE_BATCH_SIZE {
+            let overflow = self.lazy_withheld.len() - MAX_IHAVE_BATCH_SIZE + 1;
+            let _ = self.lazy_withheld.drain(..overflow);
+        }
+        self.lazy_withheld.push(LazyWithheldEntry {
+            msg_id,
+            targets: peers.to_vec(),
+            served: Vec::new(),
+        });
+    }
+
+    /// Record that `peer` pulled `msg_id` via IWANT before the flush
+    /// consumed its withheld-announce entry — the next flush skips
+    /// re-advertising to a peer that demonstrably holds the message.
+    /// No-op for ids with no live entry.
+    fn record_lazy_withheld_served(&mut self, msg_id: &MessageIdType, peer: PeerId) {
+        if let Some(entry) = self.lazy_withheld.iter_mut().find(|e| e.msg_id == *msg_id) {
+            if !entry.served.contains(&peer) {
+                entry.served.push(peer);
+            }
+        }
+    }
+
+    /// Consume the withheld-announce entries whose ids are in `batch`
+    /// and return their unserved targets, deduplicated. Consuming (unlike
+    /// `stranded_ihave_targets_for`) matches `pending_ihave`'s lossy
+    /// flush semantics: one advertisement per withheld id, no retry.
+    fn drain_lazy_withheld_targets_for(&mut self, batch: &[MessageIdType]) -> Vec<PeerId> {
+        if self.lazy_withheld.is_empty() || batch.is_empty() {
+            return Vec::new();
+        }
+        let batch_index: HashSet<MessageIdType> = batch.iter().copied().collect();
+        let mut targets: Vec<PeerId> = Vec::new();
+        self.lazy_withheld.retain(|entry| {
+            if !batch_index.contains(&entry.msg_id) {
+                return true;
+            }
+            for peer in &entry.targets {
+                if !entry.served.contains(peer) && !targets.contains(peer) {
+                    targets.push(*peer);
+                }
+            }
+            false
+        });
         targets
     }
 
@@ -7043,10 +7171,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             self.peer_scoring.note_mesh_join(topic, from);
         }
 
-        // Forward to eager_peers (except sender)
-        // DeliverOnly withholds the forward — eager_peers is emptied so
-        // the tail's send loop is a no-op while everything else (delivery,
-        // mesh bookkeeping) behaves normally.
+        // Forward to eager_peers (except sender). DeliverOnly and
+        // LazyForward withhold the forward — eager_peers is emptied so
+        // the tail's send loop is a no-op while everything else
+        // (delivery, mesh bookkeeping) behaves normally.
+        let withheld_eager: Vec<PeerId> = if validator_action == ValidationAction::LazyForward {
+            state
+                .eager_peers
+                .iter()
+                .filter(|&&p| p != from)
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let eager_peers: Vec<PeerId> = if validator_action == ValidationAction::ForwardAndDeliver {
             state
                 .eager_peers
@@ -7058,10 +7196,24 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Vec::new()
         };
 
+        // #59: a LazyForward verdict withholds the eager re-publish but
+        // keeps the pull path — the withheld peers become direct IHAVE
+        // announce targets, so they still learn the msg_id within one
+        // flush and can pull the cached copy via IWANT.
+        if !withheld_eager.is_empty() {
+            state.queue_lazy_withheld(msg_id, &withheld_eager);
+            self.stage_stats
+                .record_lazy_ihave_withheld_peers(withheld_eager.len());
+        }
+
         // Batch msg_id to pending_ihave for lazy_peers. A DeliverOnly
         // verdict withholds this — lazy peers must not be teased with a
-        // digest this node refuses to serve.
-        if validator_action == ValidationAction::ForwardAndDeliver {
+        // digest this node refuses to serve. LazyForward keeps it (the
+        // message stays serveable, so the digest is honest).
+        if matches!(
+            validator_action,
+            ValidationAction::ForwardAndDeliver | ValidationAction::LazyForward
+        ) {
             state.pending_ihave.push(msg_id);
         }
         self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
@@ -7114,8 +7266,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // dispatcher (X0X-0006: 73% of dispatcher wall-clock).
         // x0x #380: origin metering — this fan-out RELAYS another node's
         // cached message (the rate-capped class). Instrumentation only.
-        self.stage_stats
-            .record_publish_origin(false, bytes.len(), 1);
+        // #59: count only fan-outs that attempt ≥1 peer — a withheld
+        // re-publish (DeliverOnly / LazyForward with an emptied eager
+        // set) must not book relay bytes it never sent.
+        if !eager_peers.is_empty() {
+            self.stage_stats
+                .record_publish_origin(false, bytes.len(), 1);
+        }
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Forwarding EAGER");
         // Dispatcher forward path: detach accounting (detach_accounting =
         // true) so a slow peer cannot pin this worker for its full timeout
@@ -7288,7 +7445,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // succeeds — a timed-out IWANT reply must not exclude the peer
         // from the bounded retry. The emptiness probe keeps the common
         // (non-stranded) IWANT path lock-only.
-        let track_served = !state.stranded_ihave.is_empty();
+        let track_served = !state.stranded_ihave.is_empty() || !state.lazy_withheld.is_empty();
 
         for msg_id in msg_ids {
             if let Some(cached) = state.get_message(&msg_id) {
@@ -7394,7 +7551,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// x0x #613 (PR #54 r3 item 2): mark stranded ids as pull-served for
     /// `from` — called by the IWANT serve path with the ids whose reply
     /// sends actually succeeded. No-op for empty inputs or ids no longer
-    /// stranded.
+    /// stranded. Also marks #59 LazyForward withheld-announce entries
+    /// served, so a pre-flush pull is not re-advertised.
     async fn mark_stranded_ihave_served(
         &self,
         topic: TopicId,
@@ -7408,6 +7566,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if let Some(state) = topics.get_mut(&topic) {
             for msg_id in msg_ids {
                 state.record_stranded_ihave_served(msg_id, from);
+                state.record_lazy_withheld_served(msg_id, from);
             }
         }
     }
@@ -7816,6 +7975,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     // target, that advertisement is lost for this flush —
                     // the same lossy semantics as the lazy batch itself.
                     let mut ihave_targets = state.stranded_ihave_targets_for(&batch);
+                    // #59: merge the LazyForward withheld-eager announce
+                    // targets for this batch. Consumed here — one
+                    // advertisement per withheld id, lossy like the batch
+                    // itself; a peer that misses it still has anti-entropy.
+                    for peer in state.drain_lazy_withheld_targets_for(&batch) {
+                        if !ihave_targets.contains(&peer) {
+                            ihave_targets.push(peer);
+                        }
+                    }
                     for peer in state.lazy_peers.iter().copied() {
                         if !ihave_targets.contains(&peer) {
                             ihave_targets.push(peer);
@@ -8974,6 +9142,9 @@ mod tests {
         local_peer: PeerId,
         send_counts: Mutex<HashMap<PeerId, usize>>,
         connected_peer_ids: Mutex<Vec<PeerId>>,
+        /// #59: every outbound frame in send order — (peer, stream, wire
+        /// bytes) — so tests can assert which wire kind reached whom.
+        frames: Mutex<Vec<(PeerId, GossipStreamType, Bytes)>>,
     }
 
     struct PanicTransport {
@@ -8986,6 +9157,7 @@ mod tests {
                 local_peer,
                 send_counts: Mutex::new(HashMap::new()),
                 connected_peer_ids: Mutex::new(Vec::new()),
+                frames: Mutex::new(Vec::new()),
             })
         }
 
@@ -9003,6 +9175,29 @@ mod tests {
                 .get(&peer)
                 .copied()
                 .unwrap_or(0)
+        }
+
+        /// All recorded outbound frames, in send order (#59).
+        fn sent_frames(&self) -> Vec<(PeerId, GossipStreamType, Bytes)> {
+            self.frames.lock().expect("sent frames lock").clone()
+        }
+
+        /// Outbound frames of one wire kind to one peer (#59).
+        fn sent_frames_of_kind_to(&self, peer: PeerId, kind: MessageKind) -> Vec<Bytes> {
+            self.sent_frames()
+                .into_iter()
+                .filter(|(to, _stream, data)| *to == peer && peek_message_kind(data) == Some(kind))
+                .map(|(_, _, data)| data)
+                .collect()
+        }
+
+        /// Decoded outbound GossipMessages of one wire kind to one peer
+        /// (#59).
+        fn sent_messages_of_kind_to(&self, peer: PeerId, kind: MessageKind) -> Vec<GossipMessage> {
+            self.sent_frames_of_kind_to(peer, kind)
+                .iter()
+                .filter_map(|data| postcard::from_bytes(data).ok())
+                .collect()
         }
     }
 
@@ -9038,6 +9233,10 @@ mod tests {
         ) -> Result<()> {
             let mut counts = self.send_counts.lock().expect("send counts lock");
             *counts.entry(peer).or_default() += 1;
+            self.frames
+                .lock()
+                .expect("sent frames lock")
+                .push((peer, _stream_type, _data));
             Ok(())
         }
 
@@ -17335,6 +17534,290 @@ mod tests {
             assert_eq!(meter.dropped, 1);
             assert_eq!(meter.deliver_only, 1);
             let _ = state_snapshot_of(&pubsub, topic).await; // helper stays exercised
+        }
+
+        /// #59: LazyForward delivers locally, withholds every eager
+        /// re-publish, still announces via IHAVE (to the lazy set AND the
+        /// withheld eager peers), and keeps the cached copy serveable on
+        /// IWANT — the pull path `DeliverOnly` lacks and `Drop` forbids.
+        #[tokio::test]
+        async fn lazy_forward_withholds_eager_but_announces_and_serves() {
+            let topic = TopicId::new([0xA5; 32]);
+            // Deterministic harness: a recording transport (observable
+            // sends) with background tasks off — the flush is driven by
+            // hand below.
+            let local = test_peer_id(1);
+            let transport = RecordingTransport::new(local);
+            let pubsub = PlumtreePubSub::new_with_task_control(
+                local,
+                Arc::clone(&transport),
+                test_signing_key(),
+                false,
+            );
+            let mut rx = PubSub::subscribe(&pubsub, topic);
+            let eager = test_peer_id(9); // withheld announce target
+            let lazy = test_peer_id(8); // regular lazy member
+            let sender = test_peer_id(2);
+            pubsub.initialize_topic_peers(topic, vec![eager]).await;
+            // PubSub::subscribe registers via a spawned task holding the
+            // topic write lock — let it land before driving handle_eager.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            pubsub.set_topic_validator(topic, Arc::new(|_, _| ValidationAction::LazyForward));
+
+            let payload = Bytes::from_static(b"lazy-forward-payload");
+            let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+            let mut header = MessageHeader {
+                version: 1,
+                payload_hash: None,
+                topic,
+                msg_id,
+                kind: MessageKind::Eager,
+                hop: 0,
+                ttl: 10,
+            };
+            header.seal_payload_hash(Some(payload.as_ref()));
+            let signing_key = test_signing_key();
+            let signature = signing_key
+                .sign(&postcard::to_stdvec(&header).expect("serialize header"))
+                .expect("sign header");
+            pubsub
+                .handle_eager(
+                    sender,
+                    topic,
+                    GossipMessage {
+                        header,
+                        payload: Some(payload.clone()),
+                        signature,
+                        public_key: signing_key.public_key().to_vec(),
+                    },
+                )
+                .await
+                .expect("lazy-forward verdict handles cleanly");
+
+            // Delivered to the local subscriber (DeliverOnly semantics).
+            let delivered = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .expect("lazy-forward verdict still delivers locally")
+                .expect("subscriber live");
+            assert_eq!(delivered.1, payload);
+
+            // ZERO eager sends: the withheld fan-out is skipped entirely.
+            // Let any detached send tasks land, then inspect the wire.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                transport.sent_frames().is_empty(),
+                "LazyForward must send nothing before the IHAVE flush"
+            );
+
+            // The msg_id is queued for the flush and the withheld eager
+            // peer is a direct announce target.
+            {
+                let mut topics = pubsub.topics.write_topic(&topic).await;
+                let state = topics.get_mut(&topic).expect("topic state exists");
+                assert!(state.pending_ihave.contains(&msg_id));
+                assert_eq!(
+                    state
+                        .lazy_withheld
+                        .iter()
+                        .find(|e| e.msg_id == msg_id)
+                        .expect("withheld-announce entry exists")
+                        .targets,
+                    vec![eager]
+                );
+                // A regular lazy member still receives the batch IHAVE.
+                state.lazy_peers.insert(lazy);
+            }
+
+            // Drive the flush directly: one IHAVE to the lazy peer AND to
+            // the withheld eager peer.
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &pubsub.topics,
+                &pubsub.transport,
+                &pubsub.signing_key,
+                &pubsub.stage_stats,
+                &pubsub.outbound_budgets,
+                &pubsub.send_path_context(),
+            )
+            .await;
+            for peer in [eager, lazy] {
+                assert_eq!(
+                    transport
+                        .sent_frames_of_kind_to(peer, MessageKind::IHave)
+                        .len(),
+                    1,
+                    "IHAVE must reach peer {peer:?} (lazy set + withheld eager fan-out)"
+                );
+            }
+            // The flush consumed both the batch and the withheld entries.
+            {
+                let topics = pubsub.topics.read_topic(&topic).await;
+                let state = topics.get(&topic).expect("topic state exists");
+                assert!(state.pending_ihave.is_empty());
+                assert!(state.lazy_withheld.is_empty());
+            }
+
+            // IWANT from the peer whose eager send was withheld: the
+            // cached payload IS served (EAGER reply) — LazyForward keeps
+            // the message serveable, unlike Drop.
+            pubsub
+                .handle_iwant(eager, topic, vec![msg_id])
+                .await
+                .expect("iwant serve");
+            let served = transport.sent_messages_of_kind_to(eager, MessageKind::Eager);
+            assert_eq!(served.len(), 1, "exactly one IWANT-serve EAGER reply");
+            assert_eq!(served[0].payload.as_deref(), Some(payload.as_ref()));
+
+            // Meters: one lazy-forward verdict globally and per topic, and
+            // the withheld-peer announce fan-out is counted.
+            let snapshot = pubsub.stage_stats();
+            assert_eq!(snapshot.validator.lazy_forward, 1);
+            let meter = snapshot
+                .validator
+                .by_topic
+                .get(&topic.to_string())
+                .expect("per-topic meter exists");
+            assert_eq!(meter.lazy_forward, 1);
+            assert_eq!(snapshot.lazy_ihave_withheld_peers, 1);
+        }
+
+        /// #59 end-to-end: three real instances in a line A→B→C where C's
+        /// only topic peer is B and B (a pure relay, no local subscriber)
+        /// returns LazyForward. C must still receive A's payload via B's
+        /// IHAVE → IWANT → serve path, while B's eager re-publish bytes
+        /// for the message stay 0 (its only EAGER frame is the on-demand
+        /// IWANT serve, which the relay-origin meter excludes).
+        #[tokio::test]
+        async fn lazy_forward_line_topology_delivery() {
+            let topic = TopicId::new([0xB7; 32]);
+            let a = test_peer_id(10);
+            let b = test_peer_id(11);
+            let c = test_peer_id(12);
+            let ta = RecordingTransport::new(a);
+            let tb = RecordingTransport::new(b);
+            let tc = RecordingTransport::new(c);
+            let node_a = PlumtreePubSub::new_with_task_control(
+                a,
+                Arc::clone(&ta),
+                test_signing_key(),
+                false,
+            );
+            let node_b = PlumtreePubSub::new_with_task_control(
+                b,
+                Arc::clone(&tb),
+                test_signing_key(),
+                false,
+            );
+            let node_c = PlumtreePubSub::new_with_task_control(
+                c,
+                Arc::clone(&tc),
+                test_signing_key(),
+                false,
+            );
+
+            // Line topology: A's only peer is B, B relays between A and C,
+            // C's only peer is B.
+            node_a.initialize_topic_peers(topic, vec![b]).await;
+            node_b.initialize_topic_peers(topic, vec![a, c]).await;
+            node_c.initialize_topic_peers(topic, vec![b]).await;
+
+            // B is a pure relay: LazyForward on T.
+            node_b.set_topic_validator(topic, Arc::new(|_, _| ValidationAction::LazyForward));
+
+            let mut rx = PubSub::subscribe(&node_c, topic);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            let b_before = node_b.stage_stats();
+            let b_ihave_bytes_before = b_before.outbound_by_kind["ihave"].bytes;
+            let b_relay_eager_bytes_before = b_before.outbound_publish_origin.relay_bytes;
+
+            // A publishes: exactly one EAGER frame A→B.
+            let payload = Bytes::from_static(b"line-topology-payload");
+            PubSub::publish(&node_a, topic, payload.clone())
+                .await
+                .expect("publish on A");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let a_frames = ta.sent_messages_of_kind_to(b, MessageKind::Eager);
+            assert_eq!(a_frames.len(), 1, "A eager-publishes to B");
+            let published = a_frames.into_iter().next().expect("A's EAGER frame");
+            let msg_id = published.header.msg_id;
+
+            // B admits A's message and withholds the eager re-publish:
+            // nothing leaves B before its flush.
+            node_b
+                .handle_eager(a, topic, published)
+                .await
+                .expect("B handles A's EAGER");
+            tokio::time::sleep(Duration::from_millis(50)).await; // detached fan-out tasks
+            assert!(
+                tb.sent_frames().is_empty(),
+                "B must send nothing before its IHAVE flush (eager re-publish withheld)"
+            );
+
+            // B's flush advertises the msg_id to C (the withheld eager
+            // peer, merged into the announce fan-out).
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &node_b.topics,
+                &node_b.transport,
+                &node_b.signing_key,
+                &node_b.stage_stats,
+                &node_b.outbound_budgets,
+                &node_b.send_path_context(),
+            )
+            .await;
+            let b_mid = node_b.stage_stats();
+            assert!(
+                b_mid.outbound_by_kind["ihave"].bytes > b_ihave_bytes_before,
+                "B's IHAVE bytes must grow (announce fan-out)"
+            );
+            let ihaves = tb.sent_messages_of_kind_to(c, MessageKind::IHave);
+            assert_eq!(ihaves.len(), 1, "one IHAVE B→C");
+            let ihave_ids: Vec<MessageIdType> =
+                postcard::from_bytes(ihaves[0].payload.as_deref().expect("ihave payload"))
+                    .expect("ihave ids");
+            assert!(ihave_ids.contains(&msg_id));
+
+            // C learns the id and pulls: IWANT C→B, serve EAGER B→C.
+            node_c
+                .handle_ihave(b, topic, ihave_ids)
+                .await
+                .expect("C handles IHAVE");
+            let wants = tc.sent_messages_of_kind_to(b, MessageKind::IWant);
+            assert_eq!(wants.len(), 1, "one IWANT C→B");
+            let want_ids: Vec<MessageIdType> =
+                postcard::from_bytes(wants[0].payload.as_deref().expect("iwant payload"))
+                    .expect("iwant ids");
+            assert_eq!(want_ids, vec![msg_id]);
+            node_b
+                .handle_iwant(c, topic, want_ids)
+                .await
+                .expect("B serves the IWANT");
+            let serves = tb.sent_messages_of_kind_to(c, MessageKind::Eager);
+            assert_eq!(serves.len(), 1, "exactly one EAGER B→C (the IWANT serve)");
+
+            // C receives the payload through the pull path.
+            node_c
+                .handle_eager(b, topic, serves.into_iter().next().expect("serve frame"))
+                .await
+                .expect("C handles the serve");
+            let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("C receives the payload via the pull path")
+                .expect("subscriber live");
+            assert_eq!(received.0, b, "C sees B as the delivering peer");
+            assert_eq!(received.1, payload);
+
+            // B's eager re-publish bytes for A's message are 0: the only
+            // EAGER frame B ever sent is the on-demand IWANT serve, which
+            // the relay-origin meter excludes by design.
+            let b_after = node_b.stage_stats();
+            assert_eq!(
+                b_after.outbound_publish_origin.relay_bytes, b_relay_eager_bytes_before,
+                "B must eager-republish zero bytes for A's message"
+            );
+            assert!(
+                b_after.outbound_by_kind["eager"].bytes > b_before.outbound_by_kind["eager"].bytes,
+                "the IWANT serve is the single EAGER send B made"
+            );
         }
 
         /// Default (no validator registered) is byte-for-byte passthrough:

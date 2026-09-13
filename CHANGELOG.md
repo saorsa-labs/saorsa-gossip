@@ -26,6 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cooldown_bypass_probes` / `cooldown_bypass_successes` make the path
   observable in diagnostics snapshots. Supersedes PR #29.
 
+- **pubsub: WAN-realistic fallback cooling tunables (supersedes PR #29).**
+  Bootstrap nodes on WAN paths (Hetzner→DigitalOcean, 330–560 ms RTT)
+  were accumulating 12k–33k budget-pressure/cooling events per day under
+  the original constants, which were tuned for low-latency meshes.
+  `PER_PEER_REPUBLISH_TIMEOUT` 2500 ms → 4000 ms (4 RTTs of headroom on
+  the worst observed WAN hop); `PEER_TIMEOUT_THRESHOLD` 5 → 8 (packet
+  loss at 4 s budget less diagnostic at 5 triggers); fallback
+  `PEER_SUPPRESSION_COOLDOWN` 120 s → 30 s and
+  `PEER_SUPPRESSION_BACKOFF_MAX` 1800 s → 300 s (aligning the legacy
+  fallbacks with `AdaptiveCoolingConfig` defaults used in production).
+  These constants are the static fallbacks; production deployments that
+  supply `AdaptiveCoolingConfig` are unaffected in steady state.
+
 ### Added
 
 - **pubsub: regression test pinning the #32-before-replacement ordering in

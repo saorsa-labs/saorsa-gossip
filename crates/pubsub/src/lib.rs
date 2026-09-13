@@ -143,7 +143,7 @@ const MAX_EAGER_DEGREE: usize = 12;
 /// 2500 ms gives ~4 RTTs of headroom on sydney and 7+ on singapore;
 /// `PEER_TIMEOUT_THRESHOLD` is unchanged (5 timeouts in 30 s is still a
 /// real signal at 2500 ms each).
-const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(2500);
+const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(4000);
 
 /// Delay before the bounded single-shot retry of a stranded local publish
 /// (x0x #613: `attempted > 0, succeeded == 0`). Two full per-peer budgets
@@ -156,10 +156,10 @@ const STRANDED_PUBLISH_RETRY_DELAY: Duration = PER_PEER_REPUBLISH_TIMEOUT.satura
 const PEER_TIMEOUT_WINDOW: Duration = Duration::from_secs(30);
 
 /// Timeouts inside `PEER_TIMEOUT_WINDOW` before a peer is cooled.
-const PEER_TIMEOUT_THRESHOLD: usize = 5;
+const PEER_TIMEOUT_THRESHOLD: usize = 8;
 
 /// Initial sender-side suppression duration for a cooled peer.
-const PEER_SUPPRESSION_COOLDOWN: Duration = Duration::from_secs(120);
+const PEER_SUPPRESSION_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Minimum gap between zero-fan-out WARN lines for the same topic (issue #32).
 ///
@@ -171,7 +171,7 @@ const PEER_SUPPRESSION_COOLDOWN: Duration = Duration::from_secs(120);
 const ZERO_FANOUT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Maximum repeated-offender suppression duration.
-const PEER_SUPPRESSION_BACKOFF_MAX: Duration = Duration::from_secs(1_800);
+const PEER_SUPPRESSION_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
 /// Minimum interval between rate-limited recovery-bypass sends to a peer
 /// whose suppression cooldown is still active.

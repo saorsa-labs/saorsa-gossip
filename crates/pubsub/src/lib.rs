@@ -10614,6 +10614,64 @@ mod tests {
         assert_eq!(state.eager_peers.len(), 2, "degree stays at the target");
     }
 
+    /// Issue #65: pins the #32-before-replacement ordering inside
+    /// `cooling_floor_blocks_at`. PR #64 round 1 ran the graft-eligible
+    /// replacement gate BEFORE the #32 last-peer check, which silently let
+    /// the last eligible eager peer be suppressed whenever a graft-eligible
+    /// lazy peer existed — and the whole suite still passed (the Dead test
+    /// exercises the separate single-arm `cooling_floor_last_peer_blocks_at`
+    /// helper, and neither #62 leg reaches the ordering). A lazy
+    /// replacement is only *potential* until a graft actually happens, so
+    /// the last delivery path must stay protected. This test fails under
+    /// the round-1 reorder and passes as shipped.
+    #[test]
+    fn cooling_floor_blocks_last_peer_even_with_graft_eligible_replacement() {
+        let mut state = TopicState::new();
+        state.max_eager_degree = 2;
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+        let peer_c = test_peer_id(4);
+        state.eager_peers.insert(peer_a);
+        state.eager_peers.insert(peer_b);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscribers.push(tx);
+        let now = Instant::now();
+
+        // Insert the graft-eligible replacement first so B can be cooled
+        // (the replacement gate lets it through), leaving A as the LAST
+        // eligible eager peer with C still graft-eligible in lazy.
+        state.lazy_peers.insert(peer_c);
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer_b), now);
+        }
+        assert!(
+            state.is_peer_suppressed_at(peer_b, now),
+            "with a replacement available, B is cooled as a replacement"
+        );
+
+        // The ordering under test: the #32 arm must outrank the replacement
+        // gate for A — under the round-1 ordering this predicate is false
+        // because C is graft-eligible.
+        assert!(
+            state.cooling_floor_blocks_at(peer_a, now),
+            "the last eligible eager peer stays protected even with a graft-eligible lazy replacement (#32 before #62)"
+        );
+
+        // And through the full timeout path, not just the predicate: driving
+        // A to the suppression threshold must not demote it.
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer_a), now);
+        }
+        assert!(
+            !state.is_peer_suppressed_at(peer_a, now),
+            "the full timeout path must honour the #32-before-replacement ordering"
+        );
+        assert!(
+            state.eager_peers.contains(&peer_a),
+            "the last eligible eager peer must stay eager"
+        );
+    }
+
     /// Round-2 review of PR #64: the widened floor also gated the
     /// `PeerHealth::Dead` fast-suppress, so a mesh sitting exactly at its
     /// target degree with no lazy replacement would have pinned a peer the

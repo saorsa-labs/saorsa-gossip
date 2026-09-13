@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **pubsub: regression test pinning the #32-before-replacement ordering in
+  `cooling_floor_blocks_at` (#65).** PR #64 round 1 ran the graft-eligible
+  replacement gate before the #32 last-peer check and the entire suite
+  still passed — the invariant that was that review's blocker could
+  regress silently. `cooling_floor_blocks_last_peer_even_with_
+  graft_eligible_replacement` fails under the round-1 ordering (verified
+  by mutation) and passes as shipped: the last eligible eager peer stays
+  protected even while a graft-eligible lazy replacement exists, through
+  both the predicate and the full timeout path.
+
 ### Fixed
 
 - **pubsub: the pre-verify dedupe fast path no longer takes the per-topic

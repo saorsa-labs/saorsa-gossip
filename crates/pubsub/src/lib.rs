@@ -3713,19 +3713,31 @@ impl TopicState {
     ///   locks the topic at degree 1 for >= the 120 s cooldown because the
     ///   cooled peer fails `can_graft_peer_at` even after expiry).
     ///
-    /// With a graft-eligible lazy replacement available the floor never
-    /// engages: cooling is then a *replacement* — the vacancy is backfilled
-    /// — rather than a removal. An already-under-target mesh is also left
-    /// alone: pinning a timing-out peer cannot restore a degree the peer
-    /// population does not support, and the issue #32 eligibility-time
-    /// rescue plus the zero-fan-out counter remain as backstops.
+    /// Arms are evaluated in precedence order: (1) the original issue #32
+    /// last-eligible-peer arm, with no exemptions — not for a graft-eligible
+    /// lazy replacement (a replacement is only *potential* until a graft
+    /// actually happens) and not for a `PeerHealth::Dead` peer; (2) with a
+    /// graft-eligible lazy replacement available the floor never engages —
+    /// cooling is then a *replacement* the maintainer backfills rather than
+    /// a removal; (3) otherwise a suppression that would drop the mesh from
+    /// exactly the target degree to below it is blocked. An
+    /// already-under-target mesh is left alone in (3): pinning a timing-out
+    /// peer cannot restore a degree the peer population does not support,
+    /// and the issue #32 eligibility-time rescue plus the zero-fan-out
+    /// counter remain as backstops.
     fn cooling_floor_blocks_at(&self, peer: PeerId, now: Instant) -> bool {
-        // Live-subscriber check rather than `!subscribers.is_empty()`: a
-        // dropped subscription leaves a closed sender in the vector until
-        // `clean_cache` prunes it, which would otherwise keep the floor armed
-        // on a topic that has already reverted to forward-only.
-        if !self.has_live_subscribers() || !self.eager_peers.contains(&peer) {
+        let Some(eligible_after) = self.eligible_eager_after_suppressing_at(peer, now) else {
             return false;
+        };
+        // Issue #32 floor, evaluated FIRST: never suppress the last eligible
+        // eager fan-out target. This arm takes precedence over the
+        // replacement gate below — a lazy replacement only helps once a
+        // graft actually happens — and has no exemptions: it is the arm the
+        // `PeerHealth::Dead` fast-suppress consults via
+        // [`Self::cooling_floor_last_peer_blocks_at`], so it binds for Dead
+        // peers too.
+        if eligible_after == 0 {
+            return true;
         }
         // Issue #62: a graft-eligible lazy peer can backfill the vacancy, so
         // the suppression is a replacement, not a removal. `can_graft_peer_at`
@@ -3734,22 +3746,39 @@ impl TopicState {
         if self.has_graft_eligible_lazy_peer_at(now) {
             return false;
         }
-        let eligible_after = self
-            .eager_peers
-            .iter()
-            .filter(|other| **other != peer)
-            .filter(|other| !self.is_peer_suppressed_at(**other, now))
-            .count();
-        // Issue #32 floor: never suppress the last eligible eager fan-out
-        // target.
-        if eligible_after == 0 {
-            return true;
-        }
         // Issue #62 widening: `eligible_after + 1` is the eligible degree the
         // mesh holds right now (`peer` itself is unsuppressed at this point);
         // block only the drop from exactly the target degree to below it.
-        let target = MIN_EAGER_DEGREE.min(self.max_eager_degree);
-        eligible_after + 1 == target
+        eligible_after + 1 == MIN_EAGER_DEGREE.min(self.max_eager_degree)
+    }
+
+    /// The issue #32 arm alone: suppressing `peer` would leave zero eligible
+    /// eager fan-out targets on a locally subscribed topic. Used by the
+    /// `PeerHealth::Dead` fast-suppress, which is exempt from the issue #62
+    /// replacement requirement (see `record_send_timeout_inner_at`) but must
+    /// still never cool the last delivery path.
+    fn cooling_floor_last_peer_blocks_at(&self, peer: PeerId, now: Instant) -> bool {
+        self.eligible_eager_after_suppressing_at(peer, now) == Some(0)
+    }
+
+    /// Eligible (unsuppressed) eager fan-out count that would remain if
+    /// `peer` were suppressed. `None` disarms the floor entirely: no live
+    /// local subscriber — checked directly rather than via
+    /// `!subscribers.is_empty()` because a dropped subscription leaves a
+    /// closed sender in the vector until `clean_cache` prunes it, which
+    /// would otherwise keep the floor armed on a topic that has already
+    /// reverted to forward-only — or `peer` is not eager.
+    fn eligible_eager_after_suppressing_at(&self, peer: PeerId, now: Instant) -> Option<usize> {
+        if !self.has_live_subscribers() || !self.eager_peers.contains(&peer) {
+            return None;
+        }
+        Some(
+            self.eager_peers
+                .iter()
+                .filter(|other| **other != peer)
+                .filter(|other| !self.is_peer_suppressed_at(**other, now))
+                .count(),
+        )
     }
 
     /// Whether any lazy peer could be promoted right now — the same
@@ -4105,6 +4134,10 @@ impl TopicState {
                 // floor peer is never suppressed, so its cooldown never
                 // expires and it is never claimed as a recovery probe.
                 let floor_blocks = self.cooling_floor_blocks_at(attempt.peer, now);
+                // Dead exemption (issue #62 round 2, x0x #656): only the
+                // issue #32 last-peer arm binds for Dead peers. Computed
+                // before the `entry()` borrow, like `floor_blocks`.
+                let dead_floor_blocks = self.cooling_floor_last_peer_blocks_at(attempt.peer, now);
                 let cooling = self
                     .peer_cooling
                     .entry(attempt.peer)
@@ -4121,7 +4154,14 @@ impl TopicState {
                 }
 
                 cooling.timeout_count = cooling.timeout_count.saturating_add(1);
-                if matches!(health, Some(PeerHealth::Dead)) && !floor_blocks {
+                // A Dead peer is exempt from the issue #62 replacement
+                // requirement: a peer the health oracle has declared Dead is
+                // not a working delivery path, so pinning it as the
+                // "protected" eager peer would degrade fan-out instead of
+                // preserving it (x0x #656). The issue #32 last-peer arm
+                // still binds — never cool the final eligible target, even
+                // when it is Dead.
+                if matches!(health, Some(PeerHealth::Dead)) && !dead_floor_blocks {
                     let cooldown = cooling_config.map_or_else(
                         || cooling.next_legacy_cooldown(),
                         |config| cooling.dead_cooldown(config),
@@ -10364,6 +10404,66 @@ mod tests {
         assert!(state.eager_peers.contains(&peer_c));
         assert!(state.eager_peers.contains(&peer_b));
         assert_eq!(state.eager_peers.len(), 2, "degree stays at the target");
+    }
+
+    /// Round-2 review of PR #64: the widened floor also gated the
+    /// `PeerHealth::Dead` fast-suppress, so a mesh sitting exactly at its
+    /// target degree with no lazy replacement would have pinned a peer the
+    /// health oracle declared Dead — the one peer that cannot be a useful
+    /// eager delivery path (x0x #656). Dead peers are therefore exempt from
+    /// the issue #62 replacement requirement, but NOT from the issue #32
+    /// last-peer floor, which now also takes precedence over the replacement
+    /// gate for every health verdict.
+    #[test]
+    fn dead_peer_cooling_bypasses_replacement_floor_but_not_last_peer_floor() {
+        let mut state = TopicState::new();
+        state.max_eager_degree = 2;
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+        let peer_c = test_peer_id(4);
+        state.eager_peers.insert(peer_a);
+        state.eager_peers.insert(peer_b);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscribers.push(tx);
+        let now = Instant::now();
+
+        // Dead + at-target (2) + no replacement: the #62 widening must NOT
+        // pin the Dead peer — one timeout carrying a Dead health verdict
+        // fast-suppresses and demotes it.
+        state.record_send_timeout_with_context_at(
+            normal_send_attempt(peer_a),
+            now,
+            Some(PeerHealth::Dead),
+            AdaptiveCoolingConfig::default(),
+        );
+        assert!(
+            state.is_peer_suppressed_at(peer_a, now),
+            "a Dead peer must not be pinned by the replacement floor"
+        );
+        assert!(
+            !state.eager_peers.contains(&peer_a),
+            "the suppressed Dead peer must be demoted from eager"
+        );
+
+        // Dead + last eligible peer: the #32 arm binds even for Dead and
+        // even with a graft-eligible lazy peer available (a replacement is
+        // only potential until a graft happens) — the last fan-out target is
+        // never suppressed.
+        state.lazy_peers.insert(peer_c);
+        state.record_send_timeout_with_context_at(
+            normal_send_attempt(peer_b),
+            now,
+            Some(PeerHealth::Dead),
+            AdaptiveCoolingConfig::default(),
+        );
+        assert!(
+            !state.is_peer_suppressed_at(peer_b, now),
+            "the last eligible eager peer stays protected even when Dead"
+        );
+        assert!(
+            state.eager_peers.contains(&peer_b),
+            "the last eligible eager peer must stay eager"
+        );
     }
 
     /// The zero-fan-out WARN is throttled, but the counters are the machine-

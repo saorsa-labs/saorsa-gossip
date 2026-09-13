@@ -6,42 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-
-### Changed
-
-- **pubsub: WAN-realistic send-timeout tunables (PR #29 round 2 — live
-  fleet change, split from the cooldown-bypass PR #71).** Bootstrap
-  nodes on WAN paths (Hetzner→DigitalOcean, 330–560 ms RTT) accumulated
-  12k–33k budget-pressure/cooling events per day under constants tuned
-  for low-latency meshes. `PER_PEER_REPUBLISH_TIMEOUT` 2500 ms → 4000 ms
-  (~7 RTTs of headroom on the worst observed hop; also moves the x0x
-  #613 stranded-publish retry from 5 s to 8 s, since it waits 2× the
-  budget — and note `adaptive_timeout` ignores this floor once RTT
-  samples exist); `PEER_TIMEOUT_THRESHOLD` 5 → 8 and
-  `PEER_TIMEOUT_WINDOW` 30 s → 60 s, retuned together: the maximum
-  inter-timeout interval that can still trip cooling is
-  window/(threshold−1), so threshold 8 alone would have shrunk it from
-  7.5 s to 4.29 s and retired timeout cooling for precisely the WAN
-  peers it targets; the 60 s window restores the 7.5 s baseline with
-  margin (8.57 s). Unlike the fallback cooldown constants folded into
-  PR #71, these are production constants — every send-timeout path reads
-  them. **Fleet observation of the suppression-entry rate is required
-  before merge.**
-
-### Added
-
-- **pubsub: regression test pinning the #32-before-replacement ordering in
-  `cooling_floor_blocks_at` (#65).** PR #64 round 1 ran the graft-eligible
-  replacement gate before the #32 last-peer check and the entire suite
-  still passed — the invariant that was that review's blocker could
-  regress silently. `cooling_floor_blocks_last_peer_even_with_
-  graft_eligible_replacement` fails under the round-1 ordering (verified
-  by mutation) and passes as shipped: the last eligible eager peer stays
-  protected even while a graft-eligible lazy replacement exists, through
-  both the predicate and the full timeout path.
-
 ### Fixed
 
+- **pubsub: rate-limited recovery path during peer suppression (WP6).**
+  A peer in send-suppression cooldown previously received neither EAGER
+  pushes nor lazy IHAVE/anti-entropy sends for the entire cooldown, so a
+  message published while the peer was cooling was undeliverable until the
+  cooldown expired (observed live as ≥96 s CRDT propagation stalls between
+  three healthy WAN peers). The per-(topic, peer) claim gate now admits at
+  most one `CooldownBypass` send per 5 s
+  (`PEER_COOLDOWN_BYPASS_MIN_INTERVAL`) while suppression is active, so
+  IHAVE announces, anti-entropy digests, and cached-message serves trickle
+  through and a healthy-again peer converges on the anti-entropy timescale
+  (~30 s). A successful bypass send delivers data and decays the cooldown
+  memory but does **not** clear the suppression: full eager fanout still
+  waits for cooldown expiry plus one successful recovery probe, and bypass
+  timeouts do not escalate the cooldown. New stage-stats counters
+  `cooldown_bypass_probes` / `cooldown_bypass_successes` make the path
+  observable in diagnostics snapshots. Supersedes PR #29.
+  Round 2 (PR #71 review): the bypass was unreachable on Bulk-priority
+  topics — `admit_bulk` dropped with `PeerCooled` before the claim layer
+  ran — so the admission gate's cooled check now exempts a bypass-due
+  peer exactly as it exempts a probe-due peer (issue #63 pattern), and
+  the trickle reaches the transport on Bulk topics (the
+  `dropped_bulk_peer_cooled` traffic). The bypass rate-limit slot is
+  consumed (and counted) only after an outbound permit is actually
+  acquired, so budget pressure no longer burns the 5 s window or
+  over-reports `cooldown_bypass_probes`. Probe-allowance safety is the
+  `suppressed_until > now` / `<= now` split in `claim_send_attempt_at`
+  (the recovery-probe arm is unreachable while suppression is active);
+  the in-flight-probe term is defense-in-depth, not the guarantee.
+  Test-only fallback constants folded here: `PEER_SUPPRESSION_COOLDOWN`
+  120 s → 30 s and `PEER_SUPPRESSION_BACKOFF_MAX` 1800 s → 300 s — used
+  only by the `#[cfg(test)]` legacy timeout wrappers; production paths
+  always supply `AdaptiveCoolingConfig`.
 - **pubsub: the pre-verify dedupe fast path no longer takes the per-topic
   shard WRITE lock on a cache miss (#58, x0x #656).** The x0x #674 Design-B
   fast path (`handle_eager_admitted`) acquired `write_topic` before
@@ -102,6 +100,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send tasks have been handed off, so an abort past the shutdown grace
   leaves the batch pending for the next flusher instead of losing it
   (a lost batch was lost delivery until anti-entropy).
+
+### Changed
+
+- **pubsub: WAN-realistic send-timeout tunables (PR #29 round 2 — live
+  fleet change, split from the cooldown-bypass PR #71).** Bootstrap
+  nodes on WAN paths (Hetzner→DigitalOcean, 330–560 ms RTT) accumulated
+  12k–33k budget-pressure/cooling events per day under constants tuned
+  for low-latency meshes. `PER_PEER_REPUBLISH_TIMEOUT` 2500 ms → 4000 ms
+  (~7 RTTs of headroom on the worst observed hop; also moves the x0x
+  #613 stranded-publish retry from 5 s to 8 s, since it waits 2× the
+  budget — and note `adaptive_timeout` ignores this floor once RTT
+  samples exist); `PEER_TIMEOUT_THRESHOLD` 5 → 8 and
+  `PEER_TIMEOUT_WINDOW` 30 s → 60 s, retuned together: the maximum
+  inter-timeout interval that can still trip cooling is
+  window/(threshold−1), so threshold 8 alone would have shrunk it from
+  7.5 s to 4.29 s and retired timeout cooling for precisely the WAN
+  peers it targets; the 60 s window restores the 7.5 s baseline with
+  margin (8.57 s). Unlike the fallback cooldown constants folded into
+  PR #71, these are production constants — every send-timeout path reads
+  them. **Fleet observation of the suppression-entry rate is required
+  before merge.**
+
+### Added
+
+- **pubsub: regression test pinning the #32-before-replacement ordering in
+  `cooling_floor_blocks_at` (#65).** PR #64 round 1 ran the graft-eligible
+  replacement gate before the #32 last-peer check and the entire suite
+  still passed — the invariant that was that review's blocker could
+  regress silently. `cooling_floor_blocks_last_peer_even_with_
+  graft_eligible_replacement` fails under the round-1 ordering (verified
+  by mutation) and passes as shipped: the last eligible eager peer stays
+  protected even while a graft-eligible lazy replacement exists, through
+  both the predicate and the full timeout path.
 
 ## [0.5.80] - 2026-09-13
 

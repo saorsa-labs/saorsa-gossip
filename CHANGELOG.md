@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **pubsub: `ValidationAction::LazyForward` — deliver + cache + serve,
+  withhold the eager re-publish, announce via IHAVE instead (#59, x0x
+  #674 C2).** A relay (a node forwarding traffic for a topic it does not
+  consume) previously had only bad options: `ForwardAndDeliver`
+  eager-republishes every relayed message to the full eager set (the
+  fleet-CPU hot path x0x #674 exists to cut), `DeliverOnly` also
+  withholds the IHAVE (subscribers behind the relay learn nothing), and
+  `Drop` makes the payload never-serveable. `LazyForward` keeps local
+  delivery, caching and IWANT service unchanged, empties the eager
+  re-publish set exactly as `DeliverOnly` does, but still pushes the
+  msg_id to `pending_ihave` AND records the withheld eager peers as
+  direct IHAVE announce targets (new per-topic `lazy_withheld` state,
+  bounded at `MAX_IHAVE_BATCH_SIZE` like `stranded_ihave`, deliberately
+  separate from it — that path's bounded retry re-sends cached EAGER
+  wire bytes, exactly what this verdict withholds). `flush_ihave_batches`
+  merges those targets into the announce fan-out and consumes them
+  (lossy, like the batch itself); a pre-flush IWANT pull marks the entry
+  served so it is not re-advertised. Delivery guarantee: every
+  subscriber learns the id within one 100 ms flush and pulls the cached
+  payload on IWANT; anti-entropy remains the backstop. Cost shape: ~one
+  IHAVE per withheld peer instead of a full EAGER frame; worst case (the
+  peer really missed it) equals today's bytes plus ~100 ms + RTT. No
+  wire-format change; 0.41.x/0.42.x peers interoperate (they process
+  IHAVE/IWANT today). Metering: `validator.lazy_forward` (global +
+  per-topic, beside `dropped`/`deliver_only`) and
+  `PubSubStageStatsSnapshot::lazy_ihave_withheld_peers` on the
+  stage-stats snapshot. Also fixes the fan-out origin meter to count
+  relay bytes only when the eager re-publish actually attempts ≥1 peer
+  (a `DeliverOnly`/`LazyForward` verdict previously booked the full
+  frame size against zero sends).
+
 ## [0.5.78] - 2026-09-12
 
 ### Changed

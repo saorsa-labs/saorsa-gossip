@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **pubsub: the pre-verify dedupe fast path no longer takes the per-topic
+  shard WRITE lock on a cache miss (#58, x0x #656).** The x0x #674 Design-B
+  fast path (`handle_eager_admitted`) acquired `write_topic` before
+  knowing whether the msg_id was cached — but ~72% of inbound EAGER frames
+  on a bootstrap are cache MISSES, so the common case paid a write
+  acquisition (and its contention) for a read-only lookup. Measured on the
+  live 6-node fleet, `pubsub_stages.dedupe_lock_acquire.total_ns`
+  accumulated 4.12 s of wait per wall-second per daemon — comparable to
+  the relay republish cost x0x #674 C2/C3 just eliminated — and every
+  bootstrap daemon averaged 45–68% of a vCPU. The probe now takes the
+  shard READ lock (`read_topic`), and the write lock is acquired only
+  where mutation is actually required: when the probe HITS (the duplicate
+  branch must `touch` + PRUNE the sender, re-checked under the write lock
+  so a TTL/bounds eviction between probe and upgrade falls through to the
+  verify path exactly like a post-TTL arrival) and when a novel frame
+  reaches the post-verify dedupe/cache insert, whose double-checked
+  re-check under the write lock is unchanged — two threads probing the
+  same unseen msg_id still result in exactly one admission. Instrumented
+  profile (100 novel + 28 duplicate frames, the measured miss ratio):
+  write acquisitions drop from 228 to 128, i.e. the miss path takes zero
+  fast-path write acquisitions. New counter split for the fleet:
+  `PubSubStageStatsSnapshot::dedupe_lock_acquire_read` records read-probe
+  acquisitions separately from the write-side `dedupe_lock_acquire`, so
+  the effect is directly observable in `/diagnostics/gossip`. Dedupe TTL
+  and eviction policy are untouched.
+
+
 ## [0.5.80] - 2026-09-13
 
 ### Fixed

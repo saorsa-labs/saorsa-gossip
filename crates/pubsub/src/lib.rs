@@ -2153,7 +2153,9 @@ fn filter_peers_through_admission_in_state(
         }
 
         let health = peer_health_from_snapshot(send_path.peer_health_snapshot.as_ref(), &peer);
-        let is_peer_cooled = state.is_peer_suppressed_at(peer, now);
+        // Issue #63: probe-due peers are admissible so the claim layer can
+        // convert one send into the recovery probe.
+        let is_peer_cooled = state.is_peer_cooled_for_admission_at(peer, now);
         match send_path
             .admission
             .admit(topic, &peer, health, is_peer_cooled)
@@ -2918,6 +2920,13 @@ impl PeerCoolingState {
         !self.is_suppressed_at(now)
     }
 
+    /// Cooldown expired and no probe in flight — exactly the state in
+    /// which [`Self::claim_send_attempt_at`] converts the next claimed
+    /// send into a `RecoveryProbe` (issue #63).
+    fn recovery_probe_due_at(&self, now: Instant) -> bool {
+        self.suppression_expired_at(now) && !self.recovery_probe_in_flight
+    }
+
     fn claim_send_attempt_at(
         &mut self,
         now: Instant,
@@ -3664,25 +3673,121 @@ impl TopicState {
             .is_some_and(|state| state.is_suppressed_at(now))
     }
 
-    /// Issue #32 cooling floor for locally subscribed publish topics: returns
-    /// `true` when suppressing `peer` would empty this topic's eligible eager
-    /// fan-out set — i.e. `peer` is eager and every other eager peer is
-    /// already suppressed. Timeout-based cooling must never remove the last
-    /// fan-out target on a topic that can originate local publishes; without
-    /// this floor a degraded node thrashes cooling until its own publishes
-    /// fan out to zero peers while still returning `Ok(())`.
+    /// Issue #63 admission view of cooling. A peer whose cooldown has
+    /// expired but whose recovery probe has not yet succeeded is still
+    /// "suppressed" for mesh purposes (`is_peer_suppressed_at`, graft
+    /// eligibility) — but feeding that into the Bulk admission drop made
+    /// the probe unreachable: the send that would claim the probe was
+    /// dropped before the claim layer ever ran, so a Bulk-priority topic
+    /// could never self-recover from cooling. Admission is therefore fed
+    /// a probe-due exemption: a peer whose cooldown expired with no
+    /// probe in flight reads as NOT cooled, the claim layer converts
+    /// exactly one such admission into the `RecoveryProbe`, and every
+    /// later attempt sees the in-flight probe as cooled again — bounded
+    /// at one probe per cooldown expiry. Normal and Critical ignore the
+    /// cooled flag entirely, so only Bulk behaviour changes.
+    fn is_peer_cooled_for_admission_at(&self, peer: PeerId, now: Instant) -> bool {
+        self.is_peer_suppressed_at(peer, now)
+            && !self
+                .peer_cooling
+                .get(&peer)
+                .is_some_and(|state| state.recovery_probe_due_at(now))
+    }
+
+    /// Issue #32 / #62 cooling floor for locally subscribed publish topics.
+    ///
+    /// Returns `true` when suppressing `peer` must be blocked because the
+    /// demotion could not be backfilled by `maintain_degree_at`:
+    ///
+    /// - `peer` is eager and suppressing it would empty the eligible eager
+    ///   fan-out set (the original issue #32 floor: timeout-based cooling
+    ///   must never remove the last fan-out target on a topic that can
+    ///   originate local publishes, or a degraded node thrashes cooling
+    ///   until its own publishes fan out to zero peers while still
+    ///   returning `Ok(())`).
+    /// - the mesh currently sustains the maintenance target degree
+    ///   (`MIN_EAGER_DEGREE.min(max_eager_degree)`) and suppressing `peer`
+    ///   would drop it below that target with no graft-eligible lazy
+    ///   replacement to promote (issue #62, x0x #611: at a consumer-set
+    ///   max degree 2 the healthy mesh IS two peers, and a plain demotion
+    ///   locks the topic at degree 1 for >= the 120 s cooldown because the
+    ///   cooled peer fails `can_graft_peer_at` even after expiry).
+    ///
+    /// Arms are evaluated in precedence order: (1) the original issue #32
+    /// last-eligible-peer arm, with no exemptions — not for a graft-eligible
+    /// lazy replacement (a replacement is only *potential* until a graft
+    /// actually happens) and not for a `PeerHealth::Dead` peer; (2) with a
+    /// graft-eligible lazy replacement available the floor never engages —
+    /// cooling is then a *replacement* the maintainer backfills rather than
+    /// a removal; (3) otherwise a suppression that would drop the mesh from
+    /// exactly the target degree to below it is blocked. An
+    /// already-under-target mesh is left alone in (3): pinning a timing-out
+    /// peer cannot restore a degree the peer population does not support,
+    /// and the issue #32 eligibility-time rescue plus the zero-fan-out
+    /// counter remain as backstops.
     fn cooling_floor_blocks_at(&self, peer: PeerId, now: Instant) -> bool {
-        // Live-subscriber check rather than `!subscribers.is_empty()`: a
-        // dropped subscription leaves a closed sender in the vector until
-        // `clean_cache` prunes it, which would otherwise keep the floor armed
-        // on a topic that has already reverted to forward-only.
-        self.has_live_subscribers()
-            && self.eager_peers.contains(&peer)
-            && self
-                .eager_peers
+        let Some(eligible_after) = self.eligible_eager_after_suppressing_at(peer, now) else {
+            return false;
+        };
+        // Issue #32 floor, evaluated FIRST: never suppress the last eligible
+        // eager fan-out target. This arm takes precedence over the
+        // replacement gate below — a lazy replacement only helps once a
+        // graft actually happens — and has no exemptions: it is the arm the
+        // `PeerHealth::Dead` fast-suppress consults via
+        // [`Self::cooling_floor_last_peer_blocks_at`], so it binds for Dead
+        // peers too.
+        if eligible_after == 0 {
+            return true;
+        }
+        // Issue #62: a graft-eligible lazy peer can backfill the vacancy, so
+        // the suppression is a replacement, not a removal. `can_graft_peer_at`
+        // matches the filter `scored_lazy_peers_at` applies, i.e. exactly
+        // what `maintain_degree_at` can promote.
+        if self.has_graft_eligible_lazy_peer_at(now) {
+            return false;
+        }
+        // Issue #62 widening: `eligible_after + 1` is the eligible degree the
+        // mesh holds right now (`peer` itself is unsuppressed at this point);
+        // block only the drop from exactly the target degree to below it.
+        eligible_after + 1 == MIN_EAGER_DEGREE.min(self.max_eager_degree)
+    }
+
+    /// The issue #32 arm alone: suppressing `peer` would leave zero eligible
+    /// eager fan-out targets on a locally subscribed topic. Used by the
+    /// `PeerHealth::Dead` fast-suppress, which is exempt from the issue #62
+    /// replacement requirement (see `record_send_timeout_inner_at`) but must
+    /// still never cool the last delivery path.
+    fn cooling_floor_last_peer_blocks_at(&self, peer: PeerId, now: Instant) -> bool {
+        self.eligible_eager_after_suppressing_at(peer, now) == Some(0)
+    }
+
+    /// Eligible (unsuppressed) eager fan-out count that would remain if
+    /// `peer` were suppressed. `None` disarms the floor entirely: no live
+    /// local subscriber — checked directly rather than via
+    /// `!subscribers.is_empty()` because a dropped subscription leaves a
+    /// closed sender in the vector until `clean_cache` prunes it, which
+    /// would otherwise keep the floor armed on a topic that has already
+    /// reverted to forward-only — or `peer` is not eager.
+    fn eligible_eager_after_suppressing_at(&self, peer: PeerId, now: Instant) -> Option<usize> {
+        if !self.has_live_subscribers() || !self.eager_peers.contains(&peer) {
+            return None;
+        }
+        Some(
+            self.eager_peers
                 .iter()
                 .filter(|other| **other != peer)
-                .all(|other| self.is_peer_suppressed_at(*other, now))
+                .filter(|other| !self.is_peer_suppressed_at(**other, now))
+                .count(),
+        )
+    }
+
+    /// Whether any lazy peer could be promoted right now — the same
+    /// `can_graft_peer_at` gate `scored_lazy_peers_at` applies for
+    /// `maintain_degree_at` (issue #62).
+    fn has_graft_eligible_lazy_peer_at(&self, now: Instant) -> bool {
+        self.lazy_peers
+            .iter()
+            .any(|peer| self.can_graft_peer_at(*peer, now))
     }
 
     /// Issue #32 eligibility-time guarantee: if this topic has live local
@@ -4029,6 +4134,10 @@ impl TopicState {
                 // floor peer is never suppressed, so its cooldown never
                 // expires and it is never claimed as a recovery probe.
                 let floor_blocks = self.cooling_floor_blocks_at(attempt.peer, now);
+                // Dead exemption (issue #62 round 2, x0x #656): only the
+                // issue #32 last-peer arm binds for Dead peers. Computed
+                // before the `entry()` borrow, like `floor_blocks`.
+                let dead_floor_blocks = self.cooling_floor_last_peer_blocks_at(attempt.peer, now);
                 let cooling = self
                     .peer_cooling
                     .entry(attempt.peer)
@@ -4045,7 +4154,14 @@ impl TopicState {
                 }
 
                 cooling.timeout_count = cooling.timeout_count.saturating_add(1);
-                if matches!(health, Some(PeerHealth::Dead)) && !floor_blocks {
+                // A Dead peer is exempt from the issue #62 replacement
+                // requirement: a peer the health oracle has declared Dead is
+                // not a working delivery path, so pinning it as the
+                // "protected" eager peer would degrade fan-out instead of
+                // preserving it (x0x #656). The issue #32 last-peer arm
+                // still binds — never cool the final eligible target, even
+                // when it is Dead.
+                if matches!(health, Some(PeerHealth::Dead)) && !dead_floor_blocks {
                     let cooldown = cooling_config.map_or_else(
                         || cooling.next_legacy_cooldown(),
                         |config| cooling.dead_cooldown(config),
@@ -5911,16 +6027,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         result
     }
 
-    /// Inspect the per-topic cooling state for `peer`. Returns `true` if
-    /// the peer is currently suppressed for this topic. Used by the
-    /// admission gate to drop bulk admissions to cooled peers without
-    /// re-entering the per-topic send pipeline.
+    /// Inspect the per-topic cooling state for `peer` as the admission
+    /// gate sees it (issue #63: a probe-due peer is admissible so the
+    /// claim layer can convert one send into the recovery probe). Returns
+    /// `true` if the peer is currently suppressed for this topic. Used to
+    /// drop bulk admissions to cooled peers without re-entering the
+    /// per-topic send pipeline.
     async fn is_peer_currently_suppressed(&self, topic: &TopicId, peer: &PeerId) -> bool {
         let topics_guard = self.topics.read_topic(topic).await;
         let now = Instant::now();
         topics_guard
             .get(topic)
-            .is_some_and(|state| state.is_peer_suppressed_at(*peer, now))
+            .is_some_and(|state| state.is_peer_cooled_for_admission_at(*peer, now))
     }
 
     async fn claim_topic_send_attempts(
@@ -6561,7 +6679,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 Some(state) => peers
                     .iter()
                     .copied()
-                    .filter(|peer| state.is_peer_suppressed_at(*peer, now))
+                    // Issue #63: probe-due peers are admissible so the
+                    // claim layer can convert one send into the recovery
+                    // probe.
+                    .filter(|peer| state.is_peer_cooled_for_admission_at(*peer, now))
                     .collect(),
                 None => HashSet::new(),
             }
@@ -10216,6 +10337,135 @@ mod tests {
         );
     }
 
+    /// Issue #62 (x0x #611): with a consumer-configured max eager degree
+    /// of 2 (x0x Leaf) the healthy mesh IS two peers, so demoting one of
+    /// them locks the topic at degree 1 for at least the 120 s cooldown —
+    /// the cooled peer fails `can_graft_peer_at` even after cooldown
+    /// expiry, so `maintain_degree_at` cannot promote anything and the
+    /// only escape is the remote peer initiating traffic. Cooling must be
+    /// a *replacement* mechanism: with no graft-eligible lazy peer to
+    /// backfill the vacancy, the floor must keep the timeout-counting
+    /// peer eager; as soon as a graft-eligible replacement exists, the
+    /// demotion goes through and the replacement is promoted.
+    #[test]
+    fn cooling_does_not_demote_when_no_graft_eligible_replacement_exists() {
+        let mut state = TopicState::new();
+        state.max_eager_degree = 2;
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+        let peer_c = test_peer_id(4);
+        state.eager_peers.insert(peer_a);
+        state.eager_peers.insert(peer_b);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscribers.push(tx);
+
+        // Leg 1 — no replacement available: five Normal-kind timeouts at
+        // A inside one window must reach the suppression threshold but
+        // NOT demote it, because demoting would drop the eligible eager
+        // set from the target degree (2) to 1 with nothing to promote.
+        let now = Instant::now();
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer_a), now);
+        }
+        assert_eq!(
+            state.eager_peers.len(),
+            2,
+            "floor: with no graft-eligible lazy replacement, A must stay eager"
+        );
+        assert!(
+            state.eager_peers.contains(&peer_a),
+            "A must remain an eager fan-out target"
+        );
+        assert!(
+            !state.is_peer_suppressed_at(peer_a, now),
+            "A must not be suppressed while the floor holds"
+        );
+
+        // Leg 2 — a graft-eligible C appears in lazy: the very next
+        // timeout demotes A (suppressed + eager to lazy) and
+        // maintain_degree_at promotes C, proving leg 1 passed through the
+        // replacement gate rather than by disabling cooling outright.
+        state.lazy_peers.insert(peer_c);
+        let _ = state.record_send_timeout_at(normal_send_attempt(peer_a), now);
+        assert!(
+            state.is_peer_suppressed_at(peer_a, now),
+            "with a replacement available, A must be suppressed"
+        );
+        assert!(
+            !state.eager_peers.contains(&peer_a),
+            "with a replacement available, A must be demoted from eager"
+        );
+        assert!(
+            state.lazy_peers.contains(&peer_a),
+            "suppressed A must move to lazy for later recovery"
+        );
+        let (_pruned, grafted) = state.maintain_degree_at(now);
+        assert_eq!(grafted, 1, "maintain_degree_at must backfill with C");
+        assert!(state.eager_peers.contains(&peer_c));
+        assert!(state.eager_peers.contains(&peer_b));
+        assert_eq!(state.eager_peers.len(), 2, "degree stays at the target");
+    }
+
+    /// Round-2 review of PR #64: the widened floor also gated the
+    /// `PeerHealth::Dead` fast-suppress, so a mesh sitting exactly at its
+    /// target degree with no lazy replacement would have pinned a peer the
+    /// health oracle declared Dead — the one peer that cannot be a useful
+    /// eager delivery path (x0x #656). Dead peers are therefore exempt from
+    /// the issue #62 replacement requirement, but NOT from the issue #32
+    /// last-peer floor, which now also takes precedence over the replacement
+    /// gate for every health verdict.
+    #[test]
+    fn dead_peer_cooling_bypasses_replacement_floor_but_not_last_peer_floor() {
+        let mut state = TopicState::new();
+        state.max_eager_degree = 2;
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+        let peer_c = test_peer_id(4);
+        state.eager_peers.insert(peer_a);
+        state.eager_peers.insert(peer_b);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscribers.push(tx);
+        let now = Instant::now();
+
+        // Dead + at-target (2) + no replacement: the #62 widening must NOT
+        // pin the Dead peer — one timeout carrying a Dead health verdict
+        // fast-suppresses and demotes it.
+        state.record_send_timeout_with_context_at(
+            normal_send_attempt(peer_a),
+            now,
+            Some(PeerHealth::Dead),
+            AdaptiveCoolingConfig::default(),
+        );
+        assert!(
+            state.is_peer_suppressed_at(peer_a, now),
+            "a Dead peer must not be pinned by the replacement floor"
+        );
+        assert!(
+            !state.eager_peers.contains(&peer_a),
+            "the suppressed Dead peer must be demoted from eager"
+        );
+
+        // Dead + last eligible peer: the #32 arm binds even for Dead and
+        // even with a graft-eligible lazy peer available (a replacement is
+        // only potential until a graft happens) — the last fan-out target is
+        // never suppressed.
+        state.lazy_peers.insert(peer_c);
+        state.record_send_timeout_with_context_at(
+            normal_send_attempt(peer_b),
+            now,
+            Some(PeerHealth::Dead),
+            AdaptiveCoolingConfig::default(),
+        );
+        assert!(
+            !state.is_peer_suppressed_at(peer_b, now),
+            "the last eligible eager peer stays protected even when Dead"
+        );
+        assert!(
+            state.eager_peers.contains(&peer_b),
+            "the last eligible eager peer must stay eager"
+        );
+    }
+
     /// The zero-fan-out WARN is throttled, but the counters are the machine-
     /// readable signal behind `GET /diagnostics/gossip`. Throttling the log
     /// must never throttle the counters, or an operator sampling diagnostics
@@ -13821,6 +14071,174 @@ mod tests {
         assert_eq!(suppressed[0].recent_timeout_count, 1);
         assert_eq!(suppressed[0].state, "cooldown");
         assert_eq!(transport.send_count(), 1);
+    }
+
+    /// Issue #63 (x0x #611, #288, #442): on a Bulk-priority topic the
+    /// post-cooldown recovery probe was unreachable. Admission is fed
+    /// `is_peer_suppressed_at`, which stays `true` after cooldown expiry
+    /// until a probe *succeeds*, and `admit_bulk` drops cooled peers — so
+    /// no send is ever attempted, the probe is never claimed, and the
+    /// peer stays suppressed forever unless the remote side talks to us
+    /// first or the transport disconnects. Every x0x announce/discovery
+    /// lane is Bulk (`x0x.machine.announce.v2`, `x0x.user.announce.v2`,
+    /// `x0x.discovery.groups`, `x0x/release`, `x0x/caps/v1`), so one
+    /// cooling event removed a peer from all of them indefinitely.
+    ///
+    /// The fix feeds admission a probe-due exemption: a peer whose
+    /// cooldown expired with no probe in flight is admissible exactly
+    /// once; the claim layer converts that send into the `RecoveryProbe`,
+    /// and while the probe is in flight the peer reads as cooled again —
+    /// bounded at one probe per cooldown expiry, preserving the
+    /// fail-closed intent for all other Bulk traffic.
+    #[tokio::test]
+    async fn bulk_suppressed_peer_self_recovers_after_cooldown_without_inbound_traffic() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let topics = Arc::new(ShardedTopicMap::new());
+        let signing_key = Arc::new(test_signing_key());
+        let stage_stats = Arc::new(PubSubStageStats::default());
+        let topic = TopicId::new([50u8; 32]);
+        let lazy_peer = test_peer_id(2);
+        // Every x0x announce/discovery lane is Bulk-priority.
+        let admission = Arc::new(admission::AdmissionControl::new());
+        admission.registry().register(topic, TopicPriority::Bulk);
+        let send_path = SendPathContext {
+            rtt_tracker: Arc::new(PerPeerRttTracker::new()),
+            cooling_config: AdaptiveCoolingConfig::default(),
+            peer_health_snapshot: Arc::new(StdRwLock::new(HashMap::new())),
+            connected_peers_snapshot: Arc::new(StdRwLock::new(None)),
+            peer_health_oracle: Arc::new(StdRwLock::new(None)),
+            admission: Arc::clone(&admission),
+        };
+
+        // Suppress the lazy peer on the Bulk topic: five Normal-kind
+        // timeouts in one window, with a pending IHAVE so the flush has a
+        // reason to reach it.
+        {
+            let mut topics_guard = topics.write_topic(&topic).await;
+            let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(lazy_peer);
+            state.pending_ihave.push([9u8; 32]);
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                let _ =
+                    state.record_send_timeout_at(normal_send_attempt(lazy_peer), Instant::now());
+            }
+            let now = Instant::now();
+            assert!(
+                state.is_peer_suppressed_at(lazy_peer, now),
+                "five timeouts in one window must suppress the peer"
+            );
+            let (admitted, bulk) = filter_peers_through_admission_in_state(
+                &send_path,
+                state,
+                &topic,
+                vec![lazy_peer],
+                "IHAVE",
+                now,
+            );
+            assert!(
+                admitted.is_empty(),
+                "during the cooldown the Bulk admission drop must stand"
+            );
+            release_bulk_admissions_free(&send_path.admission, &bulk);
+
+            // Advance past the cooldown (paused clock: rewind the
+            // deadline). The peer is STILL suppressed for mesh purposes —
+            // graft eligibility returns only after a successful recovery
+            // probe — but admission must let the one probe through, or
+            // the probe can never exist.
+            let cooling = state
+                .peer_cooling
+                .get_mut(&lazy_peer)
+                .expect("cooling state after suppression");
+            cooling.suppressed_until = Some(Instant::now() - Duration::from_millis(1));
+            let now = Instant::now();
+            assert!(
+                state.is_peer_suppressed_at(lazy_peer, now),
+                "post-expiry the peer is still not graft-eligible"
+            );
+            let (admitted, bulk) = filter_peers_through_admission_in_state(
+                &send_path,
+                state,
+                &topic,
+                vec![lazy_peer],
+                "IHAVE",
+                now,
+            );
+            release_bulk_admissions_free(&send_path.admission, &bulk);
+            assert_eq!(
+                admitted,
+                vec![lazy_peer],
+                "post-expiry with no probe in flight, Bulk admission must let exactly the recovery probe through"
+            );
+        }
+
+        // One IHAVE flush — the only outbound lane that reaches a lazy
+        // peer. The probe-due peer is admitted, the claim layer converts
+        // the send into the recovery probe, the transport succeeds, and
+        // the successful probe clears suppression. No inbound traffic
+        // from the peer is driven anywhere in this test.
+        let policy_transport = Arc::new(PolicyTransport::new(
+            Arc::clone(&transport),
+            Arc::clone(&signing_key),
+        ));
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &topics,
+            &policy_transport,
+            &signing_key,
+            &stage_stats,
+            &Arc::new(PeerOutboundBudgets::default()),
+            &send_path,
+        )
+        .await;
+
+        assert_eq!(
+            transport.send_count_to(lazy_peer),
+            1,
+            "exactly one outbound send — the recovery probe — must reach the peer"
+        );
+        {
+            let topics_guard = topics.read_topic(&topic).await;
+            let state = topics_guard.get(&topic).expect("topic state");
+            assert!(
+                state.can_graft_peer_at(lazy_peer, Instant::now()),
+                "after the probe succeeds the peer must be graft-eligible again with no inbound traffic from it"
+            );
+        }
+
+        // Bound: exactly one probe per cooldown expiry. Re-suppress,
+        // expire, claim the probe directly, and verify Bulk admission
+        // fails closed again while the probe is in flight.
+        {
+            let mut topics_guard = topics.write_topic(&topic).await;
+            let state = topics_guard.get_mut(&topic).expect("topic state");
+            let now = Instant::now();
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                let _ = state.record_send_timeout_at(normal_send_attempt(lazy_peer), now);
+            }
+            let cooling = state
+                .peer_cooling
+                .get_mut(&lazy_peer)
+                .expect("cooling state after re-suppression");
+            cooling.suppressed_until = Some(now - Duration::from_millis(1));
+            let (attempt, _event) = state
+                .claim_send_attempt_at(lazy_peer, now)
+                .expect("probe-due peer must claim a recovery probe");
+            assert_eq!(attempt.kind, SendAttemptKind::RecoveryProbe);
+            let (admitted, bulk) = filter_peers_through_admission_in_state(
+                &send_path,
+                state,
+                &topic,
+                vec![lazy_peer],
+                "IHAVE",
+                now,
+            );
+            release_bulk_admissions_free(&send_path.admission, &bulk);
+            assert!(
+                admitted.is_empty(),
+                "while the recovery probe is in flight, Bulk admission must fail closed again"
+            );
+        }
     }
 
     #[tokio::test]

@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **pubsub: the issue #32 cooling floor is now a replacement gate — a
+  locally subscribed topic no longer demotes an eager peer below its
+  maintenance target degree unless a graft-eligible lazy peer can
+  backfill the vacancy (#62, x0x #611).** The floor previously fired only
+  when suppressing a peer would *empty* the eligible eager set. With a
+  consumer-configured max eager degree of 2 (x0x Leaf), the healthy mesh
+  is exactly two peers, so a single suppression locked the topic at
+  degree 1 for at least the 120 s cooldown: the cooled peer fails
+  `can_graft_peer_at` even after cooldown expiry (suppression clears only
+  on a successful recovery probe), `maintain_degree_at` had nothing to
+  promote, and the only escape was the remote peer initiating traffic.
+  `cooling_floor_blocks_at` now evaluates, in precedence order: (1) the
+  original issue #32 arm — never suppress the last eligible eager fan-out
+  target, with no exemptions: not for a graft-eligible lazy replacement
+  (a replacement is only potential until a graft actually happens) and
+  not for a `PeerHealth::Dead` peer; (2) a replacement arm — the floor
+  never engages when a lazy peer passes the same `can_graft_peer_at` gate
+  `scored_lazy_peers_at` applies, so cooling then behaves exactly as
+  before, as a replacement the maintainer backfills; (3) a widening —
+  block a suppression that would drop the eligible set from exactly the
+  target degree (`min(MIN_EAGER_DEGREE, max_eager_degree)`) to below it
+  with no replacement available. An already-under-target mesh is still
+  allowed to cool in (3): pinning a timing-out peer cannot restore a
+  degree the peer population does not support, and the eligibility-time
+  rescue plus zero-fan-out counters remain as backstops. **Dead peers are
+  exempt from the replacement requirement but not from the last-peer
+  floor (x0x #656):** a peer the health oracle has declared Dead cannot be
+  a useful eager delivery path, so pinning it as the "protected" peer
+  would degrade fan-out instead of preserving it; its fast-suppress
+  consults the issue #32 arm directly and therefore still never removes
+  the final eligible target.
+
+- **pubsub: Bulk-priority topics can now self-recover from cooling — a
+  peer whose cooldown expired is admissible for exactly one recovery
+  probe per expiry (#63, x0x #611, #288, #442).** The admission gate was
+  fed `is_peer_suppressed_at`, which stays `true` after cooldown expiry
+  until a recovery probe *succeeds*, and `admit_bulk` drops cooled peers
+  — so no send was ever attempted, the probe was never claimed, and the
+  peer stayed suppressed from our side forever unless the remote peer
+  initiated traffic or the transport disconnected. On Critical-priority
+  topics admission still admits a cooled peer, so the probe fired and
+  recovery happened after the cooldown; on Bulk topics (every x0x
+  announce/discovery lane: `x0x.machine.announce.v2`,
+  `x0x.user.announce.v2`, `x0x.discovery.groups`, `x0x/release`,
+  `x0x/caps/v1`) there was no self-driven escape at all. The admission
+  call sites now feed a probe-due view (`is_peer_cooled_for_admission_at`):
+  a peer whose cooldown expired with no probe in flight reads as not
+  cooled, the claim layer (`PeerCoolingState::claim_send_attempt_at`,
+  unchanged) converts exactly one such admission into the RecoveryProbe,
+  and while that probe is in flight — or a new cooldown is running — the
+  peer reads as cooled again. The exemption is therefore bounded at one
+  probe per cooldown expiry and the fail-closed intent is preserved for
+  all other Bulk traffic; a failed probe re-suppresses with backoff
+  exactly as before. Normal and Critical priorities ignore the cooled
+  flag entirely, so their behaviour is unchanged.
+
 ## [0.5.79] - 2026-09-13
 
 ### Added

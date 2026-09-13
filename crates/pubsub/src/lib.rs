@@ -109,8 +109,29 @@ const TOPIC_IDLE_TTL_SECS: u64 = 600;
 /// Maximum IHAVE batch size (per SPEC.md)
 const MAX_IHAVE_BATCH_SIZE: usize = 1024;
 
+/// Final-review cap on a topic's pending-IHAVE queue, mirroring the cap
+/// the #59 withheld-entry list already applies (MAX_IHAVE_BATCH_SIZE).
+/// The abort-safety change moved batch consumption behind the send handoff
+/// and its early-exit paths, and nothing else bounds the vector: on an
+/// all-eager topic (structurally unable to advertise — no lazy members,
+/// no stranded/withheld entries, so the flush's target set is empty and
+/// pending is never consumed) and under admission denial during
+/// congestion, it would otherwise grow one entry per message forever.
+/// Overflow drops the OLDEST ids — the stalest advertisements. The cap
+/// only gates the push side; consumption stays where the abort-safety
+/// fix put it (after send completion).
+const MAX_PENDING_IHAVE: usize = MAX_IHAVE_BATCH_SIZE;
+
 /// IHAVE flush interval (100ms)
 const IHAVE_FLUSH_INTERVAL_MS: u64 = 100;
+
+/// Issue #42: single shared deadline bounding every task join in
+/// [`PlumtreePubSub::shutdown`]. A background task that misses it (e.g. a
+/// flush iteration still awaiting per-peer sends, each independently
+/// bounded by the per-peer send timeout) is aborted — `SendAttemptClaims`'
+/// `Drop` releases in-flight recovery probes, so an abort cannot strand
+/// probe state.
+const BACKGROUND_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// Anti-entropy reconciliation interval (30 seconds)
 const ANTI_ENTROPY_INTERVAL_SECS: u64 = 30;
@@ -729,6 +750,16 @@ pub struct FanoutCounts {
     pub attempted: usize,
     /// Number of those peers that confirmed receipt before this call returned.
     pub succeeded: usize,
+}
+
+/// Issue #42: outcome of [`PlumtreePubSub::shutdown`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PubSubShutdownReport {
+    /// Background tasks that finished within the shutdown grace (including
+    /// any that had already terminated via panic — logged at WARN).
+    pub joined: usize,
+    /// Background tasks that missed the grace deadline and were aborted.
+    pub aborted: usize,
 }
 
 /// Per-stage timing counters for inbound PubSub message handling.
@@ -3599,24 +3630,60 @@ impl TopicState {
     /// and return their unserved targets, deduplicated. Consuming (unlike
     /// `stranded_ihave_targets_for`) matches `pending_ihave`'s lossy
     /// flush semantics: one advertisement per withheld id, no retry.
-    fn drain_lazy_withheld_targets_for(&mut self, batch: &[MessageIdType]) -> Vec<PeerId> {
+    /// Final-review cap: queue a msg_id for the next IHAVE flush, bounded
+    /// at [`MAX_PENDING_IHAVE`] ids (mirroring the withheld-entry list's
+    /// cap). Overflow drops the oldest ids — the stalest advertisements.
+    /// Consumption is untouched: it still happens only after the send
+    /// handoff, preserving the abort-safety property.
+    fn push_pending_ihave(&mut self, msg_id: MessageIdType) {
+        if self.pending_ihave.len() >= MAX_PENDING_IHAVE {
+            let overflow = self.pending_ihave.len() + 1 - MAX_PENDING_IHAVE;
+            self.pending_ihave.drain(..overflow);
+        }
+        self.pending_ihave.push(msg_id);
+    }
+
+    /// The #59 LazyForward withheld-eager announce targets for this
+    /// batch, WITHOUT removing the entries (the round-1 flush drained them
+    /// eagerly; the entry removal now happens in
+    /// [`Self::consume_flushed_ihave_batch`] once the sends have been
+    /// handed off, so an aborted flush leaves the announcements in place).
+    fn lazy_withheld_targets_for(&self, batch: &[MessageIdType]) -> Vec<PeerId> {
         if self.lazy_withheld.is_empty() || batch.is_empty() {
             return Vec::new();
         }
         let batch_index: HashSet<MessageIdType> = batch.iter().copied().collect();
         let mut targets: Vec<PeerId> = Vec::new();
-        self.lazy_withheld.retain(|entry| {
-            if !batch_index.contains(&entry.msg_id) {
-                return true;
-            }
-            for peer in &entry.targets {
-                if !entry.served.contains(peer) && !targets.contains(peer) {
-                    targets.push(*peer);
+        for entry in &self.lazy_withheld {
+            if batch_index.contains(&entry.msg_id) {
+                for peer in &entry.targets {
+                    if !entry.served.contains(peer) && !targets.contains(peer) {
+                        targets.push(*peer);
+                    }
                 }
             }
-            false
-        });
+        }
         targets
+    }
+
+    /// Issue #42 round 2: consume an IHAVE batch that has been handed to
+    /// the send tasks. Removal of `pending_ihave` ids and the #59
+    /// LazyForward withheld-eager entries is DEFERRED until after the
+    /// sends are spawned — the flush snapshots its work under the topic
+    /// lock and only takes it once the send tasks exist, so an abort
+    /// between the two (shutdown grace exceeded) leaves the batch in
+    /// place for the next flush instead of losing it. Since x0x's relay
+    /// fan-out withholds the eager send on ~27-30% of relayed traffic and
+    /// depends on exactly these IHAVEs, a lost batch was lost delivery
+    /// until anti-entropy.
+    fn consume_flushed_ihave_batch(&mut self, batch: &[MessageIdType]) {
+        if batch.is_empty() {
+            return;
+        }
+        let ids: HashSet<MessageIdType> = batch.iter().copied().collect();
+        self.pending_ihave.retain(|id| !ids.contains(id));
+        self.lazy_withheld
+            .retain(|entry| !ids.contains(&entry.msg_id));
     }
 
     /// Add message to cache
@@ -4929,6 +4996,15 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// rejected). The fleet-level rate of this counter schedules the
     /// [`SignaturePolicy::RejectV1`] flip.
     v1_receipts: std::sync::atomic::AtomicU64,
+    /// Issue #42: shutdown signal for the background tasks spawned at
+    /// construction (IHAVE flusher, cache cleaner, degree maintainer,
+    /// anti-entropy, connected-peers refresher). Setting the value wakes
+    /// every task's `select!` arm at its next await point.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Issue #42: retained JoinHandles for those background tasks, joined
+    /// (or aborted after a bounded grace) by [`Self::shutdown`] so no
+    /// worker is left spinning after transport shutdown.
+    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
@@ -5167,6 +5243,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             peer_scoring: Arc::new(peer_scoring::PeerScoring::new()),
             signature_policy: StdRwLock::new(SignaturePolicy::AcceptV1),
             v1_receipts: std::sync::atomic::AtomicU64::new(0),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            background_tasks: Mutex::new(Vec::new()),
         };
 
         if start_background_tasks {
@@ -5282,9 +5360,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let snapshot = Arc::clone(&self.connected_peers_snapshot);
         let transport = Arc::clone(&self.transport);
         let stage_stats = Arc::clone(&self.stage_stats);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(async move {
+                // Issue #42: handle retained so `shutdown` can join/abort
+                // the task.
+                let task = handle.spawn(async move {
                     loop {
                         refresh_connected_peers_snapshot_once(
                             &topics,
@@ -5293,9 +5374,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             &stage_stats,
                         )
                         .await;
-                        time::sleep(CONNECTED_PEERS_REFRESH_INTERVAL).await;
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => {
+                                debug!(
+                                    "PubSub connected-peers refresher stopped by shutdown signal"
+                                );
+                                break;
+                            }
+                            _ = time::sleep(CONNECTED_PEERS_REFRESH_INTERVAL) => {}
+                        }
                     }
                 });
+                self.retain_background_task(task);
             }
             Err(e) => {
                 warn!("Unable to spawn PubSub connected-peers snapshot refresher: {e}");
@@ -6961,7 +7051,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                      (throttled; counter is cumulative for this topic)"
                 );
             }
-            state.pending_ihave.push(msg_id);
+            state.push_pending_ihave(msg_id);
 
             // x0x #613 mitigation 1: queue a self-IHAVE to the attempted
             // peers so the 100 ms flush advertises this id regardless of
@@ -7375,7 +7465,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             validator_action,
             ValidationAction::ForwardAndDeliver | ValidationAction::LazyForward
         ) {
-            state.pending_ihave.push(msg_id);
+            state.push_pending_ihave(msg_id);
         }
         self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
 
@@ -8065,6 +8155,71 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         Ok(())
     }
 
+    /// Issue #42: retain a background task's JoinHandle so
+    /// [`Self::shutdown`] can join or abort it.
+    fn retain_background_task(&self, handle: tokio::task::JoinHandle<()>) {
+        match self.background_tasks.lock() {
+            Ok(mut guard) => guard.push(handle),
+            Err(poisoned) => poisoned.into_inner().push(handle),
+        }
+    }
+
+    /// Issue #42: stop every background task spawned at construction (IHAVE
+    /// flusher, cache cleaner, degree maintainer, anti-entropy,
+    /// connected-peers refresher) and wait for them to finish.
+    ///
+    /// Without this the IHAVE flusher kept looping after transport
+    /// shutdown — every flush attempt failed ("node not initialized"), was
+    /// logged at WARN and retried, saturating all runtime workers (~10 Hz
+    /// per LAN peer, +700 MB RSS during shutdown) and preventing SIGTERM
+    /// exit (x0x #368/#371; x0x ships a 5 s force-exit watchdog as an
+    /// interim). Since `ValidationAction::LazyForward` (0.5.79) the flusher
+    /// is also the relay's delivery path, so a flusher that spins after
+    /// shutdown is a delivery defect, not just a shutdown nuisance.
+    ///
+    /// Every join shares one deadline ([`BACKGROUND_SHUTDOWN_GRACE`]); a
+    /// task that misses it is aborted, so shutdown can never hang. The
+    /// transport error itself is opaque (`anyhow` from the transport
+    /// trait), so "terminal error" detection by string matching is
+    /// deliberately avoided — embedders drive a clean stop by closing
+    /// their transport and calling this, in either order. Idempotent: a
+    /// second call reports zero tasks.
+    pub async fn shutdown(&self) -> PubSubShutdownReport {
+        let _signalled = self.shutdown_tx.send(true);
+        let drained: Vec<tokio::task::JoinHandle<()>> = match self.background_tasks.lock() {
+            Ok(mut guard) => guard.drain(..).collect(),
+            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+        };
+        let deadline = tokio::time::Instant::now() + BACKGROUND_SHUTDOWN_GRACE;
+        let mut report = PubSubShutdownReport::default();
+        for mut handle in drained {
+            match tokio::time::timeout_at(deadline, &mut handle).await {
+                Ok(Ok(())) => report.joined += 1,
+                Ok(Err(join_error)) => {
+                    warn!("PubSub background task failed during shutdown: {join_error}");
+                    report.joined += 1;
+                }
+                Err(_) => {
+                    handle.abort();
+                    report.aborted += 1;
+                }
+            }
+        }
+        if report.aborted > 0 {
+            warn!(
+                joined = report.joined,
+                aborted = report.aborted,
+                "PubSub background shutdown grace exceeded; stragglers aborted"
+            );
+        } else {
+            debug!(
+                joined = report.joined,
+                "PubSub background tasks stopped on shutdown"
+            );
+        }
+        report
+    }
+
     /// Spawn background task to flush IHAVE batches
     fn spawn_ihave_flusher(&self) {
         let topics = self.topics.clone();
@@ -8073,33 +8228,64 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let stage_stats = Arc::clone(&self.stage_stats);
         let outbound_budgets = Arc::clone(&self.outbound_budgets);
         let send_path = self.send_path_context();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let initial_jitter = deterministic_jitter(
             self.peer_id,
             b"pubsub-ihave-flush",
             Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS),
         );
 
-        tokio::spawn(async move {
-            if !initial_jitter.is_zero() {
-                time::sleep(initial_jitter).await;
+        // Issue #42: select on the shutdown token at every await point so
+        // the flusher terminates on shutdown instead of spinning on
+        // failing sends after transport close.
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                _ = time::sleep(initial_jitter) => {}
             }
             let mut interval = time::interval(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS));
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
             loop {
-                interval.tick().await;
-
-                Self::flush_ihave_batches(
-                    &topics,
-                    &transport,
-                    &signing_key,
-                    &stage_stats,
-                    &outbound_budgets,
-                    &send_path,
-                )
-                .await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        debug!("PubSub IHAVE flusher stopping for shutdown: running one final flush");
+                        // Issue #42 round 2: flush once on the shutdown
+                        // signal before exiting. Since `ValidationAction::
+                        // LazyForward` the IHAVE flusher is the relay's
+                        // delivery path (the eager send is withheld and the
+                        // msg_id announced instead), so without this the
+                        // trailing interval's batch would be dropped even
+                        // on a live transport. The flush is abort-safe: an
+                        // abort past the shutdown grace leaves the batch
+                        // pending instead of losing it.
+                        Self::flush_ihave_batches(
+                            &topics,
+                            &transport,
+                            &signing_key,
+                            &stage_stats,
+                            &outbound_budgets,
+                            &send_path,
+                        )
+                        .await;
+                        debug!("PubSub IHAVE flusher stopped by shutdown signal");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        Self::flush_ihave_batches(
+                            &topics,
+                            &transport,
+                            &signing_key,
+                            &stage_stats,
+                            &outbound_budgets,
+                            &send_path,
+                        )
+                        .await;
+                    }
+                }
             }
         });
+        self.retain_background_task(handle);
     }
 
     async fn flush_ihave_batches(
@@ -8120,9 +8306,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         continue;
                     }
 
+                    // Issue #42 round 2: SNAPSHOT the batch instead of
+                    // draining it — the ids (and the #59 withheld-eager
+                    // entries) are only consumed once the sends have been
+                    // handed off (see `consume_flushed_ihave_batch`), so an
+                    // aborted flush leaves them in place.
                     let batch: Vec<MessageIdType> = state
                         .pending_ihave
-                        .drain(..state.pending_ihave.len().min(MAX_IHAVE_BATCH_SIZE))
+                        .iter()
+                        .take(MAX_IHAVE_BATCH_SIZE)
+                        .copied()
                         .collect();
 
                     // x0x #613: stranded-publish pull path. The regular
@@ -8132,15 +8325,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     // topic still advertises — otherwise the cached message
                     // would have no pull path at all. Entries are NOT
                     // consumed here (a pull can land later); the bounded
-                    // retry removes them. If admission below drops a
-                    // target, that advertisement is lost for this flush —
-                    // the same lossy semantics as the lazy batch itself.
+                    // retry removes them.
                     let mut ihave_targets = state.stranded_ihave_targets_for(&batch);
                     // #59: merge the LazyForward withheld-eager announce
-                    // targets for this batch. Consumed here — one
-                    // advertisement per withheld id, lossy like the batch
-                    // itself; a peer that misses it still has anti-entropy.
-                    for peer in state.drain_lazy_withheld_targets_for(&batch) {
+                    // targets for this batch (non-consuming snapshot; the
+                    // entries are dropped in `consume_flushed_ihave_batch`
+                    // once the sends are handed off).
+                    for peer in state.lazy_withheld_targets_for(&batch) {
                         if !ihave_targets.contains(&peer) {
                             ihave_targets.push(peer);
                         }
@@ -8293,6 +8484,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
                 claims.record_results(sent, timed_out, not_connected).await;
+                // Issue #42 round 2: the send tasks have been handed off —
+                // NOW take the batch out of the topic state. An abort
+                // before this point leaves the batch pending (re-advertised
+                // by the next flush or the final shutdown flush) instead of
+                // losing it.
+                let mut topics_guard = topics.write_topic(&topic_id).await;
+                if let Some(state) = topics_guard.get_mut(&topic_id) {
+                    state.consume_flushed_ihave_batch(&batch);
+                }
+                drop(topics_guard);
             }
             // X0X-0074: release every Bulk admission reserved above,
             // exactly once. Covers no-claim, partial-claim, and panic
@@ -8523,15 +8724,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let topics = self.topics.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
         let topic_idle_ttl = Duration::from_secs(TOPIC_IDLE_TTL_SECS);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
+        // Issue #42: handle retained so `shutdown` can join/abort the task.
+        let handle = tokio::spawn(async move {
             let mut cleanup_interval =
                 Duration::from_millis(SUPPRESSION_CLEANUP_NORMAL_INTERVAL_MS);
             let mut previous_suppression_len = 0_usize;
             let mut previous_cleanup = Instant::now();
 
             loop {
-                time::sleep(cleanup_interval).await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        debug!("PubSub cache cleaner stopped by shutdown signal");
+                        break;
+                    }
+                    _ = time::sleep(cleanup_interval) => {}
+                }
                 let before_suppression_len = stage_stats.suppressed_peer_count();
                 let cleanup_now = Instant::now();
                 let mut removed_suppressions = 0;
@@ -8546,8 +8755,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let after_suppression_len = stage_stats.suppressed_peer_count();
                 drop(topics_guard);
 
-                for topic in idle_topics {
-                    stage_stats.clear_topic_suppressions(topic);
+                for topic in &idle_topics {
+                    stage_stats.clear_topic_suppressions(*topic);
                 }
                 let now = Instant::now();
                 let elapsed = now
@@ -8585,24 +8794,34 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
         });
+        self.retain_background_task(handle);
     }
 
     /// Spawn background task to maintain eager peer degree
     fn spawn_degree_maintainer(&self) {
         let topics = self.topics.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let initial_jitter =
             deterministic_jitter(self.peer_id, b"pubsub-degree", Duration::from_secs(30));
 
-        tokio::spawn(async move {
-            if !initial_jitter.is_zero() {
-                time::sleep(initial_jitter).await;
+        // Issue #42: handle retained so `shutdown` can join/abort the task.
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                _ = time::sleep(initial_jitter) => {}
             }
             let mut interval = time::interval(Duration::from_secs(30));
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        debug!("PubSub degree maintainer stopped by shutdown signal");
+                        break;
+                    }
+                    _ = interval.tick() => {}
+                }
 
                 let mut topics_guard = topics.write_all().await;
                 let mut pruned = 0;
@@ -8624,6 +8843,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
         });
+        self.retain_background_task(handle);
     }
 
     /// Spawn background task for anti-entropy reconciliation
@@ -8637,21 +8857,30 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let stage_stats = Arc::clone(&self.stage_stats);
         let outbound_budgets = Arc::clone(&self.outbound_budgets);
         let send_path = self.send_path_context();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let initial_jitter = deterministic_jitter(
             self.peer_id,
             b"pubsub-anti-entropy",
             Duration::from_secs(ANTI_ENTROPY_INTERVAL_SECS),
         );
 
-        tokio::spawn(async move {
-            if !initial_jitter.is_zero() {
-                time::sleep(initial_jitter).await;
+        // Issue #42: handle retained so `shutdown` can join/abort the task.
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                _ = time::sleep(initial_jitter) => {}
             }
             let mut interval = time::interval(Duration::from_secs(ANTI_ENTROPY_INTERVAL_SECS));
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        debug!("PubSub anti-entropy task stopped by shutdown signal");
+                        break;
+                    }
+                    _ = interval.tick() => {}
+                }
 
                 let topics_guard = topics.read_all().await;
 
@@ -8871,6 +9100,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
         });
+        self.retain_background_task(handle);
     }
 
     /// Initialize peers for a topic from membership layer
@@ -9306,6 +9536,82 @@ mod tests {
         /// #59: every outbound frame in send order — (peer, stream, wire
         /// bytes) — so tests can assert which wire kind reached whom.
         frames: Mutex<Vec<(PeerId, GossipStreamType, Bytes)>>,
+    }
+
+    /// Issue #42: transport that starts failing every send once closed —
+    /// models the "node not initialized" state x0xd sees after QUIC
+    /// shutdown (x0x #368/#371). Counts send attempts so tests can observe
+    /// whether any worker keeps spinning.
+    struct ShutdownLivelockTransport {
+        local_peer: PeerId,
+        closed: std::sync::atomic::AtomicBool,
+        send_attempts: AtomicUsize,
+    }
+
+    impl ShutdownLivelockTransport {
+        fn new(local_peer: PeerId) -> Arc<Self> {
+            Arc::new(Self {
+                local_peer,
+                closed: std::sync::atomic::AtomicBool::new(false),
+                send_attempts: AtomicUsize::new(0),
+            })
+        }
+
+        /// Flip the transport into its post-shutdown state (distinct name
+        /// so it cannot be confused with the async trait `close`).
+        fn shutdown_sends(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+
+        fn send_attempts(&self) -> usize {
+            self.send_attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for ShutdownLivelockTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(self.local_peer)
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            self.shutdown_sends();
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            _peer: PeerId,
+            _stream_type: GossipStreamType,
+            _data: Bytes,
+        ) -> Result<()> {
+            self.send_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.closed.load(Ordering::SeqCst) {
+                Err(anyhow!("node not initialized"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+            Err(anyhow!("shutdown-livelock test transport does not receive"))
+        }
+
+        async fn connected_peer_ids(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.local_peer
+        }
     }
 
     struct PanicTransport {
@@ -10693,6 +10999,360 @@ mod tests {
         );
     }
 
+    /// Issue #42 (x0x #368/#371, and a delivery-path defect since
+    /// `ValidationAction::LazyForward` made the flusher the relay's
+    /// announce path): after transport shutdown the IHAVE flusher kept
+    /// looping — every flush attempt failed ("node not initialized"), was
+    /// logged at WARN and retried, saturating all runtime workers and
+    /// preventing SIGTERM exit. Regression: drive a transport shutdown
+    /// with the flusher active and assert (a) the background tasks
+    /// terminate, (b) no worker spins afterwards, and (c) shutdown
+    /// completes inside the existing 5 s x0x force-exit budget. On
+    /// origin/main the livelock variant of this test (transport closed, no
+    /// shutdown API) shows send attempts still climbing.
+    #[tokio::test]
+    async fn ihave_flusher_terminates_on_shutdown_and_stops_spinning() {
+        async fn seed_pending(
+            pubsub: &PlumtreePubSub<ShutdownLivelockTransport>,
+            topic: TopicId,
+            id: u8,
+        ) {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            if let Some(state) = topics.get_mut(&topic) {
+                let mut msg_id = [63u8; 32];
+                msg_id[0] = id;
+                state.pending_ihave.push(msg_id);
+            }
+        }
+
+        let peer_id = test_peer_id(1);
+        let transport = ShutdownLivelockTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+        ));
+        let topic = TopicId::new([63u8; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(test_peer_id(2));
+        }
+
+        // Shut the transport down FIRST: every send now fails instantly —
+        // the x0xd SIGTERM state.
+        transport.shutdown_sends();
+
+        // Sanity: the flusher is live and keeps retrying despite the dead
+        // transport (this is exactly the behaviour that used to spin
+        // forever; it must be stoppable, not absent).
+        seed_pending(&pubsub, topic, 1).await;
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS + 150)).await;
+        let before = transport.send_attempts();
+        seed_pending(&pubsub, topic, 2).await;
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS)).await;
+        let after = transport.send_attempts();
+        assert!(
+            after > before,
+            "flusher must be attempting sends before shutdown (before={before}, after={after})"
+        );
+
+        // (c) shutdown completes inside the existing budget (the x0x
+        // force-exit watchdog is 5 s; the internal grace is
+        // BACKGROUND_SHUTDOWN_GRACE).
+        let shutdown_started = Instant::now();
+        let report = pubsub.shutdown().await;
+        let elapsed = shutdown_started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown must fit the 5 s x0x force-exit budget, took {elapsed:?}"
+        );
+
+        // (a) every background task terminated — flusher, cache cleaner,
+        // degree maintainer, anti-entropy, connected-peers refresher — and
+        // cooperatively: in this scenario every send fails instantly, so a
+        // task only misses the grace deadline if it ignored the shutdown
+        // token (the abort backstop then masks the spin; this assertion
+        // keeps that observable).
+        assert_eq!(
+            report.joined + report.aborted,
+            5,
+            "all five background tasks must stop on shutdown (joined={}, aborted={})",
+            report.joined,
+            report.aborted
+        );
+        assert_eq!(
+            report.aborted, 0,
+            "tasks must stop cooperatively via the token, not via the abort backstop"
+        );
+
+        // (b) no worker spins afterwards: leftover pending work must never
+        // be picked up.
+        let settled = transport.send_attempts();
+        seed_pending(&pubsub, topic, 3).await;
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS)).await;
+        assert_eq!(
+            transport.send_attempts(),
+            settled,
+            "no send attempts after shutdown — the flusher must not spin"
+        );
+
+        // Idempotent: a second call reports zero tasks.
+        let second = pubsub.shutdown().await;
+        assert_eq!(second.joined + second.aborted, 0);
+    }
+
+    /// Final review: the pending-IHAVE vector must stay bounded. The
+    /// abort-safety change moved consumption behind the send handoff and
+    /// its early-exit paths, and an ALL-EAGER topic is the structural
+    /// case: no lazy members and no stranded/withheld entries, so the
+    /// flush's target set is empty and pending is never consumed — every
+    /// relayed message would otherwise leave one id behind forever. The
+    /// cap mirrors the withheld-entry list's (MAX_IHAVE_BATCH_SIZE) and
+    /// drops the oldest ids on overflow; consumption stays after the send
+    /// handoff, so the abort-safety property is untouched.
+    #[tokio::test]
+    async fn pending_ihave_stays_bounded_on_an_all_eager_topic() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let sender_key = test_signing_key();
+        // No background tasks: nothing drains pending, which is exactly
+        // the all-eager structural state (the flush's target set is empty
+        // even when it runs).
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([69u8; 32]);
+        let eager_relay = test_peer_id(2);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(eager_relay);
+        }
+
+        // Relay N distinct messages (unique msg_ids AND unique payloads —
+        // the replay cache drops repeated payloads) through the inbound
+        // EAGER path: the ForwardAndDeliver verdict queues each msg_id
+        // for the (empty) lazy advertisement set.
+        let n = MAX_PENDING_IHAVE + 200;
+        for i in 0..n {
+            let mut msg_id = [69u8; 32];
+            msg_id[0] = (i % 256) as u8;
+            msg_id[1] = (i / 256) as u8;
+            let payload = format!("all-eager-payload-{i}").into_bytes();
+            let msg = signed_eager_message(&sender_key, topic, msg_id, Bytes::from(payload));
+            pubsub
+                .handle_eager(eager_relay, topic, msg)
+                .await
+                .expect("relayed frame admitted");
+        }
+
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert_eq!(
+                state.pending_ihave.len(),
+                MAX_PENDING_IHAVE,
+                "the pending-IHAVE vector must cap on an all-eager topic, not grow per message"
+            );
+            // The OLDEST ids were dropped: the front is the (n -
+            // MAX_PENDING_IHAVE)-th id pushed.
+            let mut expected_front = [69u8; 32];
+            let front_idx = n - MAX_PENDING_IHAVE;
+            expected_front[0] = (front_idx % 256) as u8;
+            expected_front[1] = (front_idx / 256) as u8;
+            assert_eq!(
+                state.pending_ihave.first(),
+                Some(&expected_front),
+                "overflow drops the oldest (stalest) ids"
+            );
+        }
+    }
+
+    /// Issue #42 round 2: a batch pending at shutdown must still be sent.
+    /// Since `ValidationAction::LazyForward` the IHAVE flusher is the
+    /// relay's delivery path (eager send withheld, msg_id announced), so
+    /// breaking out of the loop with no final flush would drop the
+    /// trailing interval's batch even on a live transport. Paused-clock
+    /// construction: after the initial jitter is advanced past, the next
+    /// regular tick is a full interval away and CANNOT fire while
+    /// `shutdown()` runs (the clock never advances during it), so the only
+    /// possible sender of the seeded batch is the shutdown arm's final
+    /// flush.
+    #[tokio::test(start_paused = true)]
+    async fn pending_ihave_batch_is_flushed_on_shutdown() {
+        let peer_id = test_peer_id(1);
+        let transport = ShutdownLivelockTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+        ));
+        let topic = TopicId::new([66u8; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(test_peer_id(2));
+        }
+
+        // Drive the paused clock past the initial jitter and several
+        // (empty) flush ticks so the flusher parks on interval.tick().
+        // Tasks register their timers lazily (at first poll), so the
+        // advances must interleave with yields — a single big advance
+        // before the task is polled merely re-anchors its jitter deadline
+        // to the new clock.
+        for _ in 0..12 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(25)).await;
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.send_attempts(),
+            0,
+            "no sends before any batch exists"
+        );
+
+        // Seed a batch, then shut down immediately: the paused clock means
+        // no regular tick can intervene — only the final flush can send it.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            state.pending_ihave.push([66u8; 32]);
+        }
+        let report = pubsub.shutdown().await;
+        assert_eq!(report.joined + report.aborted, 5);
+        assert_eq!(
+            report.aborted, 0,
+            "final flush must fit the grace on a live transport"
+        );
+        assert_eq!(
+            transport.send_attempts(),
+            1,
+            "the batch pending at shutdown must be sent by the final flush"
+        );
+        // Deferred consumption: the batch was taken only after the send
+        // handoff, and the handoff happened.
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert!(
+                state.pending_ihave.is_empty(),
+                "a successfully handed-off batch is consumed"
+            );
+        }
+    }
+
+    /// Issue #42 round 2: an aborted flush (shutdown grace exceeded mid
+    /// send) must LEAVE the pending batch in place instead of losing it —
+    /// the flush snapshots its work and only consumes it after the send
+    /// tasks are handed off. With the round-1 drain-at-collect, an abort in
+    /// that window lost the batch permanently; since LazyForward that was
+    /// lost delivery.
+    #[tokio::test]
+    async fn aborted_flush_leaves_pending_ihave_batch_intact() {
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+        ));
+        let topic = TopicId::new([67u8; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(test_peer_id(2));
+        }
+        // Park the flusher past its jitter on an empty queue.
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS + 150)).await;
+
+        // Seed a batch and shut down: the final (or in-flight) flush blocks
+        // on the never-released send, misses the 1 s grace, and the flusher
+        // is aborted mid-send.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            state.pending_ihave.push([67u8; 32]);
+        }
+        let report = pubsub.shutdown().await;
+        assert_eq!(
+            report.aborted, 1,
+            "the flusher must be the one task aborted mid-send by the grace deadline"
+        );
+
+        // The batch was NOT consumed — it survives for whoever flushes next.
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert_eq!(
+                state.pending_ihave.len(),
+                1,
+                "an aborted flush must leave the pending batch in place, not lose it"
+            );
+        }
+        // Let the detached blocked send finish so the test runtime winds
+        // down cleanly.
+        transport.release_sends(1);
+    }
+
+    /// Issue #42 round 2: the flusher's initial-jitter sleep must also
+    /// select on the shutdown token. This test shuts down INSIDE the jitter
+    /// window (immediately after construction, before any tick could ever
+    /// fire) using a peer whose deterministic flusher jitter is
+    /// substantial: with the guard, the flusher returns at once and
+    /// shutdown completes well inside the jitter; without it, the join
+    /// blocks until the jitter sleep has run out.
+    #[tokio::test]
+    async fn flusher_exits_immediately_when_shutdown_lands_inside_the_jitter_window() {
+        // Pick a peer whose flusher jitter is substantial (deterministic
+        // blake3-derived value in [0, IHAVE_FLUSH_INTERVAL_MS)).
+        let mut peer_id = test_peer_id(1);
+        let mut jitter = Duration::ZERO;
+        for i in 1..u8::MAX {
+            let candidate = test_peer_id(i);
+            let candidate_jitter = deterministic_jitter(
+                candidate,
+                b"pubsub-ihave-flush",
+                Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS),
+            );
+            if candidate_jitter >= Duration::from_millis(80) {
+                peer_id = candidate;
+                jitter = candidate_jitter;
+                break;
+            }
+        }
+        assert!(
+            jitter >= Duration::from_millis(80),
+            "test requires a peer with substantial flusher jitter"
+        );
+
+        let transport = ShutdownLivelockTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+        ));
+
+        // Shut down immediately — inside the jitter window.
+        let started = Instant::now();
+        let report = pubsub.shutdown().await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(report.joined + report.aborted, 5);
+        assert_eq!(report.aborted, 0);
+        assert_eq!(
+            transport.send_attempts(),
+            0,
+            "no flush tick may fire before the jitter has elapsed"
+        );
+        assert!(
+            elapsed < jitter.mul_f64(0.8),
+            "shutdown inside the jitter window must not wait the jitter out (elapsed {elapsed:?} vs jitter {jitter:?})"
+        );
+    }
     /// Round-2 review of PR #64: the widened floor also gated the
     /// `PeerHealth::Dead` fast-suppress, so a mesh sitting exactly at its
     /// target degree with no lazy replacement would have pinned a peer the

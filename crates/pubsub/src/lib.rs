@@ -8293,8 +8293,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// is also the relay's delivery path, so a flusher that spins after
     /// shutdown is a delivery defect, not just a shutdown nuisance.
     ///
-    /// Every join shares one deadline ([`BACKGROUND_SHUTDOWN_GRACE`]); a
-    /// task that misses it is aborted, so shutdown can never hang. The
+    /// Every join shares one deadline (1 s, `BACKGROUND_SHUTDOWN_GRACE`);
+    /// a task that misses it is aborted, so shutdown can never hang. The
     /// transport error itself is opaque (`anyhow` from the transport
     /// trait), so "terminal error" detection by string matching is
     /// deliberately avoided — embedders drive a clean stop by closing

@@ -740,6 +740,13 @@ pub struct PubSubStageStats {
     decode: StageTimingStats,
     verify: StageTimingStats,
     dedupe_lock_acquire: StageTimingStats,
+    /// Issue #58: time waiting to acquire the per-topic shard READ lock for
+    /// the pre-verify dedupe probe. Split from `dedupe_lock_acquire` (write)
+    /// so the fleet can measure the miss path that no longer takes a write
+    /// lock: `dedupe_lock_acquire_read.count` tracks every probed frame
+    /// while `dedupe_lock_acquire.count` drops to duplicates + post-verify +
+    /// send-claim acquisitions.
+    dedupe_lock_acquire_read: StageTimingStats,
     dedupe_check: StageTimingStats,
     /// x0x #674: inbound EAGER frames dropped as msg-id duplicates BEFORE
     /// the ML-DSA-65 verify. These frames still run the duplicate-EAGER
@@ -1011,6 +1018,9 @@ pub struct PubSubStageStatsSnapshot {
     pub verify: StageTimingStatsSnapshot,
     /// Time waiting to acquire the per-topic PlumTree write lock.
     pub dedupe_lock_acquire: StageTimingStatsSnapshot,
+    /// Issue #58: time waiting to acquire the per-topic shard READ lock for
+    /// the pre-verify dedupe probe (the common-case miss path).
+    pub dedupe_lock_acquire_read: StageTimingStatsSnapshot,
     /// Time spent under the per-topic lock for dedupe/cache/bookkeeping.
     pub dedupe_check: StageTimingStatsSnapshot,
     /// x0x #674: cumulative inbound EAGER frames dropped as msg-id
@@ -1120,6 +1130,8 @@ enum PubSubStage {
     Decode,
     Verify,
     DedupeLockAcquire,
+    /// Issue #58: read-lock acquisition of the pre-verify dedupe probe.
+    DedupeLockAcquireRead,
     DedupeCheck,
     EagerFanout,
     Republish,
@@ -2278,6 +2290,9 @@ impl PubSubStageStats {
             PubSubStage::Decode => self.decode.record(duration),
             PubSubStage::Verify => self.verify.record(duration),
             PubSubStage::DedupeLockAcquire => self.dedupe_lock_acquire.record(duration),
+            PubSubStage::DedupeLockAcquireRead => {
+                self.dedupe_lock_acquire_read.record(duration);
+            }
             PubSubStage::DedupeCheck => self.dedupe_check.record(duration),
             PubSubStage::EagerFanout => self.eager_fanout.record(duration),
             PubSubStage::Republish => self.republish.record(duration),
@@ -2324,6 +2339,7 @@ impl PubSubStageStats {
             decode: self.decode.snapshot(),
             verify: self.verify.snapshot(),
             dedupe_lock_acquire: self.dedupe_lock_acquire.snapshot(),
+            dedupe_lock_acquire_read: self.dedupe_lock_acquire_read.snapshot(),
             dedupe_check: self.dedupe_check.snapshot(),
             eager_duplicate_dropped_pre_verify: self
                 .eager_duplicate_dropped_pre_verify
@@ -7107,32 +7123,56 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // - A late duplicate arriving after the cache TTL evicted the
         //   entry falls through to the normal verify-and-admit path.
         if !self.transport.migration.registered(topic) {
+            // Issue #58: probe with a READ lock first. The common case on a
+            // bootstrap is a cache MISS (~72% of inbound EAGER frames), and
+            // taking the shard WRITE lock for a read-only lookup serialized
+            // all workers on the hot path — `dedupe_lock_acquire` was
+            // measured at 4.12 s of wait per wall second on an x0x bootstrap
+            // node. The write lock is now taken only when the probe HITS
+            // (the duplicate branch must mutate: `touch` + sender PRUNE) or
+            // when the frame is novel and reaches the post-verify
+            // dedupe/cache insert below, which keeps its own double-checked
+            // re-check under the write lock.
             let lock_started = Instant::now();
-            let mut topics = self.topics.write_topic(&topic).await;
-            self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
-            let dedupe_started = Instant::now();
-            // Check for duplicate
-            if let Some(state) = topics
-                .get_mut(&topic)
-                .filter(|state| state.has_message(&msg_id))
-            {
-                state.touch();
-                // PRUNE: move sender from eager to lazy
-                if state.prune_peer(from) {
-                    self.stage_stats.record_prune();
-                    // X0X-0071 P3b: a prune bumps the (topic, peer) delivery
-                    // deficit — sticky across a later re-graft.
-                    self.peer_scoring.record_mesh_pruned(topic, from);
+            let topics = self.topics.read_topic(&topic).await;
+            self.record_stage(PubSubStage::DedupeLockAcquireRead, lock_started);
+            let duplicate = topics
+                .get(&topic)
+                .is_some_and(|state| state.has_message(&msg_id));
+            drop(topics);
+            if duplicate {
+                let lock_started = Instant::now();
+                let mut topics = self.topics.write_topic(&topic).await;
+                self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
+                let dedupe_started = Instant::now();
+                // Re-check under the write lock: the entry may have been
+                // evicted (TTL/bounds) between the probe and the upgrade.
+                // Falling through to the verify path then preserves the
+                // exact dedupe semantics — a frame whose cache entry no
+                // longer exists is treated as unseen, exactly as a
+                // post-TTL arrival always has been.
+                if let Some(state) = topics
+                    .get_mut(&topic)
+                    .filter(|state| state.has_message(&msg_id))
+                {
+                    state.touch();
+                    // PRUNE: move sender from eager to lazy
+                    if state.prune_peer(from) {
+                        self.stage_stats.record_prune();
+                        // X0X-0071 P3b: a prune bumps the (topic, peer)
+                        // delivery deficit — sticky across a later re-graft.
+                        self.peer_scoring.record_mesh_pruned(topic, from);
+                    }
+                    self.stage_stats.record_eager_duplicate_dropped_pre_verify();
+                    self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+                    return Ok(());
                 }
-                self.stage_stats.record_eager_duplicate_dropped_pre_verify();
-                self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
-                return Ok(());
             }
             // The pre-verify cache miss is a sub-microsecond lookup and is
             // left unrecorded: `DedupeCheck` continues to measure exactly
             // the under-lock bookkeeping below, one observation per
             // handled message.
-            // Release the topic lock before the ML-DSA-65 verify — the
+            // No topic lock is held across the ML-DSA-65 verify — the
             // per-topic critical section stays short (issue #27 contention
             // instrumentation) and the verify is pure CPU with no await.
         }
@@ -10125,6 +10165,195 @@ mod tests {
         }
     }
 
+    /// Issue #58: the pre-verify dedupe fast path must not take the
+    /// per-topic shard WRITE lock for its read-only cache lookup. On a
+    /// bootstrap ~72% of inbound EAGER frames are cache MISSES, and paying
+    /// a write acquisition for every one of them serialized all workers on
+    /// the hot path — `dedupe_lock_acquire` measured 4.12 s of wait per
+    /// wall second on an x0x bootstrap node (x0x #656). This test drives a
+    /// realistic miss/duplicate mix through `handle_eager` on an empty-mesh
+    /// topic (no send-claim acquisitions) and pins the acquisition profile:
+    /// every frame takes exactly ONE read probe, and the write lock is
+    /// taken only where mutation is actually required — the duplicate
+    /// upgrade and the novel post-verify dedupe/cache insert. On the
+    /// pre-#58 code the same mix takes a fast-path write acquisition per
+    /// frame as well (write count 2N+D vs N+D here).
+    #[tokio::test]
+    async fn dedupe_miss_path_takes_no_fast_path_write_lock() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let sender_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([58u8; 32]);
+
+        // 92 novel frames, then 36 duplicates of already-cached ids — a
+        // true 72%/28% miss/duplicate split over 128 frames (the issue's
+        // measured fleet ratio; the round-1 draft used 100/28, which is
+        // actually 78/22).
+        const NOVEL: usize = 92;
+        const DUPLICATES: usize = 36;
+        let mut messages = Vec::with_capacity(NOVEL);
+        for i in 0..NOVEL {
+            let msg_id = [58u8; 31]
+                .iter()
+                .copied()
+                .chain(std::iter::once(i as u8))
+                .collect::<Vec<u8>>()
+                .try_into()
+                .expect("msg id is 32 bytes");
+            messages.push(signed_eager_message(
+                &sender_key,
+                topic,
+                msg_id,
+                Bytes::from(vec![i as u8; 16]),
+            ));
+        }
+        for msg in &messages {
+            pubsub
+                .handle_eager(test_peer_id(2), topic, msg.clone())
+                .await
+                .expect("novel frame admitted");
+        }
+        for msg in messages.iter().take(DUPLICATES) {
+            pubsub
+                .handle_eager(test_peer_id(3), topic, msg.clone())
+                .await
+                .expect("duplicate frame dropped as duplicate, not an error");
+        }
+
+        let stats = pubsub.stage_stats();
+        // Every fast-path frame — novel or duplicate — probes exactly once
+        // under a READ lock.
+        assert_eq!(
+            stats.dedupe_lock_acquire_read.count,
+            (NOVEL + DUPLICATES) as u64,
+            "one read probe per inbound frame (issue #58)"
+        );
+        // Write acquisitions: NOVEL post-verify dedupe/cache inserts +
+        // DUPLICATES probe-hit upgrades. The NOVEL misses take NO
+        // fast-path write acquisition — that is the fix. The pre-#58
+        // profile on this exact mix is 2*NOVEL + DUPLICATES = 220 write
+        // acquisitions (verified on an origin/main transplant), i.e. this
+        // is a 41.8% cut with zero fast-path write acquisitions on the
+        // miss path.
+        assert_eq!(
+            stats.dedupe_lock_acquire.count,
+            (NOVEL + DUPLICATES) as u64,
+            "write lock only for duplicate upgrades and post-verify inserts — the pre-#58 profile on this mix was 2*NOVEL + DUPLICATES = 220"
+        );
+        // Semantics preserved: every novel frame verified exactly once,
+        // every duplicate dropped pre-verify, none admitted twice, none
+        // dropped.
+        assert_eq!(stats.verify.count, NOVEL as u64);
+        assert_eq!(stats.eager_duplicate_dropped_pre_verify, DUPLICATES as u64);
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state exists");
+            assert_eq!(
+                state.message_cache.len(),
+                NOVEL,
+                "exactly the novel ids are cached — no duplicate insert, no loss (usize)"
+            );
+        }
+    }
+
+    /// Issue #58 race guard: many tasks concurrently deliver frames
+    /// carrying the SAME unseen msg_id. The read-probe fast path must still
+    /// admit the message exactly once — concurrent probes all miss, the
+    /// losers fall through to the verify path, and the post-verify
+    /// double-checked re-check under the write lock drops every racer that
+    /// arrived while the winner was between probe and insert. Exactly one
+    /// subscriber delivery, exactly one cache entry, no deadlock.
+    ///
+    /// Round 2: each racer carries a DISTINCT payload under the same
+    /// msg_id (legal — msg_id is read from the header and never
+    /// recomputed), and every frame is pre-signed BEFORE the spawn loop so
+    /// signing cost cannot serialize the racers. Distinct payloads keep
+    /// this test load-bearing: with identical payloads the independent
+    /// payload-hash replay layer would suppress the losers regardless of
+    /// the msg_id check, so breaking the post-verify double-check left the
+    /// round-1 version passing. With distinct payloads, breaking that
+    /// re-check fails this test (verified by mutation).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_same_msg_id_frames_admit_exactly_once() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let sender_key = test_signing_key();
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([59u8; 32]);
+        let mut subscriber = pubsub.subscribe_ready(topic).await;
+
+        const RACERS: usize = 32;
+        let msg_id = [59u8; 32];
+        let mut frames = Vec::with_capacity(RACERS);
+        for i in 0..RACERS {
+            frames.push(signed_eager_message(
+                &sender_key,
+                topic,
+                msg_id,
+                Bytes::from(format!("race-{i}")),
+            ));
+        }
+        let frames = Arc::new(frames);
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..RACERS {
+            let pubsub = Arc::clone(&pubsub);
+            let frames = Arc::clone(&frames);
+            tasks.spawn(async move {
+                pubsub
+                    .handle_eager(test_peer_id(4 + i as u8), topic, frames[i].clone())
+                    .await
+                    .expect("every racer completes without error");
+            });
+        }
+        // Deadlock guard: the whole hammer must settle well inside a
+        // generous bound even under contention.
+        let joined = tokio::time::timeout(Duration::from_secs(30), tasks.join_all()).await;
+        assert!(
+            joined.is_ok(),
+            "concurrent same-msg_id hammer must not deadlock"
+        );
+
+        // Exactly one admission: one subscriber delivery...
+        let delivered = subscriber.try_recv();
+        assert!(
+            delivered.is_ok(),
+            "the winning racer must deliver to the subscriber exactly once"
+        );
+        assert!(
+            subscriber.try_recv().is_err(),
+            "no second admission may deliver again"
+        );
+        // ...one cache entry...
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state exists");
+            assert_eq!(state.message_cache.len(), 1);
+            assert!(state.has_message(&[59u8; 32]));
+        }
+        // ...and every frame probed the cache exactly once under a read
+        // lock.
+        let stats = pubsub.stage_stats();
+        assert_eq!(
+            stats.dedupe_lock_acquire_read.count, RACERS as u64,
+            "every racing frame takes exactly one read probe"
+        );
+        assert!(
+            stats.verify.count >= 1,
+            "at least the winning racer verified"
+        );
+    }
+
     #[tokio::test]
     async fn test_stage_stats_record_pubsub_decode_failures() {
         let peer_id = test_peer_id(1);
@@ -10404,6 +10633,64 @@ mod tests {
         assert!(state.eager_peers.contains(&peer_c));
         assert!(state.eager_peers.contains(&peer_b));
         assert_eq!(state.eager_peers.len(), 2, "degree stays at the target");
+    }
+
+    /// Issue #65: pins the #32-before-replacement ordering inside
+    /// `cooling_floor_blocks_at`. PR #64 round 1 ran the graft-eligible
+    /// replacement gate BEFORE the #32 last-peer check, which silently let
+    /// the last eligible eager peer be suppressed whenever a graft-eligible
+    /// lazy peer existed — and the whole suite still passed (the Dead test
+    /// exercises the separate single-arm `cooling_floor_last_peer_blocks_at`
+    /// helper, and neither #62 leg reaches the ordering). A lazy
+    /// replacement is only *potential* until a graft actually happens, so
+    /// the last delivery path must stay protected. This test fails under
+    /// the round-1 reorder and passes as shipped.
+    #[test]
+    fn cooling_floor_blocks_last_peer_even_with_graft_eligible_replacement() {
+        let mut state = TopicState::new();
+        state.max_eager_degree = 2;
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+        let peer_c = test_peer_id(4);
+        state.eager_peers.insert(peer_a);
+        state.eager_peers.insert(peer_b);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscribers.push(tx);
+        let now = Instant::now();
+
+        // Insert the graft-eligible replacement first so B can be cooled
+        // (the replacement gate lets it through), leaving A as the LAST
+        // eligible eager peer with C still graft-eligible in lazy.
+        state.lazy_peers.insert(peer_c);
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer_b), now);
+        }
+        assert!(
+            state.is_peer_suppressed_at(peer_b, now),
+            "with a replacement available, B is cooled as a replacement"
+        );
+
+        // The ordering under test: the #32 arm must outrank the replacement
+        // gate for A — under the round-1 ordering this predicate is false
+        // because C is graft-eligible.
+        assert!(
+            state.cooling_floor_blocks_at(peer_a, now),
+            "the last eligible eager peer stays protected even with a graft-eligible lazy replacement (#32 before #62)"
+        );
+
+        // And through the full timeout path, not just the predicate: driving
+        // A to the suppression threshold must not demote it.
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer_a), now);
+        }
+        assert!(
+            !state.is_peer_suppressed_at(peer_a, now),
+            "the full timeout path must honour the #32-before-replacement ordering"
+        );
+        assert!(
+            state.eager_peers.contains(&peer_a),
+            "the last eligible eager peer must stay eager"
+        );
     }
 
     /// Round-2 review of PR #64: the widened floor also gated the
@@ -13789,12 +14076,17 @@ mod tests {
         let stats = pubsub.stage_stats();
         assert_eq!(stats.decode.count, 1);
         assert_eq!(stats.verify.count, 1);
-        // Issue #27: count is 3 — one for the pre-verify dedup fast path,
-        // one for the post-verify dedupe/cache re-acquire (x0x #674
-        // releases the lock across the ML-DSA verify), and one for the
-        // send-claim path inside parallel_send_to_peers. Previously the
-        // send-claim lock-wait was invisibly charged to Republish.
-        assert_eq!(stats.dedupe_lock_acquire.count, 3);
+        // Issue #27 + #58: write count is 2 — the post-verify
+        // dedupe/cache re-acquire (x0x #674 releases the lock across the
+        // ML-DSA verify) and the send-claim path inside
+        // parallel_send_to_peers. Previously the send-claim lock-wait was
+        // invisibly charged to Republish, and before #58 the pre-verify
+        // dedup probe also took a WRITE lock for its read-only lookup on
+        // every frame; it is now a READ acquisition, counted separately.
+        assert_eq!(stats.dedupe_lock_acquire.count, 2);
+        // Issue #58: the pre-verify dedupe probe is a read-lock
+        // acquisition — one per inbound frame on the fast path.
+        assert_eq!(stats.dedupe_lock_acquire_read.count, 1);
         assert_eq!(stats.dedupe_check.count, 1);
         assert_eq!(stats.eager_fanout.count, 1);
         assert_eq!(stats.republish.count, 1);
@@ -13868,9 +14160,9 @@ mod tests {
     /// `parallel_send_to_peers` → `claim_topic_send_attempts` was charged to
     /// the `Republish` stage instead of `DedupeLockAcquire`. This test
     /// verifies that after a single inbound EAGER message, the
-    /// `DedupeLockAcquire` count is 3 (pre-verify dedup + post-verify
-    /// dedupe/cache + send-claim) and the `Republish` time excludes the
-    /// send-claim lock-wait.
+    /// `DedupeLockAcquire` count is 2 (post-verify dedupe/cache +
+    /// send-claim — since #58 the pre-verify probe is a READ acquisition)
+    /// and the `Republish` time excludes the send-claim lock-wait.
     #[tokio::test]
     async fn republish_excludes_send_claim_lock_wait() {
         let peer_id = test_peer_id(1);
@@ -13904,13 +14196,18 @@ mod tests {
 
         let stats = pubsub.stage_stats();
 
-        // DedupeLockAcquire fires three times: the pre-verify dedup fast
-        // path, the post-verify dedupe/cache re-acquire (x0x #674: the
-        // lock is released across the ML-DSA verify), and the send-claim
-        // inside parallel_send_to_peers.
+        // DedupeLockAcquire (write) fires twice: the post-verify
+        // dedupe/cache re-acquire (x0x #674: the lock is released across
+        // the ML-DSA verify) and the send-claim inside
+        // parallel_send_to_peers. The pre-verify probe is a READ
+        // acquisition since #58 (issue #58 counter split).
         assert_eq!(
-            stats.dedupe_lock_acquire.count, 3,
+            stats.dedupe_lock_acquire.count, 2,
             "dedupe_lock_acquire must include the send-claim lock-wait (issue #27)"
+        );
+        assert_eq!(
+            stats.dedupe_lock_acquire_read.count, 1,
+            "the pre-verify dedupe probe takes exactly one read lock per frame (issue #58)"
         );
 
         // Republish fires once and its time must exclude the send-claim

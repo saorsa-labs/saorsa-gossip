@@ -10941,9 +10941,21 @@ mod tests {
             stats.dedupe_lock_acquire_read.count, RACERS as u64,
             "every racing frame takes exactly one read probe"
         );
+        // verify.count >= 2 pins the overlap this test depends on: if the 32
+        // racers were ever serialised (e.g. pre-signing cost reintroduced, or
+        // the workload collapsed to 1 racer), only 1 frame would reach the
+        // write-lock verify path and the test would pass while exercising
+        // nothing. The measured stable profile is 8 verify hits out of 32
+        // probes, so >= 2 gives ample margin while still catching degenerate
+        // serialisation. (Refs #58, #67, #68.)
         assert!(
-            stats.verify.count >= 1,
-            "at least the winning racer verified"
+            stats.verify.count >= 2,
+            "verify.count={} — expected >= 2 concurrent racers to reach the \
+             write-lock verify path; if this is 1 the workload was serialised \
+             and the overlap the test is supposed to exercise did not occur \
+             (pre-signing removed, RACERS reduced, or the double-check \
+             refactored away)",
+            stats.verify.count
         );
     }
 

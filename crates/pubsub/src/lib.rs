@@ -112,6 +112,14 @@ const MAX_IHAVE_BATCH_SIZE: usize = 1024;
 /// IHAVE flush interval (100ms)
 const IHAVE_FLUSH_INTERVAL_MS: u64 = 100;
 
+/// Issue #42: single shared deadline bounding every task join in
+/// [`PlumtreePubSub::shutdown`]. A background task that misses it (e.g. a
+/// flush iteration still awaiting per-peer sends, each independently
+/// bounded by the per-peer send timeout) is aborted — `SendAttemptClaims`'
+/// `Drop` releases in-flight recovery probes, so an abort cannot strand
+/// probe state.
+const BACKGROUND_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
 /// Anti-entropy reconciliation interval (30 seconds)
 const ANTI_ENTROPY_INTERVAL_SECS: u64 = 30;
 
@@ -729,6 +737,16 @@ pub struct FanoutCounts {
     pub attempted: usize,
     /// Number of those peers that confirmed receipt before this call returned.
     pub succeeded: usize,
+}
+
+/// Issue #42: outcome of [`PlumtreePubSub::shutdown`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PubSubShutdownReport {
+    /// Background tasks that finished within the shutdown grace (including
+    /// any that had already terminated via panic — logged at WARN).
+    pub joined: usize,
+    /// Background tasks that missed the grace deadline and were aborted.
+    pub aborted: usize,
 }
 
 /// Per-stage timing counters for inbound PubSub message handling.
@@ -4929,6 +4947,15 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// rejected). The fleet-level rate of this counter schedules the
     /// [`SignaturePolicy::RejectV1`] flip.
     v1_receipts: std::sync::atomic::AtomicU64,
+    /// Issue #42: shutdown signal for the background tasks spawned at
+    /// construction (IHAVE flusher, cache cleaner, degree maintainer,
+    /// anti-entropy, connected-peers refresher). Setting the value wakes
+    /// every task's `select!` arm at its next await point.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Issue #42: retained JoinHandles for those background tasks, joined
+    /// (or aborted after a bounded grace) by [`Self::shutdown`] so no
+    /// worker is left spinning after transport shutdown.
+    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
@@ -5167,6 +5194,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             peer_scoring: Arc::new(peer_scoring::PeerScoring::new()),
             signature_policy: StdRwLock::new(SignaturePolicy::AcceptV1),
             v1_receipts: std::sync::atomic::AtomicU64::new(0),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            background_tasks: Mutex::new(Vec::new()),
         };
 
         if start_background_tasks {
@@ -5282,9 +5311,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let snapshot = Arc::clone(&self.connected_peers_snapshot);
         let transport = Arc::clone(&self.transport);
         let stage_stats = Arc::clone(&self.stage_stats);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(async move {
+                // Issue #42: handle retained so `shutdown` can join/abort
+                // the task.
+                let task = handle.spawn(async move {
                     loop {
                         refresh_connected_peers_snapshot_once(
                             &topics,
@@ -5293,9 +5325,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             &stage_stats,
                         )
                         .await;
-                        time::sleep(CONNECTED_PEERS_REFRESH_INTERVAL).await;
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => {
+                                debug!(
+                                    "PubSub connected-peers refresher stopped by shutdown signal"
+                                );
+                                break;
+                            }
+                            _ = time::sleep(CONNECTED_PEERS_REFRESH_INTERVAL) => {}
+                        }
                     }
                 });
+                self.retain_background_task(task);
             }
             Err(e) => {
                 warn!("Unable to spawn PubSub connected-peers snapshot refresher: {e}");
@@ -8065,6 +8106,71 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         Ok(())
     }
 
+    /// Issue #42: retain a background task's JoinHandle so
+    /// [`Self::shutdown`] can join or abort it.
+    fn retain_background_task(&self, handle: tokio::task::JoinHandle<()>) {
+        match self.background_tasks.lock() {
+            Ok(mut guard) => guard.push(handle),
+            Err(poisoned) => poisoned.into_inner().push(handle),
+        }
+    }
+
+    /// Issue #42: stop every background task spawned at construction (IHAVE
+    /// flusher, cache cleaner, degree maintainer, anti-entropy,
+    /// connected-peers refresher) and wait for them to finish.
+    ///
+    /// Without this the IHAVE flusher kept looping after transport
+    /// shutdown — every flush attempt failed ("node not initialized"), was
+    /// logged at WARN and retried, saturating all runtime workers (~10 Hz
+    /// per LAN peer, +700 MB RSS during shutdown) and preventing SIGTERM
+    /// exit (x0x #368/#371; x0x ships a 5 s force-exit watchdog as an
+    /// interim). Since `ValidationAction::LazyForward` (0.5.79) the flusher
+    /// is also the relay's delivery path, so a flusher that spins after
+    /// shutdown is a delivery defect, not just a shutdown nuisance.
+    ///
+    /// Every join shares one deadline ([`BACKGROUND_SHUTDOWN_GRACE`]); a
+    /// task that misses it is aborted, so shutdown can never hang. The
+    /// transport error itself is opaque (`anyhow` from the transport
+    /// trait), so "terminal error" detection by string matching is
+    /// deliberately avoided — embedders drive a clean stop by closing
+    /// their transport and calling this, in either order. Idempotent: a
+    /// second call reports zero tasks.
+    pub async fn shutdown(&self) -> PubSubShutdownReport {
+        let _signalled = self.shutdown_tx.send(true);
+        let drained: Vec<tokio::task::JoinHandle<()>> = match self.background_tasks.lock() {
+            Ok(mut guard) => guard.drain(..).collect(),
+            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+        };
+        let deadline = tokio::time::Instant::now() + BACKGROUND_SHUTDOWN_GRACE;
+        let mut report = PubSubShutdownReport::default();
+        for mut handle in drained {
+            match tokio::time::timeout_at(deadline, &mut handle).await {
+                Ok(Ok(())) => report.joined += 1,
+                Ok(Err(join_error)) => {
+                    warn!("PubSub background task failed during shutdown: {join_error}");
+                    report.joined += 1;
+                }
+                Err(_) => {
+                    handle.abort();
+                    report.aborted += 1;
+                }
+            }
+        }
+        if report.aborted > 0 {
+            warn!(
+                joined = report.joined,
+                aborted = report.aborted,
+                "PubSub background shutdown grace exceeded; stragglers aborted"
+            );
+        } else {
+            debug!(
+                joined = report.joined,
+                "PubSub background tasks stopped on shutdown"
+            );
+        }
+        report
+    }
+
     /// Spawn background task to flush IHAVE batches
     fn spawn_ihave_flusher(&self) {
         let topics = self.topics.clone();
@@ -8073,33 +8179,45 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let stage_stats = Arc::clone(&self.stage_stats);
         let outbound_budgets = Arc::clone(&self.outbound_budgets);
         let send_path = self.send_path_context();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let initial_jitter = deterministic_jitter(
             self.peer_id,
             b"pubsub-ihave-flush",
             Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS),
         );
 
-        tokio::spawn(async move {
-            if !initial_jitter.is_zero() {
-                time::sleep(initial_jitter).await;
+        // Issue #42: select on the shutdown token at every await point so
+        // the flusher terminates on shutdown instead of spinning on
+        // failing sends after transport close.
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                _ = time::sleep(initial_jitter) => {}
             }
             let mut interval = time::interval(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS));
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
             loop {
-                interval.tick().await;
-
-                Self::flush_ihave_batches(
-                    &topics,
-                    &transport,
-                    &signing_key,
-                    &stage_stats,
-                    &outbound_budgets,
-                    &send_path,
-                )
-                .await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        debug!("PubSub IHAVE flusher stopped by shutdown signal");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        Self::flush_ihave_batches(
+                            &topics,
+                            &transport,
+                            &signing_key,
+                            &stage_stats,
+                            &outbound_budgets,
+                            &send_path,
+                        )
+                        .await;
+                    }
+                }
             }
         });
+        self.retain_background_task(handle);
     }
 
     async fn flush_ihave_batches(
@@ -8523,15 +8641,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let topics = self.topics.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
         let topic_idle_ttl = Duration::from_secs(TOPIC_IDLE_TTL_SECS);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
+        // Issue #42: handle retained so `shutdown` can join/abort the task.
+        let handle = tokio::spawn(async move {
             let mut cleanup_interval =
                 Duration::from_millis(SUPPRESSION_CLEANUP_NORMAL_INTERVAL_MS);
             let mut previous_suppression_len = 0_usize;
             let mut previous_cleanup = Instant::now();
 
             loop {
-                time::sleep(cleanup_interval).await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        debug!("PubSub cache cleaner stopped by shutdown signal");
+                        break;
+                    }
+                    _ = time::sleep(cleanup_interval) => {}
+                }
                 let before_suppression_len = stage_stats.suppressed_peer_count();
                 let cleanup_now = Instant::now();
                 let mut removed_suppressions = 0;
@@ -8546,8 +8672,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let after_suppression_len = stage_stats.suppressed_peer_count();
                 drop(topics_guard);
 
-                for topic in idle_topics {
-                    stage_stats.clear_topic_suppressions(topic);
+                for topic in &idle_topics {
+                    stage_stats.clear_topic_suppressions(*topic);
                 }
                 let now = Instant::now();
                 let elapsed = now
@@ -8585,24 +8711,34 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
         });
+        self.retain_background_task(handle);
     }
 
     /// Spawn background task to maintain eager peer degree
     fn spawn_degree_maintainer(&self) {
         let topics = self.topics.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let initial_jitter =
             deterministic_jitter(self.peer_id, b"pubsub-degree", Duration::from_secs(30));
 
-        tokio::spawn(async move {
-            if !initial_jitter.is_zero() {
-                time::sleep(initial_jitter).await;
+        // Issue #42: handle retained so `shutdown` can join/abort the task.
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                _ = time::sleep(initial_jitter) => {}
             }
             let mut interval = time::interval(Duration::from_secs(30));
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        debug!("PubSub degree maintainer stopped by shutdown signal");
+                        break;
+                    }
+                    _ = interval.tick() => {}
+                }
 
                 let mut topics_guard = topics.write_all().await;
                 let mut pruned = 0;
@@ -8624,6 +8760,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
         });
+        self.retain_background_task(handle);
     }
 
     /// Spawn background task for anti-entropy reconciliation
@@ -8637,21 +8774,30 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let stage_stats = Arc::clone(&self.stage_stats);
         let outbound_budgets = Arc::clone(&self.outbound_budgets);
         let send_path = self.send_path_context();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let initial_jitter = deterministic_jitter(
             self.peer_id,
             b"pubsub-anti-entropy",
             Duration::from_secs(ANTI_ENTROPY_INTERVAL_SECS),
         );
 
-        tokio::spawn(async move {
-            if !initial_jitter.is_zero() {
-                time::sleep(initial_jitter).await;
+        // Issue #42: handle retained so `shutdown` can join/abort the task.
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                _ = time::sleep(initial_jitter) => {}
             }
             let mut interval = time::interval(Duration::from_secs(ANTI_ENTROPY_INTERVAL_SECS));
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        debug!("PubSub anti-entropy task stopped by shutdown signal");
+                        break;
+                    }
+                    _ = interval.tick() => {}
+                }
 
                 let topics_guard = topics.read_all().await;
 
@@ -8871,6 +9017,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
         });
+        self.retain_background_task(handle);
     }
 
     /// Initialize peers for a topic from membership layer
@@ -9306,6 +9453,82 @@ mod tests {
         /// #59: every outbound frame in send order — (peer, stream, wire
         /// bytes) — so tests can assert which wire kind reached whom.
         frames: Mutex<Vec<(PeerId, GossipStreamType, Bytes)>>,
+    }
+
+    /// Issue #42: transport that starts failing every send once closed —
+    /// models the "node not initialized" state x0xd sees after QUIC
+    /// shutdown (x0x #368/#371). Counts send attempts so tests can observe
+    /// whether any worker keeps spinning.
+    struct ShutdownLivelockTransport {
+        local_peer: PeerId,
+        closed: std::sync::atomic::AtomicBool,
+        send_attempts: AtomicUsize,
+    }
+
+    impl ShutdownLivelockTransport {
+        fn new(local_peer: PeerId) -> Arc<Self> {
+            Arc::new(Self {
+                local_peer,
+                closed: std::sync::atomic::AtomicBool::new(false),
+                send_attempts: AtomicUsize::new(0),
+            })
+        }
+
+        /// Flip the transport into its post-shutdown state (distinct name
+        /// so it cannot be confused with the async trait `close`).
+        fn shutdown_sends(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+
+        fn send_attempts(&self) -> usize {
+            self.send_attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for ShutdownLivelockTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Ok(self.local_peer)
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            self.shutdown_sends();
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            _peer: PeerId,
+            _stream_type: GossipStreamType,
+            _data: Bytes,
+        ) -> Result<()> {
+            self.send_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.closed.load(Ordering::SeqCst) {
+                Err(anyhow!("node not initialized"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+            Err(anyhow!("shutdown-livelock test transport does not receive"))
+        }
+
+        async fn connected_peer_ids(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.local_peer
+        }
     }
 
     struct PanicTransport {
@@ -10691,6 +10914,109 @@ mod tests {
             state.eager_peers.contains(&peer_a),
             "the last eligible eager peer must stay eager"
         );
+    }
+
+    /// Issue #42 (x0x #368/#371, and a delivery-path defect since
+    /// `ValidationAction::LazyForward` made the flusher the relay's
+    /// announce path): after transport shutdown the IHAVE flusher kept
+    /// looping — every flush attempt failed ("node not initialized"), was
+    /// logged at WARN and retried, saturating all runtime workers and
+    /// preventing SIGTERM exit. Regression: drive a transport shutdown
+    /// with the flusher active and assert (a) the background tasks
+    /// terminate, (b) no worker spins afterwards, and (c) shutdown
+    /// completes inside the existing 5 s x0x force-exit budget. On
+    /// origin/main the livelock variant of this test (transport closed, no
+    /// shutdown API) shows send attempts still climbing.
+    #[tokio::test]
+    async fn ihave_flusher_terminates_on_shutdown_and_stops_spinning() {
+        async fn seed_pending(
+            pubsub: &PlumtreePubSub<ShutdownLivelockTransport>,
+            topic: TopicId,
+            id: u8,
+        ) {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            if let Some(state) = topics.get_mut(&topic) {
+                let mut msg_id = [63u8; 32];
+                msg_id[0] = id;
+                state.pending_ihave.push(msg_id);
+            }
+        }
+
+        let peer_id = test_peer_id(1);
+        let transport = ShutdownLivelockTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+        ));
+        let topic = TopicId::new([63u8; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(test_peer_id(2));
+        }
+
+        // Shut the transport down FIRST: every send now fails instantly —
+        // the x0xd SIGTERM state.
+        transport.shutdown_sends();
+
+        // Sanity: the flusher is live and keeps retrying despite the dead
+        // transport (this is exactly the behaviour that used to spin
+        // forever; it must be stoppable, not absent).
+        seed_pending(&pubsub, topic, 1).await;
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS + 150)).await;
+        let before = transport.send_attempts();
+        seed_pending(&pubsub, topic, 2).await;
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS)).await;
+        let after = transport.send_attempts();
+        assert!(
+            after > before,
+            "flusher must be attempting sends before shutdown (before={before}, after={after})"
+        );
+
+        // (c) shutdown completes inside the existing budget (the x0x
+        // force-exit watchdog is 5 s; the internal grace is
+        // BACKGROUND_SHUTDOWN_GRACE).
+        let shutdown_started = Instant::now();
+        let report = pubsub.shutdown().await;
+        let elapsed = shutdown_started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown must fit the 5 s x0x force-exit budget, took {elapsed:?}"
+        );
+
+        // (a) every background task terminated — flusher, cache cleaner,
+        // degree maintainer, anti-entropy, connected-peers refresher — and
+        // cooperatively: in this scenario every send fails instantly, so a
+        // task only misses the grace deadline if it ignored the shutdown
+        // token (the abort backstop then masks the spin; this assertion
+        // keeps that observable).
+        assert_eq!(
+            report.joined + report.aborted,
+            5,
+            "all five background tasks must stop on shutdown (joined={}, aborted={})",
+            report.joined,
+            report.aborted
+        );
+        assert_eq!(
+            report.aborted, 0,
+            "tasks must stop cooperatively via the token, not via the abort backstop"
+        );
+
+        // (b) no worker spins afterwards: leftover pending work must never
+        // be picked up.
+        let settled = transport.send_attempts();
+        seed_pending(&pubsub, topic, 3).await;
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS)).await;
+        assert_eq!(
+            transport.send_attempts(),
+            settled,
+            "no send attempts after shutdown — the flusher must not spin"
+        );
+
+        // Idempotent: a second call reports zero tasks.
+        let second = pubsub.shutdown().await;
+        assert_eq!(second.joined + second.aborted, 0);
     }
 
     /// Round-2 review of PR #64: the widened floor also gated the

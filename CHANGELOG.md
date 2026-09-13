@@ -49,6 +49,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the effect is directly observable in `/diagnostics/gossip`. Dedupe TTL
   and eviction policy are untouched.
 
+- **pubsub: background tasks now have a shutdown lifecycle — the IHAVE
+  flusher no longer livelocks after transport shutdown (#42, x0x #368,
+  #371).** `spawn_ihave_flusher` (and its siblings: cache cleaner, degree
+  maintainer, anti-entropy, connected-peers refresher) dropped their
+  JoinHandles and looped forever with no cancellation path. After the
+  transport shut down, every flush attempt failed ("node not
+  initialized"), was logged at WARN and retried — saturating all runtime
+  workers (~10 Hz per LAN peer, +700 MB RSS during shutdown, ~10 MB of
+  WARN logs in seconds) and preventing SIGTERM exit; x0x shipped a 5 s
+  force-exit watchdog as an interim. Since `ValidationAction::LazyForward`
+  (0.5.79) the flusher is also the relay's delivery path, so a flusher
+  that spins after shutdown is a delivery defect, not just a shutdown
+  nuisance. Every background task now `select!`s on a `watch` shutdown
+  token at each await point, its handle is retained, and the new
+  `PlumtreePubSub::shutdown()` signals the token and joins every task
+  under one shared 1 s deadline — a straggler is aborted (`SendAttemptClaims`'
+  Drop releases in-flight recovery probes, so an abort cannot strand probe
+  state), so shutdown can never hang and always fits the 5 s x0x
+  force-exit budget. Idempotent; returns a `PubSubShutdownReport`
+  (joined/aborted) so embedders can verify. Terminal-error detection by
+  string-matching the opaque transport error is deliberately avoided —
+  embedders close their transport and call `shutdown()`, in either order.
 
 ## [0.5.80] - 2026-09-13
 

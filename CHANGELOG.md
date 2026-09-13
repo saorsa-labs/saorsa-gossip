@@ -42,6 +42,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a `DeliverOnly`/`LazyForward` verdict previously booked the full
   frame size against zero sends).
 
+### Fixed
+
+- **pubsub: the issue #32 cooling floor is now a replacement gate — a
+  locally subscribed topic no longer demotes an eager peer below its
+  maintenance target degree unless a graft-eligible lazy peer can
+  backfill the vacancy (#62, x0x #611).** The floor previously fired only
+  when suppressing a peer would *empty* the eligible eager set. With a
+  consumer-configured max eager degree of 2 (x0x Leaf), the healthy mesh
+  is exactly two peers, so a single suppression locked the topic at
+  degree 1 for at least the 120 s cooldown: the cooled peer fails
+  `can_graft_peer_at` even after cooldown expiry (suppression clears only
+  on a successful recovery probe), `maintain_degree_at` had nothing to
+  promote, and the only escape was the remote peer initiating traffic.
+  `cooling_floor_blocks_at` now (a) never engages when a lazy peer passes
+  the same `can_graft_peer_at` gate `scored_lazy_peers_at` applies —
+  cooling then behaves exactly as before, as a replacement the maintainer
+  backfills — and (b) additionally blocks a suppression that would drop
+  the eligible set from exactly the target degree
+  (`min(MIN_EAGER_DEGREE, max_eager_degree)`) to below it with no
+  replacement available. The original issue #32 guarantee (never suppress
+  the last eligible fan-out target) is unchanged, and an
+  already-under-target mesh is still allowed to cool: pinning a
+  timing-out peer cannot restore a degree the peer population does not
+  support, and the eligibility-time rescue plus zero-fan-out counters
+  remain as backstops.
+
 ## [0.5.78] - 2026-09-12
 
 ### Changed

@@ -3664,25 +3664,71 @@ impl TopicState {
             .is_some_and(|state| state.is_suppressed_at(now))
     }
 
-    /// Issue #32 cooling floor for locally subscribed publish topics: returns
-    /// `true` when suppressing `peer` would empty this topic's eligible eager
-    /// fan-out set — i.e. `peer` is eager and every other eager peer is
-    /// already suppressed. Timeout-based cooling must never remove the last
-    /// fan-out target on a topic that can originate local publishes; without
-    /// this floor a degraded node thrashes cooling until its own publishes
-    /// fan out to zero peers while still returning `Ok(())`.
+    /// Issue #32 / #62 cooling floor for locally subscribed publish topics.
+    ///
+    /// Returns `true` when suppressing `peer` must be blocked because the
+    /// demotion could not be backfilled by `maintain_degree_at`:
+    ///
+    /// - `peer` is eager and suppressing it would empty the eligible eager
+    ///   fan-out set (the original issue #32 floor: timeout-based cooling
+    ///   must never remove the last fan-out target on a topic that can
+    ///   originate local publishes, or a degraded node thrashes cooling
+    ///   until its own publishes fan out to zero peers while still
+    ///   returning `Ok(())`).
+    /// - the mesh currently sustains the maintenance target degree
+    ///   (`MIN_EAGER_DEGREE.min(max_eager_degree)`) and suppressing `peer`
+    ///   would drop it below that target with no graft-eligible lazy
+    ///   replacement to promote (issue #62, x0x #611: at a consumer-set
+    ///   max degree 2 the healthy mesh IS two peers, and a plain demotion
+    ///   locks the topic at degree 1 for >= the 120 s cooldown because the
+    ///   cooled peer fails `can_graft_peer_at` even after expiry).
+    ///
+    /// With a graft-eligible lazy replacement available the floor never
+    /// engages: cooling is then a *replacement* — the vacancy is backfilled
+    /// — rather than a removal. An already-under-target mesh is also left
+    /// alone: pinning a timing-out peer cannot restore a degree the peer
+    /// population does not support, and the issue #32 eligibility-time
+    /// rescue plus the zero-fan-out counter remain as backstops.
     fn cooling_floor_blocks_at(&self, peer: PeerId, now: Instant) -> bool {
         // Live-subscriber check rather than `!subscribers.is_empty()`: a
         // dropped subscription leaves a closed sender in the vector until
         // `clean_cache` prunes it, which would otherwise keep the floor armed
         // on a topic that has already reverted to forward-only.
-        self.has_live_subscribers()
-            && self.eager_peers.contains(&peer)
-            && self
-                .eager_peers
-                .iter()
-                .filter(|other| **other != peer)
-                .all(|other| self.is_peer_suppressed_at(*other, now))
+        if !self.has_live_subscribers() || !self.eager_peers.contains(&peer) {
+            return false;
+        }
+        // Issue #62: a graft-eligible lazy peer can backfill the vacancy, so
+        // the suppression is a replacement, not a removal. `can_graft_peer_at`
+        // matches the filter `scored_lazy_peers_at` applies, i.e. exactly
+        // what `maintain_degree_at` can promote.
+        if self.has_graft_eligible_lazy_peer_at(now) {
+            return false;
+        }
+        let eligible_after = self
+            .eager_peers
+            .iter()
+            .filter(|other| **other != peer)
+            .filter(|other| !self.is_peer_suppressed_at(**other, now))
+            .count();
+        // Issue #32 floor: never suppress the last eligible eager fan-out
+        // target.
+        if eligible_after == 0 {
+            return true;
+        }
+        // Issue #62 widening: `eligible_after + 1` is the eligible degree the
+        // mesh holds right now (`peer` itself is unsuppressed at this point);
+        // block only the drop from exactly the target degree to below it.
+        let target = MIN_EAGER_DEGREE.min(self.max_eager_degree);
+        eligible_after + 1 == target
+    }
+
+    /// Whether any lazy peer could be promoted right now — the same
+    /// `can_graft_peer_at` gate `scored_lazy_peers_at` applies for
+    /// `maintain_degree_at` (issue #62).
+    fn has_graft_eligible_lazy_peer_at(&self, now: Instant) -> bool {
+        self.lazy_peers
+            .iter()
+            .any(|peer| self.can_graft_peer_at(*peer, now))
     }
 
     /// Issue #32 eligibility-time guarantee: if this topic has live local
@@ -10214,6 +10260,75 @@ mod tests {
             !state.cooling_floor_blocks_at(last_eager, now),
             "a dropped subscription must revert the topic to forward-only"
         );
+    }
+
+    /// Issue #62 (x0x #611): with a consumer-configured max eager degree
+    /// of 2 (x0x Leaf) the healthy mesh IS two peers, so demoting one of
+    /// them locks the topic at degree 1 for at least the 120 s cooldown —
+    /// the cooled peer fails `can_graft_peer_at` even after cooldown
+    /// expiry, so `maintain_degree_at` cannot promote anything and the
+    /// only escape is the remote peer initiating traffic. Cooling must be
+    /// a *replacement* mechanism: with no graft-eligible lazy peer to
+    /// backfill the vacancy, the floor must keep the timeout-counting
+    /// peer eager; as soon as a graft-eligible replacement exists, the
+    /// demotion goes through and the replacement is promoted.
+    #[test]
+    fn cooling_does_not_demote_when_no_graft_eligible_replacement_exists() {
+        let mut state = TopicState::new();
+        state.max_eager_degree = 2;
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+        let peer_c = test_peer_id(4);
+        state.eager_peers.insert(peer_a);
+        state.eager_peers.insert(peer_b);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscribers.push(tx);
+
+        // Leg 1 — no replacement available: five Normal-kind timeouts at
+        // A inside one window must reach the suppression threshold but
+        // NOT demote it, because demoting would drop the eligible eager
+        // set from the target degree (2) to 1 with nothing to promote.
+        let now = Instant::now();
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer_a), now);
+        }
+        assert_eq!(
+            state.eager_peers.len(),
+            2,
+            "floor: with no graft-eligible lazy replacement, A must stay eager"
+        );
+        assert!(
+            state.eager_peers.contains(&peer_a),
+            "A must remain an eager fan-out target"
+        );
+        assert!(
+            !state.is_peer_suppressed_at(peer_a, now),
+            "A must not be suppressed while the floor holds"
+        );
+
+        // Leg 2 — a graft-eligible C appears in lazy: the very next
+        // timeout demotes A (suppressed + eager to lazy) and
+        // maintain_degree_at promotes C, proving leg 1 passed through the
+        // replacement gate rather than by disabling cooling outright.
+        state.lazy_peers.insert(peer_c);
+        let _ = state.record_send_timeout_at(normal_send_attempt(peer_a), now);
+        assert!(
+            state.is_peer_suppressed_at(peer_a, now),
+            "with a replacement available, A must be suppressed"
+        );
+        assert!(
+            !state.eager_peers.contains(&peer_a),
+            "with a replacement available, A must be demoted from eager"
+        );
+        assert!(
+            state.lazy_peers.contains(&peer_a),
+            "suppressed A must move to lazy for later recovery"
+        );
+        let (_pruned, grafted) = state.maintain_degree_at(now);
+        assert_eq!(grafted, 1, "maintain_degree_at must backfill with C");
+        assert!(state.eager_peers.contains(&peer_c));
+        assert!(state.eager_peers.contains(&peer_b));
+        assert_eq!(state.eager_peers.len(), 2, "degree stays at the target");
     }
 
     /// The zero-fan-out WARN is throttled, but the counters are the machine-

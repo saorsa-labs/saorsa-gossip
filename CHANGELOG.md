@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.80] - 2026-09-13
+
 ### Fixed
 
 - **pubsub: the issue #32 cooling floor is now a replacement gate — a

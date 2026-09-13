@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **pubsub: rate-limited recovery path during peer suppression (WP6).**
+  A peer in send-suppression cooldown previously received neither EAGER
+  pushes nor lazy IHAVE/anti-entropy sends for the entire cooldown, so a
+  message published while the peer was cooling was undeliverable until the
+  cooldown expired (observed live as ≥96 s CRDT propagation stalls between
+  three healthy WAN peers). The per-(topic, peer) claim gate now admits at
+  most one `CooldownBypass` send per 5 s
+  (`PEER_COOLDOWN_BYPASS_MIN_INTERVAL`) while suppression is active, so
+  IHAVE announces, anti-entropy digests, and cached-message serves trickle
+  through and a healthy-again peer converges on the anti-entropy timescale
+  (~30 s). A successful bypass send delivers data and decays the cooldown
+  memory but does **not** clear the suppression: full eager fanout still
+  waits for cooldown expiry plus one successful recovery probe, and bypass
+  timeouts do not escalate the cooldown. New stage-stats counters
+  `cooldown_bypass_probes` / `cooldown_bypass_successes` make the path
+  observable in diagnostics snapshots. Supersedes PR #29.
+
 ### Added
 
 - **pubsub: regression test pinning the #32-before-replacement ordering in

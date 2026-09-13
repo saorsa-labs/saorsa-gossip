@@ -173,6 +173,19 @@ const ZERO_FANOUT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// Maximum repeated-offender suppression duration.
 const PEER_SUPPRESSION_BACKOFF_MAX: Duration = Duration::from_secs(1_800);
 
+/// Minimum interval between rate-limited recovery-bypass sends to a peer
+/// whose suppression cooldown is still active.
+///
+/// 2026-07-12 (WP6): while a peer was suppressed it previously received
+/// NEITHER eager pushes NOR lazy IHAVE announcements — the lazy backstop
+/// was defeated exactly when it was needed, so a message published during
+/// suppression could not converge until the full cooldown elapsed. The
+/// bypass admits at most one send per this interval per (topic, peer) so
+/// cached messages, IHAVE announces, and anti-entropy digests still
+/// trickle to the peer while full eager fanout stays gated on cooldown
+/// expiry plus a successful recovery probe.
+const PEER_COOLDOWN_BYPASS_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Refresh cadence for the SWIM peer-health snapshot consumed by the
 /// pub-sub cooling hot path.
 const PEER_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -763,6 +776,10 @@ pub struct PubSubStageStats {
     /// permits. This is distinct from a transport timeout: no new task was
     /// spawned, and the peer/topic receives timeout pressure for cooling.
     outbound_budget_exhausted: AtomicU64,
+    /// WP6: rate-limited sends admitted to peers whose suppression cooldown
+    /// was still active, and how many of those completed successfully.
+    cooldown_bypass_probes: AtomicU64,
+    cooldown_bypass_successes: AtomicU64,
     /// Local publishes whose eligible eager fan-out set was empty (issue
     /// #32): every eager peer was cooled/excluded, or the topic had no eager
     /// peers at all (`attempted == 0`). The publish still returns `Ok(())`,
@@ -1037,6 +1054,14 @@ pub struct PubSubStageStatsSnapshot {
     /// Cumulative count of sends skipped before spawning because the peer had
     /// already consumed its outbound PubSub budget.
     pub outbound_budget_exhausted: u64,
+    /// WP6: cumulative count of rate-limited recovery-bypass sends admitted
+    /// to peers whose suppression cooldown was still active. Zero while
+    /// `suppressed_peers` is non-empty means the bypass is not firing.
+    pub cooldown_bypass_probes: u64,
+    /// WP6: cumulative count of cooldown-bypass sends that completed
+    /// successfully — cached messages/announcements delivered to a peer
+    /// during its suppression window.
+    pub cooldown_bypass_successes: u64,
     /// Cumulative count of local publishes where no peer was attempted
     /// (`attempted == 0`). A non-zero value means the eager set was empty or
     /// fully cooled — the message did not leave the node.
@@ -1156,6 +1181,10 @@ enum PeerSendOutcome {
 enum SendAttemptKind {
     Normal,
     RecoveryProbe,
+    /// Rate-limited send admitted while the peer's suppression cooldown is
+    /// still active (WP6 recovery bypass). Success delivers data but does
+    /// NOT clear the suppression; timeouts do not escalate it.
+    CooldownBypass,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2348,6 +2377,8 @@ impl PubSubStageStats {
             republish: self.republish.snapshot(),
             republish_per_peer_timeout: self.republish_per_peer_timeout.load(Ordering::Relaxed),
             outbound_budget_exhausted: self.outbound_budget_exhausted.load(Ordering::Relaxed),
+            cooldown_bypass_probes: self.cooldown_bypass_probes.load(Ordering::Relaxed),
+            cooldown_bypass_successes: self.cooldown_bypass_successes.load(Ordering::Relaxed),
             zero_fanout_publishes: self.zero_fanout_publishes.load(Ordering::Relaxed),
             zero_fanout_publishes_by_topic: BTreeMap::new(),
             zero_succeeded_publishes: self.zero_succeeded_publishes.load(Ordering::Relaxed),
@@ -2501,6 +2532,15 @@ impl PubSubStageStats {
 
     fn record_stranded_publish_cache_miss(&self) {
         self.stranded_publish_cache_miss
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cooldown_bypass_probe(&self) {
+        self.cooldown_bypass_probes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cooldown_bypass_success(&self) {
+        self.cooldown_bypass_successes
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2893,6 +2933,10 @@ struct PeerCoolingState {
     last_suppression_timeout_count: usize,
     recovery_probe_in_flight: bool,
     recovery_probe_id: Option<RecoveryProbeId>,
+    /// Last time a rate-limited cooldown-bypass send was claimed for this
+    /// peer (WP6). Gates the bypass to one send per
+    /// `PEER_COOLDOWN_BYPASS_MIN_INTERVAL` while suppression is active.
+    last_bypass_probe_at: Option<Instant>,
 }
 
 struct PeerSuppressionEvent {
@@ -2919,6 +2963,7 @@ impl PeerCoolingState {
             last_suppression_timeout_count: 0,
             recovery_probe_in_flight: false,
             recovery_probe_id: None,
+            last_bypass_probe_at: None,
         }
     }
 
@@ -2952,7 +2997,24 @@ impl PeerCoolingState {
         Option<PeerRecoveryProbeEvent>,
     )> {
         if self.suppressed_until.is_some_and(|until| until > now) {
-            return None;
+            // WP6 recovery bypass: suppression previously blocked BOTH
+            // eager push and lazy IHAVE/anti-entropy to this peer, so a
+            // message published during the cooldown was undeliverable
+            // until it expired. Admit one rate-limited send per
+            // `PEER_COOLDOWN_BYPASS_MIN_INTERVAL` so cached data still
+            // trickles to the peer; full fanout stays gated on cooldown
+            // expiry plus a successful recovery probe.
+            if self.recovery_probe_in_flight {
+                return None;
+            }
+            let bypass_ready = self.last_bypass_probe_at.is_none_or(|at| {
+                now.saturating_duration_since(at) >= PEER_COOLDOWN_BYPASS_MIN_INTERVAL
+            });
+            if !bypass_ready {
+                return None;
+            }
+            self.last_bypass_probe_at = Some(now);
+            return Some((SendAttemptKind::CooldownBypass, None, None));
         }
         if self.suppression_expired_at(now) {
             if self.recovery_probe_in_flight {
@@ -4056,6 +4118,21 @@ impl TopicState {
                 cooling.recovery_probe_id = None;
                 true
             }
+            SendAttemptKind::CooldownBypass => {
+                // WP6: a rate-limited send got through while the peer is
+                // still cooling. Deliverability is proven, so decay the
+                // cooldown memory — but do NOT clear the suppression:
+                // full eager fanout stays gated until the cooldown
+                // expires and a post-cooldown recovery probe succeeds.
+                if let Some(cooling) = self.peer_cooling.get_mut(&attempt.peer) {
+                    if let Some(last_suppressed_at) = cooling.last_suppressed_at {
+                        let elapsed = now.saturating_duration_since(last_suppressed_at);
+                        cooling.cooldown =
+                            cooling_config.decay_on_success(cooling.cooldown, elapsed);
+                    }
+                }
+                false
+            }
             SendAttemptKind::Normal => {
                 if let Some(cooling) = self.peer_cooling.get_mut(&attempt.peer) {
                     if !cooling.is_suppressed_at(now) {
@@ -4113,6 +4190,14 @@ impl TopicState {
                 .entry(attempt.peer)
                 .or_insert_with(|| PeerScore::new_at(now))
                 .record_outbound_send_timeout_at(now);
+        }
+
+        // WP6: a timeout on a cooldown-bypass send must not escalate the
+        // backoff — the peer is already cooling; a failed bypass is
+        // expected on a genuinely dead peer and should not extend the
+        // suppression or re-trigger scoring pressure.
+        if attempt.kind == SendAttemptKind::CooldownBypass {
+            return PeerTimeoutOutcome::default();
         }
 
         let event = {
@@ -4487,6 +4572,14 @@ async fn record_topic_send_attempt_results_for_state(
     };
 
     for completion in sent {
+        if completion.attempt.kind == SendAttemptKind::CooldownBypass {
+            stage_stats.record_cooldown_bypass_success();
+            debug!(
+                peer_id = %completion.attempt.peer,
+                topic = ?topic,
+                "Cooldown-bypass send delivered while peer suppression is active"
+            );
+        }
         if state.record_send_success_with_context_at(
             completion.attempt,
             now,
@@ -6198,6 +6291,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             .entry(peer)
                             .or_insert_with(|| PeerScore::new_at(now))
                             .record_recovery_probe_at(now);
+                    }
+                    if attempt.kind == SendAttemptKind::CooldownBypass {
+                        claim_context.stage_stats.record_cooldown_bypass_probe();
+                        debug!(
+                            peer_id = %peer,
+                            topic = ?claim_context.topic,
+                            op = claim_context.op,
+                            "{} send admitted as rate-limited cooldown bypass",
+                            claim_context.op
+                        );
                     }
                     if let Some(event) = recovery_event {
                         claim_context.stage_stats.record_peer_recovery_probe(
@@ -13159,7 +13262,35 @@ mod tests {
         assert_eq!(suppressed.len(), 1, "single-peer sends should cool peers");
         assert_eq!(suppressed[0].peer_id, slow_peer.to_string());
 
+        // WP6: the first send during active suppression is admitted as a
+        // rate-limited cooldown-bypass probe so cached data still reaches
+        // the peer.
         let attempts_after_cooling = transport.send_count();
+        tokio::time::timeout(
+            PER_PEER_REPUBLISH_TIMEOUT + Duration::from_secs(2),
+            pubsub.send_to_peer_bounded(
+                topic,
+                slow_peer,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"cooldown-bypass"),
+                "EAGER",
+            ),
+        )
+        .await
+        .expect("bypass send should return after per-peer timeout")
+        .expect("timeout outcome is recorded, not returned as an error");
+        tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("cooldown bypass should have attempted one send")
+            .expect("started channel should stay open");
+        assert_eq!(
+            transport.send_count(),
+            attempts_after_cooling + 1,
+            "suppressed peer should receive exactly one rate-limited bypass send"
+        );
+
+        // A second send inside the bypass interval must be skipped.
+        let attempts_after_bypass = transport.send_count();
         pubsub
             .send_to_peer_bounded(
                 topic,
@@ -13172,8 +13303,8 @@ mod tests {
             .expect("suppressed peer should be skipped cleanly");
         assert_eq!(
             transport.send_count(),
-            attempts_after_cooling,
-            "suppressed peer should not consume another send slot"
+            attempts_after_bypass,
+            "suppressed peer should not consume another send slot inside the bypass interval"
         );
     }
 
@@ -13232,7 +13363,34 @@ mod tests {
         assert_eq!(suppressed[0].state, "cooldown");
         assert!(!suppressed[0].recovery_probe_in_flight);
 
+        // WP6: re-suppression admits one rate-limited cooldown-bypass send
+        // (the trickle continues), but a second send inside the bypass
+        // interval must be skipped.
         let attempts_after_probe = transport.send_count();
+        tokio::time::timeout(
+            PER_PEER_REPUBLISH_TIMEOUT + Duration::from_secs(2),
+            pubsub.send_to_peer_bounded(
+                topic,
+                slow_peer,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"cooldown-bypass"),
+                "EAGER",
+            ),
+        )
+        .await
+        .expect("bypass send should return after per-peer timeout")
+        .expect("timeout outcome is recorded, not returned as an error");
+        tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+            .await
+            .expect("cooldown bypass should have attempted one send")
+            .expect("started channel should stay open");
+        assert_eq!(
+            transport.send_count(),
+            attempts_after_probe + 1,
+            "re-suppressed peer should receive exactly one rate-limited bypass send"
+        );
+
+        let attempts_after_bypass = transport.send_count();
         pubsub
             .send_to_peer_bounded(
                 topic,
@@ -13245,8 +13403,8 @@ mod tests {
             .expect("active re-suppression should skip cleanly");
         assert_eq!(
             transport.send_count(),
-            attempts_after_probe,
-            "failed recovery probe should not permit another immediate send"
+            attempts_after_bypass,
+            "failed recovery probe should not permit another send inside the bypass interval"
         );
     }
 
@@ -13775,6 +13933,7 @@ mod tests {
                 last_suppression_timeout_count: PEER_TIMEOUT_THRESHOLD,
                 recovery_probe_in_flight: false,
                 recovery_probe_id: None,
+                last_bypass_probe_at: None,
             },
         );
 
@@ -16295,6 +16454,7 @@ mod tests {
                 last_suppression_timeout_count: PEER_TIMEOUT_THRESHOLD,
                 recovery_probe_in_flight: false,
                 recovery_probe_id: None,
+                last_bypass_probe_at: None,
             },
         );
         topics.insert(topic, state);
@@ -17612,13 +17772,16 @@ mod tests {
     #[tokio::test]
     async fn critical_control_send_to_cooling_peer_counts_cooling_only() {
         // Why: the no-target split must not swallow other zero-attempt
-        // causes. A Critical control send skipped because the (connected)
-        // peer is cooling is transient backpressure — it must land in the
-        // existing cooling accounting, exactly once, and never in the
-        // benign no-target counter or the hard error.
+        // causes. With WP6 the first send to an actively-cooling peer is
+        // admitted as a rate-limited `CooldownBypass` rather than a cooling
+        // skip, so it is NOT counted as `dropped_critical_cooling` — the
+        // bypass probe counter increments instead, and the send reaches the
+        // transport. A SECOND send inside the bypass interval IS skipped and
+        // must land in cooling (not in hard-error or no-target).
         let peer_id = test_peer_id(1);
         let target = test_peer_id(2);
         let transport = RecordingTransport::new(peer_id);
+        transport.set_connected_peer_ids(vec![target]);
         let pubsub = PlumtreePubSub::new_with_task_control(
             peer_id,
             Arc::clone(&transport),
@@ -17639,6 +17802,7 @@ mod tests {
                 .await;
         }
 
+        // First send during active suppression: admitted via bypass.
         pubsub
             .send_to_peer_bounded(
                 topic,
@@ -17648,25 +17812,57 @@ mod tests {
                 "IWANT",
             )
             .await
-            .expect("cooling skip completes without error");
+            .expect("bypass send completes without error");
 
-        let stats = pubsub.admission().stats().snapshot();
+        let admission_stats = pubsub.admission().stats().snapshot();
         assert_eq!(
-            stats.dropped_critical_cooling, 1,
-            "a Critical control skip on a cooling peer must book cooling exactly once"
+            admission_stats.dropped_critical_cooling, 0,
+            "first send during cooldown is a bypass, not a cooling skip"
         );
         assert_eq!(
-            stats.dropped_critical_hard_error, 0,
-            "cooling is transient backpressure, not a hard error"
+            admission_stats.dropped_critical_hard_error, 0,
+            "bypass is not a hard error"
         );
         assert_eq!(
-            stats.dropped_critical_no_target, 0,
-            "the peer is transport-connected; this is not a no-target skip"
+            admission_stats.dropped_critical_no_target, 0,
+            "the peer is transport-connected; not a no-target skip"
+        );
+        let stage_stats = pubsub.stage_stats();
+        assert_eq!(
+            stage_stats.cooldown_bypass_probes, 1,
+            "first send during cooldown increments the bypass probe counter"
         );
         assert_eq!(
             transport.send_count_to(target),
-            0,
-            "no bytes may reach the transport for a cooling peer"
+            1,
+            "bypass send reaches the transport"
+        );
+
+        // Second send inside the bypass interval: skipped as cooling.
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"iwant-while-cooling-2"),
+                "IWANT",
+            )
+            .await
+            .expect("cooling skip completes without error");
+
+        let admission_stats2 = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            admission_stats2.dropped_critical_cooling, 1,
+            "second send inside bypass interval counts as cooling skip"
+        );
+        assert_eq!(
+            admission_stats2.dropped_critical_hard_error, 0,
+            "cooling is transient backpressure, not a hard error"
+        );
+        assert_eq!(
+            transport.send_count_to(target),
+            1,
+            "no additional bytes reach the transport during the bypass interval"
         );
     }
 
@@ -18671,6 +18867,151 @@ mod tests {
             let cached = state.get_message(&msg_id).expect("cached");
             assert!(cached.dropped, "anti-entropy serve skips dropped entries");
         }
+    }
+
+    // ── WP6 CooldownBypass tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_cooldown_bypass_allows_rate_limited_send_during_suppression() {
+        // WHY (WP6): suppression previously blocked BOTH eager push and
+        // lazy IHAVE for the whole cooldown, so a message published while
+        // a peer was cooling was undeliverable until the cooldown expired
+        // (observed live as >96 s CRDT stalls on the three-machine WAN
+        // test). During cooldown the claim gate must admit a strictly
+        // rate-limited bypass send so cached data still reaches the peer
+        // on the anti-entropy timescale.
+        let mut state = TopicState::new();
+        let peer = test_peer_id(2);
+        state.eager_peers.insert(peer);
+
+        let now = Instant::now();
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer), now);
+        }
+        assert!(state.is_peer_suppressed_at(peer, now));
+
+        // Mid-cooldown: the first claim is admitted as a bypass send.
+        let mid = now + Duration::from_secs(1);
+        let (attempt, event) = state
+            .claim_send_attempt_at(peer, mid)
+            .expect("suppressed peer should admit one rate-limited bypass send");
+        assert_eq!(attempt.kind, SendAttemptKind::CooldownBypass);
+        assert!(event.is_none(), "bypass is not a recovery-probe event");
+
+        // A second claim inside the bypass interval must be rejected —
+        // the bypass is a trickle, not a hole in the suppression.
+        let inside = mid + PEER_COOLDOWN_BYPASS_MIN_INTERVAL - Duration::from_millis(1);
+        assert!(
+            state.claim_send_attempt_at(peer, inside).is_none(),
+            "bypass must be rate-limited to one send per interval"
+        );
+
+        // Once the interval elapses (still well inside the cooldown)
+        // another bypass send is admitted.
+        let next = mid + PEER_COOLDOWN_BYPASS_MIN_INTERVAL;
+        let (attempt2, _) = state
+            .claim_send_attempt_at(peer, next)
+            .expect("bypass should re-arm after the rate-limit interval");
+        assert_eq!(attempt2.kind, SendAttemptKind::CooldownBypass);
+
+        // A successful bypass send must NOT clear the suppression: eager
+        // fanout stays gated until the cooldown genuinely ends.
+        assert!(!state.record_send_success_at(attempt2, next));
+        assert!(
+            state.is_peer_suppressed_at(peer, next),
+            "bypass success must not lift the suppression early"
+        );
+        assert!(
+            !state.can_graft_peer_at(peer, next),
+            "bypass success must not re-graft the peer into EAGER"
+        );
+    }
+
+    #[test]
+    fn test_cooldown_bypass_success_does_not_shortcut_recovery_probe() {
+        // WHY (WP6): the bypass exists to deliver cached messages, not to
+        // end cooling early. Full recovery still requires the cooldown to
+        // expire AND one successful post-cooldown recovery probe — a
+        // single lucky send under pressure must not resume full fanout.
+        let mut state = TopicState::new();
+        let peer = test_peer_id(2);
+        state.eager_peers.insert(peer);
+
+        let now = Instant::now();
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer), now);
+        }
+        let suppressed_until = state
+            .peer_cooling
+            .get(&peer)
+            .and_then(|cooling| cooling.suppressed_until)
+            .expect("peer is suppressed");
+
+        let mid = now + Duration::from_secs(1);
+        let (attempt, _) = state
+            .claim_send_attempt_at(peer, mid)
+            .expect("bypass send admitted during cooldown");
+        assert_eq!(attempt.kind, SendAttemptKind::CooldownBypass);
+        assert!(!state.record_send_success_at(attempt, mid));
+        assert_eq!(
+            state
+                .peer_cooling
+                .get(&peer)
+                .and_then(|cooling| cooling.suppressed_until),
+            Some(suppressed_until),
+            "bypass success must leave the cooldown deadline untouched"
+        );
+
+        // After genuine expiry the peer still goes through the normal
+        // recovery-probe handshake before suppression clears.
+        let after_cooldown = now + PEER_SUPPRESSION_COOLDOWN + Duration::from_millis(1);
+        let (probe, event) = state
+            .claim_send_attempt_at(peer, after_cooldown)
+            .expect("expired cooling should admit a recovery probe");
+        assert_eq!(probe.kind, SendAttemptKind::RecoveryProbe);
+        assert!(event.is_some());
+        assert!(
+            state.record_send_success_at(probe, after_cooldown),
+            "successful post-cooldown probe clears cooling"
+        );
+        assert!(!state.is_peer_suppressed_at(peer, after_cooldown));
+    }
+
+    #[test]
+    fn test_cooldown_bypass_timeout_does_not_extend_suppression() {
+        // WHY (WP6): the peer is already cooling; a failed bypass send is
+        // expected on a genuinely dead peer and must not escalate the
+        // cooldown or re-trigger suppression events (which would defeat
+        // the purpose of the fixed, rate-limited trickle).
+        let mut state = TopicState::new();
+        let peer = test_peer_id(2);
+        state.eager_peers.insert(peer);
+
+        let now = Instant::now();
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            let _ = state.record_send_timeout_at(normal_send_attempt(peer), now);
+        }
+        let (suppressed_until, cooldown) = {
+            let cooling = state.peer_cooling.get(&peer).expect("peer is cooling");
+            (cooling.suppressed_until, cooling.cooldown)
+        };
+
+        let mid = now + Duration::from_secs(1);
+        let (attempt, _) = state
+            .claim_send_attempt_at(peer, mid)
+            .expect("bypass send admitted during cooldown");
+        assert_eq!(attempt.kind, SendAttemptKind::CooldownBypass);
+
+        assert!(
+            state
+                .record_send_timeout_at(attempt, mid + Duration::from_secs(1))
+                .is_none(),
+            "bypass timeout must not emit a new suppression event"
+        );
+        let cooling = state.peer_cooling.get(&peer).expect("peer is cooling");
+        assert_eq!(cooling.suppressed_until, suppressed_until);
+        assert_eq!(cooling.cooldown, cooldown);
+        assert!(state.is_peer_suppressed_at(peer, mid));
     }
 }
 

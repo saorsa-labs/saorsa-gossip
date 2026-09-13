@@ -84,6 +84,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the effect is directly observable in `/diagnostics/gossip`. Dedupe TTL
   and eviction policy are untouched.
 
+- **pubsub: `peer_scores_v2` gains a working bound; churned-member
+  cooling/score pruning and a pending-IHAVE cap tighten the TopicState
+  footprint (#41, x0x #368, x0x#697 family).** The x0x heap profile
+  showed ~62 MB/h of TopicState growth on a NAT'd node with 10,412
+  retained `peer_scores_v2` entries against ~20 live connections after
+  3.9 days. What was already bounded on main and is NOT claimed here:
+  per-topic message caches (count+bytes+TTL), per-topic `peer_scores`
+  (`clean_cache` drops entries whose send-side evidence is older than
+  `PEER_SCORE_RETENTION` = 2400 s), and expired probe-free non-member
+  cooling entries (`clean_expired_peer_cooling`). What this adds:
+  - `peer_scores_v2` (the X0X-0071 engine, previously insert-only with
+    no removal path at all): entries for reaped topics are dropped
+    immediately, and churned non-member entries age out one hour after
+    the peer's last scoring EVIDENCE (any `record_*` / `note_mesh_join`
+    call — `PEER_SCORE_V2_RETENTION`). The idle clock is a dedicated
+    `last_activity` stamp the metrics path never touches: round 2 found
+    the first version used `last_decay_at`, which `snapshot()` rewrites
+    on every entry, so x0x's 5 s `stage_stats()` poll kept the window
+    from ever elapsing (500/500 churned entries retained across 20
+    poll-then-prune cycles). Live mesh memberships are always retained
+    regardless of age; an actively misbehaving non-member keeps its
+    P4/P7 history while it keeps offending; weights, decay, and
+    composite scores are unchanged.
+  - Per-topic `peer_scores`/`peer_cooling` churn pruning on the idle
+    sweep, faster than the 2400 s evidence TTL for the common case.
+    Cooling follows one predicate: members keep their cooling state
+    unconditionally (an expired, probe-due member entry survives so the
+    member still receives its recovery probe and keeps the adaptive
+    backoff escalation — #62/#63); churned entries are kept only while
+    they carry live meaning — an active cooldown or a recovery probe
+    whose outcome is pending. Churned entries whose suppression is NULL
+    (exactly what a first send timeout creates) and expired probe-free
+    entries are pruned; the expired/probe-free removal matches
+    `clean_expired_peer_cooling`'s rule, which also clears the peer's
+    suppression-diagnostics row.
+  - The pending-IHAVE queue (previously an uncapped `Vec`) is now a
+    bounded `VecDeque` capped at `MAX_PENDING_IHAVE` (one full flush
+    batch); overflow drops the OLDEST ids — the stalest advertisements —
+    and every dropped id is counted in the new
+    `PubSubStageStatsSnapshot::pending_ihave_dropped` so sustained
+    overflow (an all-eager topic, admission denial under congestion) is
+    observable.
+
 - **pubsub: background tasks now have a shutdown lifecycle — the IHAVE
   flusher no longer livelocks after transport shutdown (#42, x0x #368,
   #371).** `spawn_ihave_flusher` (and its siblings: cache cleaner, degree
@@ -116,6 +159,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send tasks have been handed off, so an abort past the shutdown grace
   leaves the batch pending for the next flusher instead of losing it
   (a lost batch was lost delivery until anti-entropy).
+>>>>>>> origin/main
 
 ## [0.5.80] - 2026-09-13
 

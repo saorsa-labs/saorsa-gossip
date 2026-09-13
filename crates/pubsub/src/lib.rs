@@ -40,7 +40,7 @@ use saorsa_gossip_types::{
     PeerHealthOracle, PeerId, TopicId, TopicPriority,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
@@ -106,20 +106,27 @@ const REPLAY_CACHE_TTL_SECS: u64 = 300;
 /// 2026-04-25 soak validation.
 const TOPIC_IDLE_TTL_SECS: u64 = 600;
 
+/// Issue #41: how long a churned (topic, peer) `peer_scores_v2` entry
+/// survives its last touch before the cache-cleaner sweep ages it out.
+/// Live mesh memberships are always retained regardless of age; an
+/// actively misbehaving non-member keeps its P4/P7 history while it keeps
+/// offending (every update refreshes the touch time).
+const PEER_SCORE_V2_RETENTION: Duration = Duration::from_secs(3600);
+
 /// Maximum IHAVE batch size (per SPEC.md)
 const MAX_IHAVE_BATCH_SIZE: usize = 1024;
 
-/// Final-review cap on a topic's pending-IHAVE queue, mirroring the cap
-/// the #59 withheld-entry list already applies (MAX_IHAVE_BATCH_SIZE).
-/// The abort-safety change moved batch consumption behind the send handoff
-/// and its early-exit paths, and nothing else bounds the vector: on an
-/// all-eager topic (structurally unable to advertise — no lazy members,
-/// no stranded/withheld entries, so the flush's target set is empty and
+/// Cap on a topic's pending-IHAVE queue, mirroring the cap the #59
+/// withheld-entry list already applies (`MAX_IHAVE_BATCH_SIZE` = one full
+/// batch of backlog). Nothing else bounds the queue: on an all-eager
+/// topic (structurally unable to advertise — no lazy members, no
+/// stranded/withheld entries, so the flush's target set is empty and
 /// pending is never consumed) and under admission denial during
 /// congestion, it would otherwise grow one entry per message forever.
-/// Overflow drops the OLDEST ids — the stalest advertisements. The cap
-/// only gates the push side; consumption stays where the abort-safety
-/// fix put it (after send completion).
+/// Overflow drops the OLDEST ids — the stalest advertisements — and the
+/// drops are counted (`pending_ihave_dropped`). The cap only gates the
+/// push side; consumption stays where the abort-safety fix put it
+/// (after send completion).
 const MAX_PENDING_IHAVE: usize = MAX_IHAVE_BATCH_SIZE;
 
 /// IHAVE flush interval (100ms)
@@ -796,6 +803,8 @@ pub struct PubSubStageStats {
     /// the ML-DSA-65 verify. These frames still run the duplicate-EAGER
     /// PRUNE handling but never reach `verify_message_signature`.
     eager_duplicate_dropped_pre_verify: AtomicU64,
+    /// Issue #41: msg_ids dropped by the pending-IHAVE cap.
+    pending_ihave_dropped: AtomicU64,
     eager_fanout: StageTimingStats,
     republish: StageTimingStats,
     /// Per-peer EAGER/IHAVE sends that hit `PER_PEER_REPUBLISH_TIMEOUT`.
@@ -1102,6 +1111,10 @@ pub struct PubSubStageStatsSnapshot {
     /// (`attempted == 0`). A non-zero value means the eager set was empty or
     /// fully cooled — the message did not leave the node.
     pub zero_fanout_publishes: u64,
+    /// Issue #41: msg_ids dropped by the pending-IHAVE cap (the oldest
+    /// ids evicted once the queue saturates) — sustained growth means an
+    /// all-eager topic or admission denial is overflowing the queue.
+    pub pending_ihave_dropped: u64,
     /// Per-topic view of `zero_fanout_publishes`, keyed by topic id. Counts
     /// for idle-evicted topics remain visible in the aggregate
     /// `zero_fanout_publishes` only.
@@ -2413,6 +2426,7 @@ impl PubSubStageStats {
             republish: self.republish.snapshot(),
             republish_per_peer_timeout: self.republish_per_peer_timeout.load(Ordering::Relaxed),
             outbound_budget_exhausted: self.outbound_budget_exhausted.load(Ordering::Relaxed),
+            pending_ihave_dropped: self.pending_ihave_dropped.load(Ordering::Relaxed),
             cooldown_bypass_probes: self.cooldown_bypass_probes.load(Ordering::Relaxed),
             cooldown_bypass_successes: self.cooldown_bypass_successes.load(Ordering::Relaxed),
             zero_fanout_publishes: self.zero_fanout_publishes.load(Ordering::Relaxed),
@@ -2652,6 +2666,14 @@ impl PubSubStageStats {
 
     fn record_prunes(&self, count: usize) {
         self.message_kinds.record_prunes(count);
+    }
+
+    /// Issue #41: record msg_ids dropped by the pending-IHAVE cap.
+    fn record_pending_ihave_dropped(&self, dropped: usize) {
+        if dropped > 0 {
+            self.pending_ihave_dropped
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+        }
     }
 
     fn record_eager_duplicate_dropped_pre_verify(&self) {
@@ -3465,7 +3487,7 @@ struct TopicState {
     /// Message cache: msg_id -> cached message
     message_cache: BoundedMessageCache,
     /// Pending IHAVE batch (≤1024 message IDs)
-    pending_ihave: Vec<MessageIdType>,
+    pending_ihave: VecDeque<MessageIdType>,
     /// Outstanding IWANT requests: msg_id -> (peer, timestamp)
     outstanding_iwants: HashMap<MessageIdType, (PeerId, Instant)>,
     /// Per-peer quality scores for tree optimization
@@ -3519,7 +3541,7 @@ impl TopicState {
                 cache_config.max_bytes_per_topic,
                 cache_config.max_age,
             ),
-            pending_ihave: Vec::new(),
+            pending_ihave: VecDeque::new(),
             stranded_ihave: Vec::new(),
             lazy_withheld: Vec::new(),
             outstanding_iwants: HashMap::new(),
@@ -3679,6 +3701,20 @@ impl TopicState {
         targets
     }
 
+    /// Issue #41 round 3: queue a msg_id for the next IHAVE flush, bounded
+    /// at [`MAX_PENDING_IHAVE`] ids. Overflow drops the oldest ids — the
+    /// stalest advertisements — so an all-eager topic (or admission denial
+    /// under congestion) cannot grow the vector without bound.
+    fn push_pending_ihave(&mut self, msg_id: MessageIdType) -> usize {
+        let mut dropped = 0;
+        while self.pending_ihave.len() >= MAX_PENDING_IHAVE {
+            self.pending_ihave.pop_front();
+            dropped += 1;
+        }
+        self.pending_ihave.push_back(msg_id);
+        dropped
+    }
+
     /// Queue the withheld eager peers of a LazyForward verdict (#59) as
     /// direct IHAVE announce targets for `msg_id`. Same bounding policy
     /// as `queue_stranded_ihave`: at most `MAX_IHAVE_BATCH_SIZE`
@@ -3727,14 +3763,6 @@ impl TopicState {
     /// cap). Overflow drops the oldest ids — the stalest advertisements.
     /// Consumption is untouched: it still happens only after the send
     /// handoff, preserving the abort-safety property.
-    fn push_pending_ihave(&mut self, msg_id: MessageIdType) {
-        if self.pending_ihave.len() >= MAX_PENDING_IHAVE {
-            let overflow = self.pending_ihave.len() + 1 - MAX_PENDING_IHAVE;
-            self.pending_ihave.drain(..overflow);
-        }
-        self.pending_ihave.push(msg_id);
-    }
-
     /// The #59 LazyForward withheld-eager announce targets for this
     /// batch, WITHOUT removing the entries (the round-1 flush drained them
     /// eagerly; the entry removal now happens in
@@ -3813,6 +3841,46 @@ impl TopicState {
     }
 
     /// Clean expired cache entries
+    /// Issue #41: drop per-peer score and cooling entries for peers that
+    /// are no longer mesh members (in neither the eager nor the lazy set).
+    /// Churned peers otherwise accumulate in `peer_scores` and
+    /// `peer_cooling` forever on long-lived topics — the x0x heap profile
+    /// (x0x #368) showed ~62 MB/h of TopicState growth on a NAT'd node
+    /// with ~20 live connections and thousands of retained churned
+    /// entries. `peer_scores` pruning is membership-based only; scoring
+    /// semantics for retained (member) peers are untouched, and a
+    /// returning peer starts from a fresh score like a first contact.
+    ///
+    /// Cooling entries follow ONE predicate (round 3):
+    /// - **Members keep their cooling state unconditionally.** An expired,
+    ///   probe-due member entry must survive so the member still receives
+    ///   its recovery probe and keeps the adaptive backoff escalation
+    ///   carried in `PeerCoolingState::cooldown` (deleting it would
+    ///   regress the 0.5.80 cooling work, #62/#63).
+    /// - **Churned entries are kept only while they still carry live
+    ///   meaning** — an active cooldown (`suppressed_until` in the
+    ///   future), or a recovery probe whose outcome is pending. Entries
+    ///   whose suppression is NULL (exactly what a peer's first send
+    ///   timeout creates — the largest churned population) and entries
+    ///   whose suppression expired without a probe in flight are garbage
+    ///   for a departed peer and are pruned. The expired/probe-free case
+    ///   matches the pre-existing `clean_expired_peer_cooling` removal
+    ///   rule (which runs first in the same cleaner pass and also clears
+    ///   the peer's suppression-diagnostics row), so this prune never
+    ///   orphans a `stage_stats.suppressed_peers` entry.
+    fn prune_churned_peer_state(&mut self, now: Instant) {
+        let is_member =
+            |peer: &PeerId| self.eager_peers.contains(peer) || self.lazy_peers.contains(peer);
+        self.peer_scores.retain(|peer, _| is_member(peer));
+        self.peer_cooling.retain(|peer, state| {
+            if is_member(peer) {
+                return true;
+            }
+            state.suppressed_until.is_some_and(|until| until > now)
+                || state.recovery_probe_in_flight
+        });
+    }
+
     fn clean_cache(&mut self) {
         self.message_cache.prune_expired();
 
@@ -4782,8 +4850,13 @@ fn clean_and_reap_topic_ids(
     topics: &mut HashMap<TopicId, TopicState>,
     topic_idle_ttl: Duration,
 ) -> Vec<TopicId> {
+    let sweep_now = Instant::now();
     for state in topics.values_mut() {
         state.clean_cache();
+        // Issue #41: churned peers (no longer eager or lazy members) must
+        // not retain score/cooling state forever on long-lived topics —
+        // members keep their cooling state unconditionally (round 3).
+        state.prune_churned_peer_state(sweep_now);
     }
 
     let idle: Vec<TopicId> = topics
@@ -4830,6 +4903,47 @@ fn clean_expired_peer_cooling(
         }
     }
     removed
+}
+
+/// Issue #41: bound `peer_scores_v2` on the same signal that reaps idle
+/// topics. Builds the live `(topic, peer)` membership set from the topic
+/// shards, drops every entry belonging to an already-reaped topic, and
+/// ages out non-member entries whose last touch is older than
+/// `max_idle` (the caller passes [`PEER_SCORE_V2_RETENTION`]). Split out
+/// of `spawn_cache_cleaner` so the retention rule is testable without the
+/// adaptive 10-120 s loop. Returns `(aged_out, reaped_entries)`.
+async fn prune_churned_peer_scoring(
+    topics: &ShardedTopicMap,
+    peer_scoring: &peer_scoring::PeerScoring,
+    reaped: &[TopicId],
+    now: Instant,
+    max_idle: Duration,
+) -> (usize, usize) {
+    let live: HashSet<(TopicId, PeerId)> = {
+        let guards = topics.read_all().await;
+        let mut live = HashSet::new();
+        for shard in &guards {
+            for (topic_id, state) in shard.iter() {
+                for peer in state.eager_peers.iter().chain(state.lazy_peers.iter()) {
+                    live.insert((*topic_id, *peer));
+                }
+            }
+        }
+        live
+    };
+    let aged_out = peer_scoring.retain_active_at(&live, now, max_idle);
+    // Round 2: a topic RECREATED after the sweep dropped its lock (a
+    // publisher raced the reap) is back in the live set — its fresh
+    // entries are live evidence, not garbage, so skip it.
+    let live_topics: HashSet<TopicId> = live.iter().map(|(topic, _)| *topic).collect();
+    let mut reaped_entries = 0;
+    for topic in reaped {
+        if live_topics.contains(topic) {
+            continue;
+        }
+        reaped_entries += peer_scoring.remove_topic(topic);
+    }
+    (aged_out, reaped_entries)
 }
 
 fn next_suppression_cleanup_interval(
@@ -7204,7 +7318,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                      (throttled; counter is cumulative for this topic)"
                 );
             }
-            state.push_pending_ihave(msg_id);
+            let dropped = state.push_pending_ihave(msg_id);
+            self.stage_stats.record_pending_ihave_dropped(dropped);
 
             // x0x #613 mitigation 1: queue a self-IHAVE to the attempted
             // peers so the 100 ms flush advertises this id regardless of
@@ -7618,7 +7733,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             validator_action,
             ValidationAction::ForwardAndDeliver | ValidationAction::LazyForward
         ) {
-            state.push_pending_ihave(msg_id);
+            let dropped = state.push_pending_ihave(msg_id);
+            self.stage_stats.record_pending_ihave_dropped(dropped);
         }
         self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
 
@@ -8330,8 +8446,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// is also the relay's delivery path, so a flusher that spins after
     /// shutdown is a delivery defect, not just a shutdown nuisance.
     ///
-    /// Every join shares one deadline ([`BACKGROUND_SHUTDOWN_GRACE`]); a
-    /// task that misses it is aborted, so shutdown can never hang. The
+    /// Every join shares one deadline (1 s, `BACKGROUND_SHUTDOWN_GRACE`);
+    /// a task that misses it is aborted, so shutdown can never hang. The
     /// transport error itself is opaque (`anyhow` from the transport
     /// trait), so "terminal error" detection by string matching is
     /// deliberately avoided — embedders drive a clean stop by closing
@@ -8876,6 +8992,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     fn spawn_cache_cleaner(&self) {
         let topics = self.topics.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
+        let peer_scoring = Arc::clone(&self.peer_scoring);
         let topic_idle_ttl = Duration::from_secs(TOPIC_IDLE_TTL_SECS);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -8910,6 +9027,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
                 for topic in &idle_topics {
                     stage_stats.clear_topic_suppressions(*topic);
+                }
+                // Issue #41: bound `peer_scores_v2` on the same signal —
+                // entries for reaped topics go now, churned non-member
+                // entries age out after PEER_SCORE_V2_RETENTION.
+                let (aged_out, reaped_scores) = prune_churned_peer_scoring(
+                    &topics,
+                    &peer_scoring,
+                    &idle_topics,
+                    Instant::now(),
+                    PEER_SCORE_V2_RETENTION,
+                )
+                .await;
+                if aged_out > 0 || reaped_scores > 0 {
+                    debug!(
+                        aged_out,
+                        reaped_scores, "Pruned churned peer_scores_v2 entries (issue #41)"
+                    );
                 }
                 let now = Instant::now();
                 let elapsed = now
@@ -11025,6 +11159,276 @@ mod tests {
         );
     }
 
+    /// Issue #41 (x0x #368, x0x#697 family): churned peers must not retain
+    /// per-topic score/cooling state forever, and `peer_scores_v2` entries
+    /// must not outlive their topic. Round 3 seeds BOTH states the previous
+    /// versions were blind to, so the test distinguishes the correct
+    /// predicate from wrong ones:
+    ///
+    /// - a MEMBER in the probe-due state (suppression expired, no recovery
+    ///   probe in flight) — its cooling entry must SURVIVE so it still
+    ///   receives its recovery probe and keeps the backoff escalation
+    ///   (deleting it regresses the 0.5.80 cooling work, #62/#63);
+    /// - a CHURNED peer whose suppression is NULL — exactly what a first
+    ///   send timeout creates, the largest churned population — which must
+    ///   be PRUNED (keeping it reopens #41's own leak);
+    /// - a churned peer with an ACTIVE escalated cooldown — must survive
+    ///   with its escalation intact;
+    /// - a stale churned peer (expired, probe-free) — must be pruned.
+    #[tokio::test]
+    async fn churned_peer_state_and_scores_v2_are_bounded_by_idle_sweep() {
+        let topics_map = Arc::new(ShardedTopicMap::new());
+        let scoring = peer_scoring::PeerScoring::new();
+        let live_topic = TopicId::new([64u8; 32]);
+        let dying_topic = TopicId::new([65u8; 32]);
+        let member_a = test_peer_id(2);
+        let member_b = test_peer_id(3);
+        let now = Instant::now();
+        const NULL_CHURN: usize = 20;
+        const SUPPRESSED_CHURN: usize = 20;
+        const STALE_CHURN: usize = 10;
+        const PROBE_CHURN: usize = 5;
+
+        {
+            let mut guard = topics_map.write_topic(&live_topic).await;
+            let state = guard.entry(live_topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(member_a);
+            state.lazy_peers.insert(member_b);
+            state.peer_scores.insert(member_a, PeerScore::new_at(now));
+            state.peer_scores.insert(member_b, PeerScore::new_at(now));
+            // member_a is PROBE-DUE: suppression expired, no probe claimed.
+            let mut probe_due = PeerCoolingState::new(now);
+            probe_due.suppressed_until = Some(now - Duration::from_millis(1));
+            probe_due.cooldown = Duration::from_secs(240);
+            state.peer_cooling.insert(member_a, probe_due);
+            state
+                .peer_cooling
+                .insert(member_b, PeerCoolingState::new(now));
+            for i in 0..NULL_CHURN {
+                let churned = test_peer_id(10 + i as u8);
+                // Fresh PeerCoolingState: suppression is NULL — the state a
+                // FIRST send timeout creates before any suppression fires.
+                state.peer_scores.insert(churned, PeerScore::new_at(now));
+                state
+                    .peer_cooling
+                    .insert(churned, PeerCoolingState::new(now));
+            }
+            for i in 0..SUPPRESSED_CHURN {
+                let churned = test_peer_id(40 + i as u8);
+                let mut cooling = PeerCoolingState::new(now);
+                cooling.suppressed_until = Some(now + Duration::from_secs(60));
+                cooling.cooldown = Duration::from_secs(240);
+                state.peer_scores.insert(churned, PeerScore::new_at(now));
+                state.peer_cooling.insert(churned, cooling);
+            }
+            for i in 0..STALE_CHURN {
+                let churned = test_peer_id(70 + i as u8);
+                let mut cooling = PeerCoolingState::new(now);
+                cooling.suppressed_until = Some(now - Duration::from_millis(1));
+                state.peer_scores.insert(churned, PeerScore::new_at(now));
+                state.peer_cooling.insert(churned, cooling);
+            }
+            for i in 0..PROBE_CHURN {
+                let churned = test_peer_id(90 + i as u8);
+                let mut cooling = PeerCoolingState::new(now);
+                // A recovery probe is IN FLIGHT for this churned peer: the
+                // suppression already expired but the probe outcome is
+                // pending — only the `recovery_probe_in_flight` clause of
+                // the predicate keeps it (dropping the entry would strand
+                // the in-flight probe marker).
+                cooling.suppressed_until = Some(now - Duration::from_millis(1));
+                cooling.recovery_probe_in_flight = true;
+                state.peer_scores.insert(churned, PeerScore::new_at(now));
+                state.peer_cooling.insert(churned, cooling);
+            }
+        }
+        {
+            let mut guard = topics_map.write_topic(&dying_topic).await;
+            let state = guard.entry(dying_topic).or_insert_with(TopicState::new);
+            state.last_activity = now - Duration::from_secs(TOPIC_IDLE_TTL_SECS + 1);
+        }
+
+        // v2 entries: one live member, 50 churned-on-live-topic (recently
+        // touched), and one on the dying topic.
+        scoring.note_mesh_join(live_topic, member_a);
+        for i in 0..50u8 {
+            scoring.record_first_delivery(live_topic, test_peer_id(10 + i));
+        }
+        scoring.record_first_delivery(dying_topic, member_a);
+        assert_eq!(scoring.entry_count(), 52);
+
+        // The cache cleaner's per-shard pass (the exact function it calls).
+        let reaped = {
+            let mut all = topics_map.write_all().await;
+            let mut reaped = Vec::new();
+            for shard in all.iter_mut() {
+                reaped.extend(clean_and_reap_topic_ids(
+                    shard,
+                    Duration::from_secs(TOPIC_IDLE_TTL_SECS),
+                ));
+            }
+            reaped
+        };
+        assert_eq!(reaped, vec![dying_topic], "the idle topic is reaped");
+
+        {
+            let guard = topics_map.read_topic(&live_topic).await;
+            let state = guard.get(&live_topic).expect("live topic survives");
+            assert_eq!(
+                state.peer_scores.len(),
+                2,
+                "all churned per-topic scores pruned to the live members"
+            );
+            assert_eq!(
+                state.peer_cooling.len(),
+                2 + SUPPRESSED_CHURN + PROBE_CHURN,
+                "null-suppression and stale churned cooling pruned; the probe-due MEMBER, the plain member, actively-suppressed churned, and probe-in-flight churned cooling survive"
+            );
+            // The member's probe-due entry survives VERBATIM — expiry and
+            // backoff escalation intact, so its recovery probe still fires.
+            let probe_due = state
+                .peer_cooling
+                .get(&member_a)
+                .expect("the probe-due member's cooling entry must survive");
+            assert_eq!(
+                probe_due.cooldown,
+                Duration::from_secs(240),
+                "the member's backoff escalation must survive the sweep"
+            );
+            assert!(
+                probe_due.suppression_expired_at(now),
+                "the member stays probe-due (expired, no probe in flight)"
+            );
+            // The suppressed churned survivor keeps its escalation too.
+            let escalated = state
+                .peer_cooling
+                .get(&test_peer_id(40))
+                .expect("suppressed churned cooling entry survives");
+            assert_eq!(escalated.cooldown, Duration::from_secs(240));
+            // The null-suppression churned entry is GONE — the largest
+            // churned population must not leak.
+            assert!(
+                !state.peer_cooling.contains_key(&test_peer_id(10)),
+                "a churned peer's null-suppression entry must be pruned"
+            );
+            // The probe-in-flight churned entry SURVIVES — dropping it
+            // would strand the in-flight recovery probe marker.
+            let probing = state
+                .peer_cooling
+                .get(&test_peer_id(90))
+                .expect("probe-in-flight churned cooling entry survives");
+            assert!(probing.recovery_probe_in_flight);
+        }
+
+        // The v2 bound through the exact helper the cleaner calls.
+        let (aged_out, reaped_scores) = prune_churned_peer_scoring(
+            &topics_map,
+            &scoring,
+            &reaped,
+            now,
+            PEER_SCORE_V2_RETENTION,
+        )
+        .await;
+        assert_eq!(aged_out, 0, "nothing is old enough to age out yet");
+        assert_eq!(reaped_scores, 1, "the reaped topic's entries are dropped");
+        assert_eq!(scoring.entry_count(), 51);
+    }
+
+    /// Issue #41 round 2 (BLOCKING): the `peer_scores_v2` idle window must
+    /// elapse even while the diagnostics path is polled. `snapshot()`
+    /// rewrites `last_decay_at` on every entry to keep the decayed
+    /// counters current, and x0x calls `stage_stats()` every 5 s — so a
+    /// `last_decay_at`-based "last touch" never ages and the bound does
+    /// not bound (500/500 churned entries retained across 20
+    /// poll-then-prune cycles at 4x the window, per review). The GC now
+    /// uses the evidence-only `last_activity` stamp, which the metrics
+    /// path never touches. This test POLLS the real `stage_stats()` path
+    /// between prune cycles — a test that does not poll passes either
+    /// way.
+    #[tokio::test]
+    async fn peer_scores_v2_idle_window_elapses_despite_diagnostics_polling() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([70u8; 32]);
+        const CHURNED: usize = 50;
+        // Record evidence for CHURNED (topic, peer) pairs — no mesh
+        // membership anywhere, so only the idle window can retain them.
+        for i in 0..CHURNED as u8 {
+            pubsub
+                .peer_scoring
+                .record_first_delivery(topic, test_peer_id(10 + i));
+        }
+        assert_eq!(pubsub.peer_scoring.entry_count(), CHURNED);
+
+        // A window far shorter than the poll-to-poll gap below.
+        let window = Duration::from_millis(25);
+        // Let the evidence age past the window while POLLING the real
+        // diagnostics path — exactly the x0x supervisor's behaviour.
+        for _ in 0..6 {
+            let _ = pubsub.stage_stats();
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let _ = pubsub.stage_stats();
+
+        // The cleaner's exact helper, empty live set, real now.
+        let (aged_out, _reaped) = prune_churned_peer_scoring(
+            &pubsub.topics,
+            &pubsub.peer_scoring,
+            &[],
+            Instant::now(),
+            window,
+        )
+        .await;
+        assert_eq!(
+            aged_out, CHURNED,
+            "churned entries must age out even while stage_stats() is polled — the idle clock cannot be the decay clock"
+        );
+        assert_eq!(pubsub.peer_scoring.entry_count(), 0);
+    }
+
+    /// Issue #41 round 3: the pending-IHAVE queue is bounded. Ids queued
+    /// faster than a flush consumes them (structurally on an all-eager
+    /// topic, and under admission denial once consumption is deferred past
+    /// early-exit paths) must not grow the vector without bound; overflow
+    /// drops the OLDEST ids, which are the stalest advertisements, and the
+    /// drops are counted so operators can see sustained overflow.
+    #[test]
+    fn pending_ihave_queue_is_bounded() {
+        let mut state = TopicState::new();
+        let total = MAX_PENDING_IHAVE + 500;
+        let mut dropped_total = 0;
+        for i in 0..total {
+            let mut msg_id = [68u8; 32];
+            msg_id[0] = (i % 256) as u8;
+            msg_id[1] = (i / 256) as u8;
+            dropped_total += state.push_pending_ihave(msg_id);
+        }
+        assert_eq!(
+            state.pending_ihave.len(),
+            MAX_PENDING_IHAVE,
+            "the queue must cap at MAX_PENDING_IHAVE, not grow with input"
+        );
+        // The OLDEST ids were dropped: the front is the 500th id pushed.
+        let mut expected_front = [68u8; 32];
+        expected_front[0] = (500 % 256) as u8;
+        expected_front[1] = (500 / 256) as u8;
+        assert_eq!(
+            state.pending_ihave.front(),
+            Some(&expected_front),
+            "overflow drops the oldest (stalest) ids"
+        );
+        assert_eq!(
+            dropped_total, 500,
+            "every evicted id is counted for the diagnostics surface"
+        );
+    }
+
     /// Issue #62 (x0x #611): with a consumer-configured max eager degree
     /// of 2 (x0x Leaf) the healthy mesh IS two peers, so demoting one of
     /// them locks the topic at degree 1 for at least the 120 s cooldown —
@@ -11174,7 +11578,7 @@ mod tests {
             if let Some(state) = topics.get_mut(&topic) {
                 let mut msg_id = [63u8; 32];
                 msg_id[0] = id;
-                state.pending_ihave.push(msg_id);
+                state.push_pending_ihave(msg_id);
             }
         }
 
@@ -11318,7 +11722,7 @@ mod tests {
             expected_front[0] = (front_idx % 256) as u8;
             expected_front[1] = (front_idx / 256) as u8;
             assert_eq!(
-                state.pending_ihave.first(),
+                state.pending_ihave.front(),
                 Some(&expected_front),
                 "overflow drops the oldest (stalest) ids"
             );
@@ -11373,7 +11777,7 @@ mod tests {
         {
             let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.get_mut(&topic).expect("topic state");
-            state.pending_ihave.push([66u8; 32]);
+            state.pending_ihave.push_back([66u8; 32]);
         }
         let report = pubsub.shutdown().await;
         assert_eq!(report.joined + report.aborted, 5);
@@ -11428,7 +11832,7 @@ mod tests {
         {
             let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.get_mut(&topic).expect("topic state");
-            state.pending_ihave.push([67u8; 32]);
+            state.pending_ihave.push_back([67u8; 32]);
         }
         let report = pubsub.shutdown().await;
         assert_eq!(
@@ -13688,7 +14092,7 @@ mod tests {
             let mut topics_guard = topics.write_topic(&topic).await;
             let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
             state.lazy_peers.insert(lazy_peer);
-            state.pending_ihave.push([9u8; 32]);
+            state.pending_ihave.push_back([9u8; 32]);
         }
 
         let now = Instant::now();
@@ -15107,7 +15511,7 @@ mod tests {
             let mut topics_guard = topics.write_topic(&topic).await;
             let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
             state.lazy_peers.insert(lazy_peer);
-            state.pending_ihave.push([7u8; 32]);
+            state.pending_ihave.push_back([7u8; 32]);
         }
 
         let flush_topics = Arc::clone(&topics);
@@ -15176,7 +15580,7 @@ mod tests {
             let mut topics_guard = topics.write_topic(&topic).await;
             let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
             state.lazy_peers.insert(lazy_peer);
-            state.pending_ihave.push([8u8; 32]);
+            state.pending_ihave.push_back([8u8; 32]);
             for _ in 0..PEER_TIMEOUT_THRESHOLD {
                 let _ =
                     state.record_send_timeout_at(normal_send_attempt(lazy_peer), Instant::now());
@@ -15287,7 +15691,7 @@ mod tests {
             let mut topics_guard = topics.write_topic(&topic).await;
             let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
             state.lazy_peers.insert(lazy_peer);
-            state.pending_ihave.push([9u8; 32]);
+            state.pending_ihave.push_back([9u8; 32]);
             for _ in 0..PEER_TIMEOUT_THRESHOLD {
                 let _ =
                     state.record_send_timeout_at(normal_send_attempt(lazy_peer), Instant::now());
@@ -19083,7 +19487,7 @@ mod tests {
             state
                 .map(|s| {
                     (
-                        s.has_message(&s.pending_ihave.first().copied().unwrap_or_default()),
+                        s.has_message(&s.pending_ihave.front().copied().unwrap_or_default()),
                         s.pending_ihave.len(),
                     )
                 })

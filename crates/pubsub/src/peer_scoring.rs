@@ -89,9 +89,9 @@
 
 use saorsa_gossip_types::{PeerId, TopicId};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Default P1 (time in mesh) weight — small positive.
 pub const W_P1_TIME_IN_MESH: f64 = 0.01;
@@ -345,6 +345,45 @@ impl PeerScoring {
     #[must_use]
     pub fn lock_wait_snapshot(&self) -> crate::StageTimingStatsSnapshot {
         self.lock_wait.snapshot()
+    }
+
+    /// Number of retained `(topic, peer)` entries (issue #41 test surface).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Issue #41: drop every entry for `topic` — called when the idle sweep
+    /// reaps the topic, so its per-(topic, peer) scores do not outlive the
+    /// `TopicState` that justified them. Returns the number of entries
+    /// removed. Scoring semantics for all other topics are untouched.
+    pub(crate) fn remove_topic(&self, topic: &TopicId) -> usize {
+        let mut guard = self.lock();
+        let before = guard.len();
+        guard.retain(|(retained_topic, _), _| retained_topic != topic);
+        before - guard.len()
+    }
+
+    /// Issue #41: bound the retained score map. An entry survives when its
+    /// `(topic, peer)` pair is a live mesh membership, or when it was
+    /// touched (any decay-bringing update) within `max_idle` — so an
+    /// actively misbehaving non-member keeps its P4/P7 history while it
+    /// keeps offending, while churned pairs age out. Weights, decay, and
+    /// the composite score of every retained entry are unchanged.
+    /// Returns the number of entries removed.
+    pub(crate) fn retain_active_at(
+        &self,
+        live: &HashSet<(TopicId, PeerId)>,
+        now: Instant,
+        max_idle: Duration,
+    ) -> usize {
+        let mut guard = self.lock();
+        let before = guard.len();
+        guard.retain(|key, state| {
+            live.contains(key) || now.saturating_duration_since(state.last_decay_at) <= max_idle
+        });
+        before - guard.len()
     }
 
     /// Mark that `peer` has joined our mesh for `topic` — starts the P1
@@ -832,5 +871,39 @@ mod tests {
                 .decay_per_sec,
             0.5
         );
+    }
+    #[test]
+    fn retain_active_bounds_churned_entries() {
+        let scoring = PeerScoring::new();
+        let topic = TopicId::new([7u8; 32]);
+        let other_topic = TopicId::new([8u8; 32]);
+        let member = PeerId::new([1; 32]);
+        let recent_churned = PeerId::new([2; 32]);
+        let other_non_member = PeerId::new([3; 32]);
+
+        scoring.note_mesh_join(topic, member);
+        scoring.record_first_delivery(topic, recent_churned);
+        scoring.record_first_delivery(other_topic, other_non_member);
+        assert_eq!(scoring.entry_count(), 3);
+
+        let live = HashSet::from([(topic, member)]);
+
+        // Long retention window: recency protects every non-member entry.
+        let removed = scoring.retain_active_at(&live, Instant::now(), Duration::from_secs(3600));
+        assert_eq!(removed, 0, "recently touched entries survive the window");
+        assert_eq!(scoring.entry_count(), 3);
+
+        // Zero retention window at a strictly later instant: every
+        // non-member entry is beyond the window and drops; the live
+        // membership survives regardless of age.
+        let later = Instant::now() + Duration::from_secs(1);
+        let removed = scoring.retain_active_at(&live, later, Duration::ZERO);
+        assert_eq!(removed, 2, "non-member entries drop once past the window");
+        assert_eq!(scoring.entry_count(), 1, "the live mesh member is retained");
+
+        // remove_topic drops every entry for a reaped topic.
+        let removed = scoring.remove_topic(&topic);
+        assert_eq!(removed, 1);
+        assert_eq!(scoring.entry_count(), 0);
     }
 }

@@ -49,6 +49,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the effect is directly observable in `/diagnostics/gossip`. Dedupe TTL
   and eviction policy are untouched.
 
+### Fixed
+
+- **pubsub: per-topic peer state, `peer_scores_v2`, and the pending-IHAVE
+  queue are now bounded (#41, x0x #368, x0x#697 family).** The x0x heap
+  profile showed TopicState caches accounting for ~62 MB/h on a NAT'd
+  node: churned peers were never pruned from the per-topic
+  `peer_scores`/`peer_cooling` maps, and `peer_scores_v2` (the X0X-0071
+  engine) had no removal path at all — 10,412 retained entries against
+  ~20 live connections after 3.9 days. Three bounds, all riding the
+  cache cleaner's existing idle sweep (the signal that reaps idle
+  topics):
+  - Per-topic `peer_scores` entries are pruned for peers no longer in
+    the mesh (neither eager nor lazy); scoring semantics for retained
+    members are untouched and a returning peer starts fresh.
+  - Per-topic `peer_cooling` follows ONE predicate: members keep their
+    cooling state unconditionally (an expired, probe-due member entry
+    survives so the member still receives its recovery probe and keeps
+    its adaptive backoff escalation — deleting it would regress the
+    0.5.80 cooling work, #62/#63); churned entries are kept only while
+    they carry live meaning (an active cooldown or a pending recovery
+    probe) — entries whose suppression is NULL (exactly what a first
+    send timeout creates, the largest churned population) and expired
+    probe-free entries are pruned, matching the pre-existing
+    `clean_expired_peer_cooling` removal rule so no
+    `stage_stats.suppressed_peers` row is orphaned.
+  - `peer_scores_v2`: entries for reaped topics are dropped immediately;
+    churned non-member entries age out one hour after their last touch
+    (`PEER_SCORE_V2_RETENTION`); live memberships are always retained
+    and an actively misbehaving non-member keeps its P4/P7 history while
+    it keeps offending.
+  - The pending-IHAVE queue is capped at `MAX_PENDING_IHAVE` (one full
+    flush batch); overflow drops the oldest ids. Without the cap the
+    vector grows without bound whenever ids are queued faster than a
+    flush consumes them — structurally on an all-eager topic, and under
+    admission denial once consumption is deferred past early-exit paths.
 
 ## [0.5.80] - 2026-09-13
 

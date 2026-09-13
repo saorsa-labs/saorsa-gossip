@@ -3617,24 +3617,47 @@ impl TopicState {
     /// and return their unserved targets, deduplicated. Consuming (unlike
     /// `stranded_ihave_targets_for`) matches `pending_ihave`'s lossy
     /// flush semantics: one advertisement per withheld id, no retry.
-    fn drain_lazy_withheld_targets_for(&mut self, batch: &[MessageIdType]) -> Vec<PeerId> {
+    /// The #59 LazyForward withheld-eager announce targets for this
+    /// batch, WITHOUT removing the entries (the round-1 flush drained them
+    /// eagerly; the entry removal now happens in
+    /// [`Self::consume_flushed_ihave_batch`] once the sends have been
+    /// handed off, so an aborted flush leaves the announcements in place).
+    fn lazy_withheld_targets_for(&self, batch: &[MessageIdType]) -> Vec<PeerId> {
         if self.lazy_withheld.is_empty() || batch.is_empty() {
             return Vec::new();
         }
         let batch_index: HashSet<MessageIdType> = batch.iter().copied().collect();
         let mut targets: Vec<PeerId> = Vec::new();
-        self.lazy_withheld.retain(|entry| {
-            if !batch_index.contains(&entry.msg_id) {
-                return true;
-            }
-            for peer in &entry.targets {
-                if !entry.served.contains(peer) && !targets.contains(peer) {
-                    targets.push(*peer);
+        for entry in &self.lazy_withheld {
+            if batch_index.contains(&entry.msg_id) {
+                for peer in &entry.targets {
+                    if !entry.served.contains(peer) && !targets.contains(peer) {
+                        targets.push(*peer);
+                    }
                 }
             }
-            false
-        });
+        }
         targets
+    }
+
+    /// Issue #42 round 2: consume an IHAVE batch that has been handed to
+    /// the send tasks. Removal of `pending_ihave` ids and the #59
+    /// LazyForward withheld-eager entries is DEFERRED until after the
+    /// sends are spawned — the flush snapshots its work under the topic
+    /// lock and only takes it once the send tasks exist, so an abort
+    /// between the two (shutdown grace exceeded) leaves the batch in
+    /// place for the next flush instead of losing it. Since x0x's relay
+    /// fan-out withholds the eager send on ~27-30% of relayed traffic and
+    /// depends on exactly these IHAVEs, a lost batch was lost delivery
+    /// until anti-entropy.
+    fn consume_flushed_ihave_batch(&mut self, batch: &[MessageIdType]) {
+        if batch.is_empty() {
+            return;
+        }
+        let ids: HashSet<MessageIdType> = batch.iter().copied().collect();
+        self.pending_ihave.retain(|id| !ids.contains(id));
+        self.lazy_withheld
+            .retain(|entry| !ids.contains(&entry.msg_id));
     }
 
     /// Add message to cache
@@ -8200,6 +8223,25 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
+                        debug!("PubSub IHAVE flusher stopping for shutdown: running one final flush");
+                        // Issue #42 round 2: flush once on the shutdown
+                        // signal before exiting. Since `ValidationAction::
+                        // LazyForward` the IHAVE flusher is the relay's
+                        // delivery path (the eager send is withheld and the
+                        // msg_id announced instead), so without this the
+                        // trailing interval's batch would be dropped even
+                        // on a live transport. The flush is abort-safe: an
+                        // abort past the shutdown grace leaves the batch
+                        // pending instead of losing it.
+                        Self::flush_ihave_batches(
+                            &topics,
+                            &transport,
+                            &signing_key,
+                            &stage_stats,
+                            &outbound_budgets,
+                            &send_path,
+                        )
+                        .await;
                         debug!("PubSub IHAVE flusher stopped by shutdown signal");
                         break;
                     }
@@ -8238,9 +8280,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         continue;
                     }
 
+                    // Issue #42 round 2: SNAPSHOT the batch instead of
+                    // draining it — the ids (and the #59 withheld-eager
+                    // entries) are only consumed once the sends have been
+                    // handed off (see `consume_flushed_ihave_batch`), so an
+                    // aborted flush leaves them in place.
                     let batch: Vec<MessageIdType> = state
                         .pending_ihave
-                        .drain(..state.pending_ihave.len().min(MAX_IHAVE_BATCH_SIZE))
+                        .iter()
+                        .take(MAX_IHAVE_BATCH_SIZE)
+                        .copied()
                         .collect();
 
                     // x0x #613: stranded-publish pull path. The regular
@@ -8250,15 +8299,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     // topic still advertises — otherwise the cached message
                     // would have no pull path at all. Entries are NOT
                     // consumed here (a pull can land later); the bounded
-                    // retry removes them. If admission below drops a
-                    // target, that advertisement is lost for this flush —
-                    // the same lossy semantics as the lazy batch itself.
+                    // retry removes them.
                     let mut ihave_targets = state.stranded_ihave_targets_for(&batch);
                     // #59: merge the LazyForward withheld-eager announce
-                    // targets for this batch. Consumed here — one
-                    // advertisement per withheld id, lossy like the batch
-                    // itself; a peer that misses it still has anti-entropy.
-                    for peer in state.drain_lazy_withheld_targets_for(&batch) {
+                    // targets for this batch (non-consuming snapshot; the
+                    // entries are dropped in `consume_flushed_ihave_batch`
+                    // once the sends are handed off).
+                    for peer in state.lazy_withheld_targets_for(&batch) {
                         if !ihave_targets.contains(&peer) {
                             ihave_targets.push(peer);
                         }
@@ -8411,6 +8458,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
                 claims.record_results(sent, timed_out, not_connected).await;
+                // Issue #42 round 2: the send tasks have been handed off —
+                // NOW take the batch out of the topic state. An abort
+                // before this point leaves the batch pending (re-advertised
+                // by the next flush or the final shutdown flush) instead of
+                // losing it.
+                let mut topics_guard = topics.write_topic(&topic_id).await;
+                if let Some(state) = topics_guard.get_mut(&topic_id) {
+                    state.consume_flushed_ihave_batch(&batch);
+                }
+                drop(topics_guard);
             }
             // X0X-0074: release every Bulk admission reserved above,
             // exactly once. Covers no-claim, partial-claim, and panic
@@ -11019,6 +11076,187 @@ mod tests {
         assert_eq!(second.joined + second.aborted, 0);
     }
 
+    /// Issue #42 round 2: a batch pending at shutdown must still be sent.
+    /// Since `ValidationAction::LazyForward` the IHAVE flusher is the
+    /// relay's delivery path (eager send withheld, msg_id announced), so
+    /// breaking out of the loop with no final flush would drop the
+    /// trailing interval's batch even on a live transport. Paused-clock
+    /// construction: after the initial jitter is advanced past, the next
+    /// regular tick is a full interval away and CANNOT fire while
+    /// `shutdown()` runs (the clock never advances during it), so the only
+    /// possible sender of the seeded batch is the shutdown arm's final
+    /// flush.
+    #[tokio::test(start_paused = true)]
+    async fn pending_ihave_batch_is_flushed_on_shutdown() {
+        let peer_id = test_peer_id(1);
+        let transport = ShutdownLivelockTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+        ));
+        let topic = TopicId::new([66u8; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(test_peer_id(2));
+        }
+
+        // Drive the paused clock past the initial jitter and several
+        // (empty) flush ticks so the flusher parks on interval.tick().
+        // Tasks register their timers lazily (at first poll), so the
+        // advances must interleave with yields — a single big advance
+        // before the task is polled merely re-anchors its jitter deadline
+        // to the new clock.
+        for _ in 0..12 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(25)).await;
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.send_attempts(),
+            0,
+            "no sends before any batch exists"
+        );
+
+        // Seed a batch, then shut down immediately: the paused clock means
+        // no regular tick can intervene — only the final flush can send it.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            state.pending_ihave.push([66u8; 32]);
+        }
+        let report = pubsub.shutdown().await;
+        assert_eq!(report.joined + report.aborted, 5);
+        assert_eq!(
+            report.aborted, 0,
+            "final flush must fit the grace on a live transport"
+        );
+        assert_eq!(
+            transport.send_attempts(),
+            1,
+            "the batch pending at shutdown must be sent by the final flush"
+        );
+        // Deferred consumption: the batch was taken only after the send
+        // handoff, and the handoff happened.
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert!(
+                state.pending_ihave.is_empty(),
+                "a successfully handed-off batch is consumed"
+            );
+        }
+    }
+
+    /// Issue #42 round 2: an aborted flush (shutdown grace exceeded mid
+    /// send) must LEAVE the pending batch in place instead of losing it —
+    /// the flush snapshots its work and only consumes it after the send
+    /// tasks are handed off. With the round-1 drain-at-collect, an abort in
+    /// that window lost the batch permanently; since LazyForward that was
+    /// lost delivery.
+    #[tokio::test]
+    async fn aborted_flush_leaves_pending_ihave_batch_intact() {
+        let peer_id = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+        ));
+        let topic = TopicId::new([67u8; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(test_peer_id(2));
+        }
+        // Park the flusher past its jitter on an empty queue.
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS + 150)).await;
+
+        // Seed a batch and shut down: the final (or in-flight) flush blocks
+        // on the never-released send, misses the 1 s grace, and the flusher
+        // is aborted mid-send.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            state.pending_ihave.push([67u8; 32]);
+        }
+        let report = pubsub.shutdown().await;
+        assert_eq!(
+            report.aborted, 1,
+            "the flusher must be the one task aborted mid-send by the grace deadline"
+        );
+
+        // The batch was NOT consumed — it survives for whoever flushes next.
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert_eq!(
+                state.pending_ihave.len(),
+                1,
+                "an aborted flush must leave the pending batch in place, not lose it"
+            );
+        }
+        // Let the detached blocked send finish so the test runtime winds
+        // down cleanly.
+        transport.release_sends(1);
+    }
+
+    /// Issue #42 round 2: the flusher's initial-jitter sleep must also
+    /// select on the shutdown token. This test shuts down INSIDE the jitter
+    /// window (immediately after construction, before any tick could ever
+    /// fire) using a peer whose deterministic flusher jitter is
+    /// substantial: with the guard, the flusher returns at once and
+    /// shutdown completes well inside the jitter; without it, the join
+    /// blocks until the jitter sleep has run out.
+    #[tokio::test]
+    async fn flusher_exits_immediately_when_shutdown_lands_inside_the_jitter_window() {
+        // Pick a peer whose flusher jitter is substantial (deterministic
+        // blake3-derived value in [0, IHAVE_FLUSH_INTERVAL_MS)).
+        let mut peer_id = test_peer_id(1);
+        let mut jitter = Duration::ZERO;
+        for i in 1..u8::MAX {
+            let candidate = test_peer_id(i);
+            let candidate_jitter = deterministic_jitter(
+                candidate,
+                b"pubsub-ihave-flush",
+                Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS),
+            );
+            if candidate_jitter >= Duration::from_millis(80) {
+                peer_id = candidate;
+                jitter = candidate_jitter;
+                break;
+            }
+        }
+        assert!(
+            jitter >= Duration::from_millis(80),
+            "test requires a peer with substantial flusher jitter"
+        );
+
+        let transport = ShutdownLivelockTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+        ));
+
+        // Shut down immediately — inside the jitter window.
+        let started = Instant::now();
+        let report = pubsub.shutdown().await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(report.joined + report.aborted, 5);
+        assert_eq!(report.aborted, 0);
+        assert_eq!(
+            transport.send_attempts(),
+            0,
+            "no flush tick may fire before the jitter has elapsed"
+        );
+        assert!(
+            elapsed < jitter.mul_f64(0.8),
+            "shutdown inside the jitter window must not wait the jitter out (elapsed {elapsed:?} vs jitter {jitter:?})"
+        );
+    }
     /// Round-2 review of PR #64: the widened floor also gated the
     /// `PeerHealth::Dead` fast-suppress, so a mesh sitting exactly at its
     /// target degree with no lazy replacement would have pinned a peer the

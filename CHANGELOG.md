@@ -71,6 +71,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (joined/aborted) so embedders can verify. Terminal-error detection by
   string-matching the opaque transport error is deliberately avoided —
   embedders close their transport and call `shutdown()`, in either order.
+  Round 2: the flusher's shutdown arm now runs ONE FINAL FLUSH before
+  exiting — since `ValidationAction::LazyForward` the flusher is the
+  relay's delivery path, so the trailing interval's batch is no longer
+  dropped on a live transport — and the flush itself is abort-safe: it
+  snapshots its work (pending IHAVE ids and the #59 withheld-eager
+  announce entries) under the topic lock and only consumes them once the
+  send tasks have been handed off, so an abort past the shutdown grace
+  leaves the batch pending for the next flusher instead of losing it
+  (a lost batch was lost delivery until anti-entropy).
 
 ## [0.5.80] - 2026-09-13
 

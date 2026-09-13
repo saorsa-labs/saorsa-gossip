@@ -68,6 +68,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   support, and the eligibility-time rescue plus zero-fan-out counters
   remain as backstops.
 
+- **pubsub: Bulk-priority topics can now self-recover from cooling — a
+  peer whose cooldown expired is admissible for exactly one recovery
+  probe per expiry (#63, x0x #611, #288, #442).** The admission gate was
+  fed `is_peer_suppressed_at`, which stays `true` after cooldown expiry
+  until a recovery probe *succeeds*, and `admit_bulk` drops cooled peers
+  — so no send was ever attempted, the probe was never claimed, and the
+  peer stayed suppressed from our side forever unless the remote peer
+  initiated traffic or the transport disconnected. On Critical-priority
+  topics admission still admits a cooled peer, so the probe fired and
+  recovery happened after the cooldown; on Bulk topics (every x0x
+  announce/discovery lane: `x0x.machine.announce.v2`,
+  `x0x.user.announce.v2`, `x0x.discovery.groups`, `x0x/release`,
+  `x0x/caps/v1`) there was no self-driven escape at all. The admission
+  call sites now feed a probe-due view (`is_peer_cooled_for_admission_at`):
+  a peer whose cooldown expired with no probe in flight reads as not
+  cooled, the claim layer (`PeerCoolingState::claim_send_attempt_at`,
+  unchanged) converts exactly one such admission into the RecoveryProbe,
+  and while that probe is in flight — or a new cooldown is running — the
+  peer reads as cooled again. The exemption is therefore bounded at one
+  probe per cooldown expiry and the fail-closed intent is preserved for
+  all other Bulk traffic; a failed probe re-suppresses with backoff
+  exactly as before. Normal and Critical priorities ignore the cooled
+  flag entirely, so their behaviour is unchanged.
+
 ## [0.5.78] - 2026-09-12
 
 ### Changed

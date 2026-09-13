@@ -2153,7 +2153,9 @@ fn filter_peers_through_admission_in_state(
         }
 
         let health = peer_health_from_snapshot(send_path.peer_health_snapshot.as_ref(), &peer);
-        let is_peer_cooled = state.is_peer_suppressed_at(peer, now);
+        // Issue #63: probe-due peers are admissible so the claim layer can
+        // convert one send into the recovery probe.
+        let is_peer_cooled = state.is_peer_cooled_for_admission_at(peer, now);
         match send_path
             .admission
             .admit(topic, &peer, health, is_peer_cooled)
@@ -2918,6 +2920,13 @@ impl PeerCoolingState {
         !self.is_suppressed_at(now)
     }
 
+    /// Cooldown expired and no probe in flight — exactly the state in
+    /// which [`Self::claim_send_attempt_at`] converts the next claimed
+    /// send into a `RecoveryProbe` (issue #63).
+    fn recovery_probe_due_at(&self, now: Instant) -> bool {
+        self.suppression_expired_at(now) && !self.recovery_probe_in_flight
+    }
+
     fn claim_send_attempt_at(
         &mut self,
         now: Instant,
@@ -3662,6 +3671,27 @@ impl TopicState {
         self.peer_cooling
             .get(&peer)
             .is_some_and(|state| state.is_suppressed_at(now))
+    }
+
+    /// Issue #63 admission view of cooling. A peer whose cooldown has
+    /// expired but whose recovery probe has not yet succeeded is still
+    /// "suppressed" for mesh purposes (`is_peer_suppressed_at`, graft
+    /// eligibility) — but feeding that into the Bulk admission drop made
+    /// the probe unreachable: the send that would claim the probe was
+    /// dropped before the claim layer ever ran, so a Bulk-priority topic
+    /// could never self-recover from cooling. Admission is therefore fed
+    /// a probe-due exemption: a peer whose cooldown expired with no
+    /// probe in flight reads as NOT cooled, the claim layer converts
+    /// exactly one such admission into the `RecoveryProbe`, and every
+    /// later attempt sees the in-flight probe as cooled again — bounded
+    /// at one probe per cooldown expiry. Normal and Critical ignore the
+    /// cooled flag entirely, so only Bulk behaviour changes.
+    fn is_peer_cooled_for_admission_at(&self, peer: PeerId, now: Instant) -> bool {
+        self.is_peer_suppressed_at(peer, now)
+            && !self
+                .peer_cooling
+                .get(&peer)
+                .is_some_and(|state| state.recovery_probe_due_at(now))
     }
 
     /// Issue #32 / #62 cooling floor for locally subscribed publish topics.
@@ -5957,16 +5987,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         result
     }
 
-    /// Inspect the per-topic cooling state for `peer`. Returns `true` if
-    /// the peer is currently suppressed for this topic. Used by the
-    /// admission gate to drop bulk admissions to cooled peers without
-    /// re-entering the per-topic send pipeline.
+    /// Inspect the per-topic cooling state for `peer` as the admission
+    /// gate sees it (issue #63: a probe-due peer is admissible so the
+    /// claim layer can convert one send into the recovery probe). Returns
+    /// `true` if the peer is currently suppressed for this topic. Used to
+    /// drop bulk admissions to cooled peers without re-entering the
+    /// per-topic send pipeline.
     async fn is_peer_currently_suppressed(&self, topic: &TopicId, peer: &PeerId) -> bool {
         let topics_guard = self.topics.read_topic(topic).await;
         let now = Instant::now();
         topics_guard
             .get(topic)
-            .is_some_and(|state| state.is_peer_suppressed_at(*peer, now))
+            .is_some_and(|state| state.is_peer_cooled_for_admission_at(*peer, now))
     }
 
     async fn claim_topic_send_attempts(
@@ -6607,7 +6639,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 Some(state) => peers
                     .iter()
                     .copied()
-                    .filter(|peer| state.is_peer_suppressed_at(*peer, now))
+                    // Issue #63: probe-due peers are admissible so the
+                    // claim layer can convert one send into the recovery
+                    // probe.
+                    .filter(|peer| state.is_peer_cooled_for_admission_at(*peer, now))
                     .collect(),
                 None => HashSet::new(),
             }
@@ -13936,6 +13971,174 @@ mod tests {
         assert_eq!(suppressed[0].recent_timeout_count, 1);
         assert_eq!(suppressed[0].state, "cooldown");
         assert_eq!(transport.send_count(), 1);
+    }
+
+    /// Issue #63 (x0x #611, #288, #442): on a Bulk-priority topic the
+    /// post-cooldown recovery probe was unreachable. Admission is fed
+    /// `is_peer_suppressed_at`, which stays `true` after cooldown expiry
+    /// until a probe *succeeds*, and `admit_bulk` drops cooled peers — so
+    /// no send is ever attempted, the probe is never claimed, and the
+    /// peer stays suppressed forever unless the remote side talks to us
+    /// first or the transport disconnects. Every x0x announce/discovery
+    /// lane is Bulk (`x0x.machine.announce.v2`, `x0x.user.announce.v2`,
+    /// `x0x.discovery.groups`, `x0x/release`, `x0x/caps/v1`), so one
+    /// cooling event removed a peer from all of them indefinitely.
+    ///
+    /// The fix feeds admission a probe-due exemption: a peer whose
+    /// cooldown expired with no probe in flight is admissible exactly
+    /// once; the claim layer converts that send into the `RecoveryProbe`,
+    /// and while the probe is in flight the peer reads as cooled again —
+    /// bounded at one probe per cooldown expiry, preserving the
+    /// fail-closed intent for all other Bulk traffic.
+    #[tokio::test]
+    async fn bulk_suppressed_peer_self_recovers_after_cooldown_without_inbound_traffic() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let topics = Arc::new(ShardedTopicMap::new());
+        let signing_key = Arc::new(test_signing_key());
+        let stage_stats = Arc::new(PubSubStageStats::default());
+        let topic = TopicId::new([50u8; 32]);
+        let lazy_peer = test_peer_id(2);
+        // Every x0x announce/discovery lane is Bulk-priority.
+        let admission = Arc::new(admission::AdmissionControl::new());
+        admission.registry().register(topic, TopicPriority::Bulk);
+        let send_path = SendPathContext {
+            rtt_tracker: Arc::new(PerPeerRttTracker::new()),
+            cooling_config: AdaptiveCoolingConfig::default(),
+            peer_health_snapshot: Arc::new(StdRwLock::new(HashMap::new())),
+            connected_peers_snapshot: Arc::new(StdRwLock::new(None)),
+            peer_health_oracle: Arc::new(StdRwLock::new(None)),
+            admission: Arc::clone(&admission),
+        };
+
+        // Suppress the lazy peer on the Bulk topic: five Normal-kind
+        // timeouts in one window, with a pending IHAVE so the flush has a
+        // reason to reach it.
+        {
+            let mut topics_guard = topics.write_topic(&topic).await;
+            let state = topics_guard.entry(topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(lazy_peer);
+            state.pending_ihave.push([9u8; 32]);
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                let _ =
+                    state.record_send_timeout_at(normal_send_attempt(lazy_peer), Instant::now());
+            }
+            let now = Instant::now();
+            assert!(
+                state.is_peer_suppressed_at(lazy_peer, now),
+                "five timeouts in one window must suppress the peer"
+            );
+            let (admitted, bulk) = filter_peers_through_admission_in_state(
+                &send_path,
+                state,
+                &topic,
+                vec![lazy_peer],
+                "IHAVE",
+                now,
+            );
+            assert!(
+                admitted.is_empty(),
+                "during the cooldown the Bulk admission drop must stand"
+            );
+            release_bulk_admissions_free(&send_path.admission, &bulk);
+
+            // Advance past the cooldown (paused clock: rewind the
+            // deadline). The peer is STILL suppressed for mesh purposes —
+            // graft eligibility returns only after a successful recovery
+            // probe — but admission must let the one probe through, or
+            // the probe can never exist.
+            let cooling = state
+                .peer_cooling
+                .get_mut(&lazy_peer)
+                .expect("cooling state after suppression");
+            cooling.suppressed_until = Some(Instant::now() - Duration::from_millis(1));
+            let now = Instant::now();
+            assert!(
+                state.is_peer_suppressed_at(lazy_peer, now),
+                "post-expiry the peer is still not graft-eligible"
+            );
+            let (admitted, bulk) = filter_peers_through_admission_in_state(
+                &send_path,
+                state,
+                &topic,
+                vec![lazy_peer],
+                "IHAVE",
+                now,
+            );
+            release_bulk_admissions_free(&send_path.admission, &bulk);
+            assert_eq!(
+                admitted,
+                vec![lazy_peer],
+                "post-expiry with no probe in flight, Bulk admission must let exactly the recovery probe through"
+            );
+        }
+
+        // One IHAVE flush — the only outbound lane that reaches a lazy
+        // peer. The probe-due peer is admitted, the claim layer converts
+        // the send into the recovery probe, the transport succeeds, and
+        // the successful probe clears suppression. No inbound traffic
+        // from the peer is driven anywhere in this test.
+        let policy_transport = Arc::new(PolicyTransport::new(
+            Arc::clone(&transport),
+            Arc::clone(&signing_key),
+        ));
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &topics,
+            &policy_transport,
+            &signing_key,
+            &stage_stats,
+            &Arc::new(PeerOutboundBudgets::default()),
+            &send_path,
+        )
+        .await;
+
+        assert_eq!(
+            transport.send_count_to(lazy_peer),
+            1,
+            "exactly one outbound send — the recovery probe — must reach the peer"
+        );
+        {
+            let topics_guard = topics.read_topic(&topic).await;
+            let state = topics_guard.get(&topic).expect("topic state");
+            assert!(
+                state.can_graft_peer_at(lazy_peer, Instant::now()),
+                "after the probe succeeds the peer must be graft-eligible again with no inbound traffic from it"
+            );
+        }
+
+        // Bound: exactly one probe per cooldown expiry. Re-suppress,
+        // expire, claim the probe directly, and verify Bulk admission
+        // fails closed again while the probe is in flight.
+        {
+            let mut topics_guard = topics.write_topic(&topic).await;
+            let state = topics_guard.get_mut(&topic).expect("topic state");
+            let now = Instant::now();
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                let _ = state.record_send_timeout_at(normal_send_attempt(lazy_peer), now);
+            }
+            let cooling = state
+                .peer_cooling
+                .get_mut(&lazy_peer)
+                .expect("cooling state after re-suppression");
+            cooling.suppressed_until = Some(now - Duration::from_millis(1));
+            let (attempt, _event) = state
+                .claim_send_attempt_at(lazy_peer, now)
+                .expect("probe-due peer must claim a recovery probe");
+            assert_eq!(attempt.kind, SendAttemptKind::RecoveryProbe);
+            let (admitted, bulk) = filter_peers_through_admission_in_state(
+                &send_path,
+                state,
+                &topic,
+                vec![lazy_peer],
+                "IHAVE",
+                now,
+            );
+            release_bulk_admissions_free(&send_path.admission, &bulk);
+            assert!(
+                admitted.is_empty(),
+                "while the recovery probe is in flight, Bulk admission must fail closed again"
+            );
+        }
     }
 
     #[tokio::test]

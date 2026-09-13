@@ -10191,10 +10191,12 @@ mod tests {
         );
         let topic = TopicId::new([58u8; 32]);
 
-        // 100 novel frames, then 28 duplicates of already-cached ids —
-        // the issue's measured 72%/28% miss/duplicate split.
-        const NOVEL: usize = 100;
-        const DUPLICATES: usize = 28;
+        // 92 novel frames, then 36 duplicates of already-cached ids — a
+        // true 72%/28% miss/duplicate split over 128 frames (the issue's
+        // measured fleet ratio; the round-1 draft used 100/28, which is
+        // actually 78/22).
+        const NOVEL: usize = 92;
+        const DUPLICATES: usize = 36;
         let mut messages = Vec::with_capacity(NOVEL);
         for i in 0..NOVEL {
             let msg_id = [58u8; 31]
@@ -10234,11 +10236,15 @@ mod tests {
         );
         // Write acquisitions: NOVEL post-verify dedupe/cache inserts +
         // DUPLICATES probe-hit upgrades. The NOVEL misses take NO
-        // fast-path write acquisition — that is the fix.
+        // fast-path write acquisition — that is the fix. The pre-#58
+        // profile on this exact mix is 2*NOVEL + DUPLICATES = 220 write
+        // acquisitions (verified on an origin/main transplant), i.e. this
+        // is a 41.8% cut with zero fast-path write acquisitions on the
+        // miss path.
         assert_eq!(
             stats.dedupe_lock_acquire.count,
             (NOVEL + DUPLICATES) as u64,
-            "write lock only for duplicate upgrades and post-verify inserts — the pre-#58 profile was 2*NOVEL + DUPLICATES"
+            "write lock only for duplicate upgrades and post-verify inserts — the pre-#58 profile on this mix was 2*NOVEL + DUPLICATES = 220"
         );
         // Semantics preserved: every novel frame verified exactly once,
         // every duplicate dropped pre-verify, none admitted twice, none
@@ -10263,6 +10269,16 @@ mod tests {
     /// double-checked re-check under the write lock drops every racer that
     /// arrived while the winner was between probe and insert. Exactly one
     /// subscriber delivery, exactly one cache entry, no deadlock.
+    ///
+    /// Round 2: each racer carries a DISTINCT payload under the same
+    /// msg_id (legal — msg_id is read from the header and never
+    /// recomputed), and every frame is pre-signed BEFORE the spawn loop so
+    /// signing cost cannot serialize the racers. Distinct payloads keep
+    /// this test load-bearing: with identical payloads the independent
+    /// payload-hash replay layer would suppress the losers regardless of
+    /// the msg_id check, so breaking the post-verify double-check left the
+    /// round-1 version passing. With distinct payloads, breaking that
+    /// re-check fails this test (verified by mutation).
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_same_msg_id_frames_admit_exactly_once() {
         let peer_id = test_peer_id(1);
@@ -10278,19 +10294,24 @@ mod tests {
         let mut subscriber = pubsub.subscribe_ready(topic).await;
 
         const RACERS: usize = 32;
-        let msg = Arc::new(signed_eager_message(
-            &sender_key,
-            topic,
-            [59u8; 32],
-            Bytes::from_static(b"race"),
-        ));
+        let msg_id = [59u8; 32];
+        let mut frames = Vec::with_capacity(RACERS);
+        for i in 0..RACERS {
+            frames.push(signed_eager_message(
+                &sender_key,
+                topic,
+                msg_id,
+                Bytes::from(format!("race-{i}")),
+            ));
+        }
+        let frames = Arc::new(frames);
         let mut tasks = tokio::task::JoinSet::new();
         for i in 0..RACERS {
             let pubsub = Arc::clone(&pubsub);
-            let msg = Arc::clone(&msg);
+            let frames = Arc::clone(&frames);
             tasks.spawn(async move {
                 pubsub
-                    .handle_eager(test_peer_id(4 + i as u8), topic, (*msg).clone())
+                    .handle_eager(test_peer_id(4 + i as u8), topic, frames[i].clone())
                     .await
                     .expect("every racer completes without error");
             });

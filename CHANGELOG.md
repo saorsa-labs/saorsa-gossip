@@ -39,8 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaches the post-verify dedupe/cache insert, whose double-checked
   re-check under the write lock is unchanged — two threads probing the
   same unseen msg_id still result in exactly one admission. Instrumented
-  profile (100 novel + 28 duplicate frames, the measured miss ratio):
-  write acquisitions drop from 228 to 128, i.e. the miss path takes zero
+  profile at a true 72/28 miss/duplicate split over 128 frames (92 novel
+  + 36 duplicates): write acquisitions drop from 220 (origin/main,
+  transplant-verified) to 128 — a 41.8% cut — and read-probe
+  acquisitions go from 0 to 128, i.e. the miss path takes zero
   fast-path write acquisitions. New counter split for the fleet:
   `PubSubStageStatsSnapshot::dedupe_lock_acquire_read` records read-probe
   acquisitions separately from the write-side `dedupe_lock_acquire`, so

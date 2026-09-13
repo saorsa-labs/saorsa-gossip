@@ -6,7 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-
 ### Fixed
 
 - **pubsub: rate-limited recovery path during peer suppression (WP6).**
@@ -41,21 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   120 s → 30 s and `PEER_SUPPRESSION_BACKOFF_MAX` 1800 s → 300 s — used
   only by the `#[cfg(test)]` legacy timeout wrappers; production paths
   always supply `AdaptiveCoolingConfig`.
-
-### Added
-
-- **pubsub: regression test pinning the #32-before-replacement ordering in
-  `cooling_floor_blocks_at` (#65).** PR #64 round 1 ran the graft-eligible
-  replacement gate before the #32 last-peer check and the entire suite
-  still passed — the invariant that was that review's blocker could
-  regress silently. `cooling_floor_blocks_last_peer_even_with_
-  graft_eligible_replacement` fails under the round-1 ordering (verified
-  by mutation) and passes as shipped: the last eligible eager peer stays
-  protected even while a graft-eligible lazy replacement exists, through
-  both the predicate and the full timeout path.
-
-### Fixed
-
 - **pubsub: the pre-verify dedupe fast path no longer takes the per-topic
   shard WRITE lock on a cache miss (#58, x0x #656).** The x0x #674 Design-B
   fast path (`handle_eager_admitted`) acquired `write_topic` before
@@ -160,6 +144,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves the batch pending for the next flusher instead of losing it
   (a lost batch was lost delivery until anti-entropy).
 >>>>>>> origin/main
+
+### Changed
+
+- **pubsub: WAN-realistic send-timeout tunables (PR #29 round 2 — live
+  fleet change, split from the cooldown-bypass PR #71).** Bootstrap
+  nodes on WAN paths (Hetzner→DigitalOcean, 330–560 ms RTT) accumulated
+  12k–33k budget-pressure/cooling events per day under constants tuned
+  for low-latency meshes. `PER_PEER_REPUBLISH_TIMEOUT` 2500 ms → 4000 ms
+  (~7 RTTs of headroom on the worst observed hop; also moves the x0x
+  #613 stranded-publish retry from 5 s to 8 s, since it waits 2× the
+  budget — and note `adaptive_timeout` ignores this floor once RTT
+  samples exist); `PEER_TIMEOUT_THRESHOLD` 5 → 8 and
+  `PEER_TIMEOUT_WINDOW` 30 s → 60 s, retuned together: the maximum
+  inter-timeout interval that can still trip cooling is
+  window/(threshold−1), so threshold 8 alone would have shrunk it from
+  7.5 s to 4.29 s and retired timeout cooling for precisely the WAN
+  peers it targets; the 60 s window restores the 7.5 s baseline with
+  margin (8.57 s). Unlike the fallback cooldown constants folded into
+  PR #71, these are production constants — every send-timeout path reads
+  them. **Fleet observation of the suppression-entry rate is required
+  before merge.**
+
+### Added
+
+- **pubsub: regression test pinning the #32-before-replacement ordering in
+  `cooling_floor_blocks_at` (#65).** PR #64 round 1 ran the graft-eligible
+  replacement gate before the #32 last-peer check and the entire suite
+  still passed — the invariant that was that review's blocker could
+  regress silently. `cooling_floor_blocks_last_peer_even_with_
+  graft_eligible_replacement` fails under the round-1 ordering (verified
+  by mutation) and passes as shipped: the last eligible eager peer stays
+  protected even while a graft-eligible lazy replacement exists, through
+  both the predicate and the full timeout path.
 
 ## [0.5.80] - 2026-09-13
 

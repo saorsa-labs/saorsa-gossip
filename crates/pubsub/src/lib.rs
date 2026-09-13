@@ -158,20 +158,21 @@ const MAX_EAGER_DEGREE: usize = 12;
 /// and `republish_per_peer_timeout` is incremented so the operator can see
 /// which peer is the slow one without a hung dispatcher.
 ///
-/// X0X-0061 bumped this from 750 ms → 2500 ms. The 750 ms budget was tuned
-/// for low-RTT meshes; on the SOTA-Borrow VPS mesh under sustained 4 h
-/// load, helsinki's outbound to sydney (~560 ms RTT) and singapore
-/// (~330 ms RTT) — Hetzner→DigitalOcean over public internet, no private
-/// regional peering — routinely exceeded 750 ms when a single packet loss
-/// occurred. That accumulated cooling at `PEER_TIMEOUT_THRESHOLD` per
-/// `PEER_TIMEOUT_WINDOW`, suppressing peers for the 120 s
-/// `PEER_SUPPRESSION_COOLDOWN`, oscillating helsinki's
-/// suppressed_peers/known_peer_topic_pairs ratio around 0.121–0.177 — over
-/// the 0.120 broad-launch gate every window of the 16-window 4 h soak.
-/// 2500 ms gives ~4 RTTs of headroom on sydney and 7+ on singapore;
-/// `PEER_TIMEOUT_THRESHOLD` is unchanged (5 timeouts in 30 s is still a
-/// real signal at 2500 ms each).
-const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(2500);
+/// History: 750 ms (low-RTT meshes) → 2500 ms (X0X-0061) → 4000 ms (PR
+/// #29 round 2). On the SOTA-Borrow VPS mesh under sustained 4 h load,
+/// helsinki's outbound to sydney (~560 ms RTT) and singapore (~330 ms)
+/// — Hetzner→DigitalOcean over public internet — routinely exceeded the
+/// budget on a single packet loss, accumulating cooling at
+/// `PEER_TIMEOUT_THRESHOLD` per `PEER_TIMEOUT_WINDOW` and oscillating
+/// helsinki's suppressed_peers/known_peer_topic_pairs ratio around
+/// 0.121–0.177, over the 0.120 broad-launch gate in every window of the
+/// 16-window soak. 4000 ms gives ~7 RTTs of headroom on sydney and 12+
+/// on singapore. Note `adaptive_timeout` ignores this floor once RTT
+/// samples exist — the live effect is on cold paths and on
+/// `STRANDED_PUBLISH_RETRY_DELAY` (2× this budget: 5 s → 8 s, x0x
+/// #613's bounded retry waits longer before re-entering the eager
+/// pipeline).
+const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(4000);
 
 /// Delay before the bounded single-shot retry of a stranded local publish
 /// (x0x #613: `attempted > 0, succeeded == 0`). Two full per-peer budgets
@@ -180,11 +181,19 @@ const PER_PEER_REPUBLISH_TIMEOUT: Duration = Duration::from_millis(2500);
 /// retry observes the post-timeout state rather than racing it.
 const STRANDED_PUBLISH_RETRY_DELAY: Duration = PER_PEER_REPUBLISH_TIMEOUT.saturating_mul(2);
 
-/// Rolling window for send-side slow-peer detection.
-const PEER_TIMEOUT_WINDOW: Duration = Duration::from_secs(30);
+/// Rolling window for send-side slow-peer detection. 30 s → 60 s (PR #29
+/// round 2): with `PEER_TIMEOUT_THRESHOLD` 8, the maximum interval
+/// between timeouts that can still trip cooling inside one window is
+/// window/(threshold-1) — 30/7 ≈ 4.29 s, which retires timeout cooling
+/// for exactly the high-RTT WAN peers the threshold bump targets (any
+/// peer whose p95 send duration sits above ~1.72 s at the 4 s budget).
+/// 60/7 ≈ 8.57 s restores the original 30 s/5-threshold baseline of
+/// 7.5 s with margin. Fleet observation of the suppression-entry rate
+/// is required before this lands.
+const PEER_TIMEOUT_WINDOW: Duration = Duration::from_secs(60);
 
 /// Timeouts inside `PEER_TIMEOUT_WINDOW` before a peer is cooled.
-const PEER_TIMEOUT_THRESHOLD: usize = 5;
+const PEER_TIMEOUT_THRESHOLD: usize = 8;
 
 /// Initial sender-side suppression duration for a cooled peer.
 const PEER_SUPPRESSION_COOLDOWN: Duration = Duration::from_secs(30);

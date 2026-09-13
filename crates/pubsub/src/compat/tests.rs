@@ -282,7 +282,7 @@ async fn mixed_publish_controls_cache_and_forward_preserve_authors_and_floors() 
         let mut topics = pubsub.topics.write_topic(&topic).await;
         let state = topics.get_mut(&topic).unwrap();
         state.lazy_peers.extend([old.peer_id(), modern.peer_id()]);
-        state.pending_ihave.push(cached_id);
+        state.pending_ihave.push_back(cached_id);
     }
     PlumtreePubSub::flush_ihave_batches(
         &pubsub.topics,

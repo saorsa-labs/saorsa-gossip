@@ -49,8 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the effect is directly observable in `/diagnostics/gossip`. Dedupe TTL
   and eviction policy are untouched.
 
-### Fixed
-
 - **pubsub: `peer_scores_v2` gains a working bound; churned-member
   cooling/score pruning and a pending-IHAVE cap tighten the TopicState
   footprint (#41, x0x #368, x0x#697 family).** The x0x heap profile
@@ -93,6 +91,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `PubSubStageStatsSnapshot::pending_ihave_dropped` so sustained
     overflow (an all-eager topic, admission denial under congestion) is
     observable.
+
+- **pubsub: background tasks now have a shutdown lifecycle — the IHAVE
+  flusher no longer livelocks after transport shutdown (#42, x0x #368,
+  #371).** `spawn_ihave_flusher` (and its siblings: cache cleaner, degree
+  maintainer, anti-entropy, connected-peers refresher) dropped their
+  JoinHandles and looped forever with no cancellation path. After the
+  transport shut down, every flush attempt failed ("node not
+  initialized"), was logged at WARN and retried — saturating all runtime
+  workers (~10 Hz per LAN peer, +700 MB RSS during shutdown, ~10 MB of
+  WARN logs in seconds) and preventing SIGTERM exit; x0x shipped a 5 s
+  force-exit watchdog as an interim. Since `ValidationAction::LazyForward`
+  (0.5.79) the flusher is also the relay's delivery path, so a flusher
+  that spins after shutdown is a delivery defect, not just a shutdown
+  nuisance. Every background task now `select!`s on a `watch` shutdown
+  token at its scheduling points (the initial jitter sleep and each loop
+  tick), its handle is retained, and the new
+  `PlumtreePubSub::shutdown()` signals the token and joins every task
+  under one shared 1 s deadline — a straggler is aborted (`SendAttemptClaims`'
+  Drop releases in-flight recovery probes, so an abort cannot strand probe
+  state), so shutdown can never hang and always fits the 5 s x0x
+  force-exit budget. Idempotent; returns a `PubSubShutdownReport`
+  (joined/aborted) so embedders can verify. Terminal-error detection by
+  string-matching the opaque transport error is deliberately avoided —
+  embedders close their transport and call `shutdown()`, in either order.
+  Round 2: the flusher's shutdown arm now runs ONE FINAL FLUSH before
+  exiting — since `ValidationAction::LazyForward` the flusher is the
+  relay's delivery path, so the trailing interval's batch is no longer
+  dropped on a live transport — and the flush itself is abort-safe: it
+  snapshots its work (pending IHAVE ids and the #59 withheld-eager
+  announce entries) under the topic lock and only consumes them once the
+  send tasks have been handed off, so an abort past the shutdown grace
+  leaves the batch pending for the next flusher instead of losing it
+  (a lost batch was lost delivery until anti-entropy).
+>>>>>>> origin/main
 
 ## [0.5.80] - 2026-09-13
 

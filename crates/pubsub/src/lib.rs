@@ -109,6 +109,19 @@ const TOPIC_IDLE_TTL_SECS: u64 = 600;
 /// Maximum IHAVE batch size (per SPEC.md)
 const MAX_IHAVE_BATCH_SIZE: usize = 1024;
 
+/// Final-review cap on a topic's pending-IHAVE queue, mirroring the cap
+/// the #59 withheld-entry list already applies (MAX_IHAVE_BATCH_SIZE).
+/// The abort-safety change moved batch consumption behind the send handoff
+/// and its early-exit paths, and nothing else bounds the vector: on an
+/// all-eager topic (structurally unable to advertise — no lazy members,
+/// no stranded/withheld entries, so the flush's target set is empty and
+/// pending is never consumed) and under admission denial during
+/// congestion, it would otherwise grow one entry per message forever.
+/// Overflow drops the OLDEST ids — the stalest advertisements. The cap
+/// only gates the push side; consumption stays where the abort-safety
+/// fix put it (after send completion).
+const MAX_PENDING_IHAVE: usize = MAX_IHAVE_BATCH_SIZE;
+
 /// IHAVE flush interval (100ms)
 const IHAVE_FLUSH_INTERVAL_MS: u64 = 100;
 
@@ -3617,6 +3630,19 @@ impl TopicState {
     /// and return their unserved targets, deduplicated. Consuming (unlike
     /// `stranded_ihave_targets_for`) matches `pending_ihave`'s lossy
     /// flush semantics: one advertisement per withheld id, no retry.
+    /// Final-review cap: queue a msg_id for the next IHAVE flush, bounded
+    /// at [`MAX_PENDING_IHAVE`] ids (mirroring the withheld-entry list's
+    /// cap). Overflow drops the oldest ids — the stalest advertisements.
+    /// Consumption is untouched: it still happens only after the send
+    /// handoff, preserving the abort-safety property.
+    fn push_pending_ihave(&mut self, msg_id: MessageIdType) {
+        if self.pending_ihave.len() >= MAX_PENDING_IHAVE {
+            let overflow = self.pending_ihave.len() + 1 - MAX_PENDING_IHAVE;
+            self.pending_ihave.drain(..overflow);
+        }
+        self.pending_ihave.push(msg_id);
+    }
+
     /// The #59 LazyForward withheld-eager announce targets for this
     /// batch, WITHOUT removing the entries (the round-1 flush drained them
     /// eagerly; the entry removal now happens in
@@ -7025,7 +7051,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                      (throttled; counter is cumulative for this topic)"
                 );
             }
-            state.pending_ihave.push(msg_id);
+            state.push_pending_ihave(msg_id);
 
             // x0x #613 mitigation 1: queue a self-IHAVE to the attempted
             // peers so the 100 ms flush advertises this id regardless of
@@ -7439,7 +7465,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             validator_action,
             ValidationAction::ForwardAndDeliver | ValidationAction::LazyForward
         ) {
-            state.pending_ihave.push(msg_id);
+            state.push_pending_ihave(msg_id);
         }
         self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
 
@@ -11074,6 +11100,76 @@ mod tests {
         // Idempotent: a second call reports zero tasks.
         let second = pubsub.shutdown().await;
         assert_eq!(second.joined + second.aborted, 0);
+    }
+
+    /// Final review: the pending-IHAVE vector must stay bounded. The
+    /// abort-safety change moved consumption behind the send handoff and
+    /// its early-exit paths, and an ALL-EAGER topic is the structural
+    /// case: no lazy members and no stranded/withheld entries, so the
+    /// flush's target set is empty and pending is never consumed — every
+    /// relayed message would otherwise leave one id behind forever. The
+    /// cap mirrors the withheld-entry list's (MAX_IHAVE_BATCH_SIZE) and
+    /// drops the oldest ids on overflow; consumption stays after the send
+    /// handoff, so the abort-safety property is untouched.
+    #[tokio::test]
+    async fn pending_ihave_stays_bounded_on_an_all_eager_topic() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let sender_key = test_signing_key();
+        // No background tasks: nothing drains pending, which is exactly
+        // the all-eager structural state (the flush's target set is empty
+        // even when it runs).
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([69u8; 32]);
+        let eager_relay = test_peer_id(2);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(eager_relay);
+        }
+
+        // Relay N distinct messages (unique msg_ids AND unique payloads —
+        // the replay cache drops repeated payloads) through the inbound
+        // EAGER path: the ForwardAndDeliver verdict queues each msg_id
+        // for the (empty) lazy advertisement set.
+        let n = MAX_PENDING_IHAVE + 200;
+        for i in 0..n {
+            let mut msg_id = [69u8; 32];
+            msg_id[0] = (i % 256) as u8;
+            msg_id[1] = (i / 256) as u8;
+            let payload = format!("all-eager-payload-{i}").into_bytes();
+            let msg = signed_eager_message(&sender_key, topic, msg_id, Bytes::from(payload));
+            pubsub
+                .handle_eager(eager_relay, topic, msg)
+                .await
+                .expect("relayed frame admitted");
+        }
+
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert_eq!(
+                state.pending_ihave.len(),
+                MAX_PENDING_IHAVE,
+                "the pending-IHAVE vector must cap on an all-eager topic, not grow per message"
+            );
+            // The OLDEST ids were dropped: the front is the (n -
+            // MAX_PENDING_IHAVE)-th id pushed.
+            let mut expected_front = [69u8; 32];
+            let front_idx = n - MAX_PENDING_IHAVE;
+            expected_front[0] = (front_idx % 256) as u8;
+            expected_front[1] = (front_idx / 256) as u8;
+            assert_eq!(
+                state.pending_ihave.first(),
+                Some(&expected_front),
+                "overflow drops the oldest (stalest) ids"
+            );
+        }
     }
 
     /// Issue #42 round 2: a batch pending at shutdown must still be sent.

@@ -62,7 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (0.5.79) the flusher is also the relay's delivery path, so a flusher
   that spins after shutdown is a delivery defect, not just a shutdown
   nuisance. Every background task now `select!`s on a `watch` shutdown
-  token at each await point, its handle is retained, and the new
+  token at its scheduling points (the initial jitter sleep and each loop
+  tick), its handle is retained, and the new
   `PlumtreePubSub::shutdown()` signals the token and joins every task
   under one shared 1 s deadline — a straggler is aborted (`SendAttemptClaims`'
   Drop releases in-flight recovery probes, so an abort cannot strand probe

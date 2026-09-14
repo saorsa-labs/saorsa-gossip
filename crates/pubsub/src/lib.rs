@@ -7717,11 +7717,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
         }
 
-        // x0x #613 mitigation 2: bounded single-shot retry. After two full
-        // per-peer budgets, retry the cached message once to the current
-        // eager set. A second zero-delivery outcome is terminal
-        // (`stranded_publish_retry_failed`); there is no retry loop. The
-        // publish call's own contract (Ok + counts) is unchanged — the
+        // x0x #613 mitigation 2: bounded retry. After two full per-peer
+        // budgets, retry the cached message against the current eager set.
+        // Disabled/Full mode remains single-shot; Leaf enforcement may
+        // revisit only deferred targets until the original cache deadline.
+        // The publish call's own contract (Ok + counts) is unchanged — the
         // retry runs detached, like the forward path's accounting task.
         if stranded {
             let retry_ctx = StrandedRetryContext {
@@ -9277,147 +9277,192 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// `stranded_publishes_recovered_by_pull` (every eager target already
     /// pulled), `stranded_publishes_recovered_by_retry` (≥1 delivery), or
     /// `stranded_publish_retry_failed` (nothing delivered, nothing pulled).
-    /// The message is never retried again.
+    /// Leaf enforcement may revisit deferred targets until the original
+    /// recovery deadline; the iterative state machine keeps that bounded in
+    /// time and stack. Disabled/Full mode remains single-shot.
     async fn retry_stranded_publish(
         ctx: &StrandedRetryContext<T>,
         topic: TopicId,
         msg_id: MessageIdType,
         bytes: Bytes,
     ) {
-        // Re-validate under the topic lock: the cached message must still
-        // be present, and the eager set minus the pull-served peers is
-        // re-read at retry time. The stranded entry's lifecycle ends here.
-        let (retry_targets, any_pulled, retry_already_delivered, recovery_deadline) = {
-            let mut topics_guard = ctx.topics.write_topic(&topic).await;
-            let Some(state) = topics_guard.get_mut(&topic) else {
-                ctx.stage_stats.record_stranded_publish_cache_miss();
-                return;
-            };
-            if !state.has_message(&msg_id) {
-                debug!(
-                    msg_id = ?msg_id,
-                    "stranded publish retry skipped: message no longer cached"
-                );
-                ctx.stage_stats.record_stranded_publish_cache_miss();
-                return;
-            }
-            let served = state.stranded_ihave_served_peers(&msg_id).to_vec();
-            let retry_targets: Vec<PeerId> = state
-                .eager_peers
-                .iter()
-                .copied()
-                .filter(|peer| !served.contains(peer))
-                .collect();
-            let recovery_deadline = state
-                .stranded_retry_expires(&msg_id)
-                .unwrap_or_else(Instant::now);
-            let retry_already_delivered = state
-                .stranded_ihave
-                .iter()
-                .find(|entry| entry.msg_id == msg_id)
-                .is_some_and(|entry| entry.retry_delivered);
-            (
-                retry_targets,
-                !served.is_empty() && !retry_already_delivered,
-                retry_already_delivered,
-                recovery_deadline,
-            )
+        let recovery_deadline = {
+            let topics_guard = ctx.topics.read_topic(&topic).await;
+            topics_guard
+                .get(&topic)
+                .and_then(|state| state.stranded_retry_expires(&msg_id))
+                .unwrap_or_else(Instant::now)
         };
+        'retry: loop {
+            // Re-validate under the topic lock: the cached message must still
+            // be present, and the eager set minus the pull-served peers is
+            // re-read at retry time. The stranded entry's lifecycle ends here.
+            let (retry_targets, any_pulled, retry_already_delivered) = {
+                let mut topics_guard = ctx.topics.write_topic(&topic).await;
+                let Some(state) = topics_guard.get_mut(&topic) else {
+                    ctx.stage_stats.record_stranded_publish_cache_miss();
+                    return;
+                };
+                if !state.has_message(&msg_id) {
+                    debug!(
+                        msg_id = ?msg_id,
+                        "stranded publish retry skipped: message no longer cached"
+                    );
+                    ctx.stage_stats.record_stranded_publish_cache_miss();
+                    return;
+                }
+                let served = state.stranded_ihave_served_peers(&msg_id).to_vec();
+                let retry_targets: Vec<PeerId> = state
+                    .eager_peers
+                    .iter()
+                    .copied()
+                    .filter(|peer| !served.contains(peer))
+                    .collect();
+                let retry_already_delivered = state
+                    .stranded_ihave
+                    .iter()
+                    .find(|entry| entry.msg_id == msg_id)
+                    .is_some_and(|entry| entry.retry_delivered);
+                (
+                    retry_targets,
+                    !served.is_empty() && !retry_already_delivered,
+                    retry_already_delivered,
+                )
+            };
 
-        let (retry_targets, reservations) = if ctx.egress_limiter.enabled() {
-            let mut pending = retry_targets;
-            let mut ready = Vec::new();
-            let mut reservations = HashMap::new();
-            loop {
-                let (admitted, deferred) = Self::reserve_recovery_targets(
-                    &ctx.egress_limiter,
-                    topic,
-                    pending,
-                    "EAGER",
-                    &bytes,
-                );
-                for (peer, reservation) in admitted {
-                    ready.push(peer);
-                    if let Some(reservation) = reservation {
-                        reservations.insert(peer, reservation);
+            let (retry_targets, reservations) = if ctx.egress_limiter.enabled() {
+                let mut pending = retry_targets;
+                let mut ready = Vec::new();
+                let mut reservations = HashMap::new();
+                loop {
+                    let (admitted, deferred) = Self::reserve_recovery_targets(
+                        &ctx.egress_limiter,
+                        topic,
+                        pending,
+                        "EAGER",
+                        &bytes,
+                    );
+                    for (peer, reservation) in admitted {
+                        ready.push(peer);
+                        if let Some(reservation) = reservation {
+                            reservations.insert(peer, reservation);
+                        }
                     }
+                    if !ready.is_empty()
+                        || deferred.is_empty()
+                        || Instant::now() >= recovery_deadline
+                    {
+                        break (ready, reservations);
+                    }
+                    // Keep only the peers that still lack a reservation. A ready
+                    // peer must never cause another peer's persistent recovery
+                    // intent to be discarded.
+                    pending = deferred;
+                    time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
                 }
-                if !ready.is_empty() || deferred.is_empty() || Instant::now() >= recovery_deadline {
-                    break (ready, reservations);
-                }
-                // Keep only the peers that still lack a reservation. A ready
-                // peer must never cause another peer's persistent recovery
-                // intent to be discarded.
-                pending = deferred;
-                time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
-            }
-        } else {
-            (retry_targets, HashMap::new())
-        };
-
-        if retry_targets.is_empty() {
-            let mut topics_guard = ctx.topics.write_topic(&topic).await;
-            if let Some(state) = topics_guard.get_mut(&topic) {
-                state.remove_stranded_ihave(&msg_id);
-            }
-            drop(topics_guard);
-            // Every current eager peer already holds the message (pulled
-            // via IWANT) — or the mesh emptied with nothing pulled. Either
-            // way the retry has nothing to add and is terminal.
-            if retry_already_delivered {
-                info!(
-                    topic = %LogTopicId::from(topic),
-                    msg_id = ?msg_id,
-                    "stranded publish recovered by bounded per-target retry"
-                );
-                ctx.stage_stats.record_stranded_publish_recovered_by_retry();
-            } else if any_pulled {
-                info!(
-                    topic = %LogTopicId::from(topic),
-                    msg_id = ?msg_id,
-                    "stranded publish recovered by pull path — retry skipped (no duplicate EAGER)"
-                );
-                ctx.stage_stats.record_stranded_publish_recovered_by_pull();
             } else {
-                debug!(
-                    topic = %LogTopicId::from(topic),
-                    msg_id = ?msg_id,
-                    "stranded publish retry: eager set empty, nothing pulled"
-                );
-                ctx.stage_stats.record_stranded_publish_retry_failed();
-            }
-            return;
-        }
+                (retry_targets, HashMap::new())
+            };
 
-        // Admission → claim. The Bulk guard is built as soon as the bulk
-        // list exists so every later path — including a mid-await drop of
-        // this task — releases exactly once (PR #54 review item 2; same
-        // RAII discipline as `parallel_send_to_peers`).
-        let (attempts, permits, _bulk_guard) = {
-            let now = Instant::now();
-            let mut topics_guard = ctx.topics.write_topic(&topic).await;
-            let Some(state) = topics_guard.get_mut(&topic) else {
-                ctx.stage_stats.record_stranded_publish_cache_miss();
-                return;
-            };
-            let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
-                &ctx.send_path,
-                state,
-                &topic,
-                retry_targets,
-                "EAGER",
-                now,
-            );
-            let bulk_guard = BulkAdmissionSetGuard {
-                armed: true,
-                bulk_admitted,
-                admission: Arc::clone(&ctx.send_path.admission),
-            };
-            if admitted.is_empty() {
+            if retry_targets.is_empty() {
+                let mut topics_guard = ctx.topics.write_topic(&topic).await;
+                if let Some(state) = topics_guard.get_mut(&topic) {
+                    state.remove_stranded_ihave(&msg_id);
+                }
                 drop(topics_guard);
+                // Every current eager peer already holds the message (pulled
+                // via IWANT) — or the mesh emptied with nothing pulled. Either
+                // way the retry has nothing to add and is terminal.
+                if retry_already_delivered {
+                    info!(
+                        topic = %LogTopicId::from(topic),
+                        msg_id = ?msg_id,
+                        "stranded publish recovered by bounded per-target retry"
+                    );
+                    ctx.stage_stats.record_stranded_publish_recovered_by_retry();
+                } else if any_pulled {
+                    info!(
+                        topic = %LogTopicId::from(topic),
+                        msg_id = ?msg_id,
+                        "stranded publish recovered by pull path — retry skipped (no duplicate EAGER)"
+                    );
+                    ctx.stage_stats.record_stranded_publish_recovered_by_pull();
+                } else {
+                    debug!(
+                        topic = %LogTopicId::from(topic),
+                        msg_id = ?msg_id,
+                        "stranded publish retry: eager set empty, nothing pulled"
+                    );
+                    ctx.stage_stats.record_stranded_publish_retry_failed();
+                }
+                return;
+            }
+
+            // Admission → claim. The Bulk guard is built as soon as the bulk
+            // list exists so every later path — including a mid-await drop of
+            // this task — releases exactly once (PR #54 review item 2; same
+            // RAII discipline as `parallel_send_to_peers`).
+            let (attempts, permits, _bulk_guard) = {
+                let now = Instant::now();
+                let mut topics_guard = ctx.topics.write_topic(&topic).await;
+                let Some(state) = topics_guard.get_mut(&topic) else {
+                    ctx.stage_stats.record_stranded_publish_cache_miss();
+                    return;
+                };
+                let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
+                    &ctx.send_path,
+                    state,
+                    &topic,
+                    retry_targets,
+                    "EAGER",
+                    now,
+                );
+                let bulk_guard = BulkAdmissionSetGuard {
+                    armed: true,
+                    bulk_admitted,
+                    admission: Arc::clone(&ctx.send_path.admission),
+                };
+                if admitted.is_empty() {
+                    drop(topics_guard);
+                    if ctx.egress_limiter.enabled() && Instant::now() < recovery_deadline {
+                        time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
+                        continue 'retry;
+                    } else {
+                        let mut topics_guard = ctx.topics.write_topic(&topic).await;
+                        if let Some(state) = topics_guard.get_mut(&topic) {
+                            state.remove_stranded_ihave(&msg_id);
+                        }
+                        ctx.stage_stats.record_stranded_publish_retry_failed();
+                    }
+                    return;
+                }
+                let claim_context = SendClaimContext {
+                    stage_stats: ctx.stage_stats.as_ref(),
+                    outbound_budgets: &ctx.outbound_budgets,
+                    send_path: &ctx.send_path,
+                    topic,
+                    op: "EAGER",
+                    send_class: OutboundSendClass::for_op("EAGER"),
+                    priority: ctx.send_path.admission.registry().priority_for(&topic),
+                };
+                let (attempts, permits, _skips) =
+                    Self::claim_topic_send_attempts_for_state(&claim_context, state, admitted, now);
+                (attempts, permits, bulk_guard)
+            };
+            let mut claims = SendAttemptClaims::new(
+                topic,
+                attempts,
+                permits,
+                Arc::clone(&ctx.topics),
+                Arc::clone(&ctx.stage_stats),
+                ctx.send_path.clone(),
+            );
+
+            if claims.is_empty() {
+                drop(_bulk_guard);
                 if ctx.egress_limiter.enabled() && Instant::now() < recovery_deadline {
                     time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
-                    Box::pin(Self::retry_stranded_publish(ctx, topic, msg_id, bytes)).await;
+                    continue 'retry;
                 } else {
                     let mut topics_guard = ctx.topics.write_topic(&topic).await;
                     if let Some(state) = topics_guard.get_mut(&topic) {
@@ -9427,129 +9472,95 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 return;
             }
-            let claim_context = SendClaimContext {
-                stage_stats: ctx.stage_stats.as_ref(),
-                outbound_budgets: &ctx.outbound_budgets,
-                send_path: &ctx.send_path,
-                topic,
-                op: "EAGER",
-                send_class: OutboundSendClass::for_op("EAGER"),
-                priority: ctx.send_path.admission.registry().priority_for(&topic),
-            };
-            let (attempts, permits, _skips) =
-                Self::claim_topic_send_attempts_for_state(&claim_context, state, admitted, now);
-            (attempts, permits, bulk_guard)
-        };
-        let mut claims = SendAttemptClaims::new(
-            topic,
-            attempts,
-            permits,
-            Arc::clone(&ctx.topics),
-            Arc::clone(&ctx.stage_stats),
-            ctx.send_path.clone(),
-        );
 
-        if claims.is_empty() {
+            // x0x #380: outbound demand metering — instrumentation only.
+            ctx.stage_stats
+                .record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
+            let send_tasks = Self::spawn_bounded_send_tasks(
+                FanoutSendContext {
+                    transport: &ctx.transport,
+                    egress_limiter: &ctx.egress_limiter,
+                    stage_stats: &ctx.stage_stats,
+                    rtt_tracker: &ctx.send_path.rtt_tracker,
+                    topic,
+                    stream_type: GossipStreamType::PubSub,
+                    op: "EAGER",
+                },
+                &mut claims,
+                reservations,
+                bytes.clone(),
+            );
+            let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
+            let succeeded_peers: Vec<_> = sent
+                .iter()
+                .map(|completion| completion.attempt.peer)
+                .collect();
+            let succeeded = succeeded_peers.len();
+            // Maintainer decision (review item 3): Normal-kind retry timeouts
+            // and not-connected failures are dropped — the retry must not
+            // double-count a known-starved window toward
+            // PEER_TIMEOUT_THRESHOLD. RecoveryProbe-kind attempts (claimed when
+            // a peer's suppression expired during the delay) are re-booked
+            // (r3 review item 1): a probe timeout re-suppresses with backoff
+            // without feeding the threshold window, a probe not-connected
+            // failure books the #380 eviction, and either outcome releases
+            // `recovery_probe_in_flight` — dropping it would permanently block
+            // `claim_send_attempt_at` for the peer/topic.
+            let probe_timed_out: Vec<PeerSendAttempt> = timed_out
+                .iter()
+                .copied()
+                .flat_map(recovery_probe_timeout)
+                .collect();
+            let probe_not_connected: Vec<PeerSendAttempt> = not_connected
+                .iter()
+                .copied()
+                .flat_map(recovery_probe_timeout)
+                .collect();
+            claims
+                .record_results(sent, probe_timed_out, probe_not_connected)
+                .await;
             drop(_bulk_guard);
-            if ctx.egress_limiter.enabled() && Instant::now() < recovery_deadline {
-                time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
-                Box::pin(Self::retry_stranded_publish(ctx, topic, msg_id, bytes)).await;
-            } else {
+
+            let (pending, retry_delivered) = {
                 let mut topics_guard = ctx.topics.write_topic(&topic).await;
-                if let Some(state) = topics_guard.get_mut(&topic) {
+                let Some(state) = topics_guard.get_mut(&topic) else {
+                    return;
+                };
+                for peer in succeeded_peers {
+                    state.record_stranded_retry_delivered(&msg_id, peer);
+                }
+                let served = state.stranded_ihave_served_peers(&msg_id).to_vec();
+                let pending = state.eager_peers.iter().any(|peer| !served.contains(peer));
+                let retry_delivered = state
+                    .stranded_ihave
+                    .iter()
+                    .find(|entry| entry.msg_id == msg_id)
+                    .is_some_and(|entry| entry.retry_delivered);
+                if !pending || Instant::now() >= recovery_deadline {
                     state.remove_stranded_ihave(&msg_id);
                 }
+                (pending, retry_delivered)
+            };
+            if ctx.egress_limiter.enabled() && pending && Instant::now() < recovery_deadline {
+                time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
+                continue 'retry;
+            } else if retry_delivered {
+                info!(
+                    topic = %LogTopicId::from(topic),
+                    msg_id = ?msg_id,
+                    succeeded,
+                    "stranded publish recovered by bounded per-target retry"
+                );
+                ctx.stage_stats.record_stranded_publish_recovered_by_retry();
+            } else {
+                warn!(
+                    topic = %LogTopicId::from(topic),
+                    msg_id = ?msg_id,
+                    "stranded publish retry expired without delivery; anti-entropy remains"
+                );
                 ctx.stage_stats.record_stranded_publish_retry_failed();
             }
             return;
-        }
-
-        // x0x #380: outbound demand metering — instrumentation only.
-        ctx.stage_stats
-            .record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
-        let send_tasks = Self::spawn_bounded_send_tasks(
-            FanoutSendContext {
-                transport: &ctx.transport,
-                egress_limiter: &ctx.egress_limiter,
-                stage_stats: &ctx.stage_stats,
-                rtt_tracker: &ctx.send_path.rtt_tracker,
-                topic,
-                stream_type: GossipStreamType::PubSub,
-                op: "EAGER",
-            },
-            &mut claims,
-            reservations,
-            bytes.clone(),
-        );
-        let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
-        let succeeded_peers: Vec<_> = sent
-            .iter()
-            .map(|completion| completion.attempt.peer)
-            .collect();
-        let succeeded = succeeded_peers.len();
-        // Maintainer decision (review item 3): Normal-kind retry timeouts
-        // and not-connected failures are dropped — the retry must not
-        // double-count a known-starved window toward
-        // PEER_TIMEOUT_THRESHOLD. RecoveryProbe-kind attempts (claimed when
-        // a peer's suppression expired during the delay) are re-booked
-        // (r3 review item 1): a probe timeout re-suppresses with backoff
-        // without feeding the threshold window, a probe not-connected
-        // failure books the #380 eviction, and either outcome releases
-        // `recovery_probe_in_flight` — dropping it would permanently block
-        // `claim_send_attempt_at` for the peer/topic.
-        let probe_timed_out: Vec<PeerSendAttempt> = timed_out
-            .iter()
-            .copied()
-            .flat_map(recovery_probe_timeout)
-            .collect();
-        let probe_not_connected: Vec<PeerSendAttempt> = not_connected
-            .iter()
-            .copied()
-            .flat_map(recovery_probe_timeout)
-            .collect();
-        claims
-            .record_results(sent, probe_timed_out, probe_not_connected)
-            .await;
-        drop(_bulk_guard);
-
-        let (pending, retry_delivered) = {
-            let mut topics_guard = ctx.topics.write_topic(&topic).await;
-            let Some(state) = topics_guard.get_mut(&topic) else {
-                return;
-            };
-            for peer in succeeded_peers {
-                state.record_stranded_retry_delivered(&msg_id, peer);
-            }
-            let served = state.stranded_ihave_served_peers(&msg_id).to_vec();
-            let pending = state.eager_peers.iter().any(|peer| !served.contains(peer));
-            let retry_delivered = state
-                .stranded_ihave
-                .iter()
-                .find(|entry| entry.msg_id == msg_id)
-                .is_some_and(|entry| entry.retry_delivered);
-            if !pending || Instant::now() >= recovery_deadline {
-                state.remove_stranded_ihave(&msg_id);
-            }
-            (pending, retry_delivered)
-        };
-        if ctx.egress_limiter.enabled() && pending && Instant::now() < recovery_deadline {
-            time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
-            Box::pin(Self::retry_stranded_publish(ctx, topic, msg_id, bytes)).await;
-        } else if retry_delivered {
-            info!(
-                topic = %LogTopicId::from(topic),
-                msg_id = ?msg_id,
-                succeeded,
-                "stranded publish recovered by bounded per-target retry"
-            );
-            ctx.stage_stats.record_stranded_publish_recovered_by_retry();
-        } else {
-            warn!(
-                topic = %LogTopicId::from(topic),
-                msg_id = ?msg_id,
-                "stranded publish retry expired without delivery; anti-entropy remains"
-            );
-            ctx.stage_stats.record_stranded_publish_retry_failed();
         }
     }
 

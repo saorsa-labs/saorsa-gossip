@@ -80,7 +80,7 @@ struct Intent {
     bytes: u64,
     created: Instant,
     order: u64,
-    charged: bool,
+    charged: u64,
 }
 
 #[derive(Debug)]
@@ -357,19 +357,19 @@ impl LeafEgressLimiter {
             let head = state
                 .intents
                 .iter()
-                .filter(|(_, intent)| !intent.charged)
+                .filter(|(_, intent)| intent.charged < intent.bytes)
                 .min_by_key(|(_, intent)| intent.order)
-                .map(|(key, intent)| (*key, intent.bytes));
-            let Some((key, bytes)) = head else { break };
-            if state.tokens < bytes {
+                .map(|(key, intent)| (*key, intent.bytes - intent.charged));
+            let Some((key, delta)) = head else { break };
+            if state.tokens < delta {
                 break;
             }
-            state.tokens -= bytes;
+            state.tokens -= delta;
             self.counters
                 .charged_bytes
-                .fetch_add(bytes, Ordering::Relaxed);
+                .fetch_add(delta, Ordering::Relaxed);
             if let Some(intent) = state.intents.get_mut(&key) {
-                intent.charged = true;
+                intent.charged = intent.charged.saturating_add(delta);
             }
         }
     }
@@ -400,7 +400,7 @@ impl LeafEgressLimiter {
         let reserve = state
             .intents
             .values()
-            .filter(|intent| !intent.charged)
+            .filter(|intent| intent.charged < intent.bytes)
             .map(|intent| intent.bytes)
             .max()
             .unwrap_or(fixed_reserve)
@@ -529,42 +529,63 @@ impl LeafEgressLimiter {
             return Err(ReserveError::Oversized);
         }
         let bytes = u64::try_from(frame_bytes).map_err(|_| ReserveError::Oversized)?;
-        if !state.intents.contains_key(&key) {
-            if let Some(previous) = state
+        if state.intents.contains_key(&key) {
+            if state
                 .intents
-                .keys()
-                .copied()
-                .find(|candidate| candidate.family == key.family)
+                .get(&key)
+                .is_some_and(|intent| intent.bytes != bytes)
             {
-                state.intents.remove(&previous);
+                return Err(ReserveError::Oversized);
             }
+        } else {
+            // A changed payload for the same peer/frame family replaces the
+            // prior family member. Preserve its queue position, age, and any
+            // escrowed credit so periodic digest churn cannot repeatedly burn
+            // a freshly charged intent and starve the family indefinitely.
+            // Excess credit above the new size is abandoned, never refunded.
+            let inherited = state
+                .intents
+                .iter()
+                .find(|(candidate, _)| candidate.family == key.family)
+                .map(|(candidate, intent)| (*candidate, *intent));
+            let (order, created, credit) = match inherited {
+                Some((previous_key, previous)) => {
+                    state.intents.remove(&previous_key);
+                    (
+                        previous.order,
+                        previous.created,
+                        previous.charged.min(bytes),
+                    )
+                }
+                None => {
+                    let order = state.next_order;
+                    state.next_order = state.next_order.wrapping_add(1);
+                    (order, now, 0)
+                }
+            };
             if state.intents.len() >= DEFAULT_MAX_INTENTS {
                 self.counters.queue_overflow.fetch_add(1, Ordering::Relaxed);
                 return Err(ReserveError::IntentLimit);
             }
-            let order = state.next_order;
-            state.next_order = state.next_order.wrapping_add(1);
             state.intents.insert(
                 key,
                 Intent {
                     bytes,
-                    created: now,
+                    created,
                     order,
-                    charged: false,
+                    charged: credit,
                 },
             );
             self.counters
                 .demanded_bytes
-                .fetch_add(bytes, Ordering::Relaxed);
-        } else if state
-            .intents
-            .get(&key)
-            .is_some_and(|intent| intent.bytes != bytes)
-        {
-            return Err(ReserveError::Oversized);
+                .fetch_add(bytes.saturating_sub(credit), Ordering::Relaxed);
         }
         self.charge_ready_recovery(&mut state);
-        if !state.intents.get(&key).is_some_and(|intent| intent.charged) {
+        if !state
+            .intents
+            .get(&key)
+            .is_some_and(|intent| intent.charged >= intent.bytes)
+        {
             return Err(ReserveError::Deferred);
         }
         state.intents.remove(&key);
@@ -893,5 +914,91 @@ mod tests {
             limiter.try_reserve_data(key(1), 1, false),
             Err(ReserveError::Disabled)
         );
+    }
+
+    fn digest_key(operation: u8) -> RecoveryIntentKey {
+        RecoveryIntentKey {
+            peer: [7; 32],
+            family: [7; 32],
+            operation: [operation; 32],
+        }
+    }
+
+    #[test]
+    fn changing_digest_churn_obtains_reservations_without_starving_other_families() {
+        let limiter = limiter();
+        assert!(limiter.try_reserve_data(key(1), 3072, false).is_ok());
+        // Drain the remaining burst floor so digest intents start at zero.
+        assert!(limiter.try_reserve_recovery(key(2), 1024).is_ok());
+        assert_eq!(limiter.lock_state().tokens, 0);
+        let now = Instant::now();
+        assert_eq!(
+            limiter.try_reserve_recovery_at(digest_key(1), 128, 1, now),
+            Err(ReserveError::Deferred)
+        );
+        // One frame of refill (128 bytes at 128 B/s) per interval, with the
+        // digest payload changing each interval: a new operation key in the
+        // same family. The round that charges the predecessor must hand its
+        // escrow to the replacement instead of burning it, so every churn
+        // round actually obtains a reservation rather than starving forever.
+        for round in 1u8..=4 {
+            let at = now + Duration::from_secs(u64::from(round));
+            assert!(
+                limiter
+                    .try_reserve_recovery_at(digest_key(round + 1), 128, 1, at)
+                    .is_ok(),
+                "replaced digest must obtain a reservation at one-frame refill rate"
+            );
+        }
+        let snapshot = limiter.snapshot();
+        assert_eq!(snapshot.charged_bytes, 3072 + 1024 + 4 * 128);
+        assert_eq!(snapshot.pending_recovery_intents, 0);
+        // A different family is not starved by the churn above.
+        assert!(limiter
+            .try_reserve_recovery_at(key(9), 64, 1, now + Duration::from_secs(6))
+            .is_ok());
+    }
+
+    #[test]
+    fn family_replacement_resize_charges_only_the_size_delta() {
+        let grown = limiter();
+        assert!(grown.try_reserve_data(key(1), 3072, false).is_ok());
+        assert!(grown.try_reserve_recovery(key(2), 1024).is_ok());
+        assert_eq!(grown.lock_state().tokens, 0);
+        let now = Instant::now();
+        assert_eq!(
+            grown.try_reserve_recovery_at(digest_key(1), 128, 1, now),
+            Err(ReserveError::Deferred)
+        );
+        // Larger replacement: one frame of refill escrows the predecessor's
+        // 128 bytes; the successor still needs one more frame for the delta.
+        assert_eq!(
+            grown.try_reserve_recovery_at(digest_key(2), 256, 1, now + Duration::from_secs(1)),
+            Err(ReserveError::Deferred)
+        );
+        assert_eq!(grown.snapshot().charged_bytes, 3072 + 1024 + 128);
+        assert!(grown
+            .try_reserve_recovery_at(digest_key(2), 256, 1, now + Duration::from_secs(2))
+            .is_ok());
+        assert_eq!(grown.snapshot().charged_bytes, 3072 + 1024 + 256);
+        assert_eq!(grown.lock_state().tokens, 0);
+
+        // Smaller replacement: one exact frame of refill (128 bytes at 128 B/s)
+        // escrows the predecessor's full 128 bytes, leaving zero tokens; the
+        // 64-byte successor is fully covered by the carried credit, spends
+        // nothing extra, and the abandoned 64 bytes are never refunded.
+        let shrunk = limiter();
+        let shrunk_now = Instant::now();
+        assert!(shrunk.try_reserve_data(key(1), 3072, false).is_ok());
+        assert!(shrunk.try_reserve_recovery(key(2), 1024).is_ok());
+        assert_eq!(
+            shrunk.try_reserve_recovery_at(digest_key(1), 128, 1, shrunk_now),
+            Err(ReserveError::Deferred)
+        );
+        assert!(shrunk
+            .try_reserve_recovery_at(digest_key(2), 64, 1, shrunk_now + Duration::from_secs(1))
+            .is_ok());
+        assert_eq!(shrunk.snapshot().charged_bytes, 3072 + 1024 + 128);
+        assert_eq!(shrunk.lock_state().tokens, 0);
     }
 }

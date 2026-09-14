@@ -10878,13 +10878,14 @@ mod tests {
     /// Round 3 (fixes #68): `verify.count >= 1` replaces `>= 2`.
     ///
     /// Why not `>= 2`: independent testing showed that under ~9x CPU
-    /// oversubscription `verify.count` collapsed to 1 in 6/120 unloaded
-    /// runs — a 5% spurious failure rate. The floor of `>= 2` was the
-    /// scheduler's natural overlap (deterministically `worker_threads` in
-    /// stable conditions), so any threshold above 1 may spuriously fail
-    /// under load. Additionally, `>= 2` had ~2.5% mutation-detection power
-    /// against the "signing moved into task" mutation that the round-2
-    /// review was designed to catch.
+    /// oversubscription `verify.count` collapsed to 1 in 6 of 120 runs — a
+    /// 5% spurious failure rate. Unloaded it was 100/100 green, so the
+    /// failure is load-induced and would have appeared only in CI. The floor
+    /// of `>= 2` was the scheduler's natural overlap (deterministically
+    /// `worker_threads` in stable conditions), so any threshold above 1 may
+    /// spuriously fail under load. Additionally, `>= 2` had ~2.5%
+    /// mutation-detection power against the "signing moved into task" mutation
+    /// that the round-2 review was designed to catch.
     ///
     /// Why `== RACERS` is unachievable: `verify.count` saturates at
     /// `worker_threads` regardless of gates or barriers. Since `verify` runs

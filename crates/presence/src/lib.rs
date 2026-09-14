@@ -617,13 +617,24 @@ impl PresenceManager {
         // Wait for task to complete with timeout
         {
             let mut task = self.beacon_task.write().await;
-            if let Some(handle) = task.take() {
+            if let Some(mut handle) = task.take() {
                 // Wait up to 5 seconds for graceful shutdown
-                match tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await {
+                //
+                // The handle is borrowed (&mut), not moved: on the timeout
+                // path below it must still be owned so it can be aborted —
+                // moving it into `timeout` would DROP (detach) it there,
+                // which is the saorsa-gossip#25 defect.
+                match tokio::time::timeout(tokio::time::Duration::from_secs(5), &mut handle).await {
                     Ok(join_result) => {
                         join_result.context("Beacon task panicked")?;
                     }
                     Err(_) => {
+                        // saorsa-gossip#25: a beacon mid-broadcast can exceed
+                        // the 5 s grace (the per-send timeout alone is 15 s).
+                        // Abort and await the handle so the task is
+                        // guaranteed stopped before this returns.
+                        handle.abort();
+                        let _ = handle.await;
                         return Err(anyhow::anyhow!("Beacon task shutdown timeout"));
                     }
                 }
@@ -1525,6 +1536,48 @@ mod tests {
             handle.abort();
         }
         manager.shutdown_tx.write().await.take();
+    }
+
+    // saorsa-gossip#25 (x0x#116): stop_beacons() must not detach a beacon
+    // task that outlives the 5 s shutdown grace. The real beacon loop's
+    // per-send timeout alone is 15 s (BEACON_SEND_TIMEOUT), so a mid-broadcast
+    // beacon can exceed the grace window; on that timeout stop_beacons must
+    // abort AND reap the task before returning, not drop the JoinHandle
+    // (which detaches it). The guard's Drop runs only when the task's future
+    // is actually torn down — which is what abort+await guarantees.
+    #[tokio::test(start_paused = true)]
+    async fn stop_beacons_aborts_a_task_that_outlives_the_shutdown_grace() {
+        use std::sync::atomic::AtomicBool;
+
+        struct Reaped(Arc<AtomicBool>);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let manager = create_test_manager().await;
+        let running = Arc::new(AtomicBool::new(true));
+        let stuck = tokio::spawn({
+            let running = Arc::clone(&running);
+            async move {
+                let _reaped = Reaped(running);
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+        });
+        *manager.beacon_task.write().await = Some(stuck);
+
+        let result = manager.stop_beacons().await;
+        assert!(
+            result.is_err(),
+            "a beacon stuck past the 5 s grace must surface the shutdown-timeout error"
+        );
+        assert!(
+            !running.load(Ordering::SeqCst),
+            "the beacon task must be aborted and reaped before stop_beacons returns (sg#25: it used to be detached)"
+        );
     }
 
     #[tokio::test]

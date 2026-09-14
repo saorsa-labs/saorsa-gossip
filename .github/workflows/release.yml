@@ -13,8 +13,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  release-preflight:
+    name: Verify Release Inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify crates.io credential
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: test -n "$CARGO_REGISTRY_TOKEN"
+
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches workspace version
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "Release must run from a v-prefixed tag" >&2
+            exit 1
+          fi
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          CARGO_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) does not match Cargo.toml ($CARGO_VERSION)" >&2
+            exit 1
+          fi
+
   build-release:
     name: Build Release
+    needs: release-preflight
     strategy:
       matrix:
         include:
@@ -161,16 +188,34 @@ jobs:
         # every member's dep graph against crates.io alone.
         run: |
           cargo hakari remove-deps --yes
-          if grep -R "saorsa-gossip-workspace-hack" crates bin --include Cargo.toml; then
-            echo "workspace-hack dependency remains in a publishable manifest" >&2
-            exit 1
-          fi
+          cargo metadata --no-deps --format-version 1 > /tmp/package-metadata.json
+          python3 - <<'PY'
+          import json
+
+          with open("/tmp/package-metadata.json", encoding="utf-8") as source:
+              metadata = json.load(source)
+          retained = [
+              package["name"]
+              for package in metadata["packages"]
+              if package["publish"] != []
+              and any(
+                  dependency["name"] == "saorsa-gossip-workspace-hack"
+                  for dependency in package["dependencies"]
+              )
+          ]
+          if retained:
+              raise SystemExit(
+                  "workspace-hack dependency remains in: " + ", ".join(retained)
+              )
+          PY
 
       - name: Publish crates (in dependency order)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
-          # Publish each crate in dependency order with retry logic
+          # Publish each crate in dependency order. A rerun may encounter a
+          # crate version this same release already published; every other
+          # packaging or registry failure remains fatal.
           CRATES=(
             "crates/types"
             "crates/identity"
@@ -196,10 +241,10 @@ jobs:
             # modifies member Cargo.toml in-place (strips workspace-hack
             # dep). Those changes are uncommitted but intentional, and
             # cargo publish needs --allow-dirty to proceed.
-            OUTPUT=$(cargo publish --no-verify --allow-dirty 2>&1) && {
+            OUTPUT=$(cargo publish --allow-dirty 2>&1) && {
               echo "Successfully published $crate"
             } || {
-              if echo "$OUTPUT" | grep -q "already exists"; then
+              if echo "$OUTPUT" | grep -q "already exists on crates.io index"; then
                 echo "$crate already published, skipping..."
               else
                 echo "$OUTPUT"

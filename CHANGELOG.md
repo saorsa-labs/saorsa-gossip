@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.82] - 2026-09-14
+
 ### Fixed
 
 - **presence: `stop_beacons()` aborts and reaps a beacon that outlives the

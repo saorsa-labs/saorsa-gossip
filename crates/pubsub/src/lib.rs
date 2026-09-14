@@ -18027,11 +18027,12 @@ mod tests {
     #[tokio::test]
     async fn test_ihave_iwant_eager_flow_updates_scores() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport().await;
+        let transport = RecordingTransport::new(peer_id);
         let signing_key = test_signing_key();
-        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let pubsub = PlumtreePubSub::new(peer_id, transport.clone(), signing_key.clone());
         let topic = TopicId::new([1u8; 32]);
         let from_peer = test_peer_id(2);
+        transport.set_connected_peer_ids(vec![from_peer]);
 
         let unknown_msg_id = [42u8; 32];
 
@@ -18039,7 +18040,12 @@ mod tests {
         pubsub
             .handle_ihave(from_peer, topic, vec![unknown_msg_id])
             .await
-            .ok();
+            .expect("IHAVE handling");
+        assert_eq!(
+            transport.send_count_to(from_peer),
+            1,
+            "the IWANT must reach the successful transport seam"
+        );
 
         // Verify IWANT request was tracked in score
         {

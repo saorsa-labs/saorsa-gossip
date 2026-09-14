@@ -10858,10 +10858,12 @@ mod tests {
     /// Issue #58 race guard: many tasks concurrently deliver frames
     /// carrying the SAME unseen msg_id. The read-probe fast path must still
     /// admit the message exactly once — concurrent probes all miss, the
-    /// losers fall through to the verify path, and the post-verify
-    /// double-checked re-check under the write lock drops every racer that
-    /// arrived while the winner was between probe and insert. Exactly one
-    /// subscriber delivery, exactly one cache entry, no deadlock.
+    /// losers each run the lockless ML-DSA-65 verify step (no topic lock is
+    /// held across `verify_message_signature` — see the comment at the call
+    /// site in `handle_eager_admitted`), then the post-verify double-check
+    /// under the write lock drops every racer that arrived while the winner
+    /// was between probe and insert. Exactly one subscriber delivery,
+    /// exactly one cache entry, no deadlock.
     ///
     /// Round 2: each racer carries a DISTINCT payload under the same
     /// msg_id (legal — msg_id is read from the header and never
@@ -10883,6 +10885,18 @@ mod tests {
     /// under load. Additionally, `>= 2` had ~2.5% mutation-detection power
     /// against the "signing moved into task" mutation that the round-2
     /// review was designed to catch.
+    ///
+    /// Why `== RACERS` is unachievable: `verify.count` saturates at
+    /// `worker_threads` regardless of gates or barriers. Since `verify` runs
+    /// without a topic lock (~1 ms of pure CPU), the first insertion lands
+    /// before the queued `RACERS - worker_threads` tasks even start; they
+    /// see a read-probe HIT and never verify. This means any reduction of
+    /// RACERS down to `worker_threads + 1` or more is completely invisible
+    /// to `verify.count` — a drop from 32 to 9 racers would not move the
+    /// counter at all. A structural `== RACERS` assertion was tried in four
+    /// configurations (gate alone, gate + yield_now, gate + Barrier(33),
+    /// gate + Barrier(33) + worker_threads=32) and failed consistently
+    /// (verify.count in the range 8–22, never 32) across 80 runs.
     ///
     /// Why `>= 1` is the correct floor: the winner always runs the
     /// ML-DSA-65 verify (`verify_message_signature`) before inserting into

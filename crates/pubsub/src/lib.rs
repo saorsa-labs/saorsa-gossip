@@ -10867,10 +10867,12 @@ mod tests {
     /// Issue #58 race guard: many tasks concurrently deliver frames
     /// carrying the SAME unseen msg_id. The read-probe fast path must still
     /// admit the message exactly once — concurrent probes all miss, the
-    /// losers fall through to the verify path, and the post-verify
-    /// double-checked re-check under the write lock drops every racer that
-    /// arrived while the winner was between probe and insert. Exactly one
-    /// subscriber delivery, exactly one cache entry, no deadlock.
+    /// losers each run the lockless ML-DSA-65 verify step (no topic lock is
+    /// held across `verify_message_signature` — see the comment at the call
+    /// site in `handle_eager_admitted`), then the post-verify double-check
+    /// under the write lock drops every racer that arrived while the winner
+    /// was between probe and insert. Exactly one subscriber delivery,
+    /// exactly one cache entry, no deadlock.
     ///
     /// Round 2: each racer carries a DISTINCT payload under the same
     /// msg_id (legal — msg_id is read from the header and never
@@ -10881,6 +10883,49 @@ mod tests {
     /// the msg_id check, so breaking the post-verify double-check left the
     /// round-1 version passing. With distinct payloads, breaking that
     /// re-check fails this test (verified by mutation).
+    ///
+    /// Round 3 (fixes #68): `verify.count >= 1` replaces `>= 2`.
+    ///
+    /// Why not `>= 2`: independent testing showed that under ~9x CPU
+    /// oversubscription `verify.count` collapsed to 1 in 6 of 120 runs — a
+    /// 5% spurious failure rate. Unloaded it was 100/100 green, so the
+    /// failure is load-induced and would have appeared only in CI. The floor
+    /// of `>= 2` was the scheduler's natural overlap (deterministically
+    /// `worker_threads` in stable conditions), so any threshold above 1 may
+    /// spuriously fail under load. Additionally, `>= 2` had ~2.5%
+    /// mutation-detection power against the "signing moved into task" mutation
+    /// that the round-2 review was designed to catch.
+    ///
+    /// Why `== RACERS` is unachievable: `verify.count` saturates at
+    /// `worker_threads` regardless of gates or barriers. Since `verify` runs
+    /// without a topic lock (~1 ms of pure CPU), the first insertion lands
+    /// before the queued `RACERS - worker_threads` tasks even start; they
+    /// see a read-probe HIT and never verify. This means any reduction of
+    /// RACERS down to `worker_threads + 1` or more is completely invisible
+    /// to `verify.count` — a drop from 32 to 9 racers would not move the
+    /// counter at all. A structural `== RACERS` assertion was tried in four
+    /// configurations (gate alone, gate + yield_now, gate + Barrier(33),
+    /// gate + Barrier(33) + worker_threads=32) and failed consistently
+    /// (verify.count in the range 8–22, never 32) across 80 runs.
+    ///
+    /// Why `>= 1` is the correct floor: the winner always runs the
+    /// ML-DSA-65 verify (`verify_message_signature`) before inserting into
+    /// the cache. A value of 0 would mean no frame was admitted via the
+    /// verify path — which would indicate either the topic is mistakenly
+    /// registered (bypassing the pre-verify dedup block) or the fast-path
+    /// dedup is returning a spurious HIT on a fresh msg_id. Neither can
+    /// happen with correct code, so `>= 1` is an infallible lower bound
+    /// that never produces a spurious failure under any CPU load.
+    ///
+    /// What pins the actual concurrent overlap: the existing assertions
+    /// already do this structurally. `dedupe_lock_acquire_read.count == RACERS`
+    /// proves all 32 frames took the read-probe path (none short-circuited
+    /// before the lock). The distinct-payload setup ensures the post-verify
+    /// double-check is the real guard (breaking it was verified to fail the
+    /// test in round 2). The single-delivery subscriber assertion proves
+    /// exactly one racer won. Together these assertions leave no room for the
+    /// overlap to have been absent — they just don't require an exact
+    /// `verify.count` number, which would be scheduler-dependent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_same_msg_id_frames_admit_exactly_once() {
         let peer_id = test_peer_id(1);
@@ -10950,9 +10995,20 @@ mod tests {
             stats.dedupe_lock_acquire_read.count, RACERS as u64,
             "every racing frame takes exactly one read probe"
         );
+        // The winner always runs verify_message_signature before inserting.
+        // A count of 0 would mean the winning frame skipped verify entirely,
+        // which would indicate a broken fast path (spurious pre-verify HIT on
+        // a fresh msg_id) or accidental topic registration. Neither happens
+        // with correct code, so >= 1 is always true. The exact count is
+        // scheduler-dependent (deterministically worker_threads under normal
+        // load) and is not asserted here — the real overlap guarantee comes
+        // from dedupe_lock_acquire_read.count == RACERS above plus the
+        // single-delivery assertion above. (Refs #58, #67, #68.)
         assert!(
             stats.verify.count >= 1,
-            "at least the winning racer verified"
+            "verify.count=0: no racer ran the ML-DSA-65 verify path — the \
+             winning frame either hit the pre-verify dedup cache on a fresh \
+             msg_id (spurious HIT) or the topic is incorrectly registered"
         );
     }
 

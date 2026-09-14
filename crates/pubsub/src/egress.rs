@@ -578,7 +578,7 @@ impl LeafEgressLimiter {
             );
             self.counters
                 .demanded_bytes
-                .fetch_add(bytes.saturating_sub(credit), Ordering::Relaxed);
+                .fetch_add(bytes, Ordering::Relaxed);
         }
         self.charge_ready_recovery(&mut state);
         if !state
@@ -1000,5 +1000,24 @@ mod tests {
             .is_ok());
         assert_eq!(shrunk.snapshot().charged_bytes, 3072 + 1024 + 128);
         assert_eq!(shrunk.lock_state().tokens, 0);
+    }
+
+    #[test]
+    fn family_replacement_records_full_demand_but_charges_only_unpaid_bytes() {
+        let limiter = limiter();
+        assert!(limiter.try_reserve_data(key(1), 3072, false).is_ok());
+        assert!(limiter.try_reserve_recovery(key(2), 1024).is_ok());
+        let now = Instant::now();
+        assert_eq!(
+            limiter.try_reserve_recovery_at(digest_key(1), 128, 1, now),
+            Err(ReserveError::Deferred)
+        );
+        assert_eq!(
+            limiter.try_reserve_recovery_at(digest_key(2), 256, 1, now + Duration::from_secs(1)),
+            Err(ReserveError::Deferred)
+        );
+        let snapshot = limiter.snapshot();
+        assert_eq!(snapshot.demanded_bytes, 3072 + 1024 + 128 + 256);
+        assert_eq!(snapshot.charged_bytes, 3072 + 1024 + 128);
     }
 }

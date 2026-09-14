@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **presence: `stop_beacons()` aborts and reaps a beacon that outlives the
+  5 s shutdown grace (#25, x0x#116).** The beacon `JoinHandle` was moved
+  into the 5 s join timeout, so on expiry it was dropped — detaching a
+  beacon mid-broadcast (the per-send timeout alone is 15 s) that could then
+  outlive a caller that had already awaited `stop_beacons()`. The handle is
+  now borrowed; on the timeout path `stop_beacons()` aborts and awaits it,
+  guaranteeing the task is stopped before the (still-`Err`) return.
+
 ## [0.5.81] - 2026-09-14
 ### Fixed
 

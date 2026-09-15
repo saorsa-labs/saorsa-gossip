@@ -768,20 +768,60 @@ impl StageTimingStats {
     }
 }
 
-/// Observed fan-out outcome for a single local publish.
+/// Observed fan-out outcome for a single local publish, staged so a zero
+/// attempt count is diagnosable instead of indistinguishable from empty
+/// membership.
 ///
-/// `attempted` counts peers that passed admission and dedup gating and
-/// received a send task; it does **not** guarantee delivery. `succeeded`
-/// counts peers from which a confirmed send was observed on the publish path
-/// (`detach_accounting = false`). The dispatcher forward path
-/// (`detach_accounting = true`) always returns `succeeded = 0` because
-/// outcomes are collected in a detached task after the call returns.
+/// Stage invariant: `candidates == byte_rejected + admission_dropped +
+/// claim_skipped + attempted`. `attempted` counts peers that passed byte and
+/// peer admission and dedup gating and received a send task; it does **not**
+/// guarantee delivery. `succeeded` counts peers from which a confirmed send
+/// was observed on the publish path (`detach_accounting = false`). The
+/// dispatcher forward path (`detach_accounting = true`) always returns
+/// `succeeded = 0` because outcomes are collected in a detached task after
+/// the call returns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FanoutCounts {
+    /// Incoming peer count for this fan-out call, before any admission.
+    pub candidates: usize,
+    /// Candidates excluded by Leaf serialized-byte admission — any reserve
+    /// failure (oversized frame, exhausted byte budget, waiter/intent limit,
+    /// reconfigure), not only a temporary token shortage.
+    pub byte_rejected: usize,
+    /// Byte-admitted candidates excluded by the peer admission gate
+    /// (cooling, health, dedup).
+    pub admission_dropped: usize,
+    /// Admitted candidates that acquired no send claim (transport-
+    /// disconnected, cooling at claim time, exhausted outbound budget).
+    pub claim_skipped: usize,
     /// Number of peers the message was dispatched toward.
     pub attempted: usize,
     /// Number of those peers that confirmed receipt before this call returned.
     pub succeeded: usize,
+}
+
+/// Outcome of the optional exact-peer leg of a local publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetedPublishOutcome {
+    /// The final serialized frame reached the transport send successfully.
+    Sent,
+    /// Existing byte, admission, cooling, or claim gates deferred the send.
+    Deferred,
+    /// The exact peer was no longer transport-connected.
+    NotConnected,
+    /// The caller's fixed deadline expired before the targeted leg completed.
+    TimedOut,
+    /// Serialization, admission bookkeeping, or transport returned an error.
+    Failed,
+}
+
+/// Ordinary gossip fan-out plus an exact-peer targeted leg of the same frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetedFanoutCounts {
+    /// Result of the unchanged ordinary EAGER fan-out.
+    pub fanout: FanoutCounts,
+    /// Result of sending the identical serialized frame to the requested peer.
+    pub target: TargetedPublishOutcome,
 }
 
 /// Issue #42: outcome of [`PlumtreePubSub::shutdown`].
@@ -835,11 +875,13 @@ pub struct PubSubStageStats {
     /// nothing.
     cooldown_bypass_probes: AtomicU64,
     cooldown_bypass_successes: AtomicU64,
-    /// Local publishes whose eligible eager fan-out set was empty (issue
-    /// #32): every eager peer was cooled/excluded, or the topic had no eager
-    /// peers at all (`attempted == 0`). The publish still returns `Ok(())`,
-    /// so this counter is the loud signal that the message did not leave the
-    /// node.
+    /// Local publishes where no peer was attempted (issue #32,
+    /// `attempted == 0`): the topic had no eager peers, or every eager
+    /// peer was excluded by byte admission, peer admission, or the send
+    /// claim. The publish still returns `Ok(())`, so this counter is the
+    /// loud signal that the message did not leave the node; the staged
+    /// [`FanoutCounts`] on the zero-fanout WARN distinguish which gate
+    /// excluded the peers.
     zero_fanout_publishes: AtomicU64,
     /// Local publishes where at least one peer was attempted but every send
     /// failed or timed out (`attempted > 0, succeeded == 0`). This is the
@@ -1120,8 +1162,10 @@ pub struct PubSubStageStatsSnapshot {
     /// during its suppression window.
     pub cooldown_bypass_successes: u64,
     /// Cumulative count of local publishes where no peer was attempted
-    /// (`attempted == 0`). A non-zero value means the eager set was empty or
-    /// fully cooled — the message did not leave the node.
+    /// (`attempted == 0`). A non-zero value means every eager peer was
+    /// excluded by byte admission, peer admission, or the send claim —
+    /// including an empty eager set — so the message did not leave the
+    /// node.
     pub zero_fanout_publishes: u64,
     /// Issue #41: msg_ids dropped by the pending-IHAVE cap (the oldest
     /// ids evicted once the queue saturates) — sustained growth means an
@@ -7168,6 +7212,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Leaf byte admission precedes all existing peer/transport admission.
         // Data never waits or retains another payload copy: denied EAGER peers
         // are placed on the existing direct-IHAVE lazy recovery path.
+        let candidates = peers.len();
         let mut reservations = HashMap::new();
         let peers = if self.egress_limiter.enabled() {
             let mut admitted = Vec::with_capacity(peers.len());
@@ -7218,6 +7263,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         } else {
             peers
         };
+        // FanoutCounts stage accounting (504): every peer that entered this
+        // call lands in exactly one bucket — byte_rejected here, then
+        // admission_dropped, claim_skipped, or attempted below. Keeps the
+        // invariant candidates == byte_rejected + admission_dropped +
+        // claim_skipped + attempted on every return path.
+        let byte_rejected = candidates - peers.len();
 
         // X0X-0074: admission gate runs once per (topic, peer) before
         // we claim attempts. Dropped peers never enter the send
@@ -7236,7 +7287,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         };
         let admitted_count = admitted.len();
         if admitted_count == 0 {
-            return (Duration::ZERO, FanoutCounts::default(), Vec::new());
+            return (
+                Duration::ZERO,
+                FanoutCounts {
+                    candidates,
+                    byte_rejected,
+                    admission_dropped: candidates - byte_rejected,
+                    claim_skipped: 0,
+                    attempted: 0,
+                    succeeded: 0,
+                },
+                Vec::new(),
+            );
         }
         // X0X-0074: RAII guard releases Bulk admissions for the entire
         // admitted set exactly once on drop — covers no-claim, partial-
@@ -7262,7 +7324,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if claims.is_empty() {
             // No peers got attempts. Bulk reservations release when
             // `_bulk_guard` drops at function exit.
-            return (lock_wait, FanoutCounts::default(), Vec::new());
+            return (
+                lock_wait,
+                FanoutCounts {
+                    candidates,
+                    byte_rejected,
+                    admission_dropped: candidates - byte_rejected - admitted_count,
+                    claim_skipped: admitted_count,
+                    attempted: 0,
+                    succeeded: 0,
+                },
+                Vec::new(),
+            );
         }
         let attempted = claims.attempts().len();
         // x0x #380: outbound demand metering — one wire send per claimed
@@ -7310,6 +7383,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             (
                 lock_wait,
                 FanoutCounts {
+                    candidates,
+                    byte_rejected,
+                    admission_dropped: candidates - byte_rejected - admitted_count,
+                    claim_skipped: admitted_count - attempted,
                     attempted,
                     succeeded: 0,
                 },
@@ -7327,6 +7404,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             (
                 lock_wait,
                 FanoutCounts {
+                    candidates,
+                    byte_rejected,
+                    admission_dropped: candidates - byte_rejected - admitted_count,
+                    claim_skipped: admitted_count - attempted,
                     attempted,
                     succeeded,
                 },
@@ -7546,6 +7627,34 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         payload: Bytes,
     ) -> Result<FanoutCounts> {
+        self.publish_local_with_optional_target(topic, payload, None)
+            .await
+            .map(|(fanout, _)| fanout)
+    }
+
+    /// Publish normally and concurrently target one connected peer with the
+    /// same signed, cached serialized frame through the existing bounded
+    /// recovery send path.
+    pub async fn publish_local_with_target(
+        &self,
+        topic: TopicId,
+        payload: Bytes,
+        target: PeerId,
+        deadline: Duration,
+    ) -> Result<TargetedFanoutCounts> {
+        let (fanout, target) = self
+            .publish_local_with_optional_target(topic, payload, Some((target, deadline)))
+            .await?;
+        let target = target.unwrap_or(TargetedPublishOutcome::Failed);
+        Ok(TargetedFanoutCounts { fanout, target })
+    }
+
+    async fn publish_local_with_optional_target(
+        &self,
+        topic: TopicId,
+        payload: Bytes,
+        target: Option<(PeerId, Duration)>,
+    ) -> Result<(FanoutCounts, Option<TargetedPublishOutcome>)> {
         let inner_proof = self.transport.migration.verify_inner(topic, &payload)?;
         let msg_id = self.calculate_msg_id(&topic, &payload);
 
@@ -7628,13 +7737,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // budget), not a fire-and-forget spawn that can accumulate.
         let bytes: Bytes = match leaf_wire_bytes {
             Some(bytes) => bytes,
-            None => match postcard::to_stdvec(&_message) {
-                Ok(bytes) => bytes.into(),
-                Err(error) => {
+            None => postcard::to_stdvec(&_message)
+                .map(Bytes::from)
+                .map_err(|error| {
                     warn!(msg_id = ?msg_id, "EAGER serialize failed: {error}");
-                    return Ok(FanoutCounts::default());
-                }
-            },
+                    error
+                })?,
         };
         // x0x #613: retain the serialized wire bytes for the bounded
         // single-shot stranded retry (below). A `Bytes` clone is a
@@ -7647,19 +7755,40 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Publish path: await accounting (detach_accounting = false) so
         // publish() returns only after its EAGER sends are attempted and
         // outcomes are observable (succeeded is valid here).
-        let (_, counts, attempted_peers) = self
-            .parallel_send_to_peers(
-                topic,
-                eager_peers,
-                GossipStreamType::PubSub,
-                bytes,
-                "EAGER",
-                false,
+        let ordinary = self.parallel_send_to_peers(
+            topic,
+            eager_peers,
+            GossipStreamType::PubSub,
+            bytes.clone(),
+            "EAGER",
+            false,
+        );
+        let targeted = async {
+            let (peer, deadline) = target?;
+            let outcome = tokio::time::timeout(
+                deadline,
+                self.send_to_peer_bounded_outcome(
+                    topic,
+                    peer,
+                    GossipStreamType::PubSub,
+                    bytes,
+                    "EAGER",
+                ),
             )
             .await;
+            Some(match outcome {
+                Ok(Ok(PeerSendOutcome::Sent { .. })) => TargetedPublishOutcome::Sent,
+                Ok(Ok(PeerSendOutcome::NotConnected)) => TargetedPublishOutcome::NotConnected,
+                Ok(Ok(PeerSendOutcome::Deferred)) => TargetedPublishOutcome::Deferred,
+                Ok(Ok(PeerSendOutcome::TimedOut)) | Err(_) => TargetedPublishOutcome::TimedOut,
+                Ok(Err(_)) => TargetedPublishOutcome::Failed,
+            })
+        };
+        let ((_, counts, attempted_peers), target_outcome) = tokio::join!(ordinary, targeted);
 
         // Update zero-delivery counters. Two distinct conditions:
-        //   attempted == 0 → no eligible peers (cooled / empty eager set).
+        //   attempted == 0 → every candidate was excluded by a staged gate,
+        //                    or the eager set was empty (see FanoutCounts).
         //   attempted > 0, succeeded == 0 → black-hole: peers existed but
         //                                    every send failed at dispatch.
         // The WARN fires on either condition (succeeded == 0) so operators
@@ -7683,13 +7812,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if counts.succeeded == 0 && state.record_zero_fanout_publish_at(Instant::now()) {
                 warn!(
                     topic = %topic,
+                    op = "EAGER",
                     msg_id = ?msg_id,
+                    candidates = counts.candidates,
+                    byte_rejected = counts.byte_rejected,
+                    admission_dropped = counts.admission_dropped,
+                    claim_skipped = counts.claim_skipped,
                     attempted = counts.attempted,
                     succeeded = counts.succeeded,
+                    target_outcome = ?target_outcome,
                     zero_fanout_publishes = state.zero_fanout_publishes,
                     warn_interval_secs = ZERO_FANOUT_WARN_INTERVAL.as_secs(),
-                    "local publish had zero successful remote fan-out \
-                     (throttled; counter is cumulative for this topic)"
+                    "local publish had zero successful ordinary EAGER fan-out \
+                     (candidates == byte_rejected + admission_dropped + \
+                     claim_skipped + attempted; throttled; counter is \
+                     cumulative for this topic)"
                 );
             }
             let dropped = state.push_pending_ihave(msg_id);
@@ -7738,7 +7875,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             });
         }
 
-        Ok(counts)
+        Ok((counts, target_outcome))
     }
 
     /// Handle incoming EAGER message
@@ -11671,6 +11808,449 @@ mod tests {
             stats.zero_fanout_publishes_by_topic.get(&topic.to_string()),
             Some(&1)
         );
+    }
+
+    // ---- 504: FanoutCounts stage accounting keeps an empty eager set,
+    // full byte deferral, admission drops, and claim skips distinct ----
+
+    #[tokio::test]
+    async fn fanout_stage_counts_empty_eager_set_is_all_zero() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x61; 32]);
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"no-peers"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(
+            counts,
+            FanoutCounts::default(),
+            "empty membership must be distinguishable from any exclusion"
+        );
+        assert_eq!(counts.candidates, 0);
+        assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 1);
+    }
+
+    #[tokio::test]
+    async fn fanout_stage_counts_full_byte_deferral_is_not_empty_membership() {
+        // The 504 field failure: two eager candidates, both byte-deferred
+        // before any claim. attempted == 0 alone reads as "no peers"; the
+        // stage counts must say candidates == 2, byte_rejected == 2.
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x62; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(test_peer_id(2));
+            state.eager_peers.insert(test_peer_id(3));
+        }
+        // Drain most of a valid bucket first. The publish frame remains below
+        // the configured maximum, but neither candidate can leave the fixed
+        // recovery reserve behind, so both data reservations defer.
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+        })));
+        let _drain = pubsub
+            .egress_limiter
+            .try_reserve_data(
+                egress::RecoveryIntentKey {
+                    peer: [0x91; 32],
+                    family: [0x92; 32],
+                    operation: [0x93; 32],
+                },
+                6144,
+                false,
+            )
+            .expect("valid setup reservation drains initial tokens");
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"attempt4"))
+            .await
+            .expect("fully byte-deferred publish still returns Ok");
+
+        assert_eq!(counts.candidates, 2);
+        assert_eq!(counts.byte_rejected, 2);
+        assert_eq!(counts.admission_dropped, 0);
+        assert_eq!(counts.claim_skipped, 0);
+        assert_eq!(counts.attempted, 0);
+        assert_eq!(counts.succeeded, 0);
+        assert_eq!(
+            counts.candidates,
+            counts.byte_rejected
+                + counts.admission_dropped
+                + counts.claim_skipped
+                + counts.attempted
+        );
+        assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 1);
+        assert!(transport.sent_frames().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fanout_stage_counts_admission_drop_lands_in_its_own_bucket() {
+        // Suspect health with no connected snapshot overrides nothing:
+        // peer admission drops the candidate after byte admission.
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x63; 32]);
+        let target = test_peer_id(2);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(target);
+        }
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Suspect)]),
+        );
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"admission-drop"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 1);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 1);
+        assert_eq!(counts.claim_skipped, 0);
+        assert_eq!(counts.attempted, 0);
+        assert_eq!(transport.send_count_to(target), 0);
+    }
+
+    #[tokio::test]
+    async fn fanout_stage_counts_outbound_budget_claim_skip() {
+        // The peer passes byte + peer admission (connected, healthy, not
+        // cooling) but its single in-flight outbound Data permit is already
+        // held when the claim layer runs: the exclusion happens at claim
+        // time, so it must land in claim_skipped, not admission_dropped.
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x64; 32]);
+        let target = test_peer_id(2);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(target);
+        }
+        // Admitted at the transport-connected evidence probe: the target
+        // is present in the connected snapshot.
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+
+        // Exhaust the peer's single best-effort Data permit and hold it
+        // across the publish: claim's `try_acquire` fails after admission,
+        // so the candidate is shed at claim time.
+        let held = pubsub
+            .outbound_budgets
+            .try_acquire(
+                target,
+                OutboundSendClass::Data,
+                TopicPriority::Normal,
+                Instant::now(),
+            )
+            .expect("first data permit is available");
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"claim-skip"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 1);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 0);
+        assert_eq!(counts.claim_skipped, 1);
+        assert_eq!(counts.attempted, 0);
+        assert_eq!(transport.send_count_to(target), 0);
+
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn fanout_stage_counts_mixed_admission_drop_and_success() {
+        // Two byte-admitted candidates: one drops at peer admission
+        // (Suspect, no connected snapshot), one is connected and gets the
+        // send — proving the buckets stay distinct on a successful path.
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x65; 32]);
+        let healthy = test_peer_id(2);
+        let suspect = test_peer_id(3);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(healthy);
+            state.eager_peers.insert(suspect);
+        }
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(suspect, PeerHealth::Suspect)]),
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([healthy])),
+        );
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"mixed"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 2);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 1);
+        assert_eq!(counts.claim_skipped, 0);
+        assert_eq!(counts.attempted, 1);
+        assert_eq!(counts.succeeded, 1);
+        assert_eq!(
+            counts.candidates,
+            counts.byte_rejected
+                + counts.admission_dropped
+                + counts.claim_skipped
+                + counts.attempted
+        );
+        assert_eq!(transport.send_count_to(healthy), 1);
+        assert_eq!(transport.send_count_to(suspect), 0);
+        assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 0);
+    }
+
+    #[tokio::test]
+    async fn targeted_publish_reaches_connected_peer_absent_from_eager_set() {
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![target]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x66; 32]);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+
+        let outcome = pubsub
+            .publish_local_with_target(
+                topic,
+                Bytes::from_static(b"targeted-not-eager"),
+                target,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("targeted publish succeeds");
+
+        assert_eq!(outcome.fanout.candidates, 0);
+        assert_eq!(outcome.target, TargetedPublishOutcome::Sent);
+        assert_eq!(transport.send_count_to(target), 1);
+    }
+
+    #[tokio::test]
+    async fn targeted_publish_deadline_cancels_owned_recovery_intent() {
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![target]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x67; 32]);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+        })));
+        let _drain = pubsub
+            .egress_limiter
+            .try_reserve_data(
+                egress::RecoveryIntentKey {
+                    peer: [0xa1; 32],
+                    family: [0xa2; 32],
+                    operation: [0xa3; 32],
+                },
+                6144,
+                false,
+            )
+            .expect("drain setup tokens");
+
+        let outcome = pubsub
+            .publish_local_with_target(
+                topic,
+                Bytes::from_static(b"bounded-target"),
+                target,
+                Duration::ZERO,
+            )
+            .await
+            .expect("ordinary publish contract remains successful");
+
+        assert_eq!(outcome.target, TargetedPublishOutcome::TimedOut);
+        assert_eq!(transport.send_count_to(target), 0);
+        assert_eq!(pubsub.leaf_egress_snapshot().pending_recovery_intents, 0);
+    }
+
+    #[tokio::test]
+    async fn targeted_publish_progresses_behind_recovery_backlog_with_same_cached_wire() {
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let ordinary_peer = test_peer_id(3);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![target, ordinary_peer]);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x68; 32]);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target, ordinary_peer])),
+        );
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(ordinary_peer);
+        }
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 16_384,
+            max_serialized_frame_bytes: 16_384,
+        })));
+        let _drain = pubsub
+            .egress_limiter
+            .try_reserve_data(
+                egress::RecoveryIntentKey {
+                    peer: [0xb1; 32],
+                    family: [0xb2; 32],
+                    operation: [0xb3; 32],
+                },
+                12_288,
+                false,
+            )
+            .expect("drain setup tokens while preserving the recovery floor");
+        let older = egress::RecoveryIntentKey {
+            peer: [0xc1; 32],
+            family: [0xc2; 32],
+            operation: [0xc3; 32],
+        };
+        assert_eq!(
+            pubsub.egress_limiter.try_reserve_recovery(older, 5_000),
+            Err(egress::ReserveError::Deferred),
+            "the exact target must begin behind an older uncharged intent"
+        );
+        let charged_before = pubsub.leaf_egress_snapshot().charged_bytes;
+        let payload = Bytes::from_static(b"targeted-after-backlog");
+        let running = {
+            let pubsub = Arc::clone(&pubsub);
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                pubsub
+                    .publish_local_with_target(topic, payload, target, Duration::from_secs(1))
+                    .await
+            })
+        };
+        for _ in 0..100 {
+            if pubsub.leaf_egress_snapshot().pending_recovery_intents == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pubsub.leaf_egress_snapshot().pending_recovery_intents,
+            2,
+            "older and exact-target intents must both exist before refill"
+        );
+        pubsub
+            .egress_limiter
+            .refill_after_for_test(Duration::from_secs(16_384));
+        let outcome = running
+            .await
+            .expect("target task joins")
+            .expect("targeted publish remains bounded and valid");
+
+        assert_eq!(outcome.fanout.candidates, 1, "ordinary fanout is retained");
+        assert_eq!(outcome.fanout.byte_rejected, 1);
+        assert_eq!(outcome.target, TargetedPublishOutcome::Sent);
+        let frames = transport.sent_frames_of_kind_to(target, MessageKind::Eager);
+        assert_eq!(frames.len(), 1);
+        let message: GossipMessage =
+            postcard::from_bytes(&frames[0]).expect("transported frame is the signed message");
+        assert_eq!(message.payload.as_ref(), Some(&payload));
+        let cached = {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .get_mut(&topic)
+                .and_then(|state| state.get_message(&message.header.msg_id))
+                .expect("same message id remains cached")
+        };
+        assert_eq!(
+            postcard::to_stdvec(&cached.header).expect("cached header serializes"),
+            postcard::to_stdvec(&message.header).expect("wire header serializes"),
+            "cached and targeted transport frames retain the identical signed header"
+        );
+        assert_eq!(cached.payload, payload);
+        let after = pubsub.leaf_egress_snapshot();
+        assert!(after.charged_bytes > charged_before);
+        assert!(
+            after.charged_bytes - charged_before <= 16_384,
+            "new charging stays within one configured burst"
+        );
+        assert_eq!(
+            after.pending_recovery_intents, 1,
+            "target ownership is gone while the deliberately older intent remains"
+        );
+        pubsub.egress_limiter.cancel_intent_for_test(older);
+        assert_eq!(pubsub.leaf_egress_snapshot().pending_recovery_intents, 0);
     }
 
     #[tokio::test]

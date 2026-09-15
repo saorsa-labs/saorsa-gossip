@@ -599,6 +599,20 @@ impl LeafEgressLimiter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn refill_after_for_test(&self, elapsed: Duration) {
+        let now = Instant::now();
+        let mut state = self.lock_state();
+        state.last_refill = now.checked_sub(elapsed).unwrap_or(now);
+        self.refill(&mut state, now);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_intent_for_test(&self, key: RecoveryIntentKey) {
+        let generation = self.lock_state().generation;
+        self.cancel_intent(key, generation);
+    }
+
     pub(crate) fn validate_reservation(
         &self,
         key: Option<RecoveryIntentKey>,

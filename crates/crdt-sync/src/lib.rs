@@ -12,7 +12,7 @@
 use anyhow::Result;
 use saorsa_gossip_types::{LogPeerId, PeerId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 /// CRDT types
@@ -66,6 +66,23 @@ pub struct OrSet<T: Hash + Eq + Clone> {
     changelog: HashMap<u64, ChangelogEntry<T>>,
 }
 
+/// Deterministic, bincode-layout-compatible retained state for an [`OrSet`].
+///
+/// It preserves every live tag and tombstone while normalizing local delta
+/// generation bookkeeping. Serializing this value can be deserialized
+/// directly as `OrSet<T>` by existing receivers.
+#[derive(Debug, Clone, Serialize)]
+pub struct CanonicalRetainedOrSet<T: Ord> {
+    elements: BTreeMap<T, Vec<UniqueTag>>,
+    tombstones: BTreeMap<T, Vec<UniqueTag>>,
+    version: u64,
+    changelog_floor: u64,
+    changelog: CanonicalChangelog<T>,
+}
+
+type CanonicalChangelog<T> =
+    BTreeMap<u64, (BTreeMap<T, Vec<UniqueTag>>, BTreeMap<T, Vec<UniqueTag>>)>;
+
 /// Type alias for changelog entries to reduce complexity
 type ChangelogEntry<T> = (
     HashMap<T, HashSet<UniqueTag>>,
@@ -73,6 +90,41 @@ type ChangelogEntry<T> = (
 );
 
 impl<T: Hash + Eq + Clone> OrSet<T> {
+    /// Return all merge-relevant state in deterministic wire order.
+    ///
+    /// The result intentionally clears version/changelog fields: those are
+    /// replica-local delta bookkeeping and [`merge_state`](Self::merge_state)
+    /// consumes only live tags and tombstones.
+    pub fn canonical_retained_wire(&self) -> CanonicalRetainedOrSet<T>
+    where
+        T: Ord,
+    {
+        let canonical_tags = |tags: &HashSet<UniqueTag>| {
+            let mut tags: Vec<_> = tags.iter().copied().collect();
+            tags.sort_unstable_by(|(left_peer, left_sequence), (right_peer, right_sequence)| {
+                left_peer
+                    .as_bytes()
+                    .cmp(right_peer.as_bytes())
+                    .then_with(|| left_sequence.cmp(right_sequence))
+            });
+            tags
+        };
+        CanonicalRetainedOrSet {
+            elements: self
+                .elements
+                .iter()
+                .map(|(element, tags)| (element.clone(), canonical_tags(tags)))
+                .collect(),
+            tombstones: self
+                .tombstones
+                .iter()
+                .map(|(element, tags)| (element.clone(), canonical_tags(tags)))
+                .collect(),
+            version: 0,
+            changelog_floor: 0,
+            changelog: BTreeMap::new(),
+        }
+    }
     /// Create a new OR-Set
     pub fn new() -> Self {
         Self {
@@ -1330,5 +1382,41 @@ mod tests {
         assert!(peers.contains(&p1));
         assert!(peers.contains(&p2));
         assert!(peers.contains(&p3));
+    }
+
+    #[test]
+    fn canonical_retained_wire_roundtrips_and_blocks_stale_resurrection() {
+        let origin = peer(7);
+        let mut left = OrSet::new();
+        left.add("visible".to_string(), (origin, 1))
+            .expect("visible");
+        left.add("removed".to_string(), (origin, 2))
+            .expect("removed");
+        let stale = left.clone();
+        left.remove(&"removed".to_string()).expect("tombstone");
+
+        let encoded = bincode::serialize(&left.canonical_retained_wire()).expect("canonical wire");
+        let mut restored: OrSet<String> = bincode::deserialize(&encoded).expect("old OrSet decode");
+        assert!(restored.contains(&"visible".to_string()));
+        assert!(!restored.contains(&"removed".to_string()));
+
+        restored.merge_state(&stale).expect("merge stale state");
+        assert!(
+            !restored.contains(&"removed".to_string()),
+            "canonical tombstone must block a stale add tag"
+        );
+
+        let mut right = OrSet::new();
+        right
+            .add("removed".to_string(), (origin, 2))
+            .expect("removed");
+        right
+            .add("visible".to_string(), (origin, 1))
+            .expect("visible");
+        right.remove(&"removed".to_string()).expect("tombstone");
+        assert_eq!(
+            encoded,
+            bincode::serialize(&right.canonical_retained_wire()).expect("reordered wire")
+        );
     }
 }

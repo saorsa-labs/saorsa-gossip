@@ -291,6 +291,7 @@ async fn mixed_publish_controls_cache_and_forward_preserve_authors_and_floors() 
         &pubsub.stage_stats,
         &pubsub.outbound_budgets,
         &pubsub.send_path_context(),
+        &pubsub.egress_limiter,
     )
     .await;
     let sent = transport.drain();

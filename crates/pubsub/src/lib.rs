@@ -5441,6 +5441,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 return egress::RecoveryIntentKey {
                     peer: peer.to_bytes(),
+                    scope: topic.to_bytes(),
                     family,
                     operation: *key_hasher.finalize().as_bytes(),
                 };
@@ -5452,6 +5453,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
         egress::RecoveryIntentKey {
             peer: peer.to_bytes(),
+            scope: topic.to_bytes(),
             family: *key_hasher.clone().finalize().as_bytes(),
             operation: *key_hasher.finalize().as_bytes(),
         }
@@ -12009,6 +12011,7 @@ mod tests {
             .try_reserve_data(
                 egress::RecoveryIntentKey {
                     peer: [0x91; 32],
+                    scope: [0x91; 32],
                     family: [0x92; 32],
                     operation: [0x93; 32],
                 },
@@ -12078,6 +12081,7 @@ mod tests {
             .try_reserve_data(
                 egress::RecoveryIntentKey {
                     peer: [0x81; 32],
+                    scope: [0x81; 32],
                     family: [0x82; 32],
                     operation: [0x83; 32],
                 },
@@ -12090,6 +12094,7 @@ mod tests {
             .try_reserve_recovery(
                 egress::RecoveryIntentKey {
                     peer: [0x84; 32],
+                    scope: [0x84; 32],
                     family: [0x85; 32],
                     operation: [0x86; 32],
                 },
@@ -12101,6 +12106,7 @@ mod tests {
             identity[..2].copy_from_slice(&index.to_le_bytes());
             let key = egress::RecoveryIntentKey {
                 peer: identity,
+                scope: identity,
                 family: identity,
                 operation: identity,
             };
@@ -12298,6 +12304,7 @@ mod tests {
             .try_reserve_data(
                 egress::RecoveryIntentKey {
                     peer: [0x91; 32],
+                    scope: [0x91; 32],
                     family: [0x92; 32],
                     operation: [0x93; 32],
                 },
@@ -12675,6 +12682,7 @@ mod tests {
             .try_reserve_data(
                 egress::RecoveryIntentKey {
                     peer: [0xa1; 32],
+                    scope: [0xa1; 32],
                     family: [0xa2; 32],
                     operation: [0xa3; 32],
                 },
@@ -12735,6 +12743,7 @@ mod tests {
             .try_reserve_data(
                 egress::RecoveryIntentKey {
                     peer: [0xb1; 32],
+                    scope: [0xb1; 32],
                     family: [0xb2; 32],
                     operation: [0xb3; 32],
                 },
@@ -12744,6 +12753,7 @@ mod tests {
             .expect("drain setup tokens while preserving the recovery floor");
         let older = egress::RecoveryIntentKey {
             peer: [0xc1; 32],
+            scope: [0xc1; 32],
             family: [0xc2; 32],
             operation: [0xc3; 32],
         };

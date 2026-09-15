@@ -3,7 +3,7 @@
 //! Disabled configuration preserves the historical send path. Enabled callers
 //! reserve the final serialized frame before acquiring transport admission.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,6 +21,9 @@ const ORDINARY_MAX_INTENTS: usize = DEFAULT_MAX_INTENTS - CRITICAL_MAX_INTENTS;
 const ORDINARY_MAX_WAITERS_PER_PEER: usize = DEFAULT_MAX_WAITERS_PER_PEER - 1;
 const MAX_PURPOSE_ROWS: usize = 1024;
 const RECOVERY_INTENT_MAX_AGE: Duration = Duration::from_secs(super::MAX_CACHE_AGE_SECS);
+const RECOVERY_CRITICAL_SLOTS: u8 = 7;
+const RECOVERY_TOTAL_SLOTS: u8 = RECOVERY_CRITICAL_SLOTS + 1;
+const RECOVERY_MAX_QUANTUM_BYTES: u64 = 16 * 1024;
 
 /// Leaf-only serialized PubSub egress policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +56,7 @@ impl LeafEgressConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RecoveryIntentKey {
     pub(crate) peer: [u8; 32],
+    pub(crate) scope: [u8; 32],
     pub(crate) family: [u8; 32],
     pub(crate) operation: [u8; 32],
 }
@@ -83,7 +87,7 @@ impl std::fmt::Display for ReserveError {
 #[derive(Debug, Clone, Copy)]
 struct Intent {
     bytes: u64,
-    created: Instant,
+    last_observed: Instant,
     order: u64,
     charged: u64,
     class: RecoveryClass,
@@ -107,6 +111,11 @@ struct State {
     intents: HashMap<RecoveryIntentKey, Intent>,
     waiters_by_peer: HashMap<[u8; 32], (usize, usize)>,
     next_order: u64,
+    recovery_quantum: u64,
+    recovery_slot: u8,
+    recovery_slot_remaining: u64,
+    ordinary_scopes: VecDeque<[u8; 32]>,
+    ordinary_scope_counts: HashMap<[u8; 32], usize>,
 }
 
 #[derive(Debug, Default)]
@@ -214,6 +223,11 @@ impl LeafEgressLimiter {
                 intents: HashMap::new(),
                 waiters_by_peer: HashMap::new(),
                 next_order: 0,
+                recovery_quantum: 1,
+                recovery_slot: 0,
+                recovery_slot_remaining: 1,
+                ordinary_scopes: VecDeque::new(),
+                ordinary_scope_counts: HashMap::new(),
             }),
             ordinary_waiters: Arc::new(Semaphore::new(ORDINARY_MAX_WAITERS)),
             critical_waiters: Arc::new(Semaphore::new(CRITICAL_MAX_WAITERS)),
@@ -255,6 +269,13 @@ impl LeafEgressLimiter {
         state.soft_remainder = 0;
         state.last_refill = Instant::now();
         state.intents.clear();
+        state.ordinary_scopes.clear();
+        state.ordinary_scope_counts.clear();
+        state.recovery_quantum = validated.map_or(1, |config| {
+            (config.hard_bytes_per_second / 8).clamp(1, RECOVERY_MAX_QUANTUM_BYTES)
+        });
+        state.recovery_slot = 0;
+        state.recovery_slot_remaining = state.recovery_quantum;
         true
     }
 
@@ -356,36 +377,119 @@ impl LeafEgressLimiter {
             state.soft_remainder = scaled % 1_000_000_000;
         }
         state.last_refill = now;
-        state.intents.retain(|_, intent| {
-            now.saturating_duration_since(intent.created) < RECOVERY_INTENT_MAX_AGE
-        });
+        let expired: Vec<_> = state
+            .intents
+            .iter()
+            .filter(|(_, intent)| {
+                now.saturating_duration_since(intent.last_observed) >= RECOVERY_INTENT_MAX_AGE
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in expired {
+            if let Some(intent) = state.intents.remove(&key) {
+                if intent.class == RecoveryClass::Ordinary && intent.charged < intent.bytes {
+                    Self::remove_ordinary_pending(state, key.scope);
+                }
+            }
+        }
         self.charge_ready_recovery(state);
     }
 
-    /// Convert the oldest affordable intents into charged credits. A caller
-    /// need not still be polling for the queue to advance: any refill pump
-    /// can escrow its bytes, after which later intents may progress. Removing
-    /// an abandoned charged credit never refunds bytes.
+    fn add_ordinary_pending(state: &mut State, scope: [u8; 32]) {
+        let count = state.ordinary_scope_counts.entry(scope).or_default();
+        if *count == 0 {
+            state.ordinary_scopes.push_back(scope);
+        }
+        *count = count.saturating_add(1);
+    }
+
+    fn remove_ordinary_pending(state: &mut State, scope: [u8; 32]) {
+        let remove_scope = if let Some(count) = state.ordinary_scope_counts.get_mut(&scope) {
+            *count = count.saturating_sub(1);
+            *count == 0
+        } else {
+            false
+        };
+        if remove_scope {
+            state.ordinary_scope_counts.remove(&scope);
+            state
+                .ordinary_scopes
+                .retain(|candidate| *candidate != scope);
+        }
+    }
+
+    fn advance_recovery_slot(state: &mut State) {
+        state.recovery_slot = (state.recovery_slot + 1) % RECOVERY_TOTAL_SLOTS;
+        state.recovery_slot_remaining = state.recovery_quantum;
+    }
+
+    /// Escrow recovery bytes in persistent 7:1 critical/ordinary byte slots.
+    /// Idle-class slots are donated immediately and never accrue future credit.
     fn charge_ready_recovery(&self, state: &mut State) {
-        loop {
+        while state.tokens > 0 {
+            let has_critical = state.intents.values().any(|intent| {
+                intent.class == RecoveryClass::CriticalEager && intent.charged < intent.bytes
+            });
+            let has_ordinary = !state.ordinary_scopes.is_empty();
+            let class = match (has_critical, has_ordinary) {
+                (false, false) => break,
+                (true, false) => RecoveryClass::CriticalEager,
+                (false, true) => RecoveryClass::Ordinary,
+                (true, true) if state.recovery_slot < RECOVERY_CRITICAL_SLOTS => {
+                    RecoveryClass::CriticalEager
+                }
+                (true, true) => RecoveryClass::Ordinary,
+            };
+            let ordinary_scope = (class == RecoveryClass::Ordinary)
+                .then(|| state.ordinary_scopes.front().copied())
+                .flatten();
             let head = state
                 .intents
                 .iter()
-                .filter(|(_, intent)| intent.charged < intent.bytes)
-                .min_by_key(|(_, intent)| {
-                    (intent.class != RecoveryClass::CriticalEager, intent.order)
+                .filter(|(key, intent)| {
+                    intent.class == class
+                        && intent.charged < intent.bytes
+                        && ordinary_scope.is_none_or(|scope| key.scope == scope)
                 })
+                .min_by_key(|(_, intent)| intent.order)
                 .map(|(key, intent)| (*key, intent.bytes - intent.charged));
-            let Some((key, delta)) = head else { break };
-            if state.tokens < delta {
+            let Some((key, remaining)) = head else {
+                if class == RecoveryClass::Ordinary {
+                    if let Some(scope) = ordinary_scope {
+                        state.ordinary_scope_counts.remove(&scope);
+                        state.ordinary_scopes.pop_front();
+                    }
+                    continue;
+                }
                 break;
+            };
+            let delta = remaining
+                .min(state.tokens)
+                .min(state.recovery_slot_remaining);
+            if delta == 0 {
+                Self::advance_recovery_slot(state);
+                continue;
             }
             state.tokens -= delta;
+            state.recovery_slot_remaining -= delta;
             self.counters
                 .charged_bytes
                 .fetch_add(delta, Ordering::Relaxed);
             if let Some(intent) = state.intents.get_mut(&key) {
                 intent.charged = intent.charged.saturating_add(delta);
+            }
+            if class == RecoveryClass::Ordinary && delta == remaining {
+                Self::remove_ordinary_pending(state, key.scope);
+            }
+            let scope_empty = ordinary_scope
+                .is_some_and(|scope| !state.ordinary_scope_counts.contains_key(&scope));
+            if state.recovery_slot_remaining == 0 {
+                if class == RecoveryClass::Ordinary && !scope_empty {
+                    if let Some(scope) = state.ordinary_scopes.pop_front() {
+                        state.ordinary_scopes.push_back(scope);
+                    }
+                }
+                Self::advance_recovery_slot(state);
             }
         }
     }
@@ -427,7 +531,7 @@ impl LeafEgressLimiter {
             .intents
             .values()
             .filter(|intent| intent.charged < intent.bytes)
-            .map(|intent| intent.bytes)
+            .map(|intent| intent.bytes - intent.charged)
             .max()
             .unwrap_or(fixed_reserve)
             .max(fixed_reserve);
@@ -651,6 +755,12 @@ impl LeafEgressLimiter {
                         self.counters.queue_overflow.fetch_add(1, Ordering::Relaxed);
                         return Err(ReserveError::IntentLimit);
                     }
+                    let was_pending_ordinary = state.intents.get(&key).is_some_and(|intent| {
+                        intent.class == RecoveryClass::Ordinary && intent.charged < intent.bytes
+                    });
+                    if was_pending_ordinary {
+                        Self::remove_ordinary_pending(&mut state, key.scope);
+                    }
                     if let Some(intent) = state.intents.get_mut(&key) {
                         intent.class = RecoveryClass::CriticalEager;
                     }
@@ -663,9 +773,12 @@ impl LeafEgressLimiter {
             {
                 return Err(ReserveError::Oversized);
             }
+            if let Some(intent) = state.intents.get_mut(&key) {
+                intent.last_observed = now;
+            }
         } else {
             // A changed payload for the same peer/frame family replaces the
-            // prior family member. Preserve its queue position, age, and any
+            // prior family member. Preserve its queue position, lease, and any
             // escrowed credit so periodic digest churn cannot repeatedly burn
             // a freshly charged intent and starve the family indefinitely.
             // Excess credit above the new size is abandoned, never refunded.
@@ -674,19 +787,27 @@ impl LeafEgressLimiter {
                 .iter()
                 .find(|(candidate, _)| candidate.family == key.family)
                 .map(|(candidate, intent)| (*candidate, *intent));
-            let (order, created, credit) = match inherited {
+            let (order, last_observed, credit, preserved_scope_position) = match inherited {
                 Some((previous_key, previous)) => {
                     state.intents.remove(&previous_key);
-                    (
-                        previous.order,
-                        previous.created,
-                        previous.charged.min(bytes),
-                    )
+                    let credit = previous.charged.min(bytes);
+                    let preserve_scope_position = previous.class == RecoveryClass::Ordinary
+                        && class == RecoveryClass::Ordinary
+                        && previous_key.scope == key.scope
+                        && previous.charged < previous.bytes
+                        && credit < bytes;
+                    if previous.class == RecoveryClass::Ordinary
+                        && previous.charged < previous.bytes
+                        && !preserve_scope_position
+                    {
+                        Self::remove_ordinary_pending(&mut state, previous_key.scope);
+                    }
+                    (previous.order, now, credit, preserve_scope_position)
                 }
                 None => {
                     let order = state.next_order;
                     state.next_order = state.next_order.wrapping_add(1);
-                    (order, now, 0)
+                    (order, now, 0, false)
                 }
             };
             let class_count = state
@@ -706,12 +827,15 @@ impl LeafEgressLimiter {
                 key,
                 Intent {
                     bytes,
-                    created,
+                    last_observed,
                     order,
                     charged: credit,
                     class,
                 },
             );
+            if class == RecoveryClass::Ordinary && credit < bytes && !preserved_scope_position {
+                Self::add_ordinary_pending(&mut state, key.scope);
+            }
             self.counters
                 .demanded_bytes
                 .fetch_add(bytes, Ordering::Relaxed);
@@ -731,7 +855,11 @@ impl LeafEgressLimiter {
     fn cancel_intent(&self, key: RecoveryIntentKey, generation: u64) {
         let mut state = self.lock_state();
         if state.generation == generation {
-            state.intents.remove(&key);
+            if let Some(intent) = state.intents.remove(&key) {
+                if intent.class == RecoveryClass::Ordinary && intent.charged < intent.bytes {
+                    Self::remove_ordinary_pending(&mut state, key.scope);
+                }
+            }
         }
     }
 
@@ -810,7 +938,7 @@ impl LeafEgressLimiter {
         self.lock_state()
             .intents
             .get(&key)
-            .map(|intent| (intent.bytes, intent.created))
+            .map(|intent| (intent.bytes, intent.last_observed))
     }
 
     #[cfg(test)]
@@ -857,12 +985,17 @@ impl Drop for WaiterPermit {
 }
 
 #[cfg(test)]
+#[path = "egress_fairness_tests.rs"]
+mod egress_fairness_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn key(seed: u8) -> RecoveryIntentKey {
         RecoveryIntentKey {
             peer: [seed; 32],
+            scope: [0; 32],
             family: [seed; 32],
             operation: [seed; 32],
         }
@@ -874,6 +1007,7 @@ mod tests {
         operation[..bytes.len()].copy_from_slice(&bytes);
         RecoveryIntentKey {
             peer: operation,
+            scope: [0; 32],
             family: operation,
             operation,
         }
@@ -933,7 +1067,7 @@ mod tests {
         assert_eq!(
             limiter.try_reserve_recovery_at_class(
                 critical_key,
-                1024,
+                896,
                 1,
                 now,
                 RecoveryClass::CriticalEager,
@@ -944,7 +1078,7 @@ mod tests {
         assert!(limiter
             .try_reserve_recovery_at_class(
                 critical_key,
-                1024,
+                896,
                 1,
                 now + Duration::from_secs(8),
                 RecoveryClass::CriticalEager,
@@ -1295,6 +1429,7 @@ mod tests {
     fn digest_key(operation: u8) -> RecoveryIntentKey {
         RecoveryIntentKey {
             peer: [7; 32],
+            scope: [7; 32],
             family: [7; 32],
             operation: [operation; 32],
         }

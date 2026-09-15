@@ -41,7 +41,9 @@ use saorsa_gossip_types::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1284,6 +1286,14 @@ enum PeerSendOutcome {
     /// concurrency policy deferred the work. Recovery callers must not mark
     /// cached data served on this outcome.
     Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FanoutPeerStage {
+    ByteRejected,
+    AdmissionDropped,
+    ClaimSkipped,
+    Attempted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5327,6 +5337,10 @@ impl ShardedTopicMap {
     }
 }
 
+/// Boxed Critical-fanout send future for one peer.
+type FanoutSendFuture<'a> =
+    Pin<Box<dyn Future<Output = (PeerId, (Result<PeerSendOutcome>, FanoutPeerStage))> + Send + 'a>>;
+
 /// Plumtree pub/sub implementation
 pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// Per-topic state — sharded (issue #27) to eliminate the single
@@ -6440,20 +6454,39 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
     ) -> Result<PeerSendOutcome> {
-        let operation_started = Instant::now();
+        self.send_to_peer_bounded_outcome_tracked(topic, peer, stream_type, bytes, op)
+            .await
+            .0
+    }
+
+    async fn send_to_peer_bounded_outcome_tracked(
+        &self,
+        topic: TopicId,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        bytes: Bytes,
+        op: &'static str,
+    ) -> (Result<PeerSendOutcome>, FanoutPeerStage) {
+        let operation_started = time::Instant::now();
         let operation_budget = self
             .peer_rtt_tracker
             .adaptive_timeout(&peer, PER_PEER_REPUBLISH_TIMEOUT);
+        let priority = self.admission.registry().priority_for(&topic);
         // Reserve serialized recovery/control bytes before touching admission
         // or transport permits. The digest coalesces retries of the same final
         // wire frame without retaining a second payload copy.
         let reservation = if self.egress_limiter.enabled() {
             let key = Self::recovery_intent_key(topic, peer, op, &bytes);
             let wait = operation_budget;
-            let reserve_result = self
-                .egress_limiter
-                .reserve_recovery(key, bytes.len(), wait, false)
-                .await;
+            let reserve_result = if priority == TopicPriority::Critical && op == "EAGER" {
+                self.egress_limiter
+                    .reserve_critical_eager(key, bytes.len(), wait)
+                    .await
+            } else {
+                self.egress_limiter
+                    .reserve_recovery(key, bytes.len(), wait, false)
+                    .await
+            };
             self.egress_limiter.record_purpose_demand(
                 topic.to_bytes(),
                 op,
@@ -6464,15 +6497,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 Ok(reservation) => Some(reservation),
                 Err(egress::ReserveError::Disabled) => None,
                 Err(egress::ReserveError::Deferred | egress::ReserveError::WaiterLimit) => {
-                    return Ok(PeerSendOutcome::Deferred);
+                    return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ByteRejected);
                 }
                 Err(
                     error @ (egress::ReserveError::Oversized | egress::ReserveError::IntentLimit),
                 ) => {
-                    return Err(anyhow!(error.to_string()));
+                    return (
+                        Err(anyhow!(error.to_string())),
+                        FanoutPeerStage::ByteRejected,
+                    );
                 }
                 Err(egress::ReserveError::Reconfigured) => {
-                    return Ok(PeerSendOutcome::Deferred);
+                    return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ByteRejected);
                 }
             }
         } else {
@@ -6492,7 +6528,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // disconnected target → benign `dropped_critical_no_target`,
         // cooling → `dropped_critical_cooling`, exhausted control
         // budget → the hard error.
-        let priority = self.admission.registry().priority_for(&topic);
         let health = peer_health_from_snapshot(self.peer_health_snapshot.as_ref(), &peer);
         // Normal: transport-connected overrides stale SWIM Suspect/Dead so
         // admission admits; Bulk/Critical and missing/absent snapshot keep
@@ -6512,7 +6547,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 reason = %reason,
                 "X0X-0074 admission dropped peer send"
             );
-            return Ok(PeerSendOutcome::Deferred);
+            return (
+                Ok(PeerSendOutcome::Deferred),
+                FanoutPeerStage::AdmissionDropped,
+            );
         }
 
         // Bulk-admitted means we incremented per-peer depth — release
@@ -6579,7 +6617,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
             drop(release_guard);
-            return Ok(PeerSendOutcome::Deferred);
+            return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ClaimSkipped);
         };
         let Some(permit) = claims.take_permits().into_iter().next() else {
             // Defensive: claim pushes attempt+permit together, so this is
@@ -6600,7 +6638,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 );
             }
             drop(release_guard);
-            return Ok(PeerSendOutcome::Deferred);
+            return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ClaimSkipped);
         };
 
         // x0x #380: outbound demand metering — this bounded path carries
@@ -6696,7 +6734,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         };
         drop(release_guard);
-        result
+        (result, FanoutPeerStage::Attempted)
     }
 
     async fn send_to_peer_bounded(
@@ -7214,6 +7252,97 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // are placed on the existing direct-IHAVE lazy recovery path.
         let candidates = peers.len();
         let mut reservations = HashMap::new();
+        let priority = self.admission.registry().priority_for(&topic);
+        if self.egress_limiter.enabled()
+            && priority == TopicPriority::Critical
+            && op == "EAGER"
+            && !detach_accounting
+        {
+            let mut tasks: Vec<FanoutSendFuture<'_>> = Vec::with_capacity(peers.len());
+            for peer in peers {
+                let frame = bytes.clone();
+                tasks.push(Box::pin(async move {
+                    let result = self
+                        .send_to_peer_bounded_outcome_tracked(topic, peer, stream_type, frame, op)
+                        .await;
+                    (peer, result)
+                }));
+            }
+            let mut attempted = Vec::new();
+            let mut succeeded = 0;
+            let mut deferred = Vec::new();
+            let mut byte_rejected = 0;
+            let mut admission_dropped = 0;
+            let mut claim_skipped = 0;
+            while !tasks.is_empty() {
+                let completed = std::future::poll_fn(|context| {
+                    tasks
+                        .iter_mut()
+                        .enumerate()
+                        .find_map(|(index, task)| match task.as_mut().poll(context) {
+                            std::task::Poll::Ready(result) => Some((index, result)),
+                            std::task::Poll::Pending => None,
+                        })
+                        .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+                })
+                .await;
+                let (index, result) = completed;
+                drop(tasks.swap_remove(index));
+                match result {
+                    (peer, (Ok(PeerSendOutcome::Sent { .. }), FanoutPeerStage::Attempted)) => {
+                        attempted.push(peer);
+                        succeeded += 1;
+                    }
+                    (
+                        peer,
+                        (
+                            Ok(PeerSendOutcome::NotConnected | PeerSendOutcome::TimedOut),
+                            FanoutPeerStage::Attempted,
+                        ),
+                    ) => {
+                        attempted.push(peer);
+                    }
+                    (peer, (_, FanoutPeerStage::ByteRejected)) => {
+                        byte_rejected += 1;
+                        deferred.push(peer);
+                    }
+                    (peer, (_, FanoutPeerStage::AdmissionDropped)) => {
+                        admission_dropped += 1;
+                        deferred.push(peer);
+                    }
+                    (peer, (_, FanoutPeerStage::ClaimSkipped)) => {
+                        claim_skipped += 1;
+                        deferred.push(peer);
+                    }
+                    (peer, (_, FanoutPeerStage::Attempted)) => {
+                        attempted.push(peer);
+                    }
+                }
+            }
+            if !deferred.is_empty() {
+                if let Ok((message, _)) = postcard::take_from_bytes::<GossipMessage>(&bytes) {
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        state.queue_lazy_withheld(message.header.msg_id, &deferred);
+                        self.stage_stats
+                            .record_lazy_ihave_withheld_peers(deferred.len());
+                    }
+                }
+            }
+            let attempted_count = attempted.len();
+            return (
+                Duration::ZERO,
+                FanoutCounts {
+                    candidates,
+                    byte_rejected,
+                    admission_dropped,
+                    claim_skipped,
+                    attempted: attempted_count,
+                    succeeded,
+                },
+                attempted,
+            );
+        }
         let peers = if self.egress_limiter.enabled() {
             let mut admitted = Vec::with_capacity(peers.len());
             let mut deferred = Vec::new();
@@ -7276,7 +7405,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // exactly once at the end of this function regardless of which
         // downstream path (no-claim, partial-claim, send completion)
         // the message took — the depth counter must never leak.
-        let priority = self.admission.registry().priority_for(&topic);
         let admitted = self
             .filter_peers_through_admission(&topic, peers, priority, op)
             .await;
@@ -10536,6 +10664,14 @@ mod tests {
         send_count: AtomicUsize,
     }
 
+    struct BlockingInFlightGuard<'a>(&'a AtomicUsize);
+
+    impl Drop for BlockingInFlightGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     impl BlockingTransport {
         fn new(local_peer: PeerId) -> (Arc<Self>, mpsc::UnboundedReceiver<SendRecord>) {
             let (started_tx, started_rx) = mpsc::unbounded_channel();
@@ -11038,6 +11174,7 @@ mod tests {
         ) -> Result<()> {
             self.send_count.fetch_add(1, Ordering::SeqCst);
             let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _in_flight = BlockingInFlightGuard(&self.in_flight);
             self.max_in_flight.fetch_max(current, Ordering::SeqCst);
             let _ = self.started_tx.send(SendRecord {
                 peer,
@@ -11053,7 +11190,6 @@ mod tests {
                 .await
                 .expect("semaphore should stay open");
             permit.forget();
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -11904,6 +12040,317 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn critical_eager_progresses_ahead_of_ordinary_recovery_backlog() {
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x65; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(target);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 128 * 1024,
+            burst_bytes: 4 * 1024 * 1024,
+            max_serialized_frame_bytes: 4 * 1024 * 1024,
+        })));
+        let _drain = pubsub
+            .egress_limiter
+            .try_reserve_data(
+                egress::RecoveryIntentKey {
+                    peer: [0x81; 32],
+                    family: [0x82; 32],
+                    operation: [0x83; 32],
+                },
+                3 * 1024 * 1024,
+                false,
+            )
+            .expect("setup drains data tokens while retaining recovery reserve");
+        assert!(pubsub
+            .egress_limiter
+            .try_reserve_recovery(
+                egress::RecoveryIntentKey {
+                    peer: [0x84; 32],
+                    family: [0x85; 32],
+                    operation: [0x86; 32],
+                },
+                1024 * 1024,
+            )
+            .is_ok());
+        for index in 0_u16..300 {
+            let mut identity = [0_u8; 32];
+            identity[..2].copy_from_slice(&index.to_le_bytes());
+            let key = egress::RecoveryIntentKey {
+                peer: identity,
+                family: identity,
+                operation: identity,
+            };
+            assert_eq!(
+                pubsub.egress_limiter.try_reserve_recovery(key, 1024 * 1024),
+                Err(egress::ReserveError::Deferred)
+            );
+        }
+        pubsub
+            .egress_limiter
+            .refill_after_for_test(Duration::from_secs(1));
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from(vec![7; 11 * 1024]))
+            .await
+            .expect("Critical EAGER publish remains bounded and succeeds");
+
+        assert_eq!(counts.candidates, 1);
+        assert_eq!(counts.attempted, 1);
+        assert_eq!(counts.succeeded, 1);
+        assert_eq!(transport.send_count_to(target), 1);
+        assert_eq!(
+            pubsub.egress_limiter.snapshot().pending_recovery_intents,
+            300
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_eager_ready_peer_sends_while_other_peer_gate_is_held() {
+        let local = test_peer_id(1);
+        let ready = test_peer_id(2);
+        let stalled = test_peer_id(3);
+        let transport = RecordingTransport::new(local);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x67; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .extend([ready, stalled]);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([ready, stalled])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1024 * 1024,
+            burst_bytes: 4 * 1024 * 1024,
+            max_serialized_frame_bytes: 4 * 1024 * 1024,
+        })));
+        let mut held = pubsub
+            .outbound_budgets
+            .try_acquire(
+                stalled,
+                OutboundSendClass::Data,
+                TopicPriority::Critical,
+                Instant::now(),
+            )
+            .expect("hold stalled peer gate");
+        assert!(held.engage_critical_gate(Duration::from_secs(1)).await);
+        let publishing = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                pubsub
+                    .publish_local_with_fanout(topic, Bytes::from_static(b"identity-sized"))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transport.send_count_to(ready) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ready peer sends without waiting for stalled peer");
+        assert_eq!(transport.send_count_to(stalled), 0);
+        drop(held);
+        let counts = tokio::time::timeout(Duration::from_secs(1), publishing)
+            .await
+            .expect("publish completes after gate release")
+            .expect("publish task joins")
+            .expect("publish succeeds");
+        assert_eq!(
+            (counts.candidates, counts.attempted, counts.succeeded),
+            (2, 2, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_critical_publish_cancels_owned_send_and_intent() {
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let (transport, mut started) = BlockingTransport::new(local);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x68; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        pubsub
+            .topics
+            .write_topic(&topic)
+            .await
+            .entry(topic)
+            .or_insert_with(TopicState::new)
+            .eager_peers
+            .insert(target);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1024 * 1024,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+        })));
+        let publish = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                pubsub
+                    .publish_local_with_fanout(topic, Bytes::from_static(b"cancel-owned"))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("send enters")
+            .expect("started record");
+        publish.abort();
+        let _ = publish.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transport.in_flight.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned send is cancelled");
+        assert_eq!(pubsub.egress_limiter.snapshot().pending_recovery_intents, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn critical_eager_reservation_and_send_share_one_deadline() {
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let (transport, mut started) = BlockingTransport::new(local);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x69; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        pubsub
+            .topics
+            .write_topic(&topic)
+            .await
+            .entry(topic)
+            .or_insert_with(TopicState::new)
+            .eager_peers
+            .insert(target);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 8192,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+        })));
+        let _drain = pubsub
+            .egress_limiter
+            .try_reserve_data(
+                egress::RecoveryIntentKey {
+                    peer: [0x91; 32],
+                    family: [0x92; 32],
+                    operation: [0x93; 32],
+                },
+                6144,
+                false,
+            )
+            .expect("drain leaves only the recovery floor");
+        let original_deadline = tokio::time::Instant::now() + PER_PEER_REPUBLISH_TIMEOUT;
+        let publishing = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                pubsub
+                    .publish_local_with_fanout(topic, Bytes::from_static(b"deadline"))
+                    .await
+            })
+        };
+        for _ in 0..100 {
+            if pubsub.egress_limiter.snapshot().pending_recovery_intents == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(pubsub.egress_limiter.snapshot().pending_recovery_intents, 1);
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        pubsub
+            .egress_limiter
+            .refill_after_for_test(Duration::from_secs(1));
+        tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("reservation completes and send enters")
+            .expect("started record");
+        let before_deadline = original_deadline - Duration::from_millis(10);
+        let now = tokio::time::Instant::now();
+        if before_deadline > now {
+            tokio::time::advance(before_deadline.duration_since(now)).await;
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            !publishing.is_finished(),
+            "remaining deadline is not shorter than one second"
+        );
+        let counts =
+            tokio::time::timeout_at(original_deadline + Duration::from_millis(50), publishing)
+                .await
+                .expect("publish completes at its original absolute deadline")
+                .expect("publish task joins")
+                .expect("transport timeout keeps publish result typed");
+        assert_eq!((counts.attempted, counts.succeeded), (1, 0));
+        assert_eq!(transport.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn fanout_stage_counts_admission_drop_lands_in_its_own_bucket() {
         // Suspect health with no connected snapshot overrides nothing:
         // peer admission drops the candidate after byte admission.
@@ -11993,6 +12440,123 @@ mod tests {
         assert_eq!(counts.attempted, 0);
         assert_eq!(transport.send_count_to(target), 0);
 
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn critical_fanout_stage_counts_admits_suspect_peer() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x66; 32]);
+        let target = test_peer_id(2);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1024 * 1024,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+        })));
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(target);
+        }
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Suspect)]),
+        );
+
+        // Critical bypasses the health admission gate; a connected Suspect
+        // peer must still receive control traffic. Normal coverage stays separate.
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"critical-admits-suspect"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 1);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 0);
+        assert_eq!(counts.claim_skipped, 0);
+        assert_eq!(counts.attempted, 1);
+        assert_eq!(counts.succeeded, 1);
+        assert_eq!(transport.send_count_to(target), 1);
+    }
+
+    #[tokio::test]
+    async fn critical_fanout_stage_counts_claim_queue_overflow() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x67; 32]);
+        let target = test_peer_id(2);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1024 * 1024,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+        })));
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(target);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        let held: Vec<_> = (0..OUTBOUND_CRITICAL_QUEUE_PER_PEER)
+            .map(|_| {
+                pubsub
+                    .outbound_budgets
+                    .try_acquire(
+                        target,
+                        OutboundSendClass::Data,
+                        TopicPriority::Critical,
+                        Instant::now(),
+                    )
+                    .expect("critical queue has its documented capacity")
+            })
+            .collect();
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"critical-claim-skip"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 1);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 0);
+        assert_eq!(counts.claim_skipped, 1);
+        assert_eq!(counts.attempted, 0);
+        assert_eq!(transport.send_count_to(target), 0);
         drop(held);
     }
 

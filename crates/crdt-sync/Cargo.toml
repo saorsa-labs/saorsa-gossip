@@ -23,6 +23,7 @@ saorsa-gossip-workspace-hack = { version = "0.1", path = "../../saorsa-gossip-wo
 proptest = { workspace = true }
 tokio = { workspace = true }
 postcard = { workspace = true }
+bincode = "1.3"
 
 [lints]
 workspace = true

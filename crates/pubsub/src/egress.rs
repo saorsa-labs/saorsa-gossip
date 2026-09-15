@@ -14,6 +14,11 @@ const RECOVERY_RESERVE_PERCENT: u64 = 25;
 const DEFAULT_MAX_WAITERS: usize = 256;
 const DEFAULT_MAX_WAITERS_PER_PEER: usize = 8;
 const DEFAULT_MAX_INTENTS: usize = 1024;
+const CRITICAL_MAX_WAITERS: usize = 16;
+const CRITICAL_MAX_INTENTS: usize = 64;
+const ORDINARY_MAX_WAITERS: usize = DEFAULT_MAX_WAITERS - CRITICAL_MAX_WAITERS;
+const ORDINARY_MAX_INTENTS: usize = DEFAULT_MAX_INTENTS - CRITICAL_MAX_INTENTS;
+const ORDINARY_MAX_WAITERS_PER_PEER: usize = DEFAULT_MAX_WAITERS_PER_PEER - 1;
 const MAX_PURPOSE_ROWS: usize = 1024;
 const RECOVERY_INTENT_MAX_AGE: Duration = Duration::from_secs(super::MAX_CACHE_AGE_SECS);
 
@@ -81,6 +86,13 @@ struct Intent {
     created: Instant,
     order: u64,
     charged: u64,
+    class: RecoveryClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryClass {
+    Ordinary,
+    CriticalEager,
 }
 
 #[derive(Debug)]
@@ -93,7 +105,7 @@ struct State {
     soft_remainder: u128,
     last_refill: Instant,
     intents: HashMap<RecoveryIntentKey, Intent>,
-    waiters_by_peer: HashMap<[u8; 32], usize>,
+    waiters_by_peer: HashMap<[u8; 32], (usize, usize)>,
     next_order: u64,
 }
 
@@ -182,7 +194,8 @@ impl ByteReservation {
 #[derive(Debug)]
 pub(crate) struct LeafEgressLimiter {
     state: Mutex<State>,
-    waiters: Arc<Semaphore>,
+    ordinary_waiters: Arc<Semaphore>,
+    critical_waiters: Arc<Semaphore>,
     counters: EgressCounters,
     purpose_counters: Mutex<HashMap<([u8; 32], &'static str), PurposeCounters>>,
 }
@@ -202,7 +215,8 @@ impl LeafEgressLimiter {
                 waiters_by_peer: HashMap::new(),
                 next_order: 0,
             }),
-            waiters: Arc::new(Semaphore::new(DEFAULT_MAX_WAITERS)),
+            ordinary_waiters: Arc::new(Semaphore::new(ORDINARY_MAX_WAITERS)),
+            critical_waiters: Arc::new(Semaphore::new(CRITICAL_MAX_WAITERS)),
             counters: EgressCounters::default(),
             purpose_counters: Mutex::new(HashMap::new()),
         }
@@ -358,7 +372,9 @@ impl LeafEgressLimiter {
                 .intents
                 .iter()
                 .filter(|(_, intent)| intent.charged < intent.bytes)
-                .min_by_key(|(_, intent)| intent.order)
+                .min_by_key(|(_, intent)| {
+                    (intent.class != RecoveryClass::CriticalEager, intent.order)
+                })
                 .map(|(key, intent)| (*key, intent.bytes - intent.charged));
             let Some((key, delta)) = head else { break };
             if state.tokens < delta {
@@ -380,8 +396,18 @@ impl LeafEgressLimiter {
         frame_bytes: usize,
         relayed: bool,
     ) -> Result<ByteReservation, ReserveError> {
+        self.try_reserve_data_at(key, frame_bytes, relayed, Instant::now())
+    }
+
+    fn try_reserve_data_at(
+        &self,
+        key: RecoveryIntentKey,
+        frame_bytes: usize,
+        relayed: bool,
+        now: Instant,
+    ) -> Result<ByteReservation, ReserveError> {
         let mut state = self.lock_state();
-        self.refill(&mut state, Instant::now());
+        self.refill(&mut state, now);
         let Some(config) = state.config else {
             return Err(ReserveError::Disabled);
         };
@@ -424,21 +450,41 @@ impl LeafEgressLimiter {
         })
     }
 
-    fn waiter_permit(self: &Arc<Self>, peer: [u8; 32]) -> Result<WaiterPermit, ReserveError> {
-        let global = Arc::clone(&self.waiters)
+    fn waiter_permit(
+        self: &Arc<Self>,
+        peer: [u8; 32],
+        class: RecoveryClass,
+    ) -> Result<WaiterPermit, ReserveError> {
+        let semaphore = match class {
+            RecoveryClass::Ordinary => &self.ordinary_waiters,
+            RecoveryClass::CriticalEager => &self.critical_waiters,
+        };
+        let global = Arc::clone(semaphore)
             .try_acquire_owned()
             .map_err(|_| ReserveError::WaiterLimit)?;
         {
             let mut state = self.lock_state();
-            let count = state.waiters_by_peer.entry(peer).or_default();
-            if *count >= DEFAULT_MAX_WAITERS_PER_PEER {
+            let counts = state.waiters_by_peer.entry(peer).or_default();
+            let class_count = match class {
+                RecoveryClass::Ordinary => counts.0,
+                RecoveryClass::CriticalEager => counts.1,
+            };
+            let class_limit = match class {
+                RecoveryClass::Ordinary => ORDINARY_MAX_WAITERS_PER_PEER,
+                RecoveryClass::CriticalEager => 1,
+            };
+            if class_count >= class_limit || counts.0 + counts.1 >= DEFAULT_MAX_WAITERS_PER_PEER {
                 return Err(ReserveError::WaiterLimit);
             }
-            *count += 1;
+            match class {
+                RecoveryClass::Ordinary => counts.0 += 1,
+                RecoveryClass::CriticalEager => counts.1 += 1,
+            }
         }
         Ok(WaiterPermit {
             limiter: Arc::clone(self),
             peer,
+            class,
             _global: global,
         })
     }
@@ -453,14 +499,57 @@ impl LeafEgressLimiter {
         if !self.enabled() {
             return Err(ReserveError::Disabled);
         }
-        let _waiter = self.waiter_permit(key.peer)?;
+        self.reserve_recovery_class(
+            key,
+            frame_bytes,
+            deadline,
+            keep_intent_on_timeout,
+            RecoveryClass::Ordinary,
+        )
+        .await
+    }
+
+    pub(crate) async fn reserve_critical_eager(
+        self: &Arc<Self>,
+        key: RecoveryIntentKey,
+        frame_bytes: usize,
+        deadline: Duration,
+    ) -> Result<ByteReservation, ReserveError> {
+        self.reserve_recovery_class(
+            key,
+            frame_bytes,
+            deadline,
+            false,
+            RecoveryClass::CriticalEager,
+        )
+        .await
+    }
+
+    async fn reserve_recovery_class(
+        self: &Arc<Self>,
+        key: RecoveryIntentKey,
+        frame_bytes: usize,
+        deadline: Duration,
+        keep_intent_on_timeout: bool,
+        class: RecoveryClass,
+    ) -> Result<ByteReservation, ReserveError> {
+        if !self.enabled() {
+            return Err(ReserveError::Disabled);
+        }
+        let _waiter = self.waiter_permit(key.peer, class)?;
         self.counters
             .recovery_waited
             .fetch_add(1, Ordering::Relaxed);
         let generation = self.lock_state().generation;
         let attempt = async {
             loop {
-                match self.try_reserve_recovery_at(key, frame_bytes, generation, Instant::now()) {
+                match self.try_reserve_recovery_at_class(
+                    key,
+                    frame_bytes,
+                    generation,
+                    Instant::now(),
+                    class,
+                ) {
                     Ok(reservation) => return Ok(reservation),
                     Err(ReserveError::Deferred) => {
                         tokio::time::sleep(Duration::from_millis(10)).await
@@ -517,6 +606,23 @@ impl LeafEgressLimiter {
         generation: u64,
         now: Instant,
     ) -> Result<ByteReservation, ReserveError> {
+        self.try_reserve_recovery_at_class(
+            key,
+            frame_bytes,
+            generation,
+            now,
+            RecoveryClass::Ordinary,
+        )
+    }
+
+    fn try_reserve_recovery_at_class(
+        &self,
+        key: RecoveryIntentKey,
+        frame_bytes: usize,
+        generation: u64,
+        now: Instant,
+        class: RecoveryClass,
+    ) -> Result<ByteReservation, ReserveError> {
         let mut state = self.lock_state();
         self.refill(&mut state, now);
         if state.generation != generation {
@@ -530,6 +636,26 @@ impl LeafEgressLimiter {
         }
         let bytes = u64::try_from(frame_bytes).map_err(|_| ReserveError::Oversized)?;
         if state.intents.contains_key(&key) {
+            if class == RecoveryClass::CriticalEager {
+                let critical_count = state
+                    .intents
+                    .values()
+                    .filter(|intent| intent.class == RecoveryClass::CriticalEager)
+                    .count();
+                if state
+                    .intents
+                    .get(&key)
+                    .is_some_and(|intent| intent.class != RecoveryClass::CriticalEager)
+                {
+                    if critical_count >= CRITICAL_MAX_INTENTS {
+                        self.counters.queue_overflow.fetch_add(1, Ordering::Relaxed);
+                        return Err(ReserveError::IntentLimit);
+                    }
+                    if let Some(intent) = state.intents.get_mut(&key) {
+                        intent.class = RecoveryClass::CriticalEager;
+                    }
+                }
+            }
             if state
                 .intents
                 .get(&key)
@@ -563,7 +689,16 @@ impl LeafEgressLimiter {
                     (order, now, 0)
                 }
             };
-            if state.intents.len() >= DEFAULT_MAX_INTENTS {
+            let class_count = state
+                .intents
+                .values()
+                .filter(|intent| intent.class == class)
+                .count();
+            let class_limit = match class {
+                RecoveryClass::Ordinary => ORDINARY_MAX_INTENTS,
+                RecoveryClass::CriticalEager => CRITICAL_MAX_INTENTS,
+            };
+            if state.intents.len() >= DEFAULT_MAX_INTENTS || class_count >= class_limit {
                 self.counters.queue_overflow.fetch_add(1, Ordering::Relaxed);
                 return Err(ReserveError::IntentLimit);
             }
@@ -574,6 +709,7 @@ impl LeafEgressLimiter {
                     created,
                     order,
                     charged: credit,
+                    class,
                 },
             );
             self.counters
@@ -701,15 +837,19 @@ impl Drop for IntentGuard {
 struct WaiterPermit {
     limiter: Arc<LeafEgressLimiter>,
     peer: [u8; 32],
+    class: RecoveryClass,
     _global: OwnedSemaphorePermit,
 }
 
 impl Drop for WaiterPermit {
     fn drop(&mut self) {
         let mut state = self.limiter.lock_state();
-        if let Some(count) = state.waiters_by_peer.get_mut(&self.peer) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
+        if let Some(counts) = state.waiters_by_peer.get_mut(&self.peer) {
+            match self.class {
+                RecoveryClass::Ordinary => counts.0 = counts.0.saturating_sub(1),
+                RecoveryClass::CriticalEager => counts.1 = counts.1.saturating_sub(1),
+            }
+            if counts.0 + counts.1 == 0 {
                 state.waiters_by_peer.remove(&self.peer);
             }
         }
@@ -726,6 +866,131 @@ mod tests {
             family: [seed; 32],
             operation: [seed; 32],
         }
+    }
+
+    fn indexed_key(index: usize) -> RecoveryIntentKey {
+        let bytes = index.to_le_bytes();
+        let mut operation = [0; 32];
+        operation[..bytes.len()].copy_from_slice(&bytes);
+        RecoveryIntentKey {
+            peer: operation,
+            family: operation,
+            operation,
+        }
+    }
+
+    #[test]
+    fn ordinary_metadata_saturation_preserves_critical_capacity() -> Result<(), ReserveError> {
+        let limiter = limiter();
+        let ordinary_waiters: Vec<_> = (0..ORDINARY_MAX_WAITERS)
+            .map(|index| limiter.waiter_permit(indexed_key(index).peer, RecoveryClass::Ordinary))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(matches!(
+            limiter.waiter_permit([250; 32], RecoveryClass::Ordinary),
+            Err(ReserveError::WaiterLimit)
+        ));
+        let critical_waiters: Vec<_> = (0..CRITICAL_MAX_WAITERS)
+            .map(|index| {
+                limiter.waiter_permit(indexed_key(1000 + index).peer, RecoveryClass::CriticalEager)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(limiter.ordinary_waiters.available_permits(), 0);
+        assert_eq!(limiter.critical_waiters.available_permits(), 0);
+        assert!(matches!(
+            limiter.waiter_permit([251; 32], RecoveryClass::CriticalEager),
+            Err(ReserveError::WaiterLimit)
+        ));
+        drop(critical_waiters);
+        drop(ordinary_waiters);
+
+        let peer = [252; 32];
+        let per_peer: Vec<_> = (0..ORDINARY_MAX_WAITERS_PER_PEER)
+            .map(|_| limiter.waiter_permit(peer, RecoveryClass::Ordinary))
+            .collect::<Result<Vec<_>, _>>()?;
+        let critical = limiter.waiter_permit(peer, RecoveryClass::CriticalEager)?;
+        assert!(matches!(
+            limiter.waiter_permit(peer, RecoveryClass::Ordinary),
+            Err(ReserveError::WaiterLimit)
+        ));
+        assert!(matches!(
+            limiter.waiter_permit(peer, RecoveryClass::CriticalEager),
+            Err(ReserveError::WaiterLimit)
+        ));
+        drop(critical);
+        drop(per_peer);
+
+        assert!(limiter.try_reserve_data(key(1), 3072, false).is_ok());
+        assert!(limiter.try_reserve_recovery(key(2), 1024).is_ok());
+        let now = Instant::now();
+        for index in 0..ORDINARY_MAX_INTENTS {
+            assert_eq!(
+                limiter.try_reserve_recovery_at(indexed_key(index + 10), 4096, 1, now),
+                Err(ReserveError::Deferred)
+            );
+        }
+        assert_eq!(limiter.lock_state().intents.len(), ORDINARY_MAX_INTENTS);
+        let critical_key = indexed_key(ORDINARY_MAX_INTENTS + 20);
+        assert_eq!(
+            limiter.try_reserve_recovery_at_class(
+                critical_key,
+                1024,
+                1,
+                now,
+                RecoveryClass::CriticalEager,
+            ),
+            Err(ReserveError::Deferred)
+        );
+        assert_eq!(limiter.lock_state().intents.len(), ORDINARY_MAX_INTENTS + 1);
+        assert!(limiter
+            .try_reserve_recovery_at_class(
+                critical_key,
+                1024,
+                1,
+                now + Duration::from_secs(8),
+                RecoveryClass::CriticalEager,
+            )
+            .is_ok());
+        assert_eq!(limiter.lock_state().intents.len(), ORDINARY_MAX_INTENTS);
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_intent_promotion_respects_critical_intent_cap() {
+        let limiter = limiter();
+        assert!(limiter.try_reserve_data(key(1), 3072, false).is_ok());
+        assert!(limiter.try_reserve_recovery(key(2), 1024).is_ok());
+        let now = Instant::now();
+        let ordinary = indexed_key(5000);
+        assert_eq!(
+            limiter.try_reserve_recovery_at(ordinary, 4096, 1, now),
+            Err(ReserveError::Deferred)
+        );
+        for index in 0..CRITICAL_MAX_INTENTS {
+            assert_eq!(
+                limiter.try_reserve_recovery_at_class(
+                    indexed_key(6000 + index),
+                    4096,
+                    1,
+                    now,
+                    RecoveryClass::CriticalEager,
+                ),
+                Err(ReserveError::Deferred)
+            );
+        }
+        assert_eq!(
+            limiter.try_reserve_recovery_at_class(
+                ordinary,
+                4096,
+                1,
+                now,
+                RecoveryClass::CriticalEager,
+            ),
+            Err(ReserveError::IntentLimit)
+        );
+        assert_eq!(
+            limiter.lock_state().intents.get(&ordinary).map(|i| i.class),
+            Some(RecoveryClass::Ordinary)
+        );
     }
 
     fn limiter() -> Arc<LeafEgressLimiter> {
@@ -779,6 +1044,56 @@ mod tests {
         assert!(limiter.try_reserve_recovery(recovery, 1536).is_ok());
     }
 
+    #[test]
+    fn continuous_data_cannot_spend_critical_escrow() {
+        let limiter = limiter();
+        assert!(limiter.try_reserve_data(key(1), 3072, false).is_ok());
+        assert!(limiter.try_reserve_recovery(key(2), 1024).is_ok());
+        let critical = key(4);
+        let start = Instant::now();
+        assert_eq!(
+            limiter.try_reserve_recovery_at_class(
+                critical,
+                512,
+                1,
+                start,
+                RecoveryClass::CriticalEager,
+            ),
+            Err(ReserveError::Deferred)
+        );
+        for second in 1..4 {
+            assert_eq!(
+                limiter.try_reserve_data_at(
+                    indexed_key(8000 + second),
+                    1,
+                    false,
+                    start + Duration::from_secs(second as u64),
+                ),
+                Err(ReserveError::Deferred)
+            );
+            assert_eq!(
+                limiter.try_reserve_recovery_at_class(
+                    critical,
+                    512,
+                    1,
+                    start + Duration::from_secs(second as u64),
+                    RecoveryClass::CriticalEager,
+                ),
+                Err(ReserveError::Deferred)
+            );
+        }
+        assert!(limiter
+            .try_reserve_recovery_at_class(
+                critical,
+                512,
+                1,
+                start + Duration::from_secs(4),
+                RecoveryClass::CriticalEager,
+            )
+            .is_ok());
+        assert_eq!(limiter.snapshot().charged_bytes, 4096 + 512);
+    }
+
     #[tokio::test]
     async fn timeout_releases_waiter_and_owned_retry_reaches_32_second_eligibility(
     ) -> Result<(), &'static str> {
@@ -792,7 +1107,14 @@ mod tests {
                 .await,
             Err(ReserveError::Deferred)
         );
-        assert_eq!(limiter.waiters.available_permits(), DEFAULT_MAX_WAITERS);
+        assert_eq!(
+            limiter.ordinary_waiters.available_permits(),
+            ORDINARY_MAX_WAITERS
+        );
+        assert_eq!(
+            limiter.critical_waiters.available_permits(),
+            CRITICAL_MAX_WAITERS
+        );
         assert!(limiter.lock_state().waiters_by_peer.is_empty());
         let (_, created) = limiter.intent(recovery).ok_or("persistent intent")?;
         assert!(limiter
@@ -805,7 +1127,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborted_waiter_cancels_generation_owned_intent() {
+    async fn aborted_waiter_cancels_generation_owned_intent(
+    ) -> Result<(), tokio::time::error::Elapsed> {
         let limiter = limiter();
         assert!(limiter.try_reserve_data(key(1), 3072, false).is_ok());
         let recovery = key(8);
@@ -815,10 +1138,49 @@ mod tests {
                 .reserve_recovery(recovery, 4096, Duration::from_secs(30), false)
                 .await
         });
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while limiter.ordinary_waiters.available_permits() == ORDINARY_MAX_WAITERS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         task.abort();
         let _ = task.await;
         assert!(limiter.intent(recovery).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborted_critical_waiter_releases_reserved_metadata(
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        let limiter = limiter();
+        assert!(limiter.try_reserve_data(key(1), 3072, false).is_ok());
+        assert!(limiter.try_reserve_recovery(key(3), 1024).is_ok());
+        let recovery = key(9);
+        let task_limiter = Arc::clone(&limiter);
+        let task = tokio::spawn(async move {
+            task_limiter
+                .reserve_critical_eager(recovery, 4096, Duration::from_secs(30))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while limiter.critical_waiters.available_permits() == CRITICAL_MAX_WAITERS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            limiter.critical_waiters.available_permits(),
+            CRITICAL_MAX_WAITERS - 1
+        );
+        task.abort();
+        let _ = task.await;
+        assert!(limiter.intent(recovery).is_none());
+        assert_eq!(
+            limiter.critical_waiters.available_permits(),
+            CRITICAL_MAX_WAITERS
+        );
+        Ok(())
     }
 
     #[test]

@@ -5723,14 +5723,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let mut deferred = Vec::new();
         for peer in peers {
             let key = Self::recovery_intent_key(topic, peer, op, bytes);
+            // Protected: never consult the gate. `try_reserve_recovery`
+            // registers a persistent intent and escrows tokens, so calling it
+            // first and then ignoring the denial would leave residue that
+            // nothing cancels and that starves the data lane.
+            if !shed_eligible {
+                limiter.record_purpose_demand(topic.to_bytes(), op, bytes.len(), true);
+                admitted.push((peer, limiter.reserve_protected(key, bytes.len())));
+                continue;
+            }
             let result = limiter.try_reserve_recovery(key, bytes.len());
             limiter.record_purpose_demand(topic.to_bytes(), op, bytes.len(), result.is_ok());
             match result {
                 Ok(reservation) => admitted.push((peer, Some(reservation))),
-                Err(_) if !shed_eligible => {
-                    limiter.record_shed_suppressed();
-                    admitted.push((peer, None));
-                }
                 Err(egress::ReserveError::Deferred | egress::ReserveError::WaiterLimit) => {
                     deferred.push(peer);
                 }
@@ -6794,51 +6799,71 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Reserve serialized recovery/control bytes before touching admission
         // or transport permits. The digest coalesces retries of the same final
         // wire frame without retaining a second payload copy.
+        // #504: same opt-in gate as the fan-out path. Critical-class traffic is
+        // never byte-rejected here — under the previous code a Critical EAGER
+        // that outlasted its waiter deadline came back as `Deferred` and was
+        // dropped, which is exactly the hard error the priority class exists
+        // to prevent.
+        //
+        // The gate is consulted BEFORE reserving. A protected send must not
+        // enter the waiter loop at all: that loop polls to the caller deadline
+        // (~4 s) before returning `Deferred`, so checking afterwards would
+        // stall every protected send under a saturated budget and saturate the
+        // bounded waiter semaphores. It also must not register a recovery
+        // intent it would then never cancel.
+        let protected = !self.egress_limiter.enforcing() || priority == TopicPriority::Critical;
         let reservation = if self.egress_limiter.enabled() {
             let key = Self::recovery_intent_key(topic, peer, op, &bytes);
-            let wait = operation_budget;
-            let reserve_result = if priority == TopicPriority::Critical && op == "EAGER" {
+            if !self.egress_limiter.enforcing() {
+                // ObserveOnly: meters only. Do not enter the waiter loop — it
+                // polls to the caller deadline (~4 s) before reporting
+                // `Deferred`, so waiting here would stall every send under a
+                // saturated budget and exhaust the bounded waiter semaphores,
+                // and the registered intent would escrow tokens meanwhile.
                 self.egress_limiter
-                    .reserve_critical_eager(key, bytes.len(), wait)
-                    .await
+                    .record_purpose_demand(topic.to_bytes(), op, bytes.len(), true);
+                self.egress_limiter.reserve_protected(key, bytes.len())
             } else {
-                self.egress_limiter
-                    .reserve_recovery(key, bytes.len(), wait, false)
-                    .await
-            };
-            self.egress_limiter.record_purpose_demand(
-                topic.to_bytes(),
-                op,
-                bytes.len(),
-                reserve_result.is_ok(),
-            );
-            // #504: same opt-in gate as the fan-out path. Critical-class
-            // traffic is never byte-rejected here — under the previous code a
-            // Critical EAGER that outlasted its waiter deadline came back as
-            // `Deferred` and was dropped, which is exactly the hard error the
-            // priority class exists to prevent.
-            let shed_eligible =
-                self.egress_limiter.enforcing() && priority != TopicPriority::Critical;
-            match reserve_result {
-                Ok(reservation) => Some(reservation),
-                Err(egress::ReserveError::Disabled) => None,
-                Err(_) if !shed_eligible => {
-                    self.egress_limiter.record_shed_suppressed();
-                    None
-                }
-                Err(egress::ReserveError::Deferred | egress::ReserveError::WaiterLimit) => {
-                    return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ByteRejected);
-                }
-                Err(
-                    error @ (egress::ReserveError::Oversized | egress::ReserveError::IntentLimit),
-                ) => {
-                    return (
-                        Err(anyhow!(error.to_string())),
-                        FanoutPeerStage::ByteRejected,
-                    );
-                }
-                Err(egress::ReserveError::Reconfigured) => {
-                    return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ByteRejected);
+                let wait = operation_budget;
+                let reserve_result = if priority == TopicPriority::Critical && op == "EAGER" {
+                    self.egress_limiter
+                        .reserve_critical_eager(key, bytes.len(), wait)
+                        .await
+                } else {
+                    self.egress_limiter
+                        .reserve_recovery(key, bytes.len(), wait, false)
+                        .await
+                };
+                self.egress_limiter.record_purpose_demand(
+                    topic.to_bytes(),
+                    op,
+                    bytes.len(),
+                    reserve_result.is_ok(),
+                );
+                match reserve_result {
+                    Ok(reservation) => Some(reservation),
+                    Err(egress::ReserveError::Disabled) => None,
+                    // Protected under ShedNormal. Waiting is allowed here — it
+                    // shares the send deadline and preserves the critical
+                    // escrow fairness this stack was built around — but the
+                    // outcome may never be a drop. Charge the overrun and mint
+                    // a reservation rather than byte-rejecting the frame.
+                    Err(_) if protected => self.egress_limiter.reserve_protected(key, bytes.len()),
+                    Err(egress::ReserveError::Deferred | egress::ReserveError::WaiterLimit) => {
+                        return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ByteRejected);
+                    }
+                    Err(
+                        error @ (egress::ReserveError::Oversized
+                        | egress::ReserveError::IntentLimit),
+                    ) => {
+                        return (
+                            Err(anyhow!(error.to_string())),
+                            FanoutPeerStage::ByteRejected,
+                        );
+                    }
+                    Err(egress::ReserveError::Reconfigured) => {
+                        return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ByteRejected);
+                    }
                 }
             }
         } else {
@@ -7690,6 +7715,25 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let mut deferred = Vec::new();
             for peer in peers {
                 let key = Self::recovery_intent_key(topic, peer, op, &bytes);
+                // Protection is decided before reserving, not after a denial.
+                // A protected send must never consult the gate at all: it is
+                // charged, it is never denied, and it carries a real
+                // reservation so the transport fence admits it.
+                if !shed_eligible {
+                    if let Some(reservation) =
+                        self.egress_limiter.reserve_protected(key, bytes.len())
+                    {
+                        reservations.insert(peer, reservation);
+                    }
+                    self.egress_limiter.record_purpose_demand(
+                        topic.to_bytes(),
+                        op,
+                        bytes.len(),
+                        true,
+                    );
+                    admitted.push(peer);
+                    continue;
+                }
                 let reserve_result =
                     self.egress_limiter
                         .try_reserve_data(key, bytes.len(), detach_accounting);
@@ -7705,13 +7749,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         admitted.push(peer);
                     }
                     Err(egress::ReserveError::Disabled) => admitted.push(peer),
-                    // Policy-protected: the budget is exhausted but this
-                    // class of traffic is not shed. Send it and meter the
-                    // overrun so the pressure stays visible.
-                    Err(_) if !shed_eligible => {
-                        self.egress_limiter.record_shed_suppressed();
-                        admitted.push(peer);
-                    }
                     Err(egress::ReserveError::Deferred) => deferred.push(peer),
                     Err(egress::ReserveError::Oversized) => {
                         warn!(topic = %LogTopicId::from(topic), op, bytes = bytes.len(),
@@ -12818,7 +12855,12 @@ mod tests {
     async fn over_budget_pubsub(
         priority: TopicPriority,
         policy: BytePolicy,
-    ) -> (Arc<PlumtreePubSub<RecordingTransport>>, TopicId, PeerId) {
+    ) -> (
+        Arc<PlumtreePubSub<RecordingTransport>>,
+        Arc<RecordingTransport>,
+        TopicId,
+        PeerId,
+    ) {
         let peer_id = test_peer_id(1);
         let target = test_peer_id(2);
         let transport = RecordingTransport::new(peer_id);
@@ -12867,7 +12909,7 @@ mod tests {
                 .is_ok(),
             "setup must drain the data allowance"
         );
-        (pubsub, topic, target)
+        (pubsub, transport, topic, target)
     }
 
     async fn fanout_over_budget(
@@ -12889,6 +12931,20 @@ mod tests {
             .1
     }
 
+    /// The forwarded fan-out detaches accounting, so its send completes in a
+    /// spawned task and `succeeded` is not meaningful there. Delivery is
+    /// observed on the transport instead.
+    async fn wait_for_sent_frames(transport: &RecordingTransport, expected: usize) -> usize {
+        for _ in 0..200 {
+            let sent = transport.sent_frames().len();
+            if sent >= expected {
+                return sent;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        transport.sent_frames().len()
+    }
+
     /// WHY: a byte budget is an observation instrument until an operator says
     /// otherwise. The archived #504 stack enforced whenever
     /// `hard_bytes_per_second != 0`, which meant that merely *measuring*
@@ -12896,7 +12952,7 @@ mod tests {
     /// back, this fan-out is over budget and `byte_rejected` becomes 1.
     #[tokio::test]
     async fn observe_only_sheds_nothing_past_the_hard_threshold() {
-        let (pubsub, topic, target) =
+        let (pubsub, transport, topic, target) =
             over_budget_pubsub(TopicPriority::Normal, BytePolicy::ObserveOnly).await;
         assert!(
             pubsub.egress_limiter.enabled(),
@@ -12910,7 +12966,30 @@ mod tests {
             counts.byte_rejected, 0,
             "ObserveOnly must never deny a send, however far over budget"
         );
+        // Admission is not delivery. A protected peer admitted without a
+        // reservation is rejected by the transport fence and booked as a
+        // timeout, so the frame never reaches the wire — ObserveOnly would
+        // shed 100% of egress one stage later. Assert the frame was actually
+        // sent and that the fence recorded no violation.
+        assert_eq!(
+            counts.attempted, 1,
+            "the protected peer must reach the transport, not be dropped at the fence"
+        );
+        assert_eq!(
+            wait_for_sent_frames(&transport, 1).await,
+            1,
+            "the protected frame must reach the wire"
+        );
+        assert_eq!(transport.sent_frames()[0].0, target);
         let snapshot = pubsub.leaf_egress_snapshot();
+        assert_eq!(
+            snapshot.invariant_violations, 0,
+            "a protected send must carry a real reservation, not trip the fence"
+        );
+        assert!(
+            snapshot.charged_bytes >= 64 * 1024,
+            "a protected send is charged, so charged_bytes stays honest"
+        );
         assert!(
             snapshot.shed_suppressed >= 1,
             "the overrun must still be metered — an unobservable ObserveOnly \
@@ -12925,7 +13004,7 @@ mod tests {
     /// decline to carry on someone else's behalf.
     #[tokio::test]
     async fn shed_normal_never_drops_critical_or_local_origin_over_budget() {
-        let (critical, topic, target) =
+        let (critical, critical_transport, topic, target) =
             over_budget_pubsub(TopicPriority::Critical, BytePolicy::ShedNormal).await;
         assert!(critical.egress_limiter.enforcing());
         let forwarded_critical = fanout_over_budget(&critical, topic, target, true).await;
@@ -12933,8 +13012,22 @@ mod tests {
             forwarded_critical.byte_rejected, 0,
             "Critical-class traffic must survive an exhausted byte budget"
         );
+        assert_eq!(
+            forwarded_critical.attempted, 1,
+            "surviving the gate is not enough — the Critical frame must reach transport"
+        );
+        assert_eq!(
+            wait_for_sent_frames(&critical_transport, 1).await,
+            1,
+            "the Critical frame must be delivered"
+        );
+        assert_eq!(
+            critical.leaf_egress_snapshot().invariant_violations,
+            0,
+            "a protected Critical send must not trip the transport fence"
+        );
 
-        let (normal, topic, target) =
+        let (normal, normal_transport, topic, target) =
             over_budget_pubsub(TopicPriority::Normal, BytePolicy::ShedNormal).await;
         // forwarded = false is the publish path: this node authored the frame.
         let local_origin = fanout_over_budget(&normal, topic, target, false).await;
@@ -12942,8 +13035,19 @@ mod tests {
             local_origin.byte_rejected, 0,
             "a local-origin publish is not relay load and must not be shed"
         );
+        assert_eq!(
+            local_origin.succeeded, 1,
+            "the local-origin frame must be delivered, not lost at the fence"
+        );
+        assert_eq!(
+            wait_for_sent_frames(&normal_transport, 1).await,
+            1,
+            "the local-origin frame must reach the wire"
+        );
+        let snapshot = normal.leaf_egress_snapshot();
+        assert_eq!(snapshot.invariant_violations, 0);
         assert!(
-            normal.leaf_egress_snapshot().shed_suppressed >= 1,
+            snapshot.shed_suppressed >= 1,
             "protected-but-over-budget sends must be attributable in diagnostics"
         );
     }
@@ -12955,10 +13059,15 @@ mod tests {
     #[tokio::test]
     async fn shed_normal_drops_forwarded_ordinary_traffic_over_budget() {
         for priority in [TopicPriority::Normal, TopicPriority::Bulk] {
-            let (pubsub, topic, target) =
+            let (pubsub, transport, topic, target) =
                 over_budget_pubsub(priority, BytePolicy::ShedNormal).await;
 
             let counts = fanout_over_budget(&pubsub, topic, target, true).await;
+
+            assert!(
+                transport.sent_frames().is_empty(),
+                "a shed frame must not reach the wire"
+            );
 
             assert_eq!(
                 counts.byte_rejected,

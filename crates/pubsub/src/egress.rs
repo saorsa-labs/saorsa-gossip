@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const RECOVERY_RESERVE_PERCENT: u64 = 25;
+/// Ceiling on the recovery escrow, as a percentage of `burst_bytes`. Without
+/// it a single large — or continuously renewed — recovery intent escrows the
+/// whole burst and denies every data frame for as long as it is outstanding.
+const RECOVERY_RESERVE_MAX_PERCENT: u64 = 50;
 const DEFAULT_MAX_WAITERS: usize = 256;
 const DEFAULT_MAX_WAITERS_PER_PEER: usize = 8;
 const DEFAULT_MAX_INTENTS: usize = 1024;
@@ -295,11 +299,54 @@ impl LeafEgressLimiter {
             .is_some_and(|config| config.policy == BytePolicy::ShedNormal)
     }
 
-    /// Record a send the budget would have denied but that policy protected.
-    pub(crate) fn record_shed_suppressed(&self) {
+    /// Charge a send that policy protects from shedding, and mint its
+    /// reservation.
+    ///
+    /// A protected send must still carry a *real* reservation. The transport
+    /// fence (`validate_reservation`) rejects an unreserved send whenever a
+    /// config exists, so admitting a protected peer with `None` would convert
+    /// "never shed" into a hard error one stage later — the frame would never
+    /// reach the wire, the peer would be booked as timed out, and the lazy
+    /// recovery custody would be skipped too.
+    ///
+    /// Overspend is the point: the bucket is a meter for this send, so the
+    /// full demand is charged and the bucket is allowed to floor at zero
+    /// rather than deny. This never waits and never registers a recovery
+    /// intent, so a protected send cannot stall on the waiter loop or leave
+    /// escrowed residue behind.
+    ///
+    /// Returns `None` only when the limiter is disabled, where an unreserved
+    /// send is what the fence expects. A send that the budget *would* have
+    /// denied is counted in `shed_suppressed`, so an operator can see how much
+    /// headroom enabling `ShedNormal` would actually buy.
+    pub(crate) fn reserve_protected(
+        &self,
+        key: RecoveryIntentKey,
+        frame_bytes: usize,
+    ) -> Option<ByteReservation> {
+        let mut state = self.lock_state();
+        self.refill(&mut state, Instant::now());
+        let config = state.config?;
+        let bytes = u64::try_from(frame_bytes).unwrap_or(u64::MAX);
         self.counters
-            .shed_suppressed
-            .fetch_add(1, Ordering::Relaxed);
+            .demanded_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        if frame_bytes > config.max_serialized_frame_bytes
+            || Self::data_hard_denied(&state, &config, bytes)
+        {
+            self.counters
+                .shed_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        state.tokens = state.tokens.saturating_sub(bytes);
+        state.soft_tokens = state.soft_tokens.saturating_sub(bytes);
+        self.counters
+            .charged_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        Some(ByteReservation {
+            key,
+            generation: state.generation,
+        })
     }
 
     pub(crate) fn configure(&self, requested: Option<LeafEgressConfig>) -> bool {
@@ -551,6 +598,41 @@ impl LeafEgressLimiter {
         }
     }
 
+    /// Tokens recovery has escrowed and data may not spend.
+    ///
+    /// Once recovery declares its exact serialized demand, data may still use
+    /// surplus tokens but cannot repeatedly consume the tokens that operation
+    /// needs. The escrow may grow past the fixed floor so a frame larger than
+    /// it can accumulate without globally stopping unrelated data.
+    ///
+    /// It is capped, though: an intent whose remaining demand approaches
+    /// `burst_bytes` would otherwise deny *every* data frame for as long as it
+    /// is outstanding, and an owner that keeps re-observing the intent renews
+    /// `last_observed` and so can hold that state indefinitely. The ceiling
+    /// guarantees data always keeps a share of the burst.
+    fn recovery_reserve(state: &State, config: &LeafEgressConfig) -> u64 {
+        let floor = config.burst_bytes.saturating_mul(RECOVERY_RESERVE_PERCENT) / 100;
+        let ceiling = config
+            .burst_bytes
+            .saturating_mul(RECOVERY_RESERVE_MAX_PERCENT)
+            / 100;
+        state
+            .intents
+            .values()
+            .filter(|intent| intent.charged < intent.bytes)
+            .map(|intent| intent.bytes - intent.charged)
+            .max()
+            .unwrap_or(floor)
+            .max(floor)
+            .min(ceiling.max(floor))
+    }
+
+    /// Whether the hard bucket would refuse `bytes` of data right now.
+    fn data_hard_denied(state: &State, config: &LeafEgressConfig, bytes: u64) -> bool {
+        let reserve = Self::recovery_reserve(state, config);
+        state.tokens < bytes || state.tokens.saturating_sub(bytes) < reserve
+    }
+
     pub(crate) fn try_reserve_data(
         &self,
         key: RecoveryIntentKey,
@@ -579,20 +661,7 @@ impl LeafEgressLimiter {
         self.counters
             .demanded_bytes
             .fetch_add(bytes, Ordering::Relaxed);
-        let fixed_reserve = config.burst_bytes.saturating_mul(RECOVERY_RESERVE_PERCENT) / 100;
-        // Once recovery declares its exact serialized demand, data may still
-        // use surplus tokens but cannot repeatedly consume the tokens that
-        // operation needs. This lets a frame larger than the fixed 25% floor
-        // accumulate without globally stopping unrelated data.
-        let reserve = state
-            .intents
-            .values()
-            .filter(|intent| intent.charged < intent.bytes)
-            .map(|intent| intent.bytes - intent.charged)
-            .max()
-            .unwrap_or(fixed_reserve)
-            .max(fixed_reserve);
-        let hard_denied = state.tokens < bytes || state.tokens.saturating_sub(bytes) < reserve;
+        let hard_denied = Self::data_hard_denied(&state, &config, bytes);
         let soft_denied = relayed && config.soft_bytes_per_second > 0 && state.soft_tokens < bytes;
         if hard_denied || soft_denied {
             self.counters.data_deferred.fetch_add(1, Ordering::Relaxed);

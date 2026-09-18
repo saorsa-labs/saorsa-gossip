@@ -3584,11 +3584,17 @@ struct DeferredIwant {
     requested_at: Instant,
 }
 
+/// A pull reply that the byte budget deferred, retained so the requester's
+/// pull is not lost.
+///
+/// #504: entries are only ever *relay* payloads. A local-origin reply is
+/// protected from shedding, so it is sent rather than deferred and can never
+/// reach custody — the `local_origin_only` flag this used to carry became
+/// unreachable and was removed with its merge and serve-side filter.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DeferredEagerReply {
     peer: PeerId,
     msg_id: MessageIdType,
-    local_origin_only: bool,
     requested_at: Instant,
 }
 
@@ -3690,10 +3696,10 @@ impl TopicState {
         let cache = &self.message_cache;
         self.deferred_eager_replies.retain(|entry| {
             now.saturating_duration_since(entry.requested_at) < cache.max_age
-                && cache.lru.peek(&entry.msg_id).is_some_and(|cached| {
-                    !cached.message.dropped
-                        && (!entry.local_origin_only || cached.message.local_origin)
-                })
+                && cache
+                    .lru
+                    .peek(&entry.msg_id)
+                    .is_some_and(|cached| !cached.message.dropped)
         });
     }
 
@@ -3701,20 +3707,14 @@ impl TopicState {
         &mut self,
         peer: PeerId,
         msg_id: MessageIdType,
-        local_origin_only: bool,
         now: Instant,
     ) -> bool {
         self.prune_deferred_eager_replies(now);
-        if let Some(entry) = self
+        if self
             .deferred_eager_replies
-            .iter_mut()
-            .find(|entry| entry.peer == peer && entry.msg_id == msg_id)
+            .iter()
+            .any(|entry| entry.peer == peer && entry.msg_id == msg_id)
         {
-            // A restricted request can only reach this point after an
-            // authoritative local-origin cache lookup. Keep that stronger
-            // requirement when an ordinary request for the same delivery is
-            // coalesced into its existing custody entry.
-            entry.local_origin_only |= local_origin_only;
             return true;
         }
         if self.deferred_eager_replies.len() >= MAX_DEFERRED_EAGER_REPLIES {
@@ -3723,7 +3723,6 @@ impl TopicState {
         self.deferred_eager_replies.push(DeferredEagerReply {
             peer,
             msg_id,
-            local_origin_only,
             requested_at: now,
         });
         true
@@ -9302,7 +9301,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if let Some(state) = topics.get_mut(&topic) {
                 let now = Instant::now();
                 for msg_id in deferred_ids {
-                    let _ = state.retain_deferred_eager_reply(from, msg_id, local_origin_only, now);
+                    let _ = state.retain_deferred_eager_reply(from, msg_id, now);
                 }
             }
         }
@@ -10210,8 +10209,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     .peek(&entry.msg_id)
                     .and_then(|cached| {
                         let cached = &cached.message;
-                        (!cached.dropped && (!entry.local_origin_only || cached.local_origin))
-                            .then(|| cached.clone())
+                        (!cached.dropped).then(|| cached.clone())
                     })
             };
             let Some(cached) = cached else {
@@ -10287,7 +10285,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 vec![entry.peer],
                 "EAGER",
                 &bytes,
-                entry.local_origin_only || cached.local_origin,
+                cached.local_origin,
                 send_path.admission.registry().priority_for(&topic),
             );
             let Some((peer, reservation)) = reserved.into_iter().next() else {
@@ -20101,29 +20099,29 @@ mod tests {
         );
     }
 
+    /// WHY: two pulls for the same delivery share one custody entry, so a
+    /// requester that retries cannot multiply the retained replies. The
+    /// authority-ordering half of this test went away with
+    /// `DeferredEagerReply::local_origin_only`: a local-origin reply is
+    /// protected from shedding and so never reaches custody, leaving nothing
+    /// for the two orderings to merge.
     #[test]
-    fn deferred_eager_reply_deduplicates_both_authority_orderings() {
+    fn deferred_eager_reply_deduplicates_repeat_requests() {
         let peer = test_peer_id(2);
         let topic = TopicId::new([0x8f; 32]);
         let msg_id = [0x90; 32];
         let now = Instant::now();
-        for order in [[true, false], [false, true]] {
-            let mut state = TopicState::new();
-            state.cache_message(
-                msg_id,
-                Bytes::from_static(b"local"),
-                test_header(topic, msg_id),
-                true,
-            );
-            for local_origin_only in order {
-                assert!(state.retain_deferred_eager_reply(peer, msg_id, local_origin_only, now,));
-            }
-            assert_eq!(state.deferred_eager_replies.len(), 1);
-            assert!(
-                state.deferred_eager_replies[0].local_origin_only,
-                "either ordering preserves the stronger local-origin requirement"
-            );
+        let mut state = TopicState::new();
+        state.cache_message(
+            msg_id,
+            Bytes::from_static(b"relayed"),
+            test_header(topic, msg_id),
+            false,
+        );
+        for _ in 0..2 {
+            assert!(state.retain_deferred_eager_reply(peer, msg_id, now));
         }
+        assert_eq!(state.deferred_eager_replies.len(), 1);
     }
 
     #[test]
@@ -20149,7 +20147,7 @@ mod tests {
                 test_header(topic, id),
                 true,
             );
-            assert!(state.retain_deferred_eager_reply(peer, id, true, now));
+            assert!(state.retain_deferred_eager_reply(peer, id, now));
         }
         let overflow = [0xfe; 32];
         state.cache_message(
@@ -20159,7 +20157,7 @@ mod tests {
             true,
         );
         assert_eq!(state.message_cache.len(), MAX_DEFERRED_EAGER_REPLIES + 1);
-        assert!(!state.retain_deferred_eager_reply(peer, overflow, true, now));
+        assert!(!state.retain_deferred_eager_reply(peer, overflow, now));
         assert_eq!(
             state.deferred_eager_replies.len(),
             MAX_DEFERRED_EAGER_REPLIES
@@ -20173,6 +20171,11 @@ mod tests {
         state.prune_deferred_eager_replies(now + Duration::from_millis(1_001));
         assert!(state.deferred_eager_replies.is_empty());
 
+        // A relay entry whose cache message is still live is retained; pruning
+        // is authorized by the cache, not by provenance. (This previously
+        // asserted the opposite for a `local_origin_only` entry — that filter
+        // went away with the flag, since a local-origin reply is protected and
+        // never reaches custody.)
         let remote = [0xfd; 32];
         state.cache_message(
             remote,
@@ -20180,15 +20183,21 @@ mod tests {
             test_header(topic, remote),
             false,
         );
-        assert!(state.retain_deferred_eager_reply(peer, remote, true, Instant::now()));
+        assert!(state.retain_deferred_eager_reply(peer, remote, Instant::now()));
         state.prune_deferred_eager_replies(Instant::now());
-        assert!(
-            state.deferred_eager_replies.is_empty(),
-            "local-only reply custody cannot retain a remote cache entry"
+        assert_eq!(
+            state.deferred_eager_replies.len(),
+            1,
+            "a live relay cache entry keeps its custody"
         );
     }
 
     #[tokio::test]
+    /// The rejected classes are *cache* invalidity — dropped and expired — and
+    /// a disconnected peer. A remote-origin entry used to be a third class,
+    /// rejected by the `local_origin_only` serve-side filter; that filter went
+    /// away with the flag, and a live relay entry is now exactly what this
+    /// custody legitimately serves.
     async fn deferred_eager_reply_flush_rejects_invalid_cache_and_disconnects() {
         let local = test_peer_id(1);
         let peer = test_peer_id(2);
@@ -20219,13 +20228,6 @@ mod tests {
                 true,
             );
             state.mark_message_dropped(&dropped);
-            let remote = [0x94; 32];
-            state.cache_message(
-                remote,
-                Bytes::from_static(b"remote"),
-                test_header(topic, remote),
-                false,
-            );
             let expired = [0x95; 32];
             state.message_cache.insert_at(
                 expired,
@@ -20242,19 +20244,11 @@ mod tests {
                 DeferredEagerReply {
                     peer,
                     msg_id: dropped,
-                    local_origin_only: true,
-                    requested_at: now,
-                },
-                DeferredEagerReply {
-                    peer,
-                    msg_id: remote,
-                    local_origin_only: true,
                     requested_at: now,
                 },
                 DeferredEagerReply {
                     peer,
                     msg_id: expired,
-                    local_origin_only: true,
                     requested_at: now,
                 },
             ]);
@@ -20289,7 +20283,7 @@ mod tests {
                 test_header(topic, live),
                 true,
             );
-            assert!(state.retain_deferred_eager_reply(peer, live, true, Instant::now()));
+            assert!(state.retain_deferred_eager_reply(peer, live, Instant::now()));
         }
         pubsub.set_topic_peers(topic, vec![peer]).await;
         pubsub.set_topic_peers(topic, Vec::new()).await;
@@ -20325,7 +20319,7 @@ mod tests {
                 .or_insert_with(|| pubsub.new_topic_state());
             state.cache_message(msg_id, payload, test_header(topic, msg_id), true);
             state.queue_stranded_ihave(msg_id, &[peer]);
-            assert!(state.retain_deferred_eager_reply(peer, msg_id, true, Instant::now()));
+            assert!(state.retain_deferred_eager_reply(peer, msg_id, Instant::now()));
         }
 
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(

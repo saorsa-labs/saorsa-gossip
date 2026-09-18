@@ -245,6 +245,14 @@ pub struct LeafEgressSnapshot {
     /// Critical-class/local-origin under [`BytePolicy::ShedNormal`]. This is
     /// the headroom an operator would buy by enabling shedding, and it is the
     /// only signal that an ObserveOnly budget is being exceeded at all.
+    ///
+    /// It is a *lower bound*, not an exact count. "Would have been denied" is
+    /// evaluated with the data-path predicate (the hard bucket and the
+    /// recovery escrow) plus the frame-size cap. It does not model the
+    /// recovery path's waiter-slot and intent-limit refusals, nor the relay
+    /// soft bucket, so a send those would have denied while the hard bucket
+    /// had room is not counted. Read it as "at least this much pressure",
+    /// which is what it is used for; it is not a shed-count forecast.
     pub shed_suppressed: u64,
     /// Current coalesced recovery intents awaiting enough tokens.
     pub pending_recovery_intents: usize,
@@ -356,6 +364,7 @@ impl LeafEgressLimiter {
         &self,
         key: RecoveryIntentKey,
         frame_bytes: usize,
+        relayed: bool,
     ) -> Option<ByteReservation> {
         let mut state = self.lock_state();
         self.refill(&mut state, Instant::now());
@@ -372,7 +381,12 @@ impl LeafEgressLimiter {
                 .fetch_add(1, Ordering::Relaxed);
         }
         state.tokens = state.tokens.saturating_sub(bytes);
-        state.soft_tokens = state.soft_tokens.saturating_sub(bytes);
+        // The soft bucket meters relayed EAGER only, matching
+        // `try_reserve_data_at`; charging it for our own traffic would
+        // understate the relay headroom.
+        if relayed && config.soft_bytes_per_second > 0 {
+            state.soft_tokens = state.soft_tokens.saturating_sub(bytes);
+        }
         self.counters
             .charged_bytes
             .fetch_add(bytes, Ordering::Relaxed);
@@ -478,16 +492,6 @@ impl LeafEgressLimiter {
         } else {
             entry.deferred = entry.deferred.saturating_add(1);
         }
-    }
-
-    pub(crate) fn validate_frame(&self, bytes: usize) -> Result<(), ReserveError> {
-        let state = self.lock_state();
-        let Some(config) = state.config else {
-            return Err(ReserveError::Disabled);
-        };
-        (bytes <= config.max_serialized_frame_bytes)
-            .then_some(())
-            .ok_or(ReserveError::Oversized)
     }
 
     fn refill(&self, state: &mut State, now: Instant) {

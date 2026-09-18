@@ -5770,7 +5770,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // nothing cancels and that starves the data lane.
             if !shed_eligible {
                 limiter.record_purpose_demand(topic.to_bytes(), op, bytes.len(), true);
-                admitted.push((peer, limiter.reserve_protected(key, bytes.len())));
+                admitted.push((
+                    peer,
+                    limiter.reserve_protected(key, bytes.len(), !local_origin),
+                ));
                 continue;
             }
             let result = limiter.try_reserve_recovery(key, bytes.len());
@@ -6871,7 +6874,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // it would stall every send and exhaust the waiter semaphores.
                 self.egress_limiter
                     .record_purpose_demand(topic.to_bytes(), op, bytes.len(), true);
-                self.egress_limiter.reserve_protected(key, bytes.len())
+                self.egress_limiter
+                    .reserve_protected(key, bytes.len(), !local_origin)
             } else {
                 let wait = operation_budget;
                 let reserve_result = if priority == TopicPriority::Critical && op == "EAGER" {
@@ -7668,7 +7672,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let candidates = peers.len();
         let mut reservations = HashMap::new();
         let priority = self.admission.registry().priority_for(&topic);
-        if self.egress_limiter.enabled()
+        // #504 (review r2): keyed on `enforcing()`, not `enabled()`. This
+        // sequential branch exists to order Critical sends against a shedding
+        // budget; under ObserveOnly there is nothing to order against, so an
+        // observing node keeps the unbudgeted concurrent fan-out. Same
+        // recipients either way — this keeps the ObserveOnly invariant exact
+        // rather than merely benign.
+        if self.egress_limiter.enforcing()
             && priority == TopicPriority::Critical
             && op == "EAGER"
             && !detach_accounting
@@ -7788,7 +7798,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // reservation so the transport fence admits it.
                 if !shed_eligible {
                     if let Some(reservation) =
-                        self.egress_limiter.reserve_protected(key, bytes.len())
+                        self.egress_limiter
+                            .reserve_protected(key, bytes.len(), detach_accounting)
                     {
                         reservations.insert(peer, reservation);
                     }
@@ -8261,17 +8272,25 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             public_key: self.signing_key.public_key().to_vec(),
         };
 
-        // Enabled Leaf nodes reject an oversized final serialized frame before
-        // mutating cache/claim state. Disabled/Full consumers retain the
-        // historical serialization point and have no new universal ceiling.
+        // Enabled Leaf nodes pre-serialize here so the final wire frame is
+        // built once and reused by the fan-out below.
+        //
+        // #504 (review R1): this deliberately does NOT enforce
+        // `max_serialized_frame_bytes`. It used to, keyed on `enabled()`, which
+        // hard-failed an oversized publish that an unbudgeted node sends — a
+        // behaviour change from merely *measuring* egress, and the exact
+        // divergence `BytePolicy::ObserveOnly` exists to rule out. It also
+        // contradicted the reservation layer, which deliberately bypasses the
+        // cap for protected sends: a publish is always local-origin, hence
+        // always protected, so the ceiling can never be policy-correct at this
+        // site. The cap belongs on shed-eligible traffic, where the fan-out's
+        // `ReserveError::Oversized` arm applies it.
         let leaf_wire_bytes = if self.egress_limiter.enabled() {
-            let bytes: Bytes = postcard::to_stdvec(&_message)
-                .map_err(|error| anyhow!("EAGER serialize failed: {error}"))?
-                .into();
-            self.egress_limiter
-                .validate_frame(bytes.len())
-                .map_err(|error| anyhow!(error.to_string()))?;
-            Some(bytes)
+            Some::<Bytes>(
+                postcard::to_stdvec(&_message)
+                    .map_err(|error| anyhow!("EAGER serialize failed: {error}"))?
+                    .into(),
+            )
         } else {
             None
         };
@@ -9842,7 +9861,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 ihave_targets.push(peer);
                             }
                         }
-                        if egress_limiter.enabled() {
+                        // Only meaningful when an advert could have been
+                        // byte-deferred, i.e. under ShedNormal.
+                        if egress_limiter.enforcing() {
                             ihave_targets.retain(|peer| state.ihave_target_pending(&batch, *peer));
                         }
                         let local_origin = batch.iter().any(|id| {
@@ -10117,7 +10138,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             state.record_ihave_handoff(&batch, peer);
                             state.record_stranded_ihave_advertised(&batch, peer);
                         }
-                        let all_handed_off = !egress_limiter.enabled()
+                        let all_handed_off = !egress_limiter.enforcing()
                             || intended_targets
                                 .iter()
                                 .all(|peer| !state.ihave_target_pending(&batch, *peer));
@@ -13212,6 +13233,58 @@ mod tests {
         assert_ne!(
             shedding, unbudgeted,
             "ShedNormal over the same saturated budget must behave differently"
+        );
+
+        // Review R1: the same invariant for the *frame-size* ceiling. The
+        // local-publish path used to pre-check `max_serialized_frame_bytes`
+        // whenever the limiter was merely `enabled()`, so an ObserveOnly node
+        // hard-failed an oversized publish that an unbudgeted node sends. That
+        // also contradicted the reservation layer, which deliberately ignores
+        // the cap for protected sends — a publish is always local-origin, so
+        // the cap could never be policy-correct one stage earlier.
+        async fn publish_oversized(policy: Option<BytePolicy>) -> (bool, usize) {
+            let local = test_peer_id(1);
+            let target = test_peer_id(2);
+            let transport = RecordingTransport::new(local);
+            transport.set_connected_peer_ids(vec![target]);
+            let pubsub = PlumtreePubSub::new_with_task_control(
+                local,
+                Arc::clone(&transport),
+                test_signing_key(),
+                false,
+            );
+            let topic = TopicId::new([0x2f; 32]);
+            pubsub.initialize_topic_peers(topic, vec![target]).await;
+            store_connected_peers_snapshot(
+                pubsub.connected_peers_snapshot.as_ref(),
+                Some(HashSet::from([target])),
+            );
+            if let Some(policy) = policy {
+                assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+                    soft_bytes_per_second: 0,
+                    hard_bytes_per_second: 128 * 1024,
+                    burst_bytes: 4 * 1024 * 1024,
+                    // Far below the frame published next.
+                    max_serialized_frame_bytes: 1024,
+                    policy,
+                })));
+            }
+            let published = pubsub
+                .publish(topic, Bytes::from(vec![0x33_u8; 64 * 1024]))
+                .await
+                .is_ok();
+            (published, wait_for_sent_frames(&transport, 1).await)
+        }
+
+        let unbudgeted_oversized = publish_oversized(None).await;
+        assert!(
+            unbudgeted_oversized.0,
+            "control: an unbudgeted node publishes this frame"
+        );
+        assert_eq!(
+            publish_oversized(Some(BytePolicy::ObserveOnly)).await,
+            unbudgeted_oversized,
+            "ObserveOnly must not reject an oversized publish an unbudgeted node sends"
         );
     }
 

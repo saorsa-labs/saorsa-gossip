@@ -3604,6 +3604,10 @@ struct IhaveFlushWork {
     targets: Vec<PeerId>,
     late_offer: Option<LateOfferPage>,
     kind: MessageKind,
+    /// Whether this batch advertises at least one message this node authored.
+    /// #504: a local-origin advertisement is this node's own speech, so the
+    /// byte budget may not shed it even under `BytePolicy::ShedNormal`.
+    local_origin: bool,
 }
 
 struct TopicState {
@@ -5726,12 +5730,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
     }
 
+    /// Reserve serialized bytes for a recovery fan-out.
+    ///
+    /// `local_origin` says whether the frame being served is this node's own
+    /// message rather than relayed traffic, and `priority` is the topic's
+    /// class. Both are required: under `BytePolicy::ShedNormal` only
+    /// *forwarded* non-Critical recovery traffic may be shed, so these are
+    /// what make Critical topics, local-origin custody replies and
+    /// stranded-publish retries structurally un-sheddable rather than
+    /// un-shed by luck of the bucket level.
     fn reserve_recovery_targets(
         limiter: &Arc<egress::LeafEgressLimiter>,
         topic: TopicId,
         peers: Vec<PeerId>,
         op: &'static str,
         bytes: &Bytes,
+        local_origin: bool,
+        priority: TopicPriority,
     ) -> (Vec<(PeerId, Option<egress::ByteReservation>)>, Vec<PeerId>) {
         if !limiter.enabled() {
             return (
@@ -5740,9 +5755,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             );
         }
         // #504: recovery traffic is only shed once an operator has opted in
-        // with `BytePolicy::ShedNormal`. Accounting below still runs under
+        // with `BytePolicy::ShedNormal`, and even then never for Critical-class
+        // or local-origin frames. Accounting below still runs under
         // ObserveOnly so the pressure is measurable before it is acted on.
-        let shed_eligible = limiter.enforcing();
+        let shed_eligible =
+            limiter.enforcing() && !local_origin && priority != TopicPriority::Critical;
         let mut admitted = Vec::new();
         let mut deferred = Vec::new();
         for peer in peers {
@@ -6801,12 +6818,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         stream_type: GossipStreamType,
         bytes: Bytes,
         op: &'static str,
+        local_origin: bool,
     ) -> Result<PeerSendOutcome> {
-        self.send_to_peer_bounded_outcome_tracked(topic, peer, stream_type, bytes, op)
+        self.send_to_peer_bounded_outcome_tracked(topic, peer, stream_type, bytes, op, local_origin)
             .await
             .0
     }
 
+    /// `local_origin` marks a frame this node authored (a publish, a targeted
+    /// send, or serving our own cached message back to a requester). #504:
+    /// such a frame is never shed for bytes, whatever the policy.
     async fn send_to_peer_bounded_outcome_tracked(
         &self,
         topic: TopicId,
@@ -6814,6 +6835,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         stream_type: GossipStreamType,
         bytes: Bytes,
         op: &'static str,
+        local_origin: bool,
     ) -> (Result<PeerSendOutcome>, FanoutPeerStage) {
         let operation_started = time::Instant::now();
         let operation_budget = self
@@ -6835,15 +6857,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // stall every protected send under a saturated budget and saturate the
         // bounded waiter semaphores. It also must not register a recovery
         // intent it would then never cancel.
-        let protected = !self.egress_limiter.enforcing() || priority == TopicPriority::Critical;
+        let protected =
+            !self.egress_limiter.enforcing() || priority == TopicPriority::Critical || local_origin;
         let reservation = if self.egress_limiter.enabled() {
             let key = Self::recovery_intent_key(topic, peer, op, &bytes);
-            if !self.egress_limiter.enforcing() {
-                // ObserveOnly: meters only. Do not enter the waiter loop — it
-                // polls to the caller deadline (~4 s) before reporting
-                // `Deferred`, so waiting here would stall every send under a
-                // saturated budget and exhaust the bounded waiter semaphores,
-                // and the registered intent would escrow tokens meanwhile.
+            if protected {
+                // A protected send never enters the waiter loop. The loop polls
+                // to the caller deadline (~4 s) before reporting `Deferred`,
+                // and reservation and send share one deadline — so waiting for
+                // budget we are going to grant anyway burns the send's own time
+                // and turns protection into a timeout. It also registers an
+                // intent that escrows tokens meanwhile, and under ObserveOnly
+                // it would stall every send and exhaust the waiter semaphores.
                 self.egress_limiter
                     .record_purpose_demand(topic.to_bytes(), op, bytes.len(), true);
                 self.egress_limiter.reserve_protected(key, bytes.len())
@@ -6867,12 +6892,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 match reserve_result {
                     Ok(reservation) => Some(reservation),
                     Err(egress::ReserveError::Disabled) => None,
-                    // Protected under ShedNormal. Waiting is allowed here — it
-                    // shares the send deadline and preserves the critical
-                    // escrow fairness this stack was built around — but the
-                    // outcome may never be a drop. Charge the overrun and mint
-                    // a reservation rather than byte-rejecting the frame.
-                    Err(_) if protected => self.egress_limiter.reserve_protected(key, bytes.len()),
                     Err(egress::ReserveError::Deferred | egress::ReserveError::WaiterLimit) => {
                         return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ByteRejected);
                     }
@@ -7116,6 +7135,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         (result, FanoutPeerStage::Attempted)
     }
 
+    /// Relay-origin send. Requests (IWANT) and digests (ANTI_ENTROPY) carry no
+    /// payload custody, so they default to `local_origin = false`; a caller
+    /// serving its own cached message uses
+    /// [`Self::send_to_peer_bounded_with_origin`].
     async fn send_to_peer_bounded(
         &self,
         topic: TopicId,
@@ -7124,7 +7147,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
     ) -> Result<()> {
-        self.send_to_peer_bounded_outcome(topic, peer, stream_type, bytes, op)
+        self.send_to_peer_bounded_with_origin(topic, peer, stream_type, bytes, op, false)
+            .await
+    }
+
+    async fn send_to_peer_bounded_with_origin(
+        &self,
+        topic: TopicId,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        bytes: Bytes,
+        op: &'static str,
+        local_origin: bool,
+    ) -> Result<()> {
+        self.send_to_peer_bounded_outcome(topic, peer, stream_type, bytes, op, local_origin)
             .await
             .map(|_| ())
     }
@@ -7642,7 +7678,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let frame = bytes.clone();
                 tasks.push(Box::pin(async move {
                     let result = self
-                        .send_to_peer_bounded_outcome_tracked(topic, peer, stream_type, frame, op)
+                        .send_to_peer_bounded_outcome_tracked(
+                            topic,
+                            peer,
+                            stream_type,
+                            frame,
+                            op,
+                            !detach_accounting,
+                        )
                         .await;
                     (peer, result)
                 }));
@@ -8312,6 +8355,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     GossipStreamType::PubSub,
                     bytes,
                     "EAGER",
+                    // The targeted leg of a local publish.
+                    true,
                 ),
             )
             .await;
@@ -8985,6 +9030,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     GossipStreamType::PubSub,
                     bytes.into(),
                     "IWANT",
+                    // Requesting a message we do not hold.
+                    false,
                 )
                 .await;
             self.record_stage(PubSubStage::Republish, republish_started);
@@ -9205,6 +9252,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     GossipStreamType::PubSub,
                     bytes.into(),
                     "EAGER",
+                    local_origin_only || cached.local_origin,
                 )
                 .await;
             match send_result {
@@ -9401,12 +9449,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         self.stage_stats
                             .record_publish_origin(false, bytes.len(), 1);
                         let _ = self
-                            .send_to_peer_bounded(
+                            .send_to_peer_bounded_with_origin(
                                 topic,
                                 from,
                                 GossipStreamType::PubSub,
                                 bytes.into(),
                                 "EAGER",
+                                // Usually relay traffic, but an AE serve of a
+                                // message this node authored is still our own
+                                // speech and must not be shed for bytes.
+                                cached.local_origin,
                             )
                             .await;
                     }
@@ -9793,12 +9845,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         if egress_limiter.enabled() {
                             ihave_targets.retain(|peer| state.ihave_target_pending(&batch, *peer));
                         }
+                        let local_origin = batch.iter().any(|id| {
+                            state
+                                .message_cache
+                                .lru
+                                .peek(id)
+                                .is_some_and(|cached| cached.message.local_origin)
+                        });
                         work.push(IhaveFlushWork {
                             topic: *topic_id,
                             batch,
                             targets: ihave_targets,
                             late_offer: None,
                             kind: MessageKind::IHave,
+                            local_origin,
                         });
                     }
 
@@ -9815,6 +9875,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 targets: vec![peer],
                                 late_offer: Some((peer, offer.cutoff, cursor)),
                                 kind: MessageKind::IHave,
+                                // `late_local_offer_batch` selects only
+                                // `local_origin` cache entries.
+                                local_origin: true,
                             });
                         }
                     }
@@ -9827,6 +9890,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             targets: vec![entry.peer],
                             late_offer: None,
                             kind: MessageKind::IWant,
+                            // We are asking for a message we do not hold.
+                            local_origin: false,
                         });
                     }
                 }
@@ -9841,6 +9906,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             targets: ihave_targets,
             late_offer,
             kind,
+            local_origin,
         } in work
         {
             if ihave_targets.is_empty() {
@@ -9895,8 +9961,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             } else {
                 "IHAVE"
             };
-            let (reserved_targets, budget_deferred) =
-                Self::reserve_recovery_targets(egress_limiter, topic_id, ihave_targets, op, &bytes);
+            let flush_priority = send_path.admission.registry().priority_for(&topic_id);
+            let (reserved_targets, budget_deferred) = Self::reserve_recovery_targets(
+                egress_limiter,
+                topic_id,
+                ihave_targets,
+                op,
+                &bytes,
+                local_origin,
+                flush_priority,
+            );
             let mut reservations = HashMap::new();
             let mut ihave_targets = Vec::with_capacity(reserved_targets.len());
             for (peer, reservation) in reserved_targets {
@@ -10192,6 +10266,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 vec![entry.peer],
                 "EAGER",
                 &bytes,
+                entry.local_origin_only || cached.local_origin,
+                send_path.admission.registry().priority_for(&topic),
             );
             let Some((peer, reservation)) = reserved.into_iter().next() else {
                 continue;
@@ -10344,6 +10420,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 .and_then(|state| state.stranded_retry_expires(&msg_id))
                 .unwrap_or_else(Instant::now)
         };
+        // Topic is fixed for the whole retry, so resolve its class once.
+        let retry_priority = ctx.send_path.admission.registry().priority_for(&topic);
         'retry: loop {
             // Re-validate under the topic lock: the cached message must still
             // be present, and the eager set minus the pull-served peers is
@@ -10392,6 +10470,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         pending,
                         "EAGER",
                         &bytes,
+                        // This path exists only to retry a stranded *local*
+                        // publish; its one spawn site is
+                        // `publish_local_with_optional_target`.
+                        true,
+                        retry_priority,
                     );
                     for (peer, reservation) in admitted {
                         ready.push(peer);
@@ -10895,6 +10978,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             vec![peer],
                             "ANTI_ENTROPY",
                             &bytes,
+                            // A digest of ids: no payload custody to protect.
+                            false,
+                            send_path.admission.registry().priority_for(&topic_id),
                         );
                         let Some((_, reservation)) = budgeted.pop() else {
                             continue;
@@ -13076,6 +13162,117 @@ mod tests {
         );
     }
 
+    /// The headline invariant of the opt-in policy: **under `ObserveOnly`,
+    /// observable send behaviour — what is sent, to whom, and whether it waits
+    /// — is identical to running with no byte budget at all. Only the meters
+    /// differ.**
+    ///
+    /// WHY: `ObserveOnly` is what an operator turns on to *measure* egress
+    /// before deciding whether to shed. If measuring changes behaviour, the
+    /// measurement is worthless and the rollout is unsafe. Two regressions
+    /// this catches, both of which shipped in the reviewed stack: admitting a
+    /// protected peer without a reservation (the transport fence then drops it
+    /// — review F1), and entering the ~4 s waiter loop before checking policy
+    /// (review H1).
+    #[tokio::test]
+    async fn observe_only_send_behaviour_matches_no_budget_at_all() {
+        async fn run(policy: Option<BytePolicy>) -> (usize, Vec<PeerId>, usize) {
+            // The helper configures the policy and drains the bucket past the
+            // hard threshold; `None` then clears the budget entirely, which is
+            // the "no byte budget at all" control.
+            let (pubsub, transport, topic, target) =
+                over_budget_pubsub(TopicPriority::Normal, policy.unwrap_or_default()).await;
+            if policy.is_none() {
+                assert!(pubsub.configure_leaf_egress(None));
+                assert!(!pubsub.egress_limiter.enabled());
+            }
+
+            let started = Instant::now();
+            let counts = fanout_over_budget(&pubsub, topic, target, true).await;
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "no configuration may make the fan-out wait: {elapsed:?}"
+            );
+            let sent = wait_for_sent_frames(&transport, 1).await;
+            let peers: Vec<PeerId> = transport.sent_frames().into_iter().map(|f| f.0).collect();
+            (sent, peers, counts.byte_rejected)
+        }
+
+        let unbudgeted = run(None).await;
+        let observe_only = run(Some(BytePolicy::ObserveOnly)).await;
+        assert_eq!(
+            observe_only, unbudgeted,
+            "ObserveOnly over a saturated budget must send exactly what an \
+             unbudgeted node sends, to the same peer, without deferring"
+        );
+
+        // And the contrast that proves the comparison is not vacuous.
+        let shedding = run(Some(BytePolicy::ShedNormal)).await;
+        assert_ne!(
+            shedding, unbudgeted,
+            "ShedNormal over the same saturated budget must behave differently"
+        );
+    }
+
+    /// WHY (review F2/F3): the recovery gate used to consult only `enforcing()`,
+    /// so under ShedNormal it would defer IHAVE/IWANT batches on Critical
+    /// topics, deferred-EAGER custody replies serving our own message, and
+    /// stranded-publish retries of our own publish. Protection must be
+    /// structural — a property of the traffic's class and provenance — not an
+    /// accident of how full the bucket happened to be.
+    #[tokio::test]
+    async fn recovery_gate_protects_critical_and_local_origin_structurally() {
+        // Larger than the recovery escrow left after the data drain, so an
+        // unprotected recovery reservation genuinely cannot be charged.
+        let frame = Bytes::from(vec![0x6c_u8; 2 * 1024 * 1024]);
+        let peer = test_peer_id(2);
+
+        for (priority, local_origin, label) in [
+            (TopicPriority::Critical, false, "forwarded Critical"),
+            (TopicPriority::Normal, true, "local-origin Normal"),
+            (TopicPriority::Bulk, true, "local-origin Bulk"),
+        ] {
+            let (pubsub, _transport, topic, _target) =
+                over_budget_pubsub(priority, BytePolicy::ShedNormal).await;
+            let (admitted, deferred) =
+                PlumtreePubSub::<RecordingTransport>::reserve_recovery_targets(
+                    &pubsub.egress_limiter,
+                    topic,
+                    vec![peer],
+                    "IHAVE",
+                    &frame,
+                    local_origin,
+                    priority,
+                );
+            assert!(deferred.is_empty(), "{label} recovery must not be deferred");
+            assert_eq!(admitted.len(), 1);
+            assert!(
+                admitted[0].1.is_some(),
+                "{label} must carry a real reservation, or the transport fence rejects it"
+            );
+        }
+
+        // The counterpart: forwarded ordinary recovery IS still shed, so the
+        // protection above is not simply the feature being off.
+        let (pubsub, _transport, topic, _target) =
+            over_budget_pubsub(TopicPriority::Normal, BytePolicy::ShedNormal).await;
+        let (_admitted, deferred) = PlumtreePubSub::<RecordingTransport>::reserve_recovery_targets(
+            &pubsub.egress_limiter,
+            topic,
+            vec![peer],
+            "IHAVE",
+            &frame,
+            false,
+            TopicPriority::Normal,
+        );
+        assert_eq!(
+            deferred.len(),
+            1,
+            "forwarded ordinary recovery is still shed under ShedNormal"
+        );
+    }
+
     /// WHY: the opt-in gate must not be a way of quietly disabling the feature
     /// altogether. Once an operator selects `ShedNormal`, forwarded ordinary
     /// traffic genuinely is shed at the budget and lands on the existing lazy
@@ -13343,7 +13540,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn critical_eager_reservation_and_send_share_one_deadline() {
+    async fn protected_critical_eager_never_waits_for_budget() {
         let local = test_peer_id(1);
         let target = test_peer_id(2);
         let (transport, mut started) = BlockingTransport::new(local);
@@ -13390,7 +13587,14 @@ mod tests {
                 false,
             )
             .expect("drain leaves only the recovery floor");
-        let original_deadline = tokio::time::Instant::now() + PER_PEER_REPUBLISH_TIMEOUT;
+        // #504 opt-in policy: a Critical EAGER is protected, so it must NOT
+        // enter the waiter loop at all. This test previously asserted the
+        // opposite — that the reservation waits and shares the send deadline —
+        // but that is exactly the behaviour review F1 identified as harmful:
+        // waiting for budget that will be granted anyway burns the send's own
+        // deadline, and a wait that timed out returned `Deferred`, which was
+        // then byte-rejected. A dropped Critical message is the hard error the
+        // priority class exists to prevent.
         let publishing = {
             let pubsub = Arc::clone(&pubsub);
             tokio::spawn(async move {
@@ -13399,40 +13603,34 @@ mod tests {
                     .await
             })
         };
-        for _ in 0..100 {
-            if pubsub.egress_limiter.snapshot().pending_recovery_intents == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(pubsub.egress_limiter.snapshot().pending_recovery_intents, 1);
-
-        tokio::time::advance(Duration::from_secs(3)).await;
-        pubsub
-            .egress_limiter
-            .refill_after_for_test(Duration::from_secs(1));
+        // The send enters immediately, without a refill and without the
+        // budget being restored.
         tokio::time::timeout(Duration::from_secs(1), started.recv())
             .await
-            .expect("reservation completes and send enters")
+            .expect("a protected Critical send must not wait for budget")
             .expect("started record");
-        let before_deadline = original_deadline - Duration::from_millis(10);
-        let now = tokio::time::Instant::now();
-        if before_deadline > now {
-            tokio::time::advance(before_deadline.duration_since(now)).await;
-        }
-        tokio::task::yield_now().await;
-        assert!(
-            !publishing.is_finished(),
-            "remaining deadline is not shorter than one second"
+        assert_eq!(
+            pubsub.egress_limiter.snapshot().pending_recovery_intents,
+            0,
+            "a protected send must not register an escrowed recovery intent"
         );
-        let counts =
-            tokio::time::timeout_at(original_deadline + Duration::from_millis(50), publishing)
-                .await
-                .expect("publish completes at its original absolute deadline")
-                .expect("publish task joins")
-                .expect("transport timeout keeps publish result typed");
-        assert_eq!((counts.attempted, counts.succeeded), (1, 0));
-        assert_eq!(transport.in_flight.load(Ordering::SeqCst), 0);
+        let snapshot = pubsub.leaf_egress_snapshot();
+        assert_eq!(
+            snapshot.invariant_violations, 0,
+            "the protected send carries a real reservation"
+        );
+        assert!(
+            snapshot.shed_suppressed >= 1,
+            "the overrun is still metered"
+        );
+        transport.release_sends(1);
+        let counts = tokio::time::timeout(Duration::from_secs(5), publishing)
+            .await
+            .expect("publish completes")
+            .expect("publish task joins")
+            .expect("publish result is typed");
+        assert_eq!(counts.byte_rejected, 0, "Critical is never byte-rejected");
+        assert_eq!(counts.attempted, 1);
     }
 
     #[tokio::test]
@@ -13735,7 +13933,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn targeted_publish_deadline_cancels_owned_recovery_intent() {
+    /// #504 opt-in policy: a targeted send is protected, so it never enters
+    /// the byte waiter loop and never registers a recovery intent. This test
+    /// previously asserted the opposite — that a zero deadline byte-deferred
+    /// the send to `TimedOut` and then cancelled the owned intent. The
+    /// surviving subject, and the reason the test exists, is that this path
+    /// leaks no intent; it is now guaranteed by never creating one.
+    async fn targeted_publish_is_protected_and_leaks_no_recovery_intent() {
         let local = test_peer_id(1);
         let target = test_peer_id(2);
         let transport = RecordingTransport::new(local);
@@ -13782,9 +13986,22 @@ mod tests {
             .await
             .expect("ordinary publish contract remains successful");
 
-        assert_eq!(outcome.target, TargetedPublishOutcome::TimedOut);
-        assert_eq!(transport.send_count_to(target), 0);
-        assert_eq!(pubsub.leaf_egress_snapshot().pending_recovery_intents, 0);
+        assert_eq!(
+            outcome.target,
+            TargetedPublishOutcome::Sent,
+            "a targeted send is not shed for bytes"
+        );
+        assert_eq!(transport.send_count_to(target), 1);
+        assert_eq!(
+            pubsub.leaf_egress_snapshot().pending_recovery_intents,
+            0,
+            "a protected send must not register an intent, so none can leak"
+        );
+        assert_eq!(
+            pubsub.leaf_egress_snapshot().invariant_violations,
+            0,
+            "it still carries a real reservation"
+        );
     }
 
     #[tokio::test]
@@ -13855,16 +14072,15 @@ mod tests {
                     .await
             })
         };
-        for _ in 0..100 {
-            if pubsub.leaf_egress_snapshot().pending_recovery_intents == 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        // #504 opt-in policy: the targeted leg is protected, so it does not
+        // queue behind the backlog — it neither waits nor registers a second
+        // intent. This previously asserted two coexisting intents; the older
+        // backlog intent is now the only one, and the targeted send proceeds
+        // past it rather than behind it.
         assert_eq!(
             pubsub.leaf_egress_snapshot().pending_recovery_intents,
-            2,
-            "older and exact-target intents must both exist before refill"
+            1,
+            "only the older backlog intent exists; the protected target adds none"
         );
         pubsub
             .egress_limiter
@@ -19617,52 +19833,25 @@ mod tests {
             .reserve_critical_eager(drain, eager_len, Duration::from_secs(1))
             .await
             .expect("competing Critical frame consumes reply burst");
-        assert!(!publisher
+        // #504 opt-in policy: the payload being pulled is this node's OWN
+        // message, so the byte budget may not shed the reply even though the
+        // bucket above is exhausted. This stage used to assert the opposite
+        // (deferral into `deferred_eager_replies`, then a retry on the next
+        // flush); protecting local origin makes that unreachable here. The
+        // subject of the test — the late peer receives the local-only message
+        // through the restricted pull path, charged exactly once — is kept.
+        assert!(publisher
             .handle_local_origin_iwant(receiver_id, iwants[0].clone())
             .await
-            .expect("restricted pull is retained after byte deferral"));
-        publisher
-            .handle_iwant(receiver_id, topic, vec![local_id])
-            .await
-            .expect("ordinary duplicate is also retained after byte deferral");
+            .expect("restricted pull of a local-origin payload is served"));
         {
             let topics = publisher.topics.read_topic(&topic).await;
             let replies = &topics.get(&topic).expect("topic").deferred_eager_replies;
-            assert_eq!(replies.len(), 1, "duplicate pull shares one custody entry");
             assert!(
-                replies[0].local_origin_only,
-                "ordinary duplicate cannot weaken restricted custody"
+                replies.is_empty(),
+                "a protected local-origin reply is sent, so nothing enters custody"
             );
         }
-        assert!(publisher_transport
-            .sent_messages_of_kind_to(receiver_id, MessageKind::Eager)
-            .is_empty());
-        let deferred_reply = publisher
-            .leaf_egress_snapshot()
-            .by_topic_and_purpose
-            .into_iter()
-            .find(|row| row.topic == topic.to_bytes() && row.purpose == "EAGER")
-            .expect("EAGER byte accounting");
-        assert_eq!(deferred_reply.sent_bytes, 0);
-        assert!(
-            deferred_reply.deferred >= 1,
-            "first publisher reply is byte-deferred"
-        );
-        publisher
-            .egress_limiter
-            .refill_after_for_test(Duration::from_secs(
-                u64::try_from(eager_len).expect("frame size"),
-            ));
-        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
-            &publisher.topics,
-            &publisher.transport,
-            &publisher.signing_key,
-            &publisher.stage_stats,
-            &publisher.outbound_budgets,
-            &publisher.send_path_context(),
-            &publisher.egress_limiter,
-        )
-        .await;
         let eager = publisher_transport.sent_messages_of_kind_to(receiver_id, MessageKind::Eager);
         assert_eq!(eager.len(), 1);
         assert_eq!(eager[0].payload.as_ref(), Some(&payload));
@@ -19671,11 +19860,11 @@ mod tests {
             .by_topic_and_purpose
             .into_iter()
             .find(|row| row.topic == topic.to_bytes() && row.purpose == "EAGER")
-            .expect("EAGER byte accounting after retry");
+            .expect("EAGER byte accounting");
         assert_eq!(
             eager_after_retry.sent_bytes,
             u64::try_from(eager_len).expect("frame size"),
-            "coalesced reply is charged exactly once"
+            "the protected reply is charged exactly once"
         );
         let eager_frame = publisher_transport
             .sent_frames_of_kind_to(receiver_id, MessageKind::Eager)
@@ -20164,34 +20353,18 @@ mod tests {
             &pubsub.egress_limiter,
         )
         .await;
-        assert!(transport.sent_frames().is_empty());
-        assert!(pubsub
-            .topics
-            .read_topic(&topic)
-            .await
-            .get(&topic)
-            .expect("topic")
-            .late_local_offers
-            .contains_key(&peer));
-
-        pubsub
-            .egress_limiter
-            .refill_after_for_test(Duration::from_secs(8));
-        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
-            &pubsub.topics,
-            &pubsub.transport,
-            &pubsub.signing_key,
-            &pubsub.stage_stats,
-            &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
-        )
-        .await;
+        // #504 opt-in policy: a late-local-offer page advertises only messages
+        // this node authored (`late_local_offer_batch` filters on
+        // `local_origin`), so the byte budget may not shed it even with the
+        // burst consumed. This stage used to assert a deferral here and a send
+        // on the next flush; the surviving subject is that the offer is sent
+        // exactly once and its cursor then completes.
         assert_eq!(
             transport
                 .sent_frames_of_kind_to(peer, MessageKind::IHave)
                 .len(),
-            1
+            1,
+            "a protected local-origin offer is sent despite the exhausted burst"
         );
         let purpose = pubsub
             .leaf_egress_snapshot()
@@ -20199,10 +20372,15 @@ mod tests {
             .into_iter()
             .find(|row| row.topic == topic.to_bytes() && row.purpose == "IHAVE")
             .expect("IHAVE accounting");
-        assert!(purpose.deferred >= 1);
         assert_eq!(
             purpose.sent_bytes,
-            u64::try_from(frame_len).expect("frame size")
+            u64::try_from(frame_len).expect("frame size"),
+            "charged exactly once"
+        );
+        assert_eq!(
+            pubsub.leaf_egress_snapshot().invariant_violations,
+            0,
+            "the protected offer carries a real reservation"
         );
 
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
@@ -20388,6 +20566,7 @@ mod tests {
                 GossipStreamType::PubSub,
                 frame.clone(),
                 "IWANT",
+                false,
             )
             .await
             .expect("bounded recovery send");

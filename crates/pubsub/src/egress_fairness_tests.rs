@@ -21,6 +21,7 @@ fn limiter(hard: u64, burst: u64) -> Arc<LeafEgressLimiter> {
         hard_bytes_per_second: hard,
         burst_bytes: burst,
         max_serialized_frame_bytes: usize::try_from(burst).unwrap_or(usize::MAX),
+        policy: BytePolicy::ShedNormal,
     })));
     limiter
 }
@@ -251,6 +252,7 @@ fn partial_escrow_replacement_cancel_and_reconfigure_are_non_refunding() {
         hard_bytes_per_second: 2048,
         burst_bytes: 4096,
         max_serialized_frame_bytes: 4096,
+        policy: BytePolicy::ShedNormal,
     })));
     assert!(matches!(
         limiter.try_reserve_recovery_at(stale, 1024, 1, start + Duration::from_secs(2)),

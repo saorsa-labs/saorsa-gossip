@@ -25,17 +25,46 @@ const RECOVERY_CRITICAL_SLOTS: u8 = 7;
 const RECOVERY_TOTAL_SLOTS: u8 = RECOVERY_CRITICAL_SLOTS + 1;
 const RECOVERY_MAX_QUANTUM_BYTES: u64 = 16 * 1024;
 
+/// What the Leaf serialized-byte budget is allowed to *do* once it is exceeded.
+///
+/// #504: a configured budget is an observation instrument by default. Operators
+/// have to ask for shedding explicitly, because dropping gossip is a behaviour
+/// change that has to be attributable to a deliberate decision rather than to
+/// the side effect of setting a non-zero rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BytePolicy {
+    /// Account and meter every send, but never deny one. The default: a
+    /// non-zero `hard_bytes_per_second` alone must never start dropping
+    /// traffic.
+    #[default]
+    ObserveOnly,
+    /// Shed *forwarded* Normal and Bulk traffic once the budget is exhausted.
+    ///
+    /// Never sheds: `TopicPriority::Critical` topics (DM inbox and the control
+    /// plane), locally originated publishes, own-inbox delivery, and targeted
+    /// sends. Those classes are either the node's own speech or the traffic
+    /// whose loss is a hard error, so a byte budget is not permitted to be the
+    /// thing that silences them.
+    ShedNormal,
+}
+
 /// Leaf-only serialized PubSub egress policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeafEgressConfig {
     /// Early degradation rate for relayed EAGER traffic. Zero disables it.
     pub soft_bytes_per_second: u64,
-    /// Sustained hard rate. Zero disables enforcement completely.
+    /// Sustained hard rate. Zero disables accounting completely.
+    ///
+    /// A non-zero value turns the budget *on as a meter*. It does not by
+    /// itself authorise shedding — see [`LeafEgressConfig::policy`].
     pub hard_bytes_per_second: u64,
     /// Short-spike capacity. Must cover the largest accepted frame.
     pub burst_bytes: u64,
     /// Largest final serialized frame accepted while enforcement is enabled.
     pub max_serialized_frame_bytes: usize,
+    /// Whether an exhausted budget may actually deny a send. Defaults to
+    /// [`BytePolicy::ObserveOnly`].
+    pub policy: BytePolicy,
 }
 
 impl LeafEgressConfig {
@@ -129,6 +158,7 @@ struct EgressCounters {
     budget_timeouts: AtomicU64,
     queue_overflow: AtomicU64,
     invariant_violations: AtomicU64,
+    shed_suppressed: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -180,6 +210,12 @@ pub struct LeafEgressSnapshot {
     pub queue_overflow: u64,
     /// Enabled sends that reached the final transport fence unreserved.
     pub invariant_violations: u64,
+    /// Sends the budget would have denied but that policy protected: either
+    /// [`BytePolicy::ObserveOnly`] is in force, or the traffic is
+    /// Critical-class/local-origin under [`BytePolicy::ShedNormal`]. This is
+    /// the headroom an operator would buy by enabling shedding, and it is the
+    /// only signal that an ObserveOnly budget is being exceeded at all.
+    pub shed_suppressed: u64,
     /// Current coalesced recovery intents awaiting enough tokens.
     pub pending_recovery_intents: usize,
     /// Bounded per-topic and per-wire-purpose accounting rows.
@@ -246,6 +282,26 @@ impl LeafEgressLimiter {
         self.lock_state().config.is_some()
     }
 
+    /// Whether an exhausted budget is permitted to actually deny a send.
+    ///
+    /// #504: enforcement is opt-in. `enabled()` only means "accounting is on";
+    /// a configured non-zero hard rate must never start shedding gossip by
+    /// itself, because that would make a behaviour change an accident of
+    /// configuration rather than a decision. Callers still consult per-message
+    /// protection (Critical-class, local origin) on top of this.
+    pub(crate) fn enforcing(&self) -> bool {
+        self.lock_state()
+            .config
+            .is_some_and(|config| config.policy == BytePolicy::ShedNormal)
+    }
+
+    /// Record a send the budget would have denied but that policy protected.
+    pub(crate) fn record_shed_suppressed(&self) {
+        self.counters
+            .shed_suppressed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn configure(&self, requested: Option<LeafEgressConfig>) -> bool {
         let validated = match requested {
             Some(candidate) if candidate.hard_bytes_per_second == 0 => None,
@@ -310,6 +366,7 @@ impl LeafEgressLimiter {
             budget_timeouts: self.counters.budget_timeouts.load(Ordering::Relaxed),
             queue_overflow: self.counters.queue_overflow.load(Ordering::Relaxed),
             invariant_violations: self.counters.invariant_violations.load(Ordering::Relaxed),
+            shed_suppressed: self.counters.shed_suppressed.load(Ordering::Relaxed),
             pending_recovery_intents: self.lock_state().intents.len(),
             by_topic_and_purpose,
         }
@@ -1134,6 +1191,7 @@ mod tests {
             hard_bytes_per_second: 128,
             burst_bytes: 4096,
             max_serialized_frame_bytes: 4096,
+            policy: BytePolicy::ShedNormal,
         })));
         limiter
     }
@@ -1406,6 +1464,7 @@ mod tests {
             hard_bytes_per_second: 128,
             burst_bytes: 4096,
             max_serialized_frame_bytes: 4096,
+            policy: BytePolicy::ShedNormal,
         })));
         assert!(limiter.enabled());
     }
@@ -1418,6 +1477,7 @@ mod tests {
             hard_bytes_per_second: 0,
             burst_bytes: 0,
             max_serialized_frame_bytes: 0,
+            policy: BytePolicy::ShedNormal,
         })));
         assert!(!limiter.enabled());
         assert_eq!(

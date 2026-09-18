@@ -50,7 +50,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 mod egress;
-pub use egress::{LeafEgressConfig, LeafEgressPurposeSnapshot, LeafEgressSnapshot};
+pub use egress::{BytePolicy, LeafEgressConfig, LeafEgressPurposeSnapshot, LeafEgressSnapshot};
 use tokio::time;
 use tracing::{debug, error, info, trace, warn};
 
@@ -5715,6 +5715,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 Vec::new(),
             );
         }
+        // #504: recovery traffic is only shed once an operator has opted in
+        // with `BytePolicy::ShedNormal`. Accounting below still runs under
+        // ObserveOnly so the pressure is measurable before it is acted on.
+        let shed_eligible = limiter.enforcing();
         let mut admitted = Vec::new();
         let mut deferred = Vec::new();
         for peer in peers {
@@ -5723,6 +5727,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             limiter.record_purpose_demand(topic.to_bytes(), op, bytes.len(), result.is_ok());
             match result {
                 Ok(reservation) => admitted.push((peer, Some(reservation))),
+                Err(_) if !shed_eligible => {
+                    limiter.record_shed_suppressed();
+                    admitted.push((peer, None));
+                }
                 Err(egress::ReserveError::Deferred | egress::ReserveError::WaiterLimit) => {
                     deferred.push(peer);
                 }
@@ -6804,9 +6812,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 bytes.len(),
                 reserve_result.is_ok(),
             );
+            // #504: same opt-in gate as the fan-out path. Critical-class
+            // traffic is never byte-rejected here — under the previous code a
+            // Critical EAGER that outlasted its waiter deadline came back as
+            // `Deferred` and was dropped, which is exactly the hard error the
+            // priority class exists to prevent.
+            let shed_eligible =
+                self.egress_limiter.enforcing() && priority != TopicPriority::Critical;
             match reserve_result {
                 Ok(reservation) => Some(reservation),
                 Err(egress::ReserveError::Disabled) => None,
+                Err(_) if !shed_eligible => {
+                    self.egress_limiter.record_shed_suppressed();
+                    None
+                }
                 Err(egress::ReserveError::Deferred | egress::ReserveError::WaiterLimit) => {
                     return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ByteRejected);
                 }
@@ -7654,6 +7673,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 attempted,
             );
         }
+        // #504: enforcement is opt-in, and even when opted in it is narrow.
+        // `detach_accounting` is the established local-vs-relayed marker on
+        // this path (publish passes false, the dispatcher forward passes
+        // true) and is already handed to the limiter as `relayed`. A send may
+        // be shed only when all three hold: the operator selected
+        // `BytePolicy::ShedNormal`, this is a *forwarded* relay rather than
+        // this node's own publish, and the topic is not Critical-class. A
+        // byte budget must not be the thing that silences our own speech or
+        // the DM inbox / control plane.
+        let shed_eligible = self.egress_limiter.enforcing()
+            && detach_accounting
+            && priority != TopicPriority::Critical;
         let peers = if self.egress_limiter.enabled() {
             let mut admitted = Vec::with_capacity(peers.len());
             let mut deferred = Vec::new();
@@ -7673,13 +7704,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         reservations.insert(peer, reservation);
                         admitted.push(peer);
                     }
+                    Err(egress::ReserveError::Disabled) => admitted.push(peer),
+                    // Policy-protected: the budget is exhausted but this
+                    // class of traffic is not shed. Send it and meter the
+                    // overrun so the pressure stays visible.
+                    Err(_) if !shed_eligible => {
+                        self.egress_limiter.record_shed_suppressed();
+                        admitted.push(peer);
+                    }
                     Err(egress::ReserveError::Deferred) => deferred.push(peer),
                     Err(egress::ReserveError::Oversized) => {
                         warn!(topic = %LogTopicId::from(topic), op, bytes = bytes.len(),
                             "Leaf PubSub frame exceeds configured serialized maximum");
                         deferred.push(peer);
                     }
-                    Err(egress::ReserveError::Disabled) => admitted.push(peer),
                     Err(
                         egress::ReserveError::WaiterLimit
                         | egress::ReserveError::IntentLimit
@@ -12698,6 +12736,14 @@ mod tests {
         // The 504 field failure: two eager candidates, both byte-deferred
         // before any claim. attempted == 0 alone reads as "no peers"; the
         // stage counts must say candidates == 2, byte_rejected == 2.
+        //
+        // This drives the *forwarded* dispatcher fan-out. It originally drove
+        // `publish_local_with_fanout`, but the opt-in policy added on top of
+        // this stack protects local-origin publishes from byte shedding
+        // outright, so that scenario can no longer produce a deferral — see
+        // `shed_normal_never_drops_critical_or_local_origin_over_budget`,
+        // which asserts exactly that. The subject here is the stage
+        // accounting, which is unchanged on the path where shedding is legal.
         let peer_id = test_peer_id(1);
         let transport = RecordingTransport::new(peer_id);
         let pubsub = PlumtreePubSub::new_with_task_control(
@@ -12721,6 +12767,7 @@ mod tests {
             hard_bytes_per_second: 1,
             burst_bytes: 8192,
             max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
         })));
         let _drain = pubsub
             .egress_limiter
@@ -12737,9 +12784,16 @@ mod tests {
             .expect("valid setup reservation drains initial tokens");
 
         let counts = pubsub
-            .publish_local_with_fanout(topic, Bytes::from_static(b"attempt4"))
+            .parallel_send_to_peers(
+                topic,
+                vec![test_peer_id(2), test_peer_id(3)],
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"attempt4"),
+                "EAGER",
+                true,
+            )
             .await
-            .expect("fully byte-deferred publish still returns Ok");
+            .1;
 
         assert_eq!(counts.candidates, 2);
         assert_eq!(counts.byte_rejected, 2);
@@ -12754,8 +12808,179 @@ mod tests {
                 + counts.claim_skipped
                 + counts.attempted
         );
-        assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 1);
         assert!(transport.sent_frames().is_empty());
+    }
+
+    /// #504 opt-in policy harness: a topic with one eager peer, a configured
+    /// Leaf byte budget, and the data bucket already drained past its hard
+    /// threshold. Every test below starts over budget, so the only variable
+    /// left is whether policy permits the send to be shed.
+    async fn over_budget_pubsub(
+        priority: TopicPriority,
+        policy: BytePolicy,
+    ) -> (Arc<PlumtreePubSub<RecordingTransport>>, TopicId, PeerId) {
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x5b; 32]);
+        pubsub.admission.registry().register(topic, priority);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(target);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 128 * 1024,
+            burst_bytes: 4 * 1024 * 1024,
+            max_serialized_frame_bytes: 4 * 1024 * 1024,
+            policy,
+        })));
+        // Spend the data allowance down to the recovery reserve, so any
+        // further data frame is over the hard threshold.
+        assert!(
+            pubsub
+                .egress_limiter
+                .try_reserve_data(
+                    egress::RecoveryIntentKey {
+                        peer: [0x91; 32],
+                        scope: [0x91; 32],
+                        family: [0x92; 32],
+                        operation: [0x93; 32],
+                    },
+                    3 * 1024 * 1024,
+                    false,
+                )
+                .is_ok(),
+            "setup must drain the data allowance"
+        );
+        (pubsub, topic, target)
+    }
+
+    async fn fanout_over_budget(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        target: PeerId,
+        forwarded: bool,
+    ) -> FanoutCounts {
+        pubsub
+            .parallel_send_to_peers(
+                topic,
+                vec![target],
+                GossipStreamType::PubSub,
+                Bytes::from(vec![0x7a_u8; 64 * 1024]),
+                "EAGER",
+                forwarded,
+            )
+            .await
+            .1
+    }
+
+    /// WHY: a byte budget is an observation instrument until an operator says
+    /// otherwise. The archived #504 stack enforced whenever
+    /// `hard_bytes_per_second != 0`, which meant that merely *measuring*
+    /// egress silently started dropping gossip. If that implicit rule comes
+    /// back, this fan-out is over budget and `byte_rejected` becomes 1.
+    #[tokio::test]
+    async fn observe_only_sheds_nothing_past_the_hard_threshold() {
+        let (pubsub, topic, target) =
+            over_budget_pubsub(TopicPriority::Normal, BytePolicy::ObserveOnly).await;
+        assert!(
+            pubsub.egress_limiter.enabled(),
+            "the budget must be accounting — this test is about policy, not about being off"
+        );
+        assert!(!pubsub.egress_limiter.enforcing());
+
+        let counts = fanout_over_budget(&pubsub, topic, target, true).await;
+
+        assert_eq!(
+            counts.byte_rejected, 0,
+            "ObserveOnly must never deny a send, however far over budget"
+        );
+        let snapshot = pubsub.leaf_egress_snapshot();
+        assert!(
+            snapshot.shed_suppressed >= 1,
+            "the overrun must still be metered — an unobservable ObserveOnly \
+             budget would tell an operator nothing about enabling ShedNormal"
+        );
+    }
+
+    /// WHY: `ShedNormal` buys headroom by dropping relay traffic. It must
+    /// never buy it from the classes whose loss is a hard error (Critical:
+    /// DM inbox and control plane) or from this node's own speech
+    /// (local-origin publishes), because neither is relay load this node can
+    /// decline to carry on someone else's behalf.
+    #[tokio::test]
+    async fn shed_normal_never_drops_critical_or_local_origin_over_budget() {
+        let (critical, topic, target) =
+            over_budget_pubsub(TopicPriority::Critical, BytePolicy::ShedNormal).await;
+        assert!(critical.egress_limiter.enforcing());
+        let forwarded_critical = fanout_over_budget(&critical, topic, target, true).await;
+        assert_eq!(
+            forwarded_critical.byte_rejected, 0,
+            "Critical-class traffic must survive an exhausted byte budget"
+        );
+
+        let (normal, topic, target) =
+            over_budget_pubsub(TopicPriority::Normal, BytePolicy::ShedNormal).await;
+        // forwarded = false is the publish path: this node authored the frame.
+        let local_origin = fanout_over_budget(&normal, topic, target, false).await;
+        assert_eq!(
+            local_origin.byte_rejected, 0,
+            "a local-origin publish is not relay load and must not be shed"
+        );
+        assert!(
+            normal.leaf_egress_snapshot().shed_suppressed >= 1,
+            "protected-but-over-budget sends must be attributable in diagnostics"
+        );
+    }
+
+    /// WHY: the opt-in gate must not be a way of quietly disabling the feature
+    /// altogether. Once an operator selects `ShedNormal`, forwarded ordinary
+    /// traffic genuinely is shed at the budget and lands on the existing lazy
+    /// recovery path, with the drop attributed to its wire purpose.
+    #[tokio::test]
+    async fn shed_normal_drops_forwarded_ordinary_traffic_over_budget() {
+        for priority in [TopicPriority::Normal, TopicPriority::Bulk] {
+            let (pubsub, topic, target) =
+                over_budget_pubsub(priority, BytePolicy::ShedNormal).await;
+
+            let counts = fanout_over_budget(&pubsub, topic, target, true).await;
+
+            assert_eq!(
+                counts.byte_rejected,
+                1,
+                "forwarded {} traffic must be shed once the budget is exhausted",
+                priority.as_str()
+            );
+            let snapshot = pubsub.leaf_egress_snapshot();
+            assert_eq!(
+                snapshot.shed_suppressed, 0,
+                "a genuine shed is not a suppressed one"
+            );
+            let eager = snapshot
+                .by_topic_and_purpose
+                .iter()
+                .find(|row| row.topic == topic.to_bytes() && row.purpose == "EAGER")
+                .expect("the shed must be attributed to its wire purpose");
+            assert!(
+                eager.deferred >= 1,
+                "the drop must be metered by reason, not just counted"
+            );
+        }
     }
 
     #[tokio::test]
@@ -12791,6 +13016,7 @@ mod tests {
             hard_bytes_per_second: 128 * 1024,
             burst_bytes: 4 * 1024 * 1024,
             max_serialized_frame_bytes: 4 * 1024 * 1024,
+            policy: BytePolicy::ShedNormal,
         })));
         let _drain = pubsub
             .egress_limiter
@@ -12884,6 +13110,7 @@ mod tests {
             hard_bytes_per_second: 1024 * 1024,
             burst_bytes: 4 * 1024 * 1024,
             max_serialized_frame_bytes: 4 * 1024 * 1024,
+            policy: BytePolicy::ShedNormal,
         })));
         let mut held = pubsub
             .outbound_budgets
@@ -12956,6 +13183,7 @@ mod tests {
             hard_bytes_per_second: 1024 * 1024,
             burst_bytes: 8192,
             max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
         })));
         let publish = {
             let pubsub = Arc::clone(&pubsub);
@@ -13014,6 +13242,7 @@ mod tests {
             hard_bytes_per_second: 8192,
             burst_bytes: 8192,
             max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
         })));
         let _drain = pubsub
             .egress_limiter
@@ -13187,6 +13416,7 @@ mod tests {
             hard_bytes_per_second: 1024 * 1024,
             burst_bytes: 8192,
             max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
         })));
         {
             let mut topics = pubsub.topics.write_topic(&topic).await;
@@ -13242,6 +13472,7 @@ mod tests {
             hard_bytes_per_second: 1024 * 1024,
             burst_bytes: 8192,
             max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
         })));
         {
             let mut topics = pubsub.topics.write_topic(&topic).await;
@@ -13392,6 +13623,7 @@ mod tests {
             hard_bytes_per_second: 1,
             burst_bytes: 8192,
             max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
         })));
         let _drain = pubsub
             .egress_limiter
@@ -13453,6 +13685,7 @@ mod tests {
             hard_bytes_per_second: 1,
             burst_bytes: 16_384,
             max_serialized_frame_bytes: 16_384,
+            policy: BytePolicy::ShedNormal,
         })));
         let _drain = pubsub
             .egress_limiter
@@ -13509,7 +13742,11 @@ mod tests {
             .expect("targeted publish remains bounded and valid");
 
         assert_eq!(outcome.fanout.candidates, 1, "ordinary fanout is retained");
-        assert_eq!(outcome.fanout.byte_rejected, 1);
+        // The ordinary leg of a *local* publish is policy-protected from byte
+        // shedding (#504 opt-in policy), so it is no longer byte-rejected here
+        // even behind the recovery backlog. The subject of this test is the
+        // targeted leg below, which is unaffected.
+        assert_eq!(outcome.fanout.byte_rejected, 0);
         assert_eq!(outcome.target, TargetedPublishOutcome::Sent);
         let frames = transport.sent_frames_of_kind_to(target, MessageKind::Eager);
         assert_eq!(frames.len(), 1);
@@ -14017,6 +14254,7 @@ mod tests {
             hard_bytes_per_second: u64::try_from(frame_len).expect("frame size") * 100,
             burst_bytes: u64::try_from(frame_len).expect("frame size"),
             max_serialized_frame_bytes: frame_len,
+            policy: BytePolicy::ShedNormal,
         })));
 
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
@@ -18631,6 +18869,7 @@ mod tests {
             hard_bytes_per_second: 1,
             burst_bytes: u64::try_from(iwant_frame_len).expect("frame size"),
             max_serialized_frame_bytes: iwant_frame_len,
+            policy: BytePolicy::ShedNormal,
         })));
         let drain = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
             topic,
@@ -19232,6 +19471,7 @@ mod tests {
             hard_bytes_per_second: 1,
             burst_bytes: u64::try_from(eager_len).expect("frame size"),
             max_serialized_frame_bytes: eager_len,
+            policy: BytePolicy::ShedNormal,
         })));
         let drain = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
             topic,
@@ -19724,6 +19964,7 @@ mod tests {
             hard_bytes_per_second: u64::try_from(frame_len).expect("frame size"),
             burst_bytes: u64::try_from(frame_len).expect("frame size"),
             max_serialized_frame_bytes: frame_len,
+            policy: BytePolicy::ShedNormal,
         })));
         let drain = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
             topic,
@@ -19953,6 +20194,7 @@ mod tests {
             hard_bytes_per_second: 1_000_000,
             burst_bytes: 4096,
             max_serialized_frame_bytes: 4096,
+            policy: BytePolicy::ShedNormal,
         })));
         let drain_key = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
             topic, remote, "EAGER", b"drain",

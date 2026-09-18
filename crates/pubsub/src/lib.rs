@@ -3254,6 +3254,9 @@ struct CachedMessage {
     /// for dedupe (PRUNE/GRAFT coherence) but must never leave this node
     /// — IWANT service and anti-entropy reconciliation refuse to serve it.
     dropped: bool,
+    /// True only when this process created the cached message through its
+    /// local publish API. Never inferred from a wire sender identity.
+    local_origin: bool,
     inner_proof: Option<compat::VerifiedInner>,
 }
 
@@ -3557,6 +3560,49 @@ struct LazyWithheldEntry {
     served: Vec<PeerId>,
 }
 
+#[derive(Clone, Copy)]
+struct LateLocalOffer {
+    cutoff: Instant,
+    cursor: Option<(Instant, MessageIdType)>,
+}
+
+type LateOfferPage = (PeerId, Instant, (Instant, MessageIdType));
+
+#[derive(Clone, Copy)]
+struct OutstandingIwant {
+    peer: PeerId,
+    requested_at: Instant,
+    retry_pending: bool,
+}
+
+#[derive(Clone)]
+struct DeferredIwant {
+    peer: PeerId,
+    /// Preserve the original advertisement order so every retry rebuilds the
+    /// same signed frame and recovery-intent key while the batch is live.
+    msg_ids: Vec<MessageIdType>,
+    requested_at: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DeferredEagerReply {
+    peer: PeerId,
+    msg_id: MessageIdType,
+    local_origin_only: bool,
+    requested_at: Instant,
+}
+
+const MAX_DEFERRED_IWANT_IDS: usize = MAX_IHAVE_BATCH_SIZE;
+const MAX_DEFERRED_EAGER_REPLIES: usize = MAX_IHAVE_BATCH_SIZE;
+
+struct IhaveFlushWork {
+    topic: TopicId,
+    batch: Vec<MessageIdType>,
+    targets: Vec<PeerId>,
+    late_offer: Option<LateOfferPage>,
+    kind: MessageKind,
+}
+
 struct TopicState {
     /// Spanning tree peers (forward EAGER)
     eager_peers: HashSet<PeerId>,
@@ -3590,8 +3636,18 @@ struct TopicState {
     pending_ihave: VecDeque<MessageIdType>,
     /// Successful IHAVE handoffs, bounded by `pending_ihave` membership.
     ihave_advertised: HashMap<MessageIdType, HashSet<PeerId>>,
-    /// Outstanding IWANT requests: msg_id -> (peer, timestamp)
-    outstanding_iwants: HashMap<MessageIdType, (PeerId, Instant)>,
+    /// Cursor-only catch-up offers for currently connected peers. Message ids
+    /// remain owned by the bounded cache and are derived again on each retry.
+    late_local_offers: HashMap<PeerId, LateLocalOffer>,
+    /// Outstanding IWANT requests. Byte-deferred requests retain only their
+    /// bounded ids and owner; the existing 100 ms recovery flusher retries
+    /// them through the same limiter/admission path.
+    outstanding_iwants: HashMap<MessageIdType, OutstandingIwant>,
+    deferred_iwants: Vec<DeferredIwant>,
+    /// Publisher-side custody for IWANT replies whose EAGER bytes were
+    /// deferred by the hard egress limiter. Payload and proof remain in the
+    /// bounded cache and are re-derived at each attempt.
+    deferred_eager_replies: Vec<DeferredEagerReply>,
     /// Per-peer quality scores for tree optimization
     peer_scores: HashMap<PeerId, PeerScore>,
     /// Local subscribers
@@ -3622,6 +3678,95 @@ struct TopicState {
 }
 
 impl TopicState {
+    fn prune_deferred_eager_replies(&mut self, now: Instant) {
+        self.message_cache.prune_expired_at(now);
+        let cache = &self.message_cache;
+        self.deferred_eager_replies.retain(|entry| {
+            now.saturating_duration_since(entry.requested_at) < cache.max_age
+                && cache.lru.peek(&entry.msg_id).is_some_and(|cached| {
+                    !cached.message.dropped
+                        && (!entry.local_origin_only || cached.message.local_origin)
+                })
+        });
+    }
+
+    fn retain_deferred_eager_reply(
+        &mut self,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        local_origin_only: bool,
+        now: Instant,
+    ) -> bool {
+        self.prune_deferred_eager_replies(now);
+        if let Some(entry) = self
+            .deferred_eager_replies
+            .iter_mut()
+            .find(|entry| entry.peer == peer && entry.msg_id == msg_id)
+        {
+            // A restricted request can only reach this point after an
+            // authoritative local-origin cache lookup. Keep that stronger
+            // requirement when an ordinary request for the same delivery is
+            // coalesced into its existing custody entry.
+            entry.local_origin_only |= local_origin_only;
+            return true;
+        }
+        if self.deferred_eager_replies.len() >= MAX_DEFERRED_EAGER_REPLIES {
+            return false;
+        }
+        self.deferred_eager_replies.push(DeferredEagerReply {
+            peer,
+            msg_id,
+            local_origin_only,
+            requested_at: now,
+        });
+        true
+    }
+
+    fn prune_deferred_iwants(&mut self, now: Instant) {
+        let retry_age = self.message_cache.max_age;
+        self.outstanding_iwants
+            .retain(|_, entry| now.saturating_duration_since(entry.requested_at) < retry_age);
+        let outstanding = &self.outstanding_iwants;
+        self.deferred_iwants.retain(|entry| {
+            now.saturating_duration_since(entry.requested_at) < retry_age
+                && entry.msg_ids.iter().any(|msg_id| {
+                    outstanding
+                        .get(msg_id)
+                        .is_some_and(|pending| pending.retry_pending && pending.peer == entry.peer)
+                })
+        });
+    }
+
+    fn retain_deferred_iwant(
+        &mut self,
+        peer: PeerId,
+        msg_ids: &[MessageIdType],
+        now: Instant,
+    ) -> bool {
+        self.prune_deferred_iwants(now);
+        if self
+            .deferred_iwants
+            .iter()
+            .any(|entry| entry.peer == peer && entry.msg_ids.as_slice() == msg_ids)
+        {
+            return true;
+        }
+        let retained_ids = self
+            .deferred_iwants
+            .iter()
+            .map(|entry| entry.msg_ids.len())
+            .sum::<usize>();
+        if retained_ids.saturating_add(msg_ids.len()) > MAX_DEFERRED_IWANT_IDS {
+            return false;
+        }
+        self.deferred_iwants.push(DeferredIwant {
+            peer,
+            msg_ids: msg_ids.to_vec(),
+            requested_at: now,
+        });
+        true
+    }
+
     fn set_inner_proof(&mut self, msg_id: MessageIdType, proof: Option<compat::VerifiedInner>) {
         if let Some(entry) = self.message_cache.lru.get_mut(&msg_id) {
             entry.message.inner_proof = proof;
@@ -3645,9 +3790,12 @@ impl TopicState {
             ),
             pending_ihave: VecDeque::new(),
             ihave_advertised: HashMap::new(),
+            late_local_offers: HashMap::new(),
             stranded_ihave: Vec::new(),
             lazy_withheld: Vec::new(),
             outstanding_iwants: HashMap::new(),
+            deferred_iwants: Vec::new(),
+            deferred_eager_replies: Vec::new(),
             peer_scores: HashMap::new(),
             subscribers: Vec::new(),
             replay_cache: LruCache::new(replay_cache_capacity()),
@@ -3962,7 +4110,13 @@ impl TopicState {
     }
 
     /// Add message to cache
-    fn cache_message(&mut self, msg_id: MessageIdType, payload: Bytes, header: MessageHeader) {
+    fn cache_message(
+        &mut self,
+        msg_id: MessageIdType,
+        payload: Bytes,
+        header: MessageHeader,
+        local_origin: bool,
+    ) -> bool {
         debug!(
             target: "sg.payload.trace",
             stage = "cache_insert",
@@ -3971,14 +4125,28 @@ impl TopicState {
             zero_tail = payload_zero_tail(&payload),
             kind = ?header.kind,
         );
+        // A network echo or a contrived same-id wire collision cannot replace
+        // bytes that this process already owns and then inherit local custody.
+        if !local_origin
+            && self
+                .message_cache
+                .get(&msg_id)
+                .is_some_and(|cached| cached.local_origin)
+        {
+            return false;
+        }
         let cached = CachedMessage {
             payload,
             header,
             dropped: false,
+            local_origin,
             inner_proof: None,
         };
-        self.message_cache.insert(msg_id, cached);
-        self.touch();
+        let accepted = self.message_cache.insert(msg_id, cached);
+        if accepted {
+            self.touch();
+        }
+        accepted
     }
 
     /// Storm-control: mark a cached message as validator-dropped. The
@@ -3993,6 +4161,78 @@ impl TopicState {
     /// Get cached message
     fn get_message(&mut self, msg_id: &MessageIdType) -> Option<CachedMessage> {
         self.message_cache.get(msg_id).cloned()
+    }
+
+    fn get_local_origin_message(&mut self, msg_id: &MessageIdType) -> Option<CachedMessage> {
+        self.message_cache.prune_expired();
+        self.message_cache
+            .lru
+            .peek(msg_id)
+            .map(|entry| &entry.message)
+            .filter(|cached| cached.local_origin)
+            .cloned()
+    }
+
+    fn has_live_local_origin(&mut self) -> bool {
+        self.message_cache.prune_expired();
+        self.message_cache
+            .lru
+            .iter()
+            .any(|(_, entry)| entry.message.local_origin && !entry.message.dropped)
+    }
+
+    fn queue_late_local_offer(&mut self, peer: PeerId, now: Instant) {
+        self.message_cache.prune_expired_at(now);
+        if self.has_live_local_origin() {
+            self.late_local_offers
+                .entry(peer)
+                .or_insert(LateLocalOffer {
+                    cutoff: now,
+                    cursor: None,
+                });
+        }
+    }
+
+    fn late_local_offer_batch(
+        &mut self,
+        peer: PeerId,
+        now: Instant,
+    ) -> Option<(Vec<MessageIdType>, (Instant, MessageIdType))> {
+        let offer = *self.late_local_offers.get(&peer)?;
+        self.message_cache.prune_expired_at(now);
+        let mut eligible: Vec<_> = self
+            .message_cache
+            .lru
+            .iter()
+            .filter_map(|(id, entry)| {
+                let key = (entry.inserted_at, *id);
+                (entry.message.local_origin
+                    && !entry.message.dropped
+                    && entry.inserted_at <= offer.cutoff
+                    && offer.cursor.is_none_or(|cursor| key > cursor))
+                .then_some(key)
+            })
+            .collect();
+        eligible.sort_unstable();
+        eligible.truncate(MAX_IHAVE_BATCH_SIZE);
+        let Some(last) = eligible.last().copied() else {
+            self.late_local_offers.remove(&peer);
+            return None;
+        };
+        Some((eligible.into_iter().map(|(_, id)| id).collect(), last))
+    }
+
+    fn advance_late_local_offer(
+        &mut self,
+        peer: PeerId,
+        cutoff: Instant,
+        cursor: (Instant, MessageIdType),
+    ) {
+        if let Some(offer) = self.late_local_offers.get_mut(&peer) {
+            if offer.cutoff == cutoff {
+                offer.cursor = Some(cursor);
+            }
+        }
     }
 
     /// Clean expired cache entries
@@ -4692,6 +4932,9 @@ impl TopicState {
     fn evict_not_connected_peer(&mut self, peer: PeerId) -> NotConnectedEviction {
         let eager = self.eager_peers.remove(&peer);
         let lazy = self.lazy_peers.remove(&peer);
+        self.late_local_offers.remove(&peer);
+        self.deferred_eager_replies
+            .retain(|entry| entry.peer != peer);
         let cooling = self.peer_cooling.remove(&peer).is_some();
         NotConnectedEviction {
             eager,
@@ -5504,6 +5747,72 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         data: Bytes,
     ) -> Result<()> {
         self.dispatch_message(session.peer, Some(session), data)
+            .await
+    }
+
+    /// Return topics that still retain at least one locally published,
+    /// serveable cache entry.
+    ///
+    /// The query prunes entries through the existing bounded cache lifetime;
+    /// it does not create a second origin registry or extend retention.
+    pub async fn locally_originated_cached_topic_ids(&self) -> Vec<TopicId> {
+        let mut shards = self.topics.write_all().await;
+        let mut topics = Vec::new();
+        for shard in &mut shards {
+            topics.extend(
+                shard
+                    .iter_mut()
+                    .filter_map(|(topic, state)| state.has_live_local_origin().then_some(*topic)),
+            );
+        }
+        topics.sort_by_key(|topic| topic.to_bytes());
+        topics
+    }
+
+    /// Verify and serve a full IWANT frame using only locally originated
+    /// cached entries.
+    ///
+    /// This is a terminal dispatch entry point for an unsubscribed Leaf
+    /// consumer. It rejects malformed, trailing, unsigned, or non-IWANT
+    /// frames and filters mixed batches at the authoritative cache lookup.
+    /// `Ok(true)` means at least one eligible reply was actually sent;
+    /// `Ok(false)` means the valid request had no successfully served local
+    /// entry. It never falls through to unrestricted IWANT service.
+    pub async fn handle_local_origin_iwant(&self, from: PeerId, data: Bytes) -> Result<bool> {
+        let decode_started = Instant::now();
+        let decoded: std::result::Result<(GossipMessage, &[u8]), _> =
+            postcard::take_from_bytes(&data);
+        self.record_stage(PubSubStage::Decode, decode_started);
+        let (message, trailing) = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.stage_stats.record_decode_failed();
+                return Err(anyhow!("Failed to deserialize PubSub message: {error}"));
+            }
+        };
+        anyhow::ensure!(trailing.is_empty(), "trailing IWANT frame bytes");
+        anyhow::ensure!(
+            message.header.kind == MessageKind::IWant,
+            "local-origin entry point requires IWANT"
+        );
+        self.stage_stats.record_message_kind(MessageKind::IWant);
+        anyhow::ensure!(
+            self.verify_message_signature(&message),
+            "Invalid signature on IWANT message"
+        );
+        self.transport.migration.ingress(from, None, &message)?;
+        let payload = message
+            .payload
+            .as_ref()
+            .ok_or_else(|| anyhow!("IWANT message missing payload"))?;
+        let requested: Vec<MessageIdType> = match postcard::from_bytes(payload) {
+            Ok(requested) => requested,
+            Err(error) => {
+                self.stage_stats.record_decode_failed();
+                return Err(anyhow!("Failed to deserialize IWANT payload: {error}"));
+            }
+        };
+        self.handle_iwant_admitted_filtered(from, message.header.topic, requested, true)
             .await
     }
 
@@ -7831,8 +8140,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .or_insert_with(|| self.new_topic_state());
 
         // Add to cache
-        state.cache_message(msg_id, payload.clone(), header);
-        state.set_inner_proof(msg_id, inner_proof);
+        if state.cache_message(msg_id, payload.clone(), header, true) {
+            state.set_inner_proof(msg_id, inner_proof);
+        }
 
         // Seed the replay cache so network echoes of our own publish are
         // detected as replays (defense-in-depth alongside msg_id dedup).
@@ -8257,8 +8567,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             len = payload.len(),
             zero_tail = payload_zero_tail(&payload),
         );
-        state.cache_message(msg_id, payload.clone(), message.header.clone());
-        state.set_inner_proof(msg_id, inner_proof);
+        if state.cache_message(msg_id, payload.clone(), message.header.clone(), false) {
+            state.set_inner_proof(msg_id, inner_proof);
+        }
 
         // Update peer score for the sender
         state
@@ -8480,7 +8791,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
-        let registered = self.transport.migration.registered(topic);
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
@@ -8489,6 +8799,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
         state.touch();
+        state.prune_deferred_iwants(Instant::now());
 
         let mut requested = Vec::new();
 
@@ -8503,15 +8814,22 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 continue;
             }
 
-            // Bound outstanding recovery work on audited migration topics.
-            if registered && state.outstanding_iwants.len() >= 1024 {
+            // Bound retained recovery metadata on every topic. Previously the
+            // cap applied only to migration topics, but byte-deferred IWANTs
+            // now remain live until sent or cache-age expiry.
+            if state.outstanding_iwants.len() >= MAX_IHAVE_BATCH_SIZE {
                 break;
             }
             // Request it
             requested.push(msg_id);
-            state
-                .outstanding_iwants
-                .insert(msg_id, (from, Instant::now()));
+            state.outstanding_iwants.insert(
+                msg_id,
+                OutstandingIwant {
+                    peer: from,
+                    requested_at: Instant::now(),
+                    retry_pending: false,
+                },
+            );
 
             // Track IWANT request for scoring
             state
@@ -8572,13 +8890,43 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 .await;
             self.record_stage(PubSubStage::Republish, republish_started);
             match &send_result {
-                Ok(PeerSendOutcome::Sent { .. }) => {}
-                Ok(
-                    PeerSendOutcome::TimedOut
-                    | PeerSendOutcome::NotConnected
-                    | PeerSendOutcome::Deferred,
-                )
-                | Err(_) => {
+                Ok(PeerSendOutcome::Sent { .. }) => {
+                    let handed_off_at = Instant::now();
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        for msg_id in &requested {
+                            if let Some(entry) = state.outstanding_iwants.get_mut(msg_id) {
+                                if entry.peer == from {
+                                    entry.requested_at = handed_off_at;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(PeerSendOutcome::Deferred) => {
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        for msg_id in &requested {
+                            if let Some(entry) = state.outstanding_iwants.get_mut(msg_id) {
+                                if entry.peer == from {
+                                    entry.retry_pending = true;
+                                }
+                            }
+                        }
+                        if !state.retain_deferred_iwant(from, &requested, Instant::now()) {
+                            for msg_id in &requested {
+                                if state
+                                    .outstanding_iwants
+                                    .get(msg_id)
+                                    .is_some_and(|entry| entry.peer == from)
+                                {
+                                    state.outstanding_iwants.remove(msg_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(PeerSendOutcome::TimedOut | PeerSendOutcome::NotConnected) | Err(_) => {
                     // No IWANT reached the peer. Release exactly the claims
                     // made above so a later IHAVE can retry recovery instead
                     // of remaining suppressed until the stale-request sweep.
@@ -8588,7 +8936,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             if state
                                 .outstanding_iwants
                                 .get(msg_id)
-                                .is_some_and(|(owner, _)| owner == &from)
+                                .is_some_and(|entry| entry.peer == from)
                             {
                                 state.outstanding_iwants.remove(msg_id);
                             }
@@ -8622,14 +8970,31 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
+        self.handle_iwant_admitted_filtered(from, topic, msg_ids, false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn handle_iwant_admitted_filtered(
+        &self,
+        from: PeerId,
+        topic: TopicId,
+        msg_ids: Vec<MessageIdType>,
+        local_origin_only: bool,
+    ) -> Result<bool> {
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
+        if local_origin_only && !topics.contains_key(&topic) {
+            return Ok(false);
+        }
         let state = topics
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
-        state.touch();
+        if !local_origin_only {
+            state.touch();
+        }
 
         let mut to_send = Vec::new();
         let mut requester_has_cached_message = false;
@@ -8641,7 +9006,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let track_served = !state.stranded_ihave.is_empty() || !state.lazy_withheld.is_empty();
 
         for msg_id in msg_ids {
-            if let Some(cached) = state.get_message(&msg_id) {
+            let cached = if local_origin_only {
+                state.get_local_origin_message(&msg_id)
+            } else {
+                state.get_message(&msg_id)
+            };
+            if let Some(cached) = cached {
                 // Storm-control: a validator-dropped message must never
                 // leave this node, even under IWANT recovery pressure.
                 if cached.dropped {
@@ -8659,6 +9029,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
 
         if requester_has_cached_message {
+            if local_origin_only {
+                state.touch();
+                Self::record_inbound_peer_activity_for_state(
+                    self.stage_stats.as_ref(),
+                    topic,
+                    from,
+                    state,
+                    Instant::now(),
+                    MessageKind::IWant,
+                );
+            }
             // GRAFT only when bounded score-aware maintenance chooses the
             // requester; an IWANT burst must not bypass mesh degree caps.
             state.add_new_peer_lazy(from);
@@ -8679,6 +9060,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // loop (or before an error return) so a stranded retry never
         // treats a failed reply as a completed pull.
         let mut served_ids: Vec<MessageIdType> = Vec::new();
+        let mut deferred_ids: Vec<MessageIdType> = Vec::new();
+        let mut sent_any = false;
         let mut send_err: Option<anyhow::Error> = None;
         // Send EAGER with payloads
         for (msg_id, cached) in to_send {
@@ -8727,15 +9110,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 .await;
             match send_result {
                 Ok(PeerSendOutcome::Sent { .. }) => {
+                    sent_any = true;
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        state
+                            .deferred_eager_replies
+                            .retain(|entry| entry.peer != from || entry.msg_id != msg_id);
+                    }
                     if track_served {
                         served_ids.push(msg_id);
                     }
                 }
-                Ok(
-                    PeerSendOutcome::TimedOut
-                    | PeerSendOutcome::NotConnected
-                    | PeerSendOutcome::Deferred,
-                ) => {}
+                Ok(PeerSendOutcome::Deferred) => deferred_ids.push(msg_id),
+                Ok(PeerSendOutcome::TimedOut | PeerSendOutcome::NotConnected) => {}
                 Err(e) => {
                     send_err = Some(e);
                     break;
@@ -8744,12 +9131,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
         self.mark_stranded_ihave_served(topic, from, &served_ids)
             .await;
+        if !deferred_ids.is_empty() {
+            let mut topics = self.topics.write_topic(&topic).await;
+            if let Some(state) = topics.get_mut(&topic) {
+                let now = Instant::now();
+                for msg_id in deferred_ids {
+                    let _ = state.retain_deferred_eager_reply(from, msg_id, local_origin_only, now);
+                }
+            }
+        }
         self.record_stage(PubSubStage::Republish, republish_started);
         if let Some(e) = send_err {
             return Err(e);
         }
 
-        Ok(())
+        Ok(sent_any)
     }
 
     /// x0x #613 (PR #54 r3 item 2): mark stranded ids as pull-served for
@@ -9253,62 +9649,101 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         send_path: &SendPathContext,
         egress_limiter: &Arc<egress::LeafEgressLimiter>,
     ) {
-        let work: Vec<(TopicId, Vec<MessageIdType>, Vec<PeerId>)> = {
+        let work: Vec<IhaveFlushWork> = {
             let mut topics_guard = topics.write_all().await;
             let mut work = Vec::new();
 
             for shard in topics_guard.iter_mut() {
                 for (topic_id, state) in shard.iter_mut() {
-                    if state.pending_ihave.is_empty() {
-                        continue;
+                    if !state.pending_ihave.is_empty() {
+                        // Issue #42 round 2: SNAPSHOT the batch instead of
+                        // draining it — the ids (and the #59 withheld-eager
+                        // entries) are only consumed once the sends have been
+                        // handed off (see `consume_flushed_ihave_batch`), so an
+                        // aborted flush leaves them in place.
+                        let batch: Vec<MessageIdType> = state
+                            .pending_ihave
+                            .iter()
+                            .take(MAX_IHAVE_BATCH_SIZE)
+                            .copied()
+                            .collect();
+
+                        // x0x #613: stranded-publish pull path. The regular
+                        // flush advertises only to lazy members; merge in the
+                        // unserved direct targets for this batch (the peers the
+                        // stranded EAGER fan-out attempted) so an all-eager
+                        // topic still advertises — otherwise the cached message
+                        // would have no pull path at all. Entries are NOT
+                        // consumed here (a pull can land later); the bounded
+                        // retry removes them.
+                        let mut ihave_targets = state.stranded_ihave_targets_for(&batch);
+                        // #59: merge the LazyForward withheld-eager announce
+                        // targets for this batch (non-consuming snapshot; the
+                        // entries are dropped in `consume_flushed_ihave_batch`
+                        // once the sends are handed off).
+                        for peer in state.lazy_withheld_targets_for(&batch) {
+                            if !ihave_targets.contains(&peer) {
+                                ihave_targets.push(peer);
+                            }
+                        }
+                        for peer in state.lazy_peers.iter().copied() {
+                            if !ihave_targets.contains(&peer) {
+                                ihave_targets.push(peer);
+                            }
+                        }
+                        if egress_limiter.enabled() {
+                            ihave_targets.retain(|peer| state.ihave_target_pending(&batch, *peer));
+                        }
+                        work.push(IhaveFlushWork {
+                            topic: *topic_id,
+                            batch,
+                            targets: ihave_targets,
+                            late_offer: None,
+                            kind: MessageKind::IHave,
+                        });
                     }
 
-                    // Issue #42 round 2: SNAPSHOT the batch instead of
-                    // draining it — the ids (and the #59 withheld-eager
-                    // entries) are only consumed once the sends have been
-                    // handed off (see `consume_flushed_ihave_batch`), so an
-                    // aborted flush leaves them in place.
-                    let batch: Vec<MessageIdType> = state
-                        .pending_ihave
-                        .iter()
-                        .take(MAX_IHAVE_BATCH_SIZE)
-                        .copied()
-                        .collect();
+                    let now = Instant::now();
+                    let late_peers: Vec<_> = state.late_local_offers.keys().copied().collect();
+                    for peer in late_peers {
+                        let Some(offer) = state.late_local_offers.get(&peer).copied() else {
+                            continue;
+                        };
+                        if let Some((batch, cursor)) = state.late_local_offer_batch(peer, now) {
+                            work.push(IhaveFlushWork {
+                                topic: *topic_id,
+                                batch,
+                                targets: vec![peer],
+                                late_offer: Some((peer, offer.cutoff, cursor)),
+                                kind: MessageKind::IHave,
+                            });
+                        }
+                    }
 
-                    // x0x #613: stranded-publish pull path. The regular
-                    // flush advertises only to lazy members; merge in the
-                    // unserved direct targets for this batch (the peers the
-                    // stranded EAGER fan-out attempted) so an all-eager
-                    // topic still advertises — otherwise the cached message
-                    // would have no pull path at all. Entries are NOT
-                    // consumed here (a pull can land later); the bounded
-                    // retry removes them.
-                    let mut ihave_targets = state.stranded_ihave_targets_for(&batch);
-                    // #59: merge the LazyForward withheld-eager announce
-                    // targets for this batch (non-consuming snapshot; the
-                    // entries are dropped in `consume_flushed_ihave_batch`
-                    // once the sends are handed off).
-                    for peer in state.lazy_withheld_targets_for(&batch) {
-                        if !ihave_targets.contains(&peer) {
-                            ihave_targets.push(peer);
-                        }
+                    state.prune_deferred_iwants(now);
+                    for entry in state.deferred_iwants.iter().cloned() {
+                        work.push(IhaveFlushWork {
+                            topic: *topic_id,
+                            batch: entry.msg_ids,
+                            targets: vec![entry.peer],
+                            late_offer: None,
+                            kind: MessageKind::IWant,
+                        });
                     }
-                    for peer in state.lazy_peers.iter().copied() {
-                        if !ihave_targets.contains(&peer) {
-                            ihave_targets.push(peer);
-                        }
-                    }
-                    if egress_limiter.enabled() {
-                        ihave_targets.retain(|peer| state.ihave_target_pending(&batch, *peer));
-                    }
-                    work.push((*topic_id, batch, ihave_targets));
                 }
             }
 
             work
         };
 
-        for (topic_id, batch, ihave_targets) in work {
+        for IhaveFlushWork {
+            topic: topic_id,
+            batch,
+            targets: ihave_targets,
+            late_offer,
+            kind,
+        } in work
+        {
             if ihave_targets.is_empty() {
                 continue;
             }
@@ -9328,7 +9763,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 payload_hash: None,
                 topic: topic_id,
                 msg_id: batch[0],
-                kind: MessageKind::IHave,
+                kind,
                 hop: 0,
                 ttl: 10,
             };
@@ -9356,13 +9791,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
 
-            let (reserved_targets, budget_deferred) = Self::reserve_recovery_targets(
-                egress_limiter,
-                topic_id,
-                ihave_targets,
-                "IHAVE",
-                &bytes,
-            );
+            let op = if kind == MessageKind::IWant {
+                "IWANT"
+            } else {
+                "IHAVE"
+            };
+            let (reserved_targets, budget_deferred) =
+                Self::reserve_recovery_targets(egress_limiter, topic_id, ihave_targets, op, &bytes);
             let mut reservations = HashMap::new();
             let mut ihave_targets = Vec::with_capacity(reserved_targets.len());
             for (peer, reservation) in reserved_targets {
@@ -9393,7 +9828,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     state,
                     &topic_id,
                     ihave_targets,
-                    "IHAVE",
+                    op,
                     now,
                 );
                 if admitted.is_empty() {
@@ -9405,8 +9840,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     outbound_budgets,
                     send_path,
                     topic: topic_id,
-                    op: "IHAVE",
-                    send_class: OutboundSendClass::for_op("IHAVE"),
+                    op,
+                    send_class: OutboundSendClass::for_op(op),
                     priority: send_path.admission.registry().priority_for(&topic_id),
                 };
                 // Skip reasons are only consulted by the single-peer
@@ -9433,13 +9868,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if !claims.is_empty() {
                 // x0x #380: outbound demand metering for the IHAVE flush
                 // lane. Instrumentation only.
-                stage_stats.record_outbound(
-                    topic_id,
-                    "IHAVE",
-                    bytes.len(),
-                    claims.attempts().len(),
-                );
-                let mut send_tasks = SendTaskSet::with_capacity("IHAVE", claims.attempts().len());
+                stage_stats.record_outbound(topic_id, op, bytes.len(), claims.attempts().len());
+                let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
                 let attempts = claims.attempts().to_vec();
                 let permits = claims.take_permits();
                 for (attempt, permit) in attempts.into_iter().zip(permits) {
@@ -9462,7 +9892,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 peer: attempt.peer,
                                 stream_type: GossipStreamType::PubSub,
                                 bytes,
-                                op: "IHAVE",
+                                op,
                                 send_timeout: None,
                             },
                         )
@@ -9475,6 +9905,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     .iter()
                     .map(|completion| completion.attempt.peer)
                     .collect();
+                let failed_peers: HashSet<_> = timed_out
+                    .iter()
+                    .chain(not_connected.iter())
+                    .map(|attempt| attempt.peer)
+                    .collect();
                 claims.record_results(sent, timed_out, not_connected).await;
                 // Issue #42 round 2: the send tasks have been handed off —
                 // NOW take the batch out of the topic state. An abort
@@ -9483,16 +9918,39 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // losing it.
                 let mut topics_guard = topics.write_topic(&topic_id).await;
                 if let Some(state) = topics_guard.get_mut(&topic_id) {
-                    for peer in advertised_peers {
-                        state.record_ihave_handoff(&batch, peer);
-                        state.record_stranded_ihave_advertised(&batch, peer);
-                    }
-                    let all_handed_off = !egress_limiter.enabled()
-                        || intended_targets
-                            .iter()
-                            .all(|peer| !state.ihave_target_pending(&batch, *peer));
-                    if budget_deferred.is_empty() && all_handed_off {
-                        state.consume_flushed_ihave_batch(&batch);
+                    if kind == MessageKind::IWant {
+                        let handed_off_at = Instant::now();
+                        for msg_id in &batch {
+                            let remove = state
+                                .outstanding_iwants
+                                .get(msg_id)
+                                .is_some_and(|entry| failed_peers.contains(&entry.peer));
+                            if remove {
+                                state.outstanding_iwants.remove(msg_id);
+                            } else if let Some(entry) = state.outstanding_iwants.get_mut(msg_id) {
+                                if advertised_peers.contains(&entry.peer) {
+                                    entry.retry_pending = false;
+                                    entry.requested_at = handed_off_at;
+                                }
+                            }
+                        }
+                    } else if let Some((peer, cutoff, cursor)) = late_offer {
+                        let late_offer_sent = advertised_peers.contains(&peer);
+                        if late_offer_sent {
+                            state.advance_late_local_offer(peer, cutoff, cursor);
+                        }
+                    } else {
+                        for peer in advertised_peers {
+                            state.record_ihave_handoff(&batch, peer);
+                            state.record_stranded_ihave_advertised(&batch, peer);
+                        }
+                        let all_handed_off = !egress_limiter.enabled()
+                            || intended_targets
+                                .iter()
+                                .all(|peer| !state.ihave_target_pending(&batch, *peer));
+                        if budget_deferred.is_empty() && all_handed_off {
+                            state.consume_flushed_ihave_batch(&batch);
+                        }
                     }
                 }
                 drop(topics_guard);
@@ -9502,6 +9960,233 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // paths uniformly via the explicit list rather than relying
             // on per-completion release.
             release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+        }
+        Self::flush_deferred_eager_replies(
+            topics,
+            transport,
+            signing_key,
+            stage_stats,
+            outbound_budgets,
+            send_path,
+            egress_limiter,
+        )
+        .await;
+    }
+
+    async fn flush_deferred_eager_replies(
+        topics: &Arc<ShardedTopicMap>,
+        transport: &Arc<PolicyTransport<T>>,
+        signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
+        stage_stats: &Arc<PubSubStageStats>,
+        outbound_budgets: &Arc<PeerOutboundBudgets>,
+        send_path: &SendPathContext,
+        egress_limiter: &Arc<egress::LeafEgressLimiter>,
+    ) {
+        let work: Vec<_> = {
+            let now = Instant::now();
+            let mut topics_guard = topics.write_all().await;
+            let mut work = Vec::new();
+            for shard in topics_guard.iter_mut() {
+                for (topic, state) in shard.iter_mut() {
+                    state.prune_deferred_eager_replies(now);
+                    for entry in state.deferred_eager_replies.iter().copied() {
+                        work.push((*topic, entry));
+                    }
+                }
+            }
+            work
+        };
+
+        for (topic, entry) in work {
+            // Snapshot only bounded identity metadata above. Re-read the cache
+            // immediately before this attempt so an expiry, validator drop,
+            // or loss of local-origin authority cannot race a stale clone.
+            let cached = {
+                let mut guard = topics.write_topic(&topic).await;
+                let Some(state) = guard.get_mut(&topic) else {
+                    continue;
+                };
+                state.prune_deferred_eager_replies(Instant::now());
+                if !state.deferred_eager_replies.contains(&entry) {
+                    continue;
+                }
+                state
+                    .message_cache
+                    .lru
+                    .peek(&entry.msg_id)
+                    .and_then(|cached| {
+                        let cached = &cached.message;
+                        (!cached.dropped && (!entry.local_origin_only || cached.local_origin))
+                            .then(|| cached.clone())
+                    })
+            };
+            let Some(cached) = cached else {
+                continue;
+            };
+            if transport
+                .migration
+                .admit_cache_serve(
+                    topic,
+                    cached.payload.len()
+                        + MESSAGE_CRYPTO_OVERHEAD_BYTES
+                        + MESSAGE_HEADER_OVERHEAD_BYTES,
+                )
+                .is_err()
+                || !forwardable_payload("iwant_serve", &entry.msg_id, &cached.payload)
+            {
+                let mut guard = topics.write_topic(&topic).await;
+                if let Some(state) = guard.get_mut(&topic) {
+                    state
+                        .deferred_eager_replies
+                        .retain(|candidate| *candidate != entry);
+                }
+                continue;
+            }
+            let header_bytes = match postcard::to_stdvec(&cached.header) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    warn!(topic = %LogTopicId::from(topic), "deferred EAGER header serialize failed: {error}");
+                    let mut guard = topics.write_topic(&topic).await;
+                    if let Some(state) = guard.get_mut(&topic) {
+                        state
+                            .deferred_eager_replies
+                            .retain(|candidate| *candidate != entry);
+                    }
+                    continue;
+                }
+            };
+            let signature = match signing_key.sign(&header_bytes) {
+                Ok(signature) => signature,
+                Err(error) => {
+                    warn!(topic = %LogTopicId::from(topic), "deferred EAGER signing failed: {error}");
+                    let mut guard = topics.write_topic(&topic).await;
+                    if let Some(state) = guard.get_mut(&topic) {
+                        state
+                            .deferred_eager_replies
+                            .retain(|candidate| *candidate != entry);
+                    }
+                    continue;
+                }
+            };
+            let message = GossipMessage {
+                header: cached.header.clone(),
+                payload: Some(cached.payload.clone()),
+                signature,
+                public_key: signing_key.public_key().to_vec(),
+            };
+            let bytes = match postcard::to_stdvec(&message).map(Bytes::from) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    warn!(topic = %LogTopicId::from(topic), "deferred EAGER serialize failed: {error}");
+                    let mut guard = topics.write_topic(&topic).await;
+                    if let Some(state) = guard.get_mut(&topic) {
+                        state
+                            .deferred_eager_replies
+                            .retain(|candidate| *candidate != entry);
+                    }
+                    continue;
+                }
+            };
+            let (reserved, _) = Self::reserve_recovery_targets(
+                egress_limiter,
+                topic,
+                vec![entry.peer],
+                "EAGER",
+                &bytes,
+            );
+            let Some((peer, reservation)) = reserved.into_iter().next() else {
+                continue;
+            };
+            let (attempts, permits, bulk_admitted) = {
+                let now = Instant::now();
+                let mut guard = topics.write_topic(&topic).await;
+                let Some(state) = guard.get_mut(&topic) else {
+                    continue;
+                };
+                let (admitted, bulk) = filter_peers_through_admission_in_state(
+                    send_path,
+                    state,
+                    &topic,
+                    vec![peer],
+                    "EAGER",
+                    now,
+                );
+                let context = SendClaimContext {
+                    stage_stats: stage_stats.as_ref(),
+                    outbound_budgets,
+                    send_path,
+                    topic,
+                    op: "EAGER",
+                    send_class: OutboundSendClass::for_op("EAGER"),
+                    priority: send_path.admission.registry().priority_for(&topic),
+                };
+                let (attempts, permits, _) =
+                    Self::claim_topic_send_attempts_for_state(&context, state, admitted, now);
+                (attempts, permits, bulk)
+            };
+            let mut claims = SendAttemptClaims::new(
+                topic,
+                attempts,
+                permits,
+                Arc::clone(topics),
+                Arc::clone(stage_stats),
+                send_path.clone(),
+            );
+            if !claims.is_empty() {
+                stage_stats.record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
+            }
+            let attempts = claims.attempts().to_vec();
+            let permits = claims.take_permits();
+            let mut tasks = SendTaskSet::with_capacity("EAGER", attempts.len());
+            let mut reservation = reservation;
+            for (attempt, permit) in attempts.into_iter().zip(permits) {
+                let transport = Arc::clone(transport);
+                let stage_stats = Arc::clone(stage_stats);
+                let limiter = Arc::clone(egress_limiter);
+                let rtt_tracker = Arc::clone(&send_path.rtt_tracker);
+                let bytes = bytes.clone();
+                let reservation = reservation.take();
+                let handle = tokio::spawn(async move {
+                    let _permit = permit;
+                    Self::send_to_peer_with_timeout(
+                        transport,
+                        limiter,
+                        stage_stats,
+                        rtt_tracker,
+                        PeerSendRequest {
+                            reservation,
+                            topic,
+                            peer: attempt.peer,
+                            stream_type: GossipStreamType::PubSub,
+                            bytes,
+                            op: "EAGER",
+                            send_timeout: None,
+                        },
+                    )
+                    .await
+                });
+                tasks.push(attempt, handle);
+            }
+            let (sent, timed_out, not_connected) = tasks.collect_results().await;
+            let served_peers: Vec<_> = sent
+                .iter()
+                .map(|completion| completion.attempt.peer)
+                .collect();
+            let terminal = !sent.is_empty() || !timed_out.is_empty() || !not_connected.is_empty();
+            claims.record_results(sent, timed_out, not_connected).await;
+            release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+            if terminal {
+                let mut guard = topics.write_topic(&topic).await;
+                if let Some(state) = guard.get_mut(&topic) {
+                    for peer in served_peers {
+                        state.record_stranded_ihave_served(&entry.msg_id, peer);
+                        state.record_lazy_withheld_served(&entry.msg_id, peer);
+                    }
+                    state
+                        .deferred_eager_replies
+                        .retain(|candidate| *candidate != entry);
+                }
+            }
         }
     }
 
@@ -10276,11 +10961,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
 
+        let known: HashSet<_> = state
+            .eager_peers
+            .iter()
+            .chain(state.lazy_peers.iter())
+            .copied()
+            .collect();
         let now = Instant::now();
         for peer in peers {
             // New peers enter LAZY first; score-aware maintenance chooses the
             // bounded EAGER subset instead of bulk-promoting the full view.
             state.add_new_peer_lazy(peer);
+            if !known.contains(&peer) {
+                state.queue_late_local_offer(peer, now);
+            }
         }
 
         let (pruned, grafted) = state.maintain_degree_at(now);
@@ -10312,10 +11006,28 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .or_insert_with(|| self.new_topic_state());
 
         let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
+        let previously_connected: HashSet<_> = state
+            .eager_peers
+            .iter()
+            .chain(state.lazy_peers.iter())
+            .copied()
+            .collect();
 
         // Remove stale peers (no longer connected) from both sets.
         state.eager_peers.retain(|p| connected_set.contains(p));
         state.lazy_peers.retain(|p| connected_set.contains(p));
+        state
+            .late_local_offers
+            .retain(|peer, _| connected_set.contains(peer));
+        state
+            .outstanding_iwants
+            .retain(|_, entry| connected_set.contains(&entry.peer));
+        state
+            .deferred_iwants
+            .retain(|entry| connected_set.contains(&entry.peer));
+        state
+            .deferred_eager_replies
+            .retain(|entry| connected_set.contains(&entry.peer));
         let removed_cooling = state.clear_disconnected_peer_cooling(&connected_set);
         for peer in removed_cooling {
             self.stage_stats.clear_peer_suppression(topic, peer);
@@ -10327,6 +11039,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let now = Instant::now();
         for peer in connected_set.iter().copied() {
             state.add_new_peer_lazy(peer);
+            if !previously_connected.contains(&peer) {
+                state.queue_late_local_offer(peer, now);
+            }
         }
 
         let (pruned, grafted) = state.maintain_degree_at(now);
@@ -10632,6 +11347,7 @@ mod tests {
             payload: Bytes::from(vec![0u8; payload_len]),
             header: test_header(topic, msg_id),
             dropped: false,
+            local_origin: false,
             inner_proof: None,
         }
     }
@@ -17878,6 +18594,1352 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn byte_deferred_iwant_retries_once_and_recovers_local_origin_payload() {
+        let publisher_id = test_peer_id(1);
+        let receiver_id = test_peer_id(2);
+        let topic = TopicId::new([0x91; 32]);
+        let publisher_transport = RecordingTransport::new(publisher_id);
+        publisher_transport.set_connected_peer_ids(vec![receiver_id]);
+        let publisher = PlumtreePubSub::new_with_task_control(
+            publisher_id,
+            publisher_transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let payload = Bytes::from_static(b"deferred-iwant-local-origin");
+        let msg_id = publisher.calculate_msg_id(&topic, &payload);
+        publisher
+            .publish_local(topic, payload.clone())
+            .await
+            .expect("publisher caches local origin");
+
+        let receiver_transport = RecordingTransport::new(receiver_id);
+        receiver_transport.set_connected_peer_ids(vec![publisher_id]);
+        let receiver = PlumtreePubSub::new_with_task_control(
+            receiver_id,
+            receiver_transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let mut subscription = receiver.subscribe(topic);
+        let ids = vec![msg_id];
+        let iwant_payload: Bytes = postcard::to_stdvec(&ids).expect("IWANT ids").into();
+        let iwant_frame_len =
+            signed_control_frame(&receiver, topic, MessageKind::IWant, iwant_payload.clone()).len();
+        assert!(receiver.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: u64::try_from(iwant_frame_len).expect("frame size"),
+            max_serialized_frame_bytes: iwant_frame_len,
+        })));
+        let drain = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
+            topic,
+            publisher_id,
+            "EAGER",
+            b"consume-recovery-burst",
+        );
+        let _charged = receiver
+            .egress_limiter
+            .reserve_critical_eager(drain, iwant_frame_len, Duration::from_secs(1))
+            .await
+            .expect("competing Critical frame consumes burst");
+
+        let ihave_payload: Bytes = postcard::to_stdvec(&ids).expect("IHAVE ids").into();
+        let ihave = signed_control_frame(&publisher, topic, MessageKind::IHave, ihave_payload);
+        receiver
+            .dispatch_message(publisher_id, None, ihave)
+            .await
+            .expect("valid IHAVE survives byte deferral");
+        assert!(receiver_transport
+            .sent_frames_of_kind_to(publisher_id, MessageKind::IWant)
+            .is_empty());
+        let deferred = receiver
+            .leaf_egress_snapshot()
+            .by_topic_and_purpose
+            .into_iter()
+            .find(|row| row.topic == topic.to_bytes() && row.purpose == "IWANT")
+            .expect("IWANT byte accounting");
+        assert_eq!(deferred.sent_bytes, 0);
+        assert!(deferred.deferred >= 1, "first pull is byte-deferred");
+
+        receiver
+            .egress_limiter
+            .refill_after_for_test(Duration::from_secs(
+                u64::try_from(iwant_frame_len).expect("frame size"),
+            ));
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &receiver.topics,
+            &receiver.transport,
+            &receiver.signing_key,
+            &receiver.stage_stats,
+            &receiver.outbound_budgets,
+            &receiver.send_path_context(),
+            &receiver.egress_limiter,
+        )
+        .await;
+        let iwants = receiver_transport.sent_frames_of_kind_to(publisher_id, MessageKind::IWant);
+        assert_eq!(iwants.len(), 1, "deferred pull retries after refill");
+        assert!(publisher
+            .handle_local_origin_iwant(receiver_id, iwants[0].clone())
+            .await
+            .expect("restricted handler serves retried pull"));
+        let eager = publisher_transport.sent_frames_of_kind_to(receiver_id, MessageKind::Eager);
+        assert_eq!(eager.len(), 1);
+        let eager_message: GossipMessage = postcard::from_bytes(&eager[0]).expect("cached EAGER");
+        assert_eq!(eager_message.header.msg_id, msg_id);
+        assert_eq!(eager_message.payload.as_ref(), Some(&payload));
+        receiver
+            .dispatch_message(publisher_id, None, eager[0].clone())
+            .await
+            .expect("receiver handles cached EAGER");
+        let (delivered_from, delivered_payload) =
+            tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+                .await
+                .expect("subscriber delivery deadline")
+                .expect("subscription remains live");
+        assert_eq!(delivered_from, publisher_id);
+        assert_eq!(delivered_payload, payload);
+
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &receiver.topics,
+            &receiver.transport,
+            &receiver.signing_key,
+            &receiver.stage_stats,
+            &receiver.outbound_budgets,
+            &receiver.send_path_context(),
+            &receiver.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            receiver_transport
+                .sent_frames_of_kind_to(publisher_id, MessageKind::IWant)
+                .len(),
+            1,
+            "successful retry retires deferred custody"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_iwant_custody_expires_with_cache_age_and_disconnects() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x92; 32]);
+        let id = [0x93; 32];
+        let transport = RecordingTransport::new(local);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(local, transport, test_signing_key(), false);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(|| {
+                TopicState::with_cache_config(PubSubCacheConfig {
+                    max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+                    max_bytes_per_topic: 64 * 1024,
+                    max_age: Duration::from_secs(1),
+                })
+            });
+            let requested_at = Instant::now() - Duration::from_secs(2);
+            state.outstanding_iwants.insert(
+                id,
+                OutstandingIwant {
+                    peer,
+                    requested_at,
+                    retry_pending: true,
+                },
+            );
+            state.deferred_iwants.push(DeferredIwant {
+                peer,
+                msg_ids: vec![id],
+                requested_at,
+            });
+        }
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic");
+            assert!(state.outstanding_iwants.is_empty());
+            assert!(state.deferred_iwants.is_empty());
+        }
+
+        let requested_at = Instant::now();
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic");
+            state.outstanding_iwants.insert(
+                id,
+                OutstandingIwant {
+                    peer,
+                    requested_at,
+                    retry_pending: true,
+                },
+            );
+            state.deferred_iwants.push(DeferredIwant {
+                peer,
+                msg_ids: vec![id],
+                requested_at,
+            });
+        }
+        pubsub.set_topic_peers(topic, vec![peer]).await;
+        pubsub.set_topic_peers(topic, Vec::new()).await;
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic");
+        assert!(state.outstanding_iwants.is_empty());
+        assert!(state.deferred_iwants.is_empty());
+    }
+
+    #[test]
+    fn deferred_iwant_batch_stays_byte_stable_after_partial_eager_delivery() {
+        let peer = test_peer_id(2);
+        let first = [0x94; 32];
+        let second = [0x95; 32];
+        let now = Instant::now();
+        let mut state = TopicState::new();
+        for msg_id in [first, second] {
+            state.outstanding_iwants.insert(
+                msg_id,
+                OutstandingIwant {
+                    peer,
+                    requested_at: now,
+                    retry_pending: true,
+                },
+            );
+        }
+        assert!(state.retain_deferred_iwant(peer, &[first, second], now));
+        let original_payload =
+            postcard::to_stdvec(&state.deferred_iwants[0].msg_ids).expect("original IWANT payload");
+
+        state.outstanding_iwants.remove(&first);
+        state.prune_deferred_iwants(now);
+        assert_eq!(state.deferred_iwants[0].msg_ids, vec![first, second]);
+        assert_eq!(
+            postcard::to_stdvec(&state.deferred_iwants[0].msg_ids).expect("retry IWANT payload"),
+            original_payload,
+            "partial EAGER delivery must not change the signed retry frame or escrow key"
+        );
+    }
+
+    #[test]
+    fn deferred_iwant_retained_id_bound_preserves_existing_owner() {
+        let peer = test_peer_id(2);
+        let other = test_peer_id(3);
+        let now = Instant::now();
+        let mut state = TopicState::new();
+        let ids = (0..MAX_DEFERRED_IWANT_IDS)
+            .map(|index| {
+                let mut id = [0_u8; 32];
+                id[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+                state.outstanding_iwants.insert(
+                    id,
+                    OutstandingIwant {
+                        peer,
+                        requested_at: now,
+                        retry_pending: true,
+                    },
+                );
+                id
+            })
+            .collect::<Vec<_>>();
+        assert!(state.retain_deferred_iwant(peer, &ids, now));
+        let overflow = [0xff; 32];
+        state.outstanding_iwants.insert(
+            overflow,
+            OutstandingIwant {
+                peer: other,
+                requested_at: now,
+                retry_pending: true,
+            },
+        );
+        assert!(!state.retain_deferred_iwant(other, &[overflow], now));
+        assert_eq!(state.deferred_iwants.len(), 1);
+        assert_eq!(state.deferred_iwants[0].peer, peer);
+        assert!(state.outstanding_iwants.contains_key(&ids[0]));
+    }
+
+    #[tokio::test]
+    async fn sent_outstanding_iwants_expire_and_release_full_topic_capacity() {
+        let peer = test_peer_id(2);
+        let base = Instant::now();
+        let mut state = TopicState::with_cache_config(PubSubCacheConfig {
+            max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+            max_bytes_per_topic: 64 * 1024,
+            max_age: Duration::from_secs(1),
+        });
+        for index in 0..MAX_IHAVE_BATCH_SIZE {
+            let mut id = [0_u8; 32];
+            id[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+            state.outstanding_iwants.insert(
+                id,
+                OutstandingIwant {
+                    peer,
+                    requested_at: base,
+                    retry_pending: false,
+                },
+            );
+        }
+        state.prune_deferred_iwants(base + Duration::from_millis(999));
+        assert_eq!(state.outstanding_iwants.len(), MAX_IHAVE_BATCH_SIZE);
+
+        state.prune_deferred_iwants(base + Duration::from_millis(1_001));
+        assert!(state.outstanding_iwants.is_empty());
+        let fresh = [0xfe; 32];
+        assert!(state.outstanding_iwants.len() < MAX_IHAVE_BATCH_SIZE);
+        state.outstanding_iwants.insert(
+            fresh,
+            OutstandingIwant {
+                peer,
+                requested_at: base + Duration::from_millis(1_001),
+                retry_pending: false,
+            },
+        );
+        assert!(state.outstanding_iwants.contains_key(&fresh));
+
+        let local = test_peer_id(1);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control_and_cache_config(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+            PubSubCacheConfig {
+                max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+                max_bytes_per_topic: 64 * 1024,
+                max_age: Duration::from_secs(1),
+            },
+        );
+        let topic = TopicId::new([0xfc; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            for index in 0..MAX_IHAVE_BATCH_SIZE {
+                let mut id = [0_u8; 32];
+                id[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+                state.outstanding_iwants.insert(
+                    id,
+                    OutstandingIwant {
+                        peer,
+                        requested_at: Instant::now() - Duration::from_secs(2),
+                        retry_pending: false,
+                    },
+                );
+            }
+        }
+        pubsub
+            .handle_ihave(peer, topic, vec![fresh])
+            .await
+            .expect("fresh IHAVE reclaims expired capacity");
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::IWant)
+                .len(),
+            1
+        );
+        assert!(pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .expect("topic")
+            .outstanding_iwants
+            .contains_key(&fresh));
+    }
+
+    #[test]
+    fn deferred_iwant_attempts_do_not_extend_cache_age_expiry() {
+        let peer = test_peer_id(2);
+        let id = [0xfd; 32];
+        let base = Instant::now();
+        let mut state = TopicState::with_cache_config(PubSubCacheConfig {
+            max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+            max_bytes_per_topic: 64 * 1024,
+            max_age: Duration::from_secs(1),
+        });
+        state.outstanding_iwants.insert(
+            id,
+            OutstandingIwant {
+                peer,
+                requested_at: base,
+                retry_pending: true,
+            },
+        );
+        assert!(state.retain_deferred_iwant(peer, &[id], base));
+
+        state.prune_deferred_iwants(base + Duration::from_millis(500));
+        assert_eq!(
+            state
+                .outstanding_iwants
+                .get(&id)
+                .map(|entry| entry.requested_at),
+            Some(base),
+            "deferred retry scans must not renew the response window"
+        );
+        state.prune_deferred_iwants(base + Duration::from_millis(1_001));
+        assert!(state.outstanding_iwants.is_empty());
+        assert!(state.deferred_iwants.is_empty());
+    }
+
+    fn signed_control_frame(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        kind: MessageKind,
+        payload: Bytes,
+    ) -> Bytes {
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id: [0x55; 32],
+            kind,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(payload.as_ref()));
+        postcard::to_stdvec(&GossipMessage {
+            signature: pubsub.sign_message(&header),
+            public_key: pubsub.signing_key.public_key().to_vec(),
+            header,
+            payload: Some(payload),
+        })
+        .expect("control frame")
+        .into()
+    }
+
+    #[tokio::test]
+    async fn local_origin_iwant_filters_mixed_cache_at_reply_lookup() {
+        let local = test_peer_id(1);
+        let requester = test_peer_id(2);
+        let topic = TopicId::new([0x71; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![requester]);
+        let pubsub = PlumtreePubSub::new(local, transport.clone(), test_signing_key());
+        let local_payload = Bytes::from_static(b"locally-published");
+        let local_id = pubsub.calculate_msg_id(&topic, &local_payload);
+        pubsub
+            .publish_local(topic, local_payload.clone())
+            .await
+            .expect("local publish");
+        let remote_id = [0x72; 32];
+        let dropped_id = [0x73; 32];
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("local topic");
+            state.cache_message(
+                remote_id,
+                Bytes::from_static(b"remote"),
+                test_header(topic, remote_id),
+                false,
+            );
+            state.cache_message(
+                dropped_id,
+                Bytes::from_static(b"dropped-local"),
+                test_header(topic, dropped_id),
+                true,
+            );
+            state.mark_message_dropped(&dropped_id);
+        }
+        assert_eq!(
+            pubsub.locally_originated_cached_topic_ids().await,
+            vec![topic]
+        );
+
+        let requested = vec![remote_id, local_id, [0x74; 32], dropped_id];
+        let payload: Bytes = postcard::to_stdvec(&requested).expect("IWANT ids").into();
+        let frame = signed_control_frame(&pubsub, topic, MessageKind::IWant, payload);
+        assert!(pubsub
+            .handle_local_origin_iwant(requester, frame)
+            .await
+            .expect("verified local-only IWANT"));
+        let eager = transport.sent_messages_of_kind_to(requester, MessageKind::Eager);
+        assert_eq!(eager.len(), 1);
+        assert_eq!(eager[0].header.msg_id, local_id);
+        assert_eq!(eager[0].payload.as_ref(), Some(&local_payload));
+
+        let remote_only: Bytes = postcard::to_stdvec(&vec![remote_id])
+            .expect("remote IWANT")
+            .into();
+        let before_remote_only = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("local topic");
+            (
+                state.message_cache.len(),
+                state.eager_peers.clone(),
+                state.lazy_peers.clone(),
+                state.peer_scores.len(),
+                state.peer_cooling.len(),
+                state.last_activity,
+            )
+        };
+        assert!(!pubsub
+            .handle_local_origin_iwant(
+                requester,
+                signed_control_frame(&pubsub, topic, MessageKind::IWant, remote_only),
+            )
+            .await
+            .expect("valid remote-only IWANT"));
+        assert_eq!(
+            transport
+                .sent_messages_of_kind_to(requester, MessageKind::Eager)
+                .len(),
+            1,
+            "remote cache entry must never be served by the local-only entry point"
+        );
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("local topic");
+        assert_eq!(state.message_cache.len(), before_remote_only.0);
+        assert_eq!(state.eager_peers, before_remote_only.1);
+        assert_eq!(state.lazy_peers, before_remote_only.2);
+        assert_eq!(state.peer_scores.len(), before_remote_only.3);
+        assert_eq!(state.peer_cooling.len(), before_remote_only.4);
+        assert_eq!(state.last_activity, before_remote_only.5);
+    }
+
+    #[tokio::test]
+    async fn local_origin_iwant_unknown_topic_is_read_only() {
+        let local = test_peer_id(1);
+        let requester = test_peer_id(2);
+        let topic = TopicId::new([0x7c; 32]);
+        let transport = RecordingTransport::new(local);
+        let pubsub = PlumtreePubSub::new(local, transport.clone(), test_signing_key());
+        let payload: Bytes = postcard::to_stdvec(&vec![[0x7d; 32]])
+            .expect("unknown id")
+            .into();
+        assert_eq!(pubsub.topics.topic_count().await, 0);
+        assert!(!pubsub
+            .handle_local_origin_iwant(
+                requester,
+                signed_control_frame(&pubsub, topic, MessageKind::IWant, payload),
+            )
+            .await
+            .expect("valid unknown-topic IWANT"));
+        assert_eq!(pubsub.topics.topic_count().await, 0);
+        assert!(transport.sent_frames().is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_eager_peer_receives_local_only_ihave_and_pull_path() {
+        let publisher_id = test_peer_id(1);
+        let receiver_id = test_peer_id(2);
+        let topic = TopicId::new([0x7e; 32]);
+        let publisher_transport = RecordingTransport::new(publisher_id);
+        publisher_transport.set_connected_peer_ids(vec![receiver_id]);
+        let publisher = PlumtreePubSub::new_with_task_control(
+            publisher_id,
+            publisher_transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let payload = Bytes::from_static(b"late-local-history");
+        let local_id = publisher.calculate_msg_id(&topic, &payload);
+        publisher
+            .publish_local(topic, payload.clone())
+            .await
+            .expect("cache local history");
+        {
+            let mut topics = publisher.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("published topic");
+            state.pending_ihave.clear();
+            let remote_id = [0x7f; 32];
+            state.cache_message(
+                remote_id,
+                Bytes::from_static(b"remote-cache"),
+                test_header(topic, remote_id),
+                false,
+            );
+            let dropped_id = [0x80; 32];
+            state.cache_message(
+                dropped_id,
+                Bytes::from_static(b"dropped-local"),
+                test_header(topic, dropped_id),
+                true,
+            );
+            state.mark_message_dropped(&dropped_id);
+        }
+
+        publisher.set_topic_peers(topic, vec![receiver_id]).await;
+        {
+            let topics = publisher.topics.read_topic(&topic).await;
+            assert!(topics
+                .get(&topic)
+                .expect("topic")
+                .eager_peers
+                .contains(&receiver_id));
+        }
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &publisher.topics,
+            &publisher.transport,
+            &publisher.signing_key,
+            &publisher.stage_stats,
+            &publisher.outbound_budgets,
+            &publisher.send_path_context(),
+            &publisher.egress_limiter,
+        )
+        .await;
+        let ihaves = publisher_transport.sent_frames_of_kind_to(receiver_id, MessageKind::IHave);
+        assert_eq!(ihaves.len(), 1, "late peer receives one targeted offer");
+        let offered: GossipMessage = postcard::from_bytes(&ihaves[0]).expect("signed IHAVE");
+        let ids: Vec<MessageIdType> =
+            postcard::from_bytes(offered.payload.as_deref().expect("IHAVE payload"))
+                .expect("IHAVE ids");
+        assert_eq!(
+            ids,
+            vec![local_id],
+            "remote and dropped cache ids stay private"
+        );
+
+        let receiver_transport = RecordingTransport::new(receiver_id);
+        receiver_transport.set_connected_peer_ids(vec![publisher_id]);
+        let receiver = PlumtreePubSub::new_with_task_control(
+            receiver_id,
+            receiver_transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let mut subscription = receiver.subscribe(topic);
+        receiver
+            .dispatch_message(publisher_id, None, ihaves[0].clone())
+            .await
+            .expect("receiver handles signed IHAVE");
+        let iwants = receiver_transport.sent_frames_of_kind_to(publisher_id, MessageKind::IWant);
+        assert_eq!(iwants.len(), 1);
+        let eager_len = {
+            let mut topics = publisher.topics.write_topic(&topic).await;
+            let cached = topics
+                .get_mut(&topic)
+                .expect("topic")
+                .get_local_origin_message(&local_id)
+                .expect("local cached message");
+            postcard::to_stdvec(&GossipMessage {
+                signature: publisher.sign_message(&cached.header),
+                public_key: publisher.signing_key.public_key().to_vec(),
+                header: cached.header,
+                payload: Some(cached.payload),
+            })
+            .expect("EAGER frame")
+            .len()
+        };
+        assert!(publisher.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: u64::try_from(eager_len).expect("frame size"),
+            max_serialized_frame_bytes: eager_len,
+        })));
+        let drain = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
+            topic,
+            receiver_id,
+            "EAGER",
+            b"consume-reply-burst",
+        );
+        let _charged = publisher
+            .egress_limiter
+            .reserve_critical_eager(drain, eager_len, Duration::from_secs(1))
+            .await
+            .expect("competing Critical frame consumes reply burst");
+        assert!(!publisher
+            .handle_local_origin_iwant(receiver_id, iwants[0].clone())
+            .await
+            .expect("restricted pull is retained after byte deferral"));
+        publisher
+            .handle_iwant(receiver_id, topic, vec![local_id])
+            .await
+            .expect("ordinary duplicate is also retained after byte deferral");
+        {
+            let topics = publisher.topics.read_topic(&topic).await;
+            let replies = &topics.get(&topic).expect("topic").deferred_eager_replies;
+            assert_eq!(replies.len(), 1, "duplicate pull shares one custody entry");
+            assert!(
+                replies[0].local_origin_only,
+                "ordinary duplicate cannot weaken restricted custody"
+            );
+        }
+        assert!(publisher_transport
+            .sent_messages_of_kind_to(receiver_id, MessageKind::Eager)
+            .is_empty());
+        let deferred_reply = publisher
+            .leaf_egress_snapshot()
+            .by_topic_and_purpose
+            .into_iter()
+            .find(|row| row.topic == topic.to_bytes() && row.purpose == "EAGER")
+            .expect("EAGER byte accounting");
+        assert_eq!(deferred_reply.sent_bytes, 0);
+        assert!(
+            deferred_reply.deferred >= 1,
+            "first publisher reply is byte-deferred"
+        );
+        publisher
+            .egress_limiter
+            .refill_after_for_test(Duration::from_secs(
+                u64::try_from(eager_len).expect("frame size"),
+            ));
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &publisher.topics,
+            &publisher.transport,
+            &publisher.signing_key,
+            &publisher.stage_stats,
+            &publisher.outbound_budgets,
+            &publisher.send_path_context(),
+            &publisher.egress_limiter,
+        )
+        .await;
+        let eager = publisher_transport.sent_messages_of_kind_to(receiver_id, MessageKind::Eager);
+        assert_eq!(eager.len(), 1);
+        assert_eq!(eager[0].payload.as_ref(), Some(&payload));
+        let eager_after_retry = publisher
+            .leaf_egress_snapshot()
+            .by_topic_and_purpose
+            .into_iter()
+            .find(|row| row.topic == topic.to_bytes() && row.purpose == "EAGER")
+            .expect("EAGER byte accounting after retry");
+        assert_eq!(
+            eager_after_retry.sent_bytes,
+            u64::try_from(eager_len).expect("frame size"),
+            "coalesced reply is charged exactly once"
+        );
+        let eager_frame = publisher_transport
+            .sent_frames_of_kind_to(receiver_id, MessageKind::Eager)
+            .into_iter()
+            .next()
+            .expect("retried EAGER frame");
+        receiver
+            .dispatch_message(publisher_id, None, eager_frame)
+            .await
+            .expect("receiver handles retried EAGER");
+        let (delivered_from, delivered_payload) =
+            tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+                .await
+                .expect("subscriber delivery deadline")
+                .expect("subscription remains live");
+        assert_eq!(delivered_from, publisher_id);
+        assert_eq!(delivered_payload, payload);
+
+        // The first successful flush advances the cursor. The next scan proves
+        // it complete and removes it; unchanged membership cannot re-add it.
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &publisher.topics,
+            &publisher.transport,
+            &publisher.signing_key,
+            &publisher.stage_stats,
+            &publisher.outbound_budgets,
+            &publisher.send_path_context(),
+            &publisher.egress_limiter,
+        )
+        .await;
+        publisher.set_topic_peers(topic, vec![receiver_id]).await;
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &publisher.topics,
+            &publisher.transport,
+            &publisher.signing_key,
+            &publisher.stage_stats,
+            &publisher.outbound_budgets,
+            &publisher.send_path_context(),
+            &publisher.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            publisher_transport
+                .sent_frames_of_kind_to(receiver_id, MessageKind::IHave)
+                .len(),
+            1,
+            "repeated peer refresh must not resend completed history"
+        );
+        assert_eq!(
+            publisher_transport
+                .sent_frames_of_kind_to(receiver_id, MessageKind::Eager)
+                .len(),
+            1,
+            "successful reply retry retires custody"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_local_offer_disconnect_and_cache_expiry_remove_custody() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x81; 32]);
+        let transport = RecordingTransport::new(local);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(local, transport, test_signing_key(), false);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(|| {
+                TopicState::with_cache_config(PubSubCacheConfig {
+                    max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+                    max_bytes_per_topic: 64 * 1024,
+                    max_age: Duration::from_secs(1),
+                })
+            });
+            let id = [0x82; 32];
+            state.message_cache.insert_at(
+                id,
+                CachedMessage {
+                    payload: Bytes::from_static(b"expired-local"),
+                    header: test_header(topic, id),
+                    dropped: false,
+                    local_origin: true,
+                    inner_proof: None,
+                },
+                Instant::now() - Duration::from_secs(2),
+            );
+            state.late_local_offers.insert(
+                peer,
+                LateLocalOffer {
+                    cutoff: Instant::now(),
+                    cursor: None,
+                },
+            );
+            assert!(state.late_local_offer_batch(peer, Instant::now()).is_none());
+            assert!(state.late_local_offers.is_empty());
+            state.cache_message(
+                [0x83; 32],
+                Bytes::from_static(b"live"),
+                test_header(topic, [0x83; 32]),
+                true,
+            );
+        }
+        pubsub.set_topic_peers(topic, vec![peer]).await;
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            assert!(topics
+                .get(&topic)
+                .expect("topic")
+                .late_local_offers
+                .contains_key(&peer));
+        }
+        pubsub.set_topic_peers(topic, Vec::new()).await;
+        let topics = pubsub.topics.read_topic(&topic).await;
+        assert!(topics
+            .get(&topic)
+            .expect("topic")
+            .late_local_offers
+            .is_empty());
+    }
+
+    #[test]
+    fn deferred_eager_reply_deduplicates_both_authority_orderings() {
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x8f; 32]);
+        let msg_id = [0x90; 32];
+        let now = Instant::now();
+        for order in [[true, false], [false, true]] {
+            let mut state = TopicState::new();
+            state.cache_message(
+                msg_id,
+                Bytes::from_static(b"local"),
+                test_header(topic, msg_id),
+                true,
+            );
+            for local_origin_only in order {
+                assert!(state.retain_deferred_eager_reply(peer, msg_id, local_origin_only, now,));
+            }
+            assert_eq!(state.deferred_eager_replies.len(), 1);
+            assert!(
+                state.deferred_eager_replies[0].local_origin_only,
+                "either ordering preserves the stronger local-origin requirement"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_eager_reply_custody_is_bounded_and_cache_authorized() {
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x91; 32]);
+        let now = Instant::now();
+        let mut state = TopicState::with_cache_config(PubSubCacheConfig {
+            max_messages_per_topic: NonZeroUsize::new(MAX_DEFERRED_EAGER_REPLIES + 2)
+                .expect("nonzero"),
+            max_bytes_per_topic: (b"overflow".len()
+                + MESSAGE_HEADER_OVERHEAD_BYTES
+                + MESSAGE_CRYPTO_OVERHEAD_BYTES)
+                * (MAX_DEFERRED_EAGER_REPLIES + 2),
+            max_age: Duration::from_secs(1),
+        });
+        for index in 0..MAX_DEFERRED_EAGER_REPLIES {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&u64::try_from(index).expect("bounded index").to_le_bytes());
+            state.cache_message(
+                id,
+                Bytes::from_static(b"local"),
+                test_header(topic, id),
+                true,
+            );
+            assert!(state.retain_deferred_eager_reply(peer, id, true, now));
+        }
+        let overflow = [0xfe; 32];
+        state.cache_message(
+            overflow,
+            Bytes::from_static(b"overflow"),
+            test_header(topic, overflow),
+            true,
+        );
+        assert_eq!(state.message_cache.len(), MAX_DEFERRED_EAGER_REPLIES + 1);
+        assert!(!state.retain_deferred_eager_reply(peer, overflow, true, now));
+        assert_eq!(
+            state.deferred_eager_replies.len(),
+            MAX_DEFERRED_EAGER_REPLIES
+        );
+
+        state.prune_deferred_eager_replies(now + Duration::from_millis(999));
+        assert_eq!(
+            state.deferred_eager_replies.len(),
+            MAX_DEFERRED_EAGER_REPLIES
+        );
+        state.prune_deferred_eager_replies(now + Duration::from_millis(1_001));
+        assert!(state.deferred_eager_replies.is_empty());
+
+        let remote = [0xfd; 32];
+        state.cache_message(
+            remote,
+            Bytes::from_static(b"remote"),
+            test_header(topic, remote),
+            false,
+        );
+        assert!(state.retain_deferred_eager_reply(peer, remote, true, Instant::now()));
+        state.prune_deferred_eager_replies(Instant::now());
+        assert!(
+            state.deferred_eager_replies.is_empty(),
+            "local-only reply custody cannot retain a remote cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_eager_reply_flush_rejects_invalid_cache_and_disconnects() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x92; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let now = Instant::now();
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(|| {
+                TopicState::with_cache_config(PubSubCacheConfig {
+                    max_messages_per_topic: NonZeroUsize::new(8).expect("nonzero"),
+                    max_bytes_per_topic: 64 * 1024,
+                    max_age: Duration::from_secs(1),
+                })
+            });
+            let dropped = [0x93; 32];
+            state.cache_message(
+                dropped,
+                Bytes::from_static(b"dropped"),
+                test_header(topic, dropped),
+                true,
+            );
+            state.mark_message_dropped(&dropped);
+            let remote = [0x94; 32];
+            state.cache_message(
+                remote,
+                Bytes::from_static(b"remote"),
+                test_header(topic, remote),
+                false,
+            );
+            let expired = [0x95; 32];
+            state.message_cache.insert_at(
+                expired,
+                CachedMessage {
+                    payload: Bytes::from_static(b"expired"),
+                    header: test_header(topic, expired),
+                    dropped: false,
+                    local_origin: true,
+                    inner_proof: None,
+                },
+                now - Duration::from_secs(2),
+            );
+            state.deferred_eager_replies.extend([
+                DeferredEagerReply {
+                    peer,
+                    msg_id: dropped,
+                    local_origin_only: true,
+                    requested_at: now,
+                },
+                DeferredEagerReply {
+                    peer,
+                    msg_id: remote,
+                    local_origin_only: true,
+                    requested_at: now,
+                },
+                DeferredEagerReply {
+                    peer,
+                    msg_id: expired,
+                    local_origin_only: true,
+                    requested_at: now,
+                },
+            ]);
+        }
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert!(transport.sent_frames().is_empty());
+        assert!(pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .expect("topic")
+            .deferred_eager_replies
+            .is_empty());
+
+        let live = [0x96; 32];
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic");
+            state.cache_message(
+                live,
+                Bytes::from_static(b"live"),
+                test_header(topic, live),
+                true,
+            );
+            assert!(state.retain_deferred_eager_reply(peer, live, true, Instant::now()));
+        }
+        pubsub.set_topic_peers(topic, vec![peer]).await;
+        pubsub.set_topic_peers(topic, Vec::new()).await;
+        assert!(pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .expect("topic")
+            .deferred_eager_replies
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_eager_reply_success_marks_stranded_pull_served() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x97; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let payload = Bytes::from_static(b"stranded-pull-reply");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            state.cache_message(msg_id, payload, test_header(topic, msg_id), true);
+            state.queue_stranded_ihave(msg_id, &[peer]);
+            assert!(state.retain_deferred_eager_reply(peer, msg_id, true, Instant::now()));
+        }
+
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len(),
+            1
+        );
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic");
+        assert!(state.deferred_eager_replies.is_empty());
+        assert!(
+            state.stranded_ihave_targets_for(&[msg_id]).is_empty(),
+            "a successful pull reply excludes the peer from later stranded EAGER retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_local_offer_survives_leaf_budget_deferral_then_sends_once() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x84; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let payload = Bytes::from_static(b"deferred-late-history");
+        let id = pubsub.calculate_msg_id(&topic, &payload);
+        pubsub
+            .publish_local(topic, payload)
+            .await
+            .expect("cache local history");
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics.get_mut(&topic).expect("topic").pending_ihave.clear();
+        }
+        pubsub.set_topic_peers(topic, vec![peer]).await;
+
+        let ihave_payload: Bytes = postcard::to_stdvec(&vec![id]).expect("ids").into();
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id: id,
+            kind: MessageKind::IHave,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(ihave_payload.as_ref()));
+        let frame_len = postcard::to_stdvec(&GossipMessage {
+            signature: pubsub.sign_message(&header),
+            public_key: pubsub.signing_key.public_key().to_vec(),
+            header,
+            payload: Some(ihave_payload),
+        })
+        .expect("IHAVE frame")
+        .len();
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: u64::try_from(frame_len).expect("frame size"),
+            burst_bytes: u64::try_from(frame_len).expect("frame size"),
+            max_serialized_frame_bytes: frame_len,
+        })));
+        let drain = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
+            topic,
+            peer,
+            "EAGER",
+            b"drain-late-offer",
+        );
+        let _competing_charge = pubsub
+            .egress_limiter
+            .reserve_critical_eager(drain, frame_len, Duration::from_secs(1))
+            .await
+            .expect("competing Critical EAGER consumes the bounded burst");
+
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert!(transport.sent_frames().is_empty());
+        assert!(pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .expect("topic")
+            .late_local_offers
+            .contains_key(&peer));
+
+        pubsub
+            .egress_limiter
+            .refill_after_for_test(Duration::from_secs(8));
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::IHave)
+                .len(),
+            1
+        );
+        let purpose = pubsub
+            .leaf_egress_snapshot()
+            .by_topic_and_purpose
+            .into_iter()
+            .find(|row| row.topic == topic.to_bytes() && row.purpose == "IHAVE")
+            .expect("IHAVE accounting");
+        assert!(purpose.deferred >= 1);
+        assert_eq!(
+            purpose.sent_bytes,
+            u64::try_from(frame_len).expect("frame size")
+        );
+
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::IHave)
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn local_origin_iwant_rejects_non_iwant_and_malformed_frames() {
+        let local = test_peer_id(1);
+        let requester = test_peer_id(2);
+        let topic = TopicId::new([0x75; 32]);
+        let transport = RecordingTransport::new(local);
+        let pubsub = PlumtreePubSub::new(local, transport, test_signing_key());
+        let ids: Bytes = postcard::to_stdvec(&vec![[0x76; 32]]).expect("ids").into();
+        assert!(pubsub
+            .handle_local_origin_iwant(
+                requester,
+                signed_control_frame(&pubsub, topic, MessageKind::IHave, ids),
+            )
+            .await
+            .is_err());
+        let mut trailing = signed_control_frame(
+            &pubsub,
+            topic,
+            MessageKind::IWant,
+            postcard::to_stdvec(&vec![[0x76; 32]]).expect("ids").into(),
+        )
+        .to_vec();
+        trailing.push(0);
+        assert!(pubsub
+            .handle_local_origin_iwant(requester, trailing.into())
+            .await
+            .is_err());
+        assert!(pubsub
+            .handle_local_origin_iwant(requester, Bytes::from_static(b"malformed"))
+            .await
+            .is_err());
+        assert!(pubsub
+            .handle_local_origin_iwant(
+                requester,
+                signed_control_frame(
+                    &pubsub,
+                    topic,
+                    MessageKind::IWant,
+                    Bytes::from_static(b"bad-id-vector"),
+                ),
+            )
+            .await
+            .is_err());
+        let valid_payload: Bytes = postcard::to_stdvec(&vec![[0x76; 32]]).expect("ids").into();
+        let valid = signed_control_frame(&pubsub, topic, MessageKind::IWant, valid_payload);
+        let mut invalid: GossipMessage = postcard::from_bytes(&valid).expect("signed frame");
+        invalid.signature[0] ^= 1;
+        assert!(pubsub
+            .handle_local_origin_iwant(
+                requester,
+                postcard::to_stdvec(&invalid)
+                    .expect("invalid signature frame")
+                    .into(),
+            )
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn local_origin_custody_survives_echo_but_never_elevates_remote_cache() {
+        let topic = TopicId::new([0x77; 32]);
+        let id = [0x78; 32];
+        let mut state = TopicState::new();
+        state.cache_message(
+            id,
+            Bytes::from_static(b"remote-first"),
+            test_header(topic, id),
+            false,
+        );
+        assert!(!state.get_message(&id).expect("remote entry").local_origin);
+        state.cache_message(
+            id,
+            Bytes::from_static(b"local"),
+            test_header(topic, id),
+            true,
+        );
+        let local_proof = compat::VerifiedInner {
+            author: test_peer_id(3),
+            digest: [0x79; 32],
+            revision: 7,
+        };
+        state.set_inner_proof(id, Some(local_proof.clone()));
+        let inbound_proof = compat::VerifiedInner {
+            author: test_peer_id(4),
+            digest: [0x7a; 32],
+            revision: 8,
+        };
+        if state.cache_message(
+            id,
+            Bytes::from_static(b"wire-echo"),
+            test_header(topic, id),
+            false,
+        ) {
+            state.set_inner_proof(id, Some(inbound_proof));
+        }
+        let cached = state.get_message(&id).expect("promoted local entry");
+        assert!(cached.local_origin);
+        assert_eq!(cached.payload, Bytes::from_static(b"local"));
+        assert_eq!(cached.inner_proof, Some(local_proof));
+    }
+
+    #[test]
+    fn local_origin_query_excludes_dropped_and_expired_entries() {
+        let topic = TopicId::new([0x79; 32]);
+        let dropped_id = [0x7a; 32];
+        let expired_id = [0x7b; 32];
+        let mut state = TopicState::with_cache_config(PubSubCacheConfig {
+            max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+            max_bytes_per_topic: 64 * 1024,
+            max_age: Duration::from_secs(1),
+        });
+        state.cache_message(
+            dropped_id,
+            Bytes::from_static(b"dropped"),
+            test_header(topic, dropped_id),
+            true,
+        );
+        state.mark_message_dropped(&dropped_id);
+        state.message_cache.insert_at(
+            expired_id,
+            CachedMessage {
+                payload: Bytes::from_static(b"expired"),
+                header: test_header(topic, expired_id),
+                dropped: false,
+                local_origin: true,
+                inner_proof: None,
+            },
+            Instant::now() - Duration::from_secs(2),
+        );
+        assert!(!state.has_live_local_origin());
+        assert!(!state.message_cache.contains(&expired_id));
+    }
+
+    #[tokio::test]
     async fn leaf_recovery_reservation_reaches_real_transport_send_seam() {
         let local = test_peer_id(1);
         let remote = test_peer_id(2);
@@ -18327,7 +20389,7 @@ mod tests {
                 hop: 0,
                 ttl: 10,
             };
-            state.cache_message(msg_id, Bytes::from(vec![i as u8]), header);
+            state.cache_message(msg_id, Bytes::from(vec![i as u8]), header, false);
         }
 
         assert_eq!(
@@ -18427,7 +20489,7 @@ mod tests {
                 hop: 0,
                 ttl: 10,
             };
-            state.cache_message(known_msg_id, Bytes::from_static(b"known"), header);
+            state.cache_message(known_msg_id, Bytes::from_static(b"known"), header, false);
             state.last_activity = old_activity;
         }
 

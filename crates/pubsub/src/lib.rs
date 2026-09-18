@@ -41,11 +41,16 @@ use saorsa_gossip_types::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
+
+mod egress;
+pub use egress::{BytePolicy, LeafEgressConfig, LeafEgressPurposeSnapshot, LeafEgressSnapshot};
 use tokio::time;
 use tracing::{debug, error, info, trace, warn};
 
@@ -765,20 +770,60 @@ impl StageTimingStats {
     }
 }
 
-/// Observed fan-out outcome for a single local publish.
+/// Observed fan-out outcome for a single local publish, staged so a zero
+/// attempt count is diagnosable instead of indistinguishable from empty
+/// membership.
 ///
-/// `attempted` counts peers that passed admission and dedup gating and
-/// received a send task; it does **not** guarantee delivery. `succeeded`
-/// counts peers from which a confirmed send was observed on the publish path
-/// (`detach_accounting = false`). The dispatcher forward path
-/// (`detach_accounting = true`) always returns `succeeded = 0` because
-/// outcomes are collected in a detached task after the call returns.
+/// Stage invariant: `candidates == byte_rejected + admission_dropped +
+/// claim_skipped + attempted`. `attempted` counts peers that passed byte and
+/// peer admission and dedup gating and received a send task; it does **not**
+/// guarantee delivery. `succeeded` counts peers from which a confirmed send
+/// was observed on the publish path (`detach_accounting = false`). The
+/// dispatcher forward path (`detach_accounting = true`) always returns
+/// `succeeded = 0` because outcomes are collected in a detached task after
+/// the call returns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FanoutCounts {
+    /// Incoming peer count for this fan-out call, before any admission.
+    pub candidates: usize,
+    /// Candidates excluded by Leaf serialized-byte admission — any reserve
+    /// failure (oversized frame, exhausted byte budget, waiter/intent limit,
+    /// reconfigure), not only a temporary token shortage.
+    pub byte_rejected: usize,
+    /// Byte-admitted candidates excluded by the peer admission gate
+    /// (cooling, health, dedup).
+    pub admission_dropped: usize,
+    /// Admitted candidates that acquired no send claim (transport-
+    /// disconnected, cooling at claim time, exhausted outbound budget).
+    pub claim_skipped: usize,
     /// Number of peers the message was dispatched toward.
     pub attempted: usize,
     /// Number of those peers that confirmed receipt before this call returned.
     pub succeeded: usize,
+}
+
+/// Outcome of the optional exact-peer leg of a local publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetedPublishOutcome {
+    /// The final serialized frame reached the transport send successfully.
+    Sent,
+    /// Existing byte, admission, cooling, or claim gates deferred the send.
+    Deferred,
+    /// The exact peer was no longer transport-connected.
+    NotConnected,
+    /// The caller's fixed deadline expired before the targeted leg completed.
+    TimedOut,
+    /// Serialization, admission bookkeeping, or transport returned an error.
+    Failed,
+}
+
+/// Ordinary gossip fan-out plus an exact-peer targeted leg of the same frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetedFanoutCounts {
+    /// Result of the unchanged ordinary EAGER fan-out.
+    pub fanout: FanoutCounts,
+    /// Result of sending the identical serialized frame to the requested peer.
+    pub target: TargetedPublishOutcome,
 }
 
 /// Issue #42: outcome of [`PlumtreePubSub::shutdown`].
@@ -832,11 +877,13 @@ pub struct PubSubStageStats {
     /// nothing.
     cooldown_bypass_probes: AtomicU64,
     cooldown_bypass_successes: AtomicU64,
-    /// Local publishes whose eligible eager fan-out set was empty (issue
-    /// #32): every eager peer was cooled/excluded, or the topic had no eager
-    /// peers at all (`attempted == 0`). The publish still returns `Ok(())`,
-    /// so this counter is the loud signal that the message did not leave the
-    /// node.
+    /// Local publishes where no peer was attempted (issue #32,
+    /// `attempted == 0`): the topic had no eager peers, or every eager
+    /// peer was excluded by byte admission, peer admission, or the send
+    /// claim. The publish still returns `Ok(())`, so this counter is the
+    /// loud signal that the message did not leave the node; the staged
+    /// [`FanoutCounts`] on the zero-fanout WARN distinguish which gate
+    /// excluded the peers.
     zero_fanout_publishes: AtomicU64,
     /// Local publishes where at least one peer was attempted but every send
     /// failed or timed out (`attempted > 0, succeeded == 0`). This is the
@@ -1117,8 +1164,10 @@ pub struct PubSubStageStatsSnapshot {
     /// during its suppression window.
     pub cooldown_bypass_successes: u64,
     /// Cumulative count of local publishes where no peer was attempted
-    /// (`attempted == 0`). A non-zero value means the eager set was empty or
-    /// fully cooled — the message did not leave the node.
+    /// (`attempted == 0`). A non-zero value means every eager peer was
+    /// excluded by byte admission, peer admission, or the send claim —
+    /// including an empty eager set — so the message did not leave the
+    /// node.
     pub zero_fanout_publishes: u64,
     /// Issue #41: msg_ids dropped by the pending-IHAVE cap (the oldest
     /// ids evicted once the queue saturates) — sustained growth means an
@@ -1233,6 +1282,18 @@ enum PeerSendOutcome {
     /// the peer from the topic's eager/lazy sets and the periodic
     /// `set_topic_peers` refresh re-adds it once genuinely reconnected.
     NotConnected,
+    /// No transport attempt was made because byte, admission, or per-peer
+    /// concurrency policy deferred the work. Recovery callers must not mark
+    /// cached data served on this outcome.
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FanoutPeerStage {
+    ByteRejected,
+    AdmissionDropped,
+    ClaimSkipped,
+    Attempted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1690,6 +1751,26 @@ struct SendPathContext {
     admission: Arc<admission::AdmissionControl>,
 }
 
+struct PeerSendRequest {
+    reservation: Option<egress::ByteReservation>,
+    topic: TopicId,
+    peer: PeerId,
+    stream_type: GossipStreamType,
+    bytes: Bytes,
+    op: &'static str,
+    send_timeout: Option<Duration>,
+}
+
+struct FanoutSendContext<'a, T: GossipTransport + 'static> {
+    transport: &'a Arc<PolicyTransport<T>>,
+    egress_limiter: &'a Arc<egress::LeafEgressLimiter>,
+    stage_stats: &'a Arc<PubSubStageStats>,
+    rtt_tracker: &'a Arc<PerPeerRttTracker>,
+    topic: TopicId,
+    stream_type: GossipStreamType,
+    op: &'static str,
+}
+
 /// Context bundle for the detached stranded-publish retry (x0x #613): the
 /// Arc handles [`PlumtreePubSub::retry_stranded_publish`] needs beyond
 /// [`SendPathContext`], moved into the retry task so it can run after the
@@ -1699,6 +1780,9 @@ struct StrandedRetryContext<T: GossipTransport + 'static> {
     transport: Arc<PolicyTransport<T>>,
     stage_stats: Arc<PubSubStageStats>,
     outbound_budgets: Arc<PeerOutboundBudgets>,
+    /// Optional Leaf-only serialized-byte limiter. The shared handle is
+    /// reconfigured in place so already-spawned maintenance tasks observe it.
+    egress_limiter: Arc<egress::LeafEgressLimiter>,
     send_path: SendPathContext,
 }
 
@@ -1919,7 +2003,9 @@ impl SendTaskSet {
                     sent.push(PeerSendCompletion { attempt, observed });
                 }
                 Ok(Ok(PeerSendOutcome::NotConnected)) => not_connected.push(attempt),
-                Ok(Ok(PeerSendOutcome::TimedOut) | Err(_)) => timed_out.push(attempt),
+                Ok(Ok(PeerSendOutcome::TimedOut | PeerSendOutcome::Deferred) | Err(_)) => {
+                    timed_out.push(attempt)
+                }
                 Err(e) => {
                     timed_out.extend(recovery_probe_timeout(attempt));
                     warn!(
@@ -3168,6 +3254,9 @@ struct CachedMessage {
     /// for dedupe (PRUNE/GRAFT coherence) but must never leave this node
     /// — IWANT service and anti-entropy reconciliation refuse to serve it.
     dropped: bool,
+    /// True only when this process created the cached message through its
+    /// local publish API. Never inferred from a wire sender identity.
+    local_origin: bool,
     inner_proof: Option<compat::VerifiedInner>,
 }
 
@@ -3450,6 +3539,11 @@ struct StrandedIhaveEntry {
     /// review item 1, the x0x #611 direction). Records ANY requester, not
     /// just original targets: whoever holds the copy must not get another.
     served: Vec<PeerId>,
+    /// Peers that already accepted this entry's direct IHAVE handoff.
+    advertised: Vec<PeerId>,
+    /// Absolute terminal bound shared by every per-target retry pass.
+    retry_expires: Instant,
+    retry_delivered: bool,
 }
 
 /// One LazyForward verdict's withheld-eager announce bookkeeping (#59):
@@ -3464,6 +3558,62 @@ struct LazyWithheldEntry {
     /// Targets that already pulled this id via IWANT before the flush
     /// consumed the entry — excluded from re-advertising.
     served: Vec<PeerId>,
+}
+
+#[derive(Clone, Copy)]
+struct LateLocalOffer {
+    cutoff: Instant,
+    cursor: Option<(Instant, MessageIdType)>,
+}
+
+type LateOfferPage = (PeerId, Instant, (Instant, MessageIdType));
+
+#[derive(Clone, Copy)]
+struct OutstandingIwant {
+    peer: PeerId,
+    requested_at: Instant,
+    retry_pending: bool,
+}
+
+#[derive(Clone)]
+struct DeferredIwant {
+    peer: PeerId,
+    /// Preserve the original advertisement order so every retry rebuilds the
+    /// same signed frame and recovery-intent key while the batch is live.
+    msg_ids: Vec<MessageIdType>,
+    requested_at: Instant,
+}
+
+/// A pull reply that the byte budget deferred, retained so the requester's
+/// pull is not lost.
+///
+/// #504: entries are only ever *relay* payloads. A local-origin reply is
+/// protected from shedding, so it is sent rather than deferred and can never
+/// reach custody — the `local_origin_only` flag this used to carry became
+/// unreachable and was removed with its merge and serve-side filter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DeferredEagerReply {
+    peer: PeerId,
+    msg_id: MessageIdType,
+    requested_at: Instant,
+}
+
+const MAX_DEFERRED_IWANT_IDS: usize = MAX_IHAVE_BATCH_SIZE;
+const MAX_DEFERRED_EAGER_REPLIES: usize = MAX_IHAVE_BATCH_SIZE;
+/// Per-topic cap on outstanding late-local-offer pagination cursors. One entry
+/// per peer being caught up; churn must not grow this without bound.
+const MAX_LATE_LOCAL_OFFERS: usize = MAX_IHAVE_BATCH_SIZE;
+
+struct IhaveFlushWork {
+    topic: TopicId,
+    batch: Vec<MessageIdType>,
+    targets: Vec<PeerId>,
+    late_offer: Option<LateOfferPage>,
+    kind: MessageKind,
+    /// Whether this batch advertises at least one message this node authored.
+    /// #504: a local-origin advertisement is this node's own speech, so the
+    /// byte budget may not shed it even under `BytePolicy::ShedNormal`.
+    local_origin: bool,
 }
 
 struct TopicState {
@@ -3497,8 +3647,20 @@ struct TopicState {
     message_cache: BoundedMessageCache,
     /// Pending IHAVE batch (≤1024 message IDs)
     pending_ihave: VecDeque<MessageIdType>,
-    /// Outstanding IWANT requests: msg_id -> (peer, timestamp)
-    outstanding_iwants: HashMap<MessageIdType, (PeerId, Instant)>,
+    /// Successful IHAVE handoffs, bounded by `pending_ihave` membership.
+    ihave_advertised: HashMap<MessageIdType, HashSet<PeerId>>,
+    /// Cursor-only catch-up offers for currently connected peers. Message ids
+    /// remain owned by the bounded cache and are derived again on each retry.
+    late_local_offers: HashMap<PeerId, LateLocalOffer>,
+    /// Outstanding IWANT requests. Byte-deferred requests retain only their
+    /// bounded ids and owner; the existing 100 ms recovery flusher retries
+    /// them through the same limiter/admission path.
+    outstanding_iwants: HashMap<MessageIdType, OutstandingIwant>,
+    deferred_iwants: Vec<DeferredIwant>,
+    /// Publisher-side custody for IWANT replies whose EAGER bytes were
+    /// deferred by the hard egress limiter. Payload and proof remain in the
+    /// bounded cache and are re-derived at each attempt.
+    deferred_eager_replies: Vec<DeferredEagerReply>,
     /// Per-peer quality scores for tree optimization
     peer_scores: HashMap<PeerId, PeerScore>,
     /// Local subscribers
@@ -3529,6 +3691,88 @@ struct TopicState {
 }
 
 impl TopicState {
+    fn prune_deferred_eager_replies(&mut self, now: Instant) {
+        self.message_cache.prune_expired_at(now);
+        let cache = &self.message_cache;
+        self.deferred_eager_replies.retain(|entry| {
+            now.saturating_duration_since(entry.requested_at) < cache.max_age
+                && cache
+                    .lru
+                    .peek(&entry.msg_id)
+                    .is_some_and(|cached| !cached.message.dropped)
+        });
+    }
+
+    fn retain_deferred_eager_reply(
+        &mut self,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        now: Instant,
+    ) -> bool {
+        self.prune_deferred_eager_replies(now);
+        if self
+            .deferred_eager_replies
+            .iter()
+            .any(|entry| entry.peer == peer && entry.msg_id == msg_id)
+        {
+            return true;
+        }
+        if self.deferred_eager_replies.len() >= MAX_DEFERRED_EAGER_REPLIES {
+            return false;
+        }
+        self.deferred_eager_replies.push(DeferredEagerReply {
+            peer,
+            msg_id,
+            requested_at: now,
+        });
+        true
+    }
+
+    fn prune_deferred_iwants(&mut self, now: Instant) {
+        let retry_age = self.message_cache.max_age;
+        self.outstanding_iwants
+            .retain(|_, entry| now.saturating_duration_since(entry.requested_at) < retry_age);
+        let outstanding = &self.outstanding_iwants;
+        self.deferred_iwants.retain(|entry| {
+            now.saturating_duration_since(entry.requested_at) < retry_age
+                && entry.msg_ids.iter().any(|msg_id| {
+                    outstanding
+                        .get(msg_id)
+                        .is_some_and(|pending| pending.retry_pending && pending.peer == entry.peer)
+                })
+        });
+    }
+
+    fn retain_deferred_iwant(
+        &mut self,
+        peer: PeerId,
+        msg_ids: &[MessageIdType],
+        now: Instant,
+    ) -> bool {
+        self.prune_deferred_iwants(now);
+        if self
+            .deferred_iwants
+            .iter()
+            .any(|entry| entry.peer == peer && entry.msg_ids.as_slice() == msg_ids)
+        {
+            return true;
+        }
+        let retained_ids = self
+            .deferred_iwants
+            .iter()
+            .map(|entry| entry.msg_ids.len())
+            .sum::<usize>();
+        if retained_ids.saturating_add(msg_ids.len()) > MAX_DEFERRED_IWANT_IDS {
+            return false;
+        }
+        self.deferred_iwants.push(DeferredIwant {
+            peer,
+            msg_ids: msg_ids.to_vec(),
+            requested_at: now,
+        });
+        true
+    }
+
     fn set_inner_proof(&mut self, msg_id: MessageIdType, proof: Option<compat::VerifiedInner>) {
         if let Some(entry) = self.message_cache.lru.get_mut(&msg_id) {
             entry.message.inner_proof = proof;
@@ -3551,9 +3795,13 @@ impl TopicState {
                 cache_config.max_age,
             ),
             pending_ihave: VecDeque::new(),
+            ihave_advertised: HashMap::new(),
+            late_local_offers: HashMap::new(),
             stranded_ihave: Vec::new(),
             lazy_withheld: Vec::new(),
             outstanding_iwants: HashMap::new(),
+            deferred_iwants: Vec::new(),
+            deferred_eager_replies: Vec::new(),
             peer_scores: HashMap::new(),
             subscribers: Vec::new(),
             replay_cache: LruCache::new(replay_cache_capacity()),
@@ -3657,6 +3905,9 @@ impl TopicState {
             msg_id,
             targets: peers.to_vec(),
             served: Vec::new(),
+            advertised: Vec::new(),
+            retry_expires: Instant::now() + Duration::from_secs(MAX_CACHE_AGE_SECS),
+            retry_delivered: false,
         });
     }
 
@@ -3672,6 +3923,14 @@ impl TopicState {
         }
     }
 
+    fn record_stranded_ihave_advertised(&mut self, batch: &[MessageIdType], peer: PeerId) {
+        for entry in &mut self.stranded_ihave {
+            if batch.contains(&entry.msg_id) && !entry.advertised.contains(&peer) {
+                entry.advertised.push(peer);
+            }
+        }
+    }
+
     /// The peers already served this stranded id via the IWANT pull path.
     fn stranded_ihave_served_peers(&self, msg_id: &MessageIdType) -> &[PeerId] {
         self.stranded_ihave
@@ -3679,6 +3938,26 @@ impl TopicState {
             .find(|e| e.msg_id == *msg_id)
             .map(|e| e.served.as_slice())
             .unwrap_or(&[])
+    }
+
+    fn stranded_retry_expires(&self, msg_id: &MessageIdType) -> Option<Instant> {
+        self.stranded_ihave
+            .iter()
+            .find(|entry| entry.msg_id == *msg_id)
+            .map(|entry| entry.retry_expires)
+    }
+
+    fn record_stranded_retry_delivered(&mut self, msg_id: &MessageIdType, peer: PeerId) {
+        if let Some(entry) = self
+            .stranded_ihave
+            .iter_mut()
+            .find(|entry| entry.msg_id == *msg_id)
+        {
+            entry.retry_delivered = true;
+            if !entry.served.contains(&peer) {
+                entry.served.push(peer);
+            }
+        }
     }
 
     /// Consume the entry for a stranded id — done by the bounded retry,
@@ -3701,7 +3980,10 @@ impl TopicState {
         for entry in &self.stranded_ihave {
             if batch_index.contains(&entry.msg_id) {
                 for peer in &entry.targets {
-                    if !entry.served.contains(peer) && !targets.contains(peer) {
+                    if !entry.served.contains(peer)
+                        && !entry.advertised.contains(peer)
+                        && !targets.contains(peer)
+                    {
                         targets.push(*peer);
                     }
                 }
@@ -3717,11 +3999,28 @@ impl TopicState {
     fn push_pending_ihave(&mut self, msg_id: MessageIdType) -> usize {
         let mut dropped = 0;
         while self.pending_ihave.len() >= MAX_PENDING_IHAVE {
-            self.pending_ihave.pop_front();
+            if let Some(expired) = self.pending_ihave.pop_front() {
+                self.ihave_advertised.remove(&expired);
+            }
             dropped += 1;
         }
         self.pending_ihave.push_back(msg_id);
         dropped
+    }
+
+    fn ihave_target_pending(&self, batch: &[MessageIdType], peer: PeerId) -> bool {
+        batch.iter().any(|id| {
+            !self
+                .ihave_advertised
+                .get(id)
+                .is_some_and(|advertised| advertised.contains(&peer))
+        })
+    }
+
+    fn record_ihave_handoff(&mut self, batch: &[MessageIdType], peer: PeerId) {
+        for id in batch {
+            self.ihave_advertised.entry(*id).or_default().insert(peer);
+        }
     }
 
     /// Queue the withheld eager peers of a LazyForward verdict (#59) as
@@ -3811,12 +4110,19 @@ impl TopicState {
         }
         let ids: HashSet<MessageIdType> = batch.iter().copied().collect();
         self.pending_ihave.retain(|id| !ids.contains(id));
+        self.ihave_advertised.retain(|id, _| !ids.contains(id));
         self.lazy_withheld
             .retain(|entry| !ids.contains(&entry.msg_id));
     }
 
     /// Add message to cache
-    fn cache_message(&mut self, msg_id: MessageIdType, payload: Bytes, header: MessageHeader) {
+    fn cache_message(
+        &mut self,
+        msg_id: MessageIdType,
+        payload: Bytes,
+        header: MessageHeader,
+        local_origin: bool,
+    ) -> bool {
         debug!(
             target: "sg.payload.trace",
             stage = "cache_insert",
@@ -3825,14 +4131,28 @@ impl TopicState {
             zero_tail = payload_zero_tail(&payload),
             kind = ?header.kind,
         );
+        // A network echo or a contrived same-id wire collision cannot replace
+        // bytes that this process already owns and then inherit local custody.
+        if !local_origin
+            && self
+                .message_cache
+                .get(&msg_id)
+                .is_some_and(|cached| cached.local_origin)
+        {
+            return false;
+        }
         let cached = CachedMessage {
             payload,
             header,
             dropped: false,
+            local_origin,
             inner_proof: None,
         };
-        self.message_cache.insert(msg_id, cached);
-        self.touch();
+        let accepted = self.message_cache.insert(msg_id, cached);
+        if accepted {
+            self.touch();
+        }
+        accepted
     }
 
     /// Storm-control: mark a cached message as validator-dropped. The
@@ -3847,6 +4167,99 @@ impl TopicState {
     /// Get cached message
     fn get_message(&mut self, msg_id: &MessageIdType) -> Option<CachedMessage> {
         self.message_cache.get(msg_id).cloned()
+    }
+
+    fn get_local_origin_message(&mut self, msg_id: &MessageIdType) -> Option<CachedMessage> {
+        self.message_cache.prune_expired();
+        self.message_cache
+            .lru
+            .peek(msg_id)
+            .map(|entry| &entry.message)
+            .filter(|cached| cached.local_origin)
+            .cloned()
+    }
+
+    fn has_live_local_origin(&mut self) -> bool {
+        self.message_cache.prune_expired();
+        self.message_cache
+            .lru
+            .iter()
+            .any(|(_, entry)| entry.message.local_origin && !entry.message.dropped)
+    }
+
+    /// Drop offers older than the cache they page over.
+    ///
+    /// An offer whose cutoff has aged past `max_age` can only select messages
+    /// that are themselves already expired, so it can never produce another
+    /// batch and would otherwise sit in the map until that peer is removed —
+    /// the "record outlives the connection" shape. Mirrors the age pruning its
+    /// siblings `deferred_eager_replies` / `deferred_iwants` already do.
+    fn prune_late_local_offers(&mut self, now: Instant) {
+        let max_age = self.message_cache.max_age;
+        self.late_local_offers
+            .retain(|_, offer| now.saturating_duration_since(offer.cutoff) < max_age);
+    }
+
+    fn queue_late_local_offer(&mut self, peer: PeerId, now: Instant) {
+        self.message_cache.prune_expired_at(now);
+        self.prune_late_local_offers(now);
+        if self.has_live_local_origin() {
+            // Bounded like every other per-peer custody map: an unbounded one
+            // grows with peer churn, not with work outstanding.
+            if self.late_local_offers.len() >= MAX_LATE_LOCAL_OFFERS
+                && !self.late_local_offers.contains_key(&peer)
+            {
+                return;
+            }
+            self.late_local_offers
+                .entry(peer)
+                .or_insert(LateLocalOffer {
+                    cutoff: now,
+                    cursor: None,
+                });
+        }
+    }
+
+    fn late_local_offer_batch(
+        &mut self,
+        peer: PeerId,
+        now: Instant,
+    ) -> Option<(Vec<MessageIdType>, (Instant, MessageIdType))> {
+        let offer = *self.late_local_offers.get(&peer)?;
+        self.message_cache.prune_expired_at(now);
+        let mut eligible: Vec<_> = self
+            .message_cache
+            .lru
+            .iter()
+            .filter_map(|(id, entry)| {
+                let key = (entry.inserted_at, *id);
+                (entry.message.local_origin
+                    && !entry.message.dropped
+                    && entry.inserted_at <= offer.cutoff
+                    && offer.cursor.is_none_or(|cursor| key > cursor))
+                .then_some(key)
+            })
+            .collect();
+        eligible.sort_unstable();
+        eligible.truncate(MAX_IHAVE_BATCH_SIZE);
+        let Some(last) = eligible.last().copied() else {
+            self.late_local_offers.remove(&peer);
+            return None;
+        };
+        Some((eligible.into_iter().map(|(_, id)| id).collect(), last))
+    }
+
+    fn advance_late_local_offer(
+        &mut self,
+        peer: PeerId,
+        cutoff: Instant,
+        cursor: (Instant, MessageIdType),
+    ) {
+        if let Some(offer) = self.late_local_offers.get_mut(&peer) {
+            if offer.cutoff == cutoff {
+                offer.cursor = Some(cursor);
+            }
+        }
     }
 
     /// Clean expired cache entries
@@ -4546,6 +4959,9 @@ impl TopicState {
     fn evict_not_connected_peer(&mut self, peer: PeerId) -> NotConnectedEviction {
         let eager = self.eager_peers.remove(&peer);
         let lazy = self.lazy_peers.remove(&peer);
+        self.late_local_offers.remove(&peer);
+        self.deferred_eager_replies
+            .retain(|entry| entry.peer != peer);
         let cooling = self.peer_cooling.remove(&peer).is_some();
         NotConnectedEviction {
             eager,
@@ -5191,6 +5607,10 @@ impl ShardedTopicMap {
     }
 }
 
+/// Boxed Critical-fanout send future for one peer.
+type FanoutSendFuture<'a> =
+    Pin<Box<dyn Future<Output = (PeerId, (Result<PeerSendOutcome>, FanoutPeerStage))> + Send + 'a>>;
+
 /// Plumtree pub/sub implementation
 pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// Per-topic state — sharded (issue #27) to eliminate the single
@@ -5217,6 +5637,9 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     topic_cache_snapshot: Arc<StdRwLock<Arc<Vec<TopicCacheStatsSnapshot>>>>,
     /// Global per-peer outbound PubSub budgets shared by all topics and send classes.
     outbound_budgets: Arc<PeerOutboundBudgets>,
+    /// Optional Leaf-only serialized-byte limiter. The shared handle is
+    /// reconfigured in place so already-spawned maintenance tasks observe it.
+    egress_limiter: Arc<egress::LeafEgressLimiter>,
     /// Storm-control validators by topic (x0x announce storm mitigation).
     /// Registration is rare (startup / config change); lookup is a std
     /// RwLock read on the inbound hot path when present.
@@ -5269,6 +5692,102 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
+    fn recovery_intent_key(
+        topic: TopicId,
+        peer: PeerId,
+        op: &'static str,
+        bytes: &[u8],
+    ) -> egress::RecoveryIntentKey {
+        let mut key_hasher = blake3::Hasher::new();
+        key_hasher.update(&topic.to_bytes());
+        key_hasher.update(peer.as_bytes());
+        key_hasher.update(op.as_bytes());
+        if let Ok((message, trailing)) = postcard::take_from_bytes::<GossipMessage>(bytes) {
+            if trailing.is_empty() {
+                key_hasher.update(&message.header.msg_id);
+                let family = *key_hasher.clone().finalize().as_bytes();
+                if let Some(payload) = message.payload {
+                    key_hasher.update(blake3::hash(&payload).as_bytes());
+                }
+                return egress::RecoveryIntentKey {
+                    peer: peer.to_bytes(),
+                    scope: topic.to_bytes(),
+                    family,
+                    operation: *key_hasher.finalize().as_bytes(),
+                };
+            } else {
+                key_hasher.update(blake3::hash(bytes).as_bytes());
+            }
+        } else {
+            key_hasher.update(blake3::hash(bytes).as_bytes());
+        }
+        egress::RecoveryIntentKey {
+            peer: peer.to_bytes(),
+            scope: topic.to_bytes(),
+            family: *key_hasher.clone().finalize().as_bytes(),
+            operation: *key_hasher.finalize().as_bytes(),
+        }
+    }
+
+    /// Reserve serialized bytes for a recovery fan-out.
+    ///
+    /// `local_origin` says whether the frame being served is this node's own
+    /// message rather than relayed traffic, and `priority` is the topic's
+    /// class. Both are required: under `BytePolicy::ShedNormal` only
+    /// *forwarded* non-Critical recovery traffic may be shed, so these are
+    /// what make Critical topics, local-origin custody replies and
+    /// stranded-publish retries structurally un-sheddable rather than
+    /// un-shed by luck of the bucket level.
+    fn reserve_recovery_targets(
+        limiter: &Arc<egress::LeafEgressLimiter>,
+        topic: TopicId,
+        peers: Vec<PeerId>,
+        op: &'static str,
+        bytes: &Bytes,
+        local_origin: bool,
+        priority: TopicPriority,
+    ) -> (Vec<(PeerId, Option<egress::ByteReservation>)>, Vec<PeerId>) {
+        if !limiter.enabled() {
+            return (
+                peers.into_iter().map(|peer| (peer, None)).collect(),
+                Vec::new(),
+            );
+        }
+        // #504: recovery traffic is only shed once an operator has opted in
+        // with `BytePolicy::ShedNormal`, and even then never for Critical-class
+        // or local-origin frames. Accounting below still runs under
+        // ObserveOnly so the pressure is measurable before it is acted on.
+        let shed_eligible =
+            limiter.enforcing() && !local_origin && priority != TopicPriority::Critical;
+        let mut admitted = Vec::new();
+        let mut deferred = Vec::new();
+        for peer in peers {
+            let key = Self::recovery_intent_key(topic, peer, op, bytes);
+            // Protected: never consult the gate. `try_reserve_recovery`
+            // registers a persistent intent and escrows tokens, so calling it
+            // first and then ignoring the denial would leave residue that
+            // nothing cancels and that starves the data lane.
+            if !shed_eligible {
+                limiter.record_purpose_demand(topic.to_bytes(), op, bytes.len(), true);
+                admitted.push((
+                    peer,
+                    limiter.reserve_protected(key, bytes.len(), !local_origin),
+                ));
+                continue;
+            }
+            let result = limiter.try_reserve_recovery(key, bytes.len());
+            limiter.record_purpose_demand(topic.to_bytes(), op, bytes.len(), result.is_ok());
+            match result {
+                Ok(reservation) => admitted.push((peer, Some(reservation))),
+                Err(egress::ReserveError::Deferred | egress::ReserveError::WaiterLimit) => {
+                    deferred.push(peer);
+                }
+                Err(_) => deferred.push(peer),
+            }
+        }
+        (admitted, deferred)
+    }
+
     /// Trusted local migration configuration; disabled until explicitly registered
     /// and granted. A grant cannot override ADR-012 RejectV1.
     pub fn legacy_migration(&self) -> &Arc<compat::LegacyMigration> {
@@ -5284,6 +5803,72 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         data: Bytes,
     ) -> Result<()> {
         self.dispatch_message(session.peer, Some(session), data)
+            .await
+    }
+
+    /// Return topics that still retain at least one locally published,
+    /// serveable cache entry.
+    ///
+    /// The query prunes entries through the existing bounded cache lifetime;
+    /// it does not create a second origin registry or extend retention.
+    pub async fn locally_originated_cached_topic_ids(&self) -> Vec<TopicId> {
+        let mut shards = self.topics.write_all().await;
+        let mut topics = Vec::new();
+        for shard in &mut shards {
+            topics.extend(
+                shard
+                    .iter_mut()
+                    .filter_map(|(topic, state)| state.has_live_local_origin().then_some(*topic)),
+            );
+        }
+        topics.sort_by_key(|topic| topic.to_bytes());
+        topics
+    }
+
+    /// Verify and serve a full IWANT frame using only locally originated
+    /// cached entries.
+    ///
+    /// This is a terminal dispatch entry point for an unsubscribed Leaf
+    /// consumer. It rejects malformed, trailing, unsigned, or non-IWANT
+    /// frames and filters mixed batches at the authoritative cache lookup.
+    /// `Ok(true)` means at least one eligible reply was actually sent;
+    /// `Ok(false)` means the valid request had no successfully served local
+    /// entry. It never falls through to unrestricted IWANT service.
+    pub async fn handle_local_origin_iwant(&self, from: PeerId, data: Bytes) -> Result<bool> {
+        let decode_started = Instant::now();
+        let decoded: std::result::Result<(GossipMessage, &[u8]), _> =
+            postcard::take_from_bytes(&data);
+        self.record_stage(PubSubStage::Decode, decode_started);
+        let (message, trailing) = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.stage_stats.record_decode_failed();
+                return Err(anyhow!("Failed to deserialize PubSub message: {error}"));
+            }
+        };
+        anyhow::ensure!(trailing.is_empty(), "trailing IWANT frame bytes");
+        anyhow::ensure!(
+            message.header.kind == MessageKind::IWant,
+            "local-origin entry point requires IWANT"
+        );
+        self.stage_stats.record_message_kind(MessageKind::IWant);
+        anyhow::ensure!(
+            self.verify_message_signature(&message),
+            "Invalid signature on IWANT message"
+        );
+        self.transport.migration.ingress(from, None, &message)?;
+        let payload = message
+            .payload
+            .as_ref()
+            .ok_or_else(|| anyhow!("IWANT message missing payload"))?;
+        let requested: Vec<MessageIdType> = match postcard::from_bytes(payload) {
+            Ok(requested) => requested,
+            Err(error) => {
+                self.stage_stats.record_decode_failed();
+                return Err(anyhow!("Failed to deserialize IWANT payload: {error}"));
+            }
+        };
+        self.handle_iwant_admitted_filtered(from, message.header.topic, requested, true)
             .await
     }
 
@@ -5493,6 +6078,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             peer_score_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
             topic_cache_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
             outbound_budgets: Arc::new(PeerOutboundBudgets::default()),
+            egress_limiter: Arc::new(egress::LeafEgressLimiter::disabled()),
             topic_validators: Arc::new(StdRwLock::new(HashMap::new())),
             peer_rtt_tracker: Arc::new(PerPeerRttTracker::new()),
             cooling_config: AdaptiveCoolingConfig::default(),
@@ -5706,6 +6292,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 self.stage_stats.record_grafts(grafted);
             }
         }
+    }
+
+    /// Enable serialized-byte enforcement for a resolved Leaf node, or disable
+    /// it for Full/unspecified consumers. Invalid enabled configuration is
+    /// rejected without changing the transport contract.
+    pub fn configure_leaf_egress(&self, config: Option<LeafEgressConfig>) -> bool {
+        self.egress_limiter.configure(config)
+    }
+
+    /// Snapshot Leaf serialized-byte limiter demand, admission and deferral.
+    pub fn leaf_egress_snapshot(&self) -> LeafEgressSnapshot {
+        self.egress_limiter.snapshot()
     }
 
     /// Snapshot per-stage timings for inbound PubSub message handling.
@@ -6131,16 +6729,39 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
     async fn send_to_peer_with_timeout(
         transport: Arc<PolicyTransport<T>>,
+        egress_limiter: Arc<egress::LeafEgressLimiter>,
         stage_stats: Arc<PubSubStageStats>,
         rtt_tracker: Arc<PerPeerRttTracker>,
-        peer: PeerId,
-        stream_type: GossipStreamType,
-        bytes: Bytes,
-        op: &'static str,
+        request: PeerSendRequest,
     ) -> Result<PeerSendOutcome> {
-        let timeout = rtt_tracker.adaptive_timeout(&peer, PER_PEER_REPUBLISH_TIMEOUT);
+        let PeerSendRequest {
+            reservation,
+            topic,
+            peer,
+            stream_type,
+            bytes,
+            op,
+            send_timeout,
+        } = request;
+        let reservation_key = if egress_limiter.enabled() || reservation.is_some() {
+            Some(Self::recovery_intent_key(topic, peer, op, &bytes))
+        } else {
+            None
+        };
+        if !egress_limiter.validate_reservation(reservation_key, reservation) {
+            return Err(anyhow!(
+                "enabled Leaf PubSub send reached transport unreserved"
+            ));
+        }
+        let timeout = send_timeout
+            .unwrap_or_else(|| rtt_tracker.adaptive_timeout(&peer, PER_PEER_REPUBLISH_TIMEOUT));
         let started = Instant::now();
-        match tokio::time::timeout(timeout, transport.send_to_peer(peer, stream_type, bytes)).await
+        let frame_bytes = bytes.len();
+        let result = match tokio::time::timeout(
+            timeout,
+            transport.send_to_peer(peer, stream_type, bytes),
+        )
+        .await
         {
             Ok(Ok(())) => Ok(PeerSendOutcome::Sent {
                 observed: started.elapsed(),
@@ -6159,14 +6780,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         op,
                         "{op} peer not connected at transport — evicting from topic sets"
                     );
-                    return Ok(PeerSendOutcome::NotConnected);
+                    Ok(PeerSendOutcome::NotConnected)
+                } else {
+                    warn!(
+                        peer_id = %LogPeerId::from(peer),
+                        op,
+                        "{op} per-peer send failed: {e}"
+                    );
+                    Err(e)
                 }
-                warn!(
-                    peer_id = %LogPeerId::from(peer),
-                    op,
-                    "{op} per-peer send failed: {e}"
-                );
-                Err(e)
             }
             Err(_) => {
                 stage_stats.record_per_peer_timeout();
@@ -6181,17 +6803,118 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 );
                 Ok(PeerSendOutcome::TimedOut)
             }
-        }
+        };
+        egress_limiter.record_send_outcome(
+            topic.to_bytes(),
+            op,
+            frame_bytes,
+            matches!(&result, Ok(PeerSendOutcome::Sent { .. })),
+        );
+        result
     }
 
-    async fn send_to_peer_bounded(
+    async fn send_to_peer_bounded_outcome(
         &self,
         topic: TopicId,
         peer: PeerId,
         stream_type: GossipStreamType,
         bytes: Bytes,
         op: &'static str,
-    ) -> Result<()> {
+        local_origin: bool,
+    ) -> Result<PeerSendOutcome> {
+        self.send_to_peer_bounded_outcome_tracked(topic, peer, stream_type, bytes, op, local_origin)
+            .await
+            .0
+    }
+
+    /// `local_origin` marks a frame this node authored (a publish, a targeted
+    /// send, or serving our own cached message back to a requester). #504:
+    /// such a frame is never shed for bytes, whatever the policy.
+    async fn send_to_peer_bounded_outcome_tracked(
+        &self,
+        topic: TopicId,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        bytes: Bytes,
+        op: &'static str,
+        local_origin: bool,
+    ) -> (Result<PeerSendOutcome>, FanoutPeerStage) {
+        let operation_started = time::Instant::now();
+        let operation_budget = self
+            .peer_rtt_tracker
+            .adaptive_timeout(&peer, PER_PEER_REPUBLISH_TIMEOUT);
+        let priority = self.admission.registry().priority_for(&topic);
+        // Reserve serialized recovery/control bytes before touching admission
+        // or transport permits. The digest coalesces retries of the same final
+        // wire frame without retaining a second payload copy.
+        // #504: same opt-in gate as the fan-out path. Critical-class traffic is
+        // never byte-rejected here — under the previous code a Critical EAGER
+        // that outlasted its waiter deadline came back as `Deferred` and was
+        // dropped, which is exactly the hard error the priority class exists
+        // to prevent.
+        //
+        // The gate is consulted BEFORE reserving. A protected send must not
+        // enter the waiter loop at all: that loop polls to the caller deadline
+        // (~4 s) before returning `Deferred`, so checking afterwards would
+        // stall every protected send under a saturated budget and saturate the
+        // bounded waiter semaphores. It also must not register a recovery
+        // intent it would then never cancel.
+        let protected =
+            !self.egress_limiter.enforcing() || priority == TopicPriority::Critical || local_origin;
+        let reservation = if self.egress_limiter.enabled() {
+            let key = Self::recovery_intent_key(topic, peer, op, &bytes);
+            if protected {
+                // A protected send never enters the waiter loop. The loop polls
+                // to the caller deadline (~4 s) before reporting `Deferred`,
+                // and reservation and send share one deadline — so waiting for
+                // budget we are going to grant anyway burns the send's own time
+                // and turns protection into a timeout. It also registers an
+                // intent that escrows tokens meanwhile, and under ObserveOnly
+                // it would stall every send and exhaust the waiter semaphores.
+                self.egress_limiter
+                    .record_purpose_demand(topic.to_bytes(), op, bytes.len(), true);
+                self.egress_limiter
+                    .reserve_protected(key, bytes.len(), !local_origin)
+            } else {
+                let wait = operation_budget;
+                let reserve_result = if priority == TopicPriority::Critical && op == "EAGER" {
+                    self.egress_limiter
+                        .reserve_critical_eager(key, bytes.len(), wait)
+                        .await
+                } else {
+                    self.egress_limiter
+                        .reserve_recovery(key, bytes.len(), wait, false)
+                        .await
+                };
+                self.egress_limiter.record_purpose_demand(
+                    topic.to_bytes(),
+                    op,
+                    bytes.len(),
+                    reserve_result.is_ok(),
+                );
+                match reserve_result {
+                    Ok(reservation) => Some(reservation),
+                    Err(egress::ReserveError::Disabled) => None,
+                    Err(egress::ReserveError::Deferred | egress::ReserveError::WaiterLimit) => {
+                        return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ByteRejected);
+                    }
+                    Err(
+                        error @ (egress::ReserveError::Oversized
+                        | egress::ReserveError::IntentLimit),
+                    ) => {
+                        return (
+                            Err(anyhow!(error.to_string())),
+                            FanoutPeerStage::ByteRejected,
+                        );
+                    }
+                    Err(egress::ReserveError::Reconfigured) => {
+                        return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ByteRejected);
+                    }
+                }
+            }
+        } else {
+            None
+        };
         // X0X-0074: admission control gate. Consults topic priority,
         // peer health (from the snapshot — sync, no await under lock),
         // and per-peer cooled state to decide whether the message
@@ -6206,7 +6929,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // disconnected target → benign `dropped_critical_no_target`,
         // cooling → `dropped_critical_cooling`, exhausted control
         // budget → the hard error.
-        let priority = self.admission.registry().priority_for(&topic);
         let health = peer_health_from_snapshot(self.peer_health_snapshot.as_ref(), &peer);
         // Normal: transport-connected overrides stale SWIM Suspect/Dead so
         // admission admits; Bulk/Critical and missing/absent snapshot keep
@@ -6226,7 +6948,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 reason = %reason,
                 "X0X-0074 admission dropped peer send"
             );
-            return Ok(());
+            return (
+                Ok(PeerSendOutcome::Deferred),
+                FanoutPeerStage::AdmissionDropped,
+            );
         }
 
         // Bulk-admitted means we incremented per-peer depth — release
@@ -6293,7 +7018,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
             drop(release_guard);
-            return Ok(());
+            return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ClaimSkipped);
         };
         let Some(permit) = claims.take_permits().into_iter().next() else {
             // Defensive: claim pushes attempt+permit together, so this is
@@ -6314,33 +7039,45 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 );
             }
             drop(release_guard);
-            return Ok(());
+            return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ClaimSkipped);
         };
 
         // x0x #380: outbound demand metering — this bounded path carries
         // exactly one claimed per-peer send. Instrumentation only.
         self.stage_stats.record_outbound(topic, op, bytes.len(), 1);
         let transport = Arc::clone(&self.transport);
+        let egress_limiter = Arc::clone(&self.egress_limiter);
         let stage_stats = Arc::clone(&self.stage_stats);
         let rtt_tracker = Arc::clone(&self.peer_rtt_tracker);
         let handle = AbortOnDropSendHandle::new(tokio::spawn(async move {
             let mut permit = permit;
             // X0X-0074d: for Critical, wait FIFO for the peer's in-flight slot
             // (no-op otherwise). Held until the send completes.
-            let gate_wait_timeout =
-                rtt_tracker.adaptive_timeout(&attempt.peer, PER_PEER_REPUBLISH_TIMEOUT);
+            let gate_wait_timeout = operation_budget.saturating_sub(operation_started.elapsed());
+            if gate_wait_timeout.is_zero() {
+                stage_stats.record_per_peer_timeout();
+                return Ok(PeerSendOutcome::TimedOut);
+            }
             if !permit.engage_critical_gate(gate_wait_timeout).await {
                 stage_stats.record_per_peer_timeout();
                 return Ok(PeerSendOutcome::TimedOut);
             }
             Self::send_to_peer_with_timeout(
                 transport,
+                egress_limiter,
                 stage_stats,
                 rtt_tracker,
-                attempt.peer,
-                stream_type,
-                bytes,
-                op,
+                PeerSendRequest {
+                    reservation,
+                    topic,
+                    peer: attempt.peer,
+                    stream_type,
+                    bytes,
+                    op,
+                    send_timeout: Some(
+                        operation_budget.saturating_sub(operation_started.elapsed()),
+                    ),
+                },
             )
             .await
         }));
@@ -6354,13 +7091,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         Vec::new(),
                     )
                     .await;
-                Ok(())
+                Ok(PeerSendOutcome::Sent { observed })
             }
             Ok(Ok(PeerSendOutcome::TimedOut)) => {
                 claims
                     .record_results(Vec::new(), vec![attempt], Vec::new())
                     .await;
-                Ok(())
+                Ok(PeerSendOutcome::TimedOut)
             }
             Ok(Ok(PeerSendOutcome::NotConnected)) => {
                 // x0x #380: eviction, booked below — never a timeout sample
@@ -6368,7 +7105,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 claims
                     .record_results(Vec::new(), Vec::new(), vec![attempt])
                     .await;
-                Ok(())
+                Ok(PeerSendOutcome::NotConnected)
+            }
+            Ok(Ok(PeerSendOutcome::Deferred)) => {
+                let timed_out = recovery_probe_timeout(attempt);
+                claims
+                    .record_results(Vec::new(), timed_out, Vec::new())
+                    .await;
+                Ok(PeerSendOutcome::Deferred)
             }
             Ok(Err(e)) => {
                 let timed_out = recovery_probe_timeout(attempt);
@@ -6391,7 +7135,37 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         };
         drop(release_guard);
-        result
+        (result, FanoutPeerStage::Attempted)
+    }
+
+    /// Relay-origin send. Requests (IWANT) and digests (ANTI_ENTROPY) carry no
+    /// payload custody, so they default to `local_origin = false`; a caller
+    /// serving its own cached message uses
+    /// [`Self::send_to_peer_bounded_with_origin`].
+    async fn send_to_peer_bounded(
+        &self,
+        topic: TopicId,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        bytes: Bytes,
+        op: &'static str,
+    ) -> Result<()> {
+        self.send_to_peer_bounded_with_origin(topic, peer, stream_type, bytes, op, false)
+            .await
+    }
+
+    async fn send_to_peer_bounded_with_origin(
+        &self,
+        topic: TopicId,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        bytes: Bytes,
+        op: &'static str,
+        local_origin: bool,
+    ) -> Result<()> {
+        self.send_to_peer_bounded_outcome(topic, peer, stream_type, bytes, op, local_origin)
+            .await
+            .map(|_| ())
     }
 
     /// Inspect the per-topic cooling state for `peer` as the admission
@@ -6816,22 +7590,30 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// caller unpinned. Each task is bounded by
     /// `rtt_tracker.adaptive_timeout(peer, PER_PEER_REPUBLISH_TIMEOUT)`.
     fn spawn_bounded_send_tasks(
-        transport: &Arc<PolicyTransport<T>>,
-        stage_stats: &Arc<PubSubStageStats>,
-        rtt_tracker: &Arc<PerPeerRttTracker>,
+        context: FanoutSendContext<'_, T>,
         claims: &mut SendAttemptClaims,
-        stream_type: GossipStreamType,
+        mut reservations: HashMap<PeerId, egress::ByteReservation>,
         bytes: Bytes,
-        op: &'static str,
     ) -> SendTaskSet {
+        let FanoutSendContext {
+            transport,
+            egress_limiter,
+            stage_stats,
+            rtt_tracker,
+            topic,
+            stream_type,
+            op,
+        } = context;
         let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
         let attempts = claims.attempts().to_vec();
         let permits = claims.take_permits();
         for (attempt, permit) in attempts.into_iter().zip(permits) {
             let transport = Arc::clone(transport);
+            let egress_limiter = Arc::clone(egress_limiter);
             let bytes = bytes.clone();
             let stage_stats = Arc::clone(stage_stats);
             let rtt_tracker = Arc::clone(rtt_tracker);
+            let reservation = reservations.remove(&attempt.peer);
             let handle = tokio::spawn(async move {
                 let mut permit = permit;
                 let gate_wait_timeout =
@@ -6842,12 +7624,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 Self::send_to_peer_with_timeout(
                     transport,
+                    egress_limiter,
                     stage_stats,
                     rtt_tracker,
-                    attempt.peer,
-                    stream_type,
-                    bytes,
-                    op,
+                    PeerSendRequest {
+                        reservation,
+                        topic,
+                        peer: attempt.peer,
+                        stream_type,
+                        bytes,
+                        op,
+                        send_timeout: None,
+                    },
                 )
                 .await
             });
@@ -6877,13 +7665,209 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         op: &'static str,
         detach_accounting: bool,
     ) -> (Duration, FanoutCounts, Vec<PeerId>) {
+        // Leaf byte admission precedes all existing peer/transport admission.
+        // Data never waits or retains another payload copy: denied EAGER peers
+        // are placed on the existing direct-IHAVE lazy recovery path.
+        let candidates = peers.len();
+        let mut reservations = HashMap::new();
+        let priority = self.admission.registry().priority_for(&topic);
+        // #504 (review r2): keyed on `enforcing()`, not `enabled()`. This
+        // sequential branch exists to order Critical sends against a shedding
+        // budget; under ObserveOnly there is nothing to order against, so an
+        // observing node keeps the unbudgeted concurrent fan-out. Same
+        // recipients either way — this keeps the ObserveOnly invariant exact
+        // rather than merely benign.
+        if self.egress_limiter.enforcing()
+            && priority == TopicPriority::Critical
+            && op == "EAGER"
+            && !detach_accounting
+        {
+            let mut tasks: Vec<FanoutSendFuture<'_>> = Vec::with_capacity(peers.len());
+            for peer in peers {
+                let frame = bytes.clone();
+                tasks.push(Box::pin(async move {
+                    let result = self
+                        .send_to_peer_bounded_outcome_tracked(
+                            topic,
+                            peer,
+                            stream_type,
+                            frame,
+                            op,
+                            !detach_accounting,
+                        )
+                        .await;
+                    (peer, result)
+                }));
+            }
+            let mut attempted = Vec::new();
+            let mut succeeded = 0;
+            let mut deferred = Vec::new();
+            let mut byte_rejected = 0;
+            let mut admission_dropped = 0;
+            let mut claim_skipped = 0;
+            while !tasks.is_empty() {
+                let completed = std::future::poll_fn(|context| {
+                    tasks
+                        .iter_mut()
+                        .enumerate()
+                        .find_map(|(index, task)| match task.as_mut().poll(context) {
+                            std::task::Poll::Ready(result) => Some((index, result)),
+                            std::task::Poll::Pending => None,
+                        })
+                        .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+                })
+                .await;
+                let (index, result) = completed;
+                drop(tasks.swap_remove(index));
+                match result {
+                    (peer, (Ok(PeerSendOutcome::Sent { .. }), FanoutPeerStage::Attempted)) => {
+                        attempted.push(peer);
+                        succeeded += 1;
+                    }
+                    (
+                        peer,
+                        (
+                            Ok(PeerSendOutcome::NotConnected | PeerSendOutcome::TimedOut),
+                            FanoutPeerStage::Attempted,
+                        ),
+                    ) => {
+                        attempted.push(peer);
+                    }
+                    (peer, (_, FanoutPeerStage::ByteRejected)) => {
+                        byte_rejected += 1;
+                        deferred.push(peer);
+                    }
+                    (peer, (_, FanoutPeerStage::AdmissionDropped)) => {
+                        admission_dropped += 1;
+                        deferred.push(peer);
+                    }
+                    (peer, (_, FanoutPeerStage::ClaimSkipped)) => {
+                        claim_skipped += 1;
+                        deferred.push(peer);
+                    }
+                    (peer, (_, FanoutPeerStage::Attempted)) => {
+                        attempted.push(peer);
+                    }
+                }
+            }
+            if !deferred.is_empty() {
+                if let Ok((message, _)) = postcard::take_from_bytes::<GossipMessage>(&bytes) {
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        state.queue_lazy_withheld(message.header.msg_id, &deferred);
+                        self.stage_stats
+                            .record_lazy_ihave_withheld_peers(deferred.len());
+                    }
+                }
+            }
+            let attempted_count = attempted.len();
+            return (
+                Duration::ZERO,
+                FanoutCounts {
+                    candidates,
+                    byte_rejected,
+                    admission_dropped,
+                    claim_skipped,
+                    attempted: attempted_count,
+                    succeeded,
+                },
+                attempted,
+            );
+        }
+        // #504: enforcement is opt-in, and even when opted in it is narrow.
+        // `detach_accounting` is the established local-vs-relayed marker on
+        // this path (publish passes false, the dispatcher forward passes
+        // true) and is already handed to the limiter as `relayed`. A send may
+        // be shed only when all three hold: the operator selected
+        // `BytePolicy::ShedNormal`, this is a *forwarded* relay rather than
+        // this node's own publish, and the topic is not Critical-class. A
+        // byte budget must not be the thing that silences our own speech or
+        // the DM inbox / control plane.
+        let shed_eligible = self.egress_limiter.enforcing()
+            && detach_accounting
+            && priority != TopicPriority::Critical;
+        let peers = if self.egress_limiter.enabled() {
+            let mut admitted = Vec::with_capacity(peers.len());
+            let mut deferred = Vec::new();
+            for peer in peers {
+                let key = Self::recovery_intent_key(topic, peer, op, &bytes);
+                // Protection is decided before reserving, not after a denial.
+                // A protected send must never consult the gate at all: it is
+                // charged, it is never denied, and it carries a real
+                // reservation so the transport fence admits it.
+                if !shed_eligible {
+                    if let Some(reservation) =
+                        self.egress_limiter
+                            .reserve_protected(key, bytes.len(), detach_accounting)
+                    {
+                        reservations.insert(peer, reservation);
+                    }
+                    self.egress_limiter.record_purpose_demand(
+                        topic.to_bytes(),
+                        op,
+                        bytes.len(),
+                        true,
+                    );
+                    admitted.push(peer);
+                    continue;
+                }
+                let reserve_result =
+                    self.egress_limiter
+                        .try_reserve_data(key, bytes.len(), detach_accounting);
+                self.egress_limiter.record_purpose_demand(
+                    topic.to_bytes(),
+                    op,
+                    bytes.len(),
+                    reserve_result.is_ok(),
+                );
+                match reserve_result {
+                    Ok(reservation) => {
+                        reservations.insert(peer, reservation);
+                        admitted.push(peer);
+                    }
+                    Err(egress::ReserveError::Disabled) => admitted.push(peer),
+                    Err(egress::ReserveError::Deferred) => deferred.push(peer),
+                    Err(egress::ReserveError::Oversized) => {
+                        warn!(topic = %LogTopicId::from(topic), op, bytes = bytes.len(),
+                            "Leaf PubSub frame exceeds configured serialized maximum");
+                        deferred.push(peer);
+                    }
+                    Err(
+                        egress::ReserveError::WaiterLimit
+                        | egress::ReserveError::IntentLimit
+                        | egress::ReserveError::Reconfigured,
+                    ) => {
+                        deferred.push(peer);
+                    }
+                }
+            }
+            if !deferred.is_empty() && op == "EAGER" {
+                if let Ok((message, _)) = postcard::take_from_bytes::<GossipMessage>(&bytes) {
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        state.queue_lazy_withheld(message.header.msg_id, &deferred);
+                        self.stage_stats
+                            .record_lazy_ihave_withheld_peers(deferred.len());
+                    }
+                }
+            }
+            admitted
+        } else {
+            peers
+        };
+        // FanoutCounts stage accounting (504): every peer that entered this
+        // call lands in exactly one bucket — byte_rejected here, then
+        // admission_dropped, claim_skipped, or attempted below. Keeps the
+        // invariant candidates == byte_rejected + admission_dropped +
+        // claim_skipped + attempted on every return path.
+        let byte_rejected = candidates - peers.len();
+
         // X0X-0074: admission gate runs once per (topic, peer) before
         // we claim attempts. Dropped peers never enter the send
         // pipeline. Bulk admissions are reserved here and released
         // exactly once at the end of this function regardless of which
         // downstream path (no-claim, partial-claim, send completion)
         // the message took — the depth counter must never leak.
-        let priority = self.admission.registry().priority_for(&topic);
         let admitted = self
             .filter_peers_through_admission(&topic, peers, priority, op)
             .await;
@@ -6894,7 +7878,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         };
         let admitted_count = admitted.len();
         if admitted_count == 0 {
-            return (Duration::ZERO, FanoutCounts::default(), Vec::new());
+            return (
+                Duration::ZERO,
+                FanoutCounts {
+                    candidates,
+                    byte_rejected,
+                    admission_dropped: candidates - byte_rejected,
+                    claim_skipped: 0,
+                    attempted: 0,
+                    succeeded: 0,
+                },
+                Vec::new(),
+            );
         }
         // X0X-0074: RAII guard releases Bulk admissions for the entire
         // admitted set exactly once on drop — covers no-claim, partial-
@@ -6920,7 +7915,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if claims.is_empty() {
             // No peers got attempts. Bulk reservations release when
             // `_bulk_guard` drops at function exit.
-            return (lock_wait, FanoutCounts::default(), Vec::new());
+            return (
+                lock_wait,
+                FanoutCounts {
+                    candidates,
+                    byte_rejected,
+                    admission_dropped: candidates - byte_rejected - admitted_count,
+                    claim_skipped: admitted_count,
+                    attempted: 0,
+                    succeeded: 0,
+                },
+                Vec::new(),
+            );
         }
         let attempted = claims.attempts().len();
         // x0x #380: outbound demand metering — one wire send per claimed
@@ -6932,13 +7938,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // exactly the peers the pull path (self-IHAVE) must target.
         let attempted_peers: Vec<PeerId> = claims.attempts().iter().map(|a| a.peer).collect();
         let send_tasks = Self::spawn_bounded_send_tasks(
-            &self.transport,
-            &self.stage_stats,
-            &self.peer_rtt_tracker,
+            FanoutSendContext {
+                transport: &self.transport,
+                egress_limiter: &self.egress_limiter,
+                stage_stats: &self.stage_stats,
+                rtt_tracker: &self.peer_rtt_tracker,
+                topic,
+                stream_type,
+                op,
+            },
             &mut claims,
-            stream_type,
+            reservations,
             bytes,
-            op,
         );
         if detach_accounting {
             // Dispatcher forward path: detach fan-out result accounting so
@@ -6963,6 +7974,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             (
                 lock_wait,
                 FanoutCounts {
+                    candidates,
+                    byte_rejected,
+                    admission_dropped: candidates - byte_rejected - admitted_count,
+                    claim_skipped: admitted_count - attempted,
                     attempted,
                     succeeded: 0,
                 },
@@ -6980,6 +7995,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             (
                 lock_wait,
                 FanoutCounts {
+                    candidates,
+                    byte_rejected,
+                    admission_dropped: candidates - byte_rejected - admitted_count,
+                    claim_skipped: admitted_count - attempted,
                     attempted,
                     succeeded,
                 },
@@ -7199,6 +8218,34 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         payload: Bytes,
     ) -> Result<FanoutCounts> {
+        self.publish_local_with_optional_target(topic, payload, None)
+            .await
+            .map(|(fanout, _)| fanout)
+    }
+
+    /// Publish normally and concurrently target one connected peer with the
+    /// same signed, cached serialized frame through the existing bounded
+    /// recovery send path.
+    pub async fn publish_local_with_target(
+        &self,
+        topic: TopicId,
+        payload: Bytes,
+        target: PeerId,
+        deadline: Duration,
+    ) -> Result<TargetedFanoutCounts> {
+        let (fanout, target) = self
+            .publish_local_with_optional_target(topic, payload, Some((target, deadline)))
+            .await?;
+        let target = target.unwrap_or(TargetedPublishOutcome::Failed);
+        Ok(TargetedFanoutCounts { fanout, target })
+    }
+
+    async fn publish_local_with_optional_target(
+        &self,
+        topic: TopicId,
+        payload: Bytes,
+        target: Option<(PeerId, Duration)>,
+    ) -> Result<(FanoutCounts, Option<TargetedPublishOutcome>)> {
         let inner_proof = self.transport.migration.verify_inner(topic, &payload)?;
         let msg_id = self.calculate_msg_id(&topic, &payload);
 
@@ -7224,14 +8271,38 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             public_key: self.signing_key.public_key().to_vec(),
         };
 
+        // Enabled Leaf nodes pre-serialize here so the final wire frame is
+        // built once and reused by the fan-out below.
+        //
+        // #504 (review R1): this deliberately does NOT enforce
+        // `max_serialized_frame_bytes`. It used to, keyed on `enabled()`, which
+        // hard-failed an oversized publish that an unbudgeted node sends — a
+        // behaviour change from merely *measuring* egress, and the exact
+        // divergence `BytePolicy::ObserveOnly` exists to rule out. It also
+        // contradicted the reservation layer, which deliberately bypasses the
+        // cap for protected sends: a publish is always local-origin, hence
+        // always protected, so the ceiling can never be policy-correct at this
+        // site. The cap belongs on shed-eligible traffic, where the fan-out's
+        // `ReserveError::Oversized` arm applies it.
+        let leaf_wire_bytes = if self.egress_limiter.enabled() {
+            Some::<Bytes>(
+                postcard::to_stdvec(&_message)
+                    .map_err(|error| anyhow!("EAGER serialize failed: {error}"))?
+                    .into(),
+            )
+        } else {
+            None
+        };
+
         let mut topics = self.topics.write_topic(&topic).await;
         let state = topics
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
 
         // Add to cache
-        state.cache_message(msg_id, payload.clone(), header);
-        state.set_inner_proof(msg_id, inner_proof);
+        if state.cache_message(msg_id, payload.clone(), header, true) {
+            state.set_inner_proof(msg_id, inner_proof);
+        }
 
         // Seed the replay cache so network echoes of our own publish are
         // detected as replays (defense-in-depth alongside msg_id dedup).
@@ -7264,12 +8335,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // 2026-04-25 OOM-on-spawn issue stays addressed: this is a bounded
         // concurrent send (one task per peer that completes within the
         // budget), not a fire-and-forget spawn that can accumulate.
-        let bytes: Bytes = match postcard::to_stdvec(&_message) {
-            Ok(b) => b.into(),
-            Err(e) => {
-                warn!(msg_id = ?msg_id, "EAGER serialize failed: {e}");
-                return Ok(FanoutCounts::default());
-            }
+        let bytes: Bytes = match leaf_wire_bytes {
+            Some(bytes) => bytes,
+            None => postcard::to_stdvec(&_message)
+                .map(Bytes::from)
+                .map_err(|error| {
+                    warn!(msg_id = ?msg_id, "EAGER serialize failed: {error}");
+                    error
+                })?,
         };
         // x0x #613: retain the serialized wire bytes for the bounded
         // single-shot stranded retry (below). A `Bytes` clone is a
@@ -7282,19 +8355,42 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Publish path: await accounting (detach_accounting = false) so
         // publish() returns only after its EAGER sends are attempted and
         // outcomes are observable (succeeded is valid here).
-        let (_, counts, attempted_peers) = self
-            .parallel_send_to_peers(
-                topic,
-                eager_peers,
-                GossipStreamType::PubSub,
-                bytes,
-                "EAGER",
-                false,
+        let ordinary = self.parallel_send_to_peers(
+            topic,
+            eager_peers,
+            GossipStreamType::PubSub,
+            bytes.clone(),
+            "EAGER",
+            false,
+        );
+        let targeted = async {
+            let (peer, deadline) = target?;
+            let outcome = tokio::time::timeout(
+                deadline,
+                self.send_to_peer_bounded_outcome(
+                    topic,
+                    peer,
+                    GossipStreamType::PubSub,
+                    bytes,
+                    "EAGER",
+                    // The targeted leg of a local publish.
+                    true,
+                ),
             )
             .await;
+            Some(match outcome {
+                Ok(Ok(PeerSendOutcome::Sent { .. })) => TargetedPublishOutcome::Sent,
+                Ok(Ok(PeerSendOutcome::NotConnected)) => TargetedPublishOutcome::NotConnected,
+                Ok(Ok(PeerSendOutcome::Deferred)) => TargetedPublishOutcome::Deferred,
+                Ok(Ok(PeerSendOutcome::TimedOut)) | Err(_) => TargetedPublishOutcome::TimedOut,
+                Ok(Err(_)) => TargetedPublishOutcome::Failed,
+            })
+        };
+        let ((_, counts, attempted_peers), target_outcome) = tokio::join!(ordinary, targeted);
 
         // Update zero-delivery counters. Two distinct conditions:
-        //   attempted == 0 → no eligible peers (cooled / empty eager set).
+        //   attempted == 0 → every candidate was excluded by a staged gate,
+        //                    or the eager set was empty (see FanoutCounts).
         //   attempted > 0, succeeded == 0 → black-hole: peers existed but
         //                                    every send failed at dispatch.
         // The WARN fires on either condition (succeeded == 0) so operators
@@ -7318,13 +8414,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if counts.succeeded == 0 && state.record_zero_fanout_publish_at(Instant::now()) {
                 warn!(
                     topic = %topic,
+                    op = "EAGER",
                     msg_id = ?msg_id,
+                    candidates = counts.candidates,
+                    byte_rejected = counts.byte_rejected,
+                    admission_dropped = counts.admission_dropped,
+                    claim_skipped = counts.claim_skipped,
                     attempted = counts.attempted,
                     succeeded = counts.succeeded,
+                    target_outcome = ?target_outcome,
                     zero_fanout_publishes = state.zero_fanout_publishes,
                     warn_interval_secs = ZERO_FANOUT_WARN_INTERVAL.as_secs(),
-                    "local publish had zero successful remote fan-out \
-                     (throttled; counter is cumulative for this topic)"
+                    "local publish had zero successful ordinary EAGER fan-out \
+                     (candidates == byte_rejected + admission_dropped + \
+                     claim_skipped + attempted; throttled; counter is \
+                     cumulative for this topic)"
                 );
             }
             let dropped = state.push_pending_ihave(msg_id);
@@ -7352,11 +8456,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
         }
 
-        // x0x #613 mitigation 2: bounded single-shot retry. After two full
-        // per-peer budgets, retry the cached message once to the current
-        // eager set. A second zero-delivery outcome is terminal
-        // (`stranded_publish_retry_failed`); there is no retry loop. The
-        // publish call's own contract (Ok + counts) is unchanged — the
+        // x0x #613 mitigation 2: bounded retry. After two full per-peer
+        // budgets, retry the cached message against the current eager set.
+        // Disabled/Full mode remains single-shot; Leaf enforcement may
+        // revisit only deferred targets until the original cache deadline.
+        // The publish call's own contract (Ok + counts) is unchanged — the
         // retry runs detached, like the forward path's accounting task.
         if stranded {
             let retry_ctx = StrandedRetryContext {
@@ -7364,6 +8468,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 transport: Arc::clone(&self.transport),
                 stage_stats: Arc::clone(&self.stage_stats),
                 outbound_budgets: Arc::clone(&self.outbound_budgets),
+                egress_limiter: Arc::clone(&self.egress_limiter),
                 send_path: self.send_path_context(),
             };
             tokio::spawn(async move {
@@ -7372,7 +8477,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             });
         }
 
-        Ok(counts)
+        Ok((counts, target_outcome))
     }
 
     /// Handle incoming EAGER message
@@ -7624,8 +8729,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             len = payload.len(),
             zero_tail = payload_zero_tail(&payload),
         );
-        state.cache_message(msg_id, payload.clone(), message.header.clone());
-        state.set_inner_proof(msg_id, inner_proof);
+        if state.cache_message(msg_id, payload.clone(), message.header.clone(), false) {
+            state.set_inner_proof(msg_id, inner_proof);
+        }
 
         // Update peer score for the sender
         state
@@ -7847,7 +8953,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
-        let registered = self.transport.migration.registered(topic);
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
@@ -7856,6 +8961,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
         state.touch();
+        state.prune_deferred_iwants(Instant::now());
 
         let mut requested = Vec::new();
 
@@ -7870,15 +8976,22 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 continue;
             }
 
-            // Bound outstanding recovery work on audited migration topics.
-            if registered && state.outstanding_iwants.len() >= 1024 {
+            // Bound retained recovery metadata on every topic. Previously the
+            // cap applied only to migration topics, but byte-deferred IWANTs
+            // now remain live until sent or cache-age expiry.
+            if state.outstanding_iwants.len() >= MAX_IHAVE_BATCH_SIZE {
                 break;
             }
             // Request it
             requested.push(msg_id);
-            state
-                .outstanding_iwants
-                .insert(msg_id, (from, Instant::now()));
+            state.outstanding_iwants.insert(
+                msg_id,
+                OutstandingIwant {
+                    peer: from,
+                    requested_at: Instant::now(),
+                    retry_pending: false,
+                },
+            );
 
             // Track IWANT request for scoring
             state
@@ -7929,10 +9042,73 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
             let send_result = self
-                .send_to_peer_bounded(topic, from, GossipStreamType::PubSub, bytes.into(), "IWANT")
+                .send_to_peer_bounded_outcome(
+                    topic,
+                    from,
+                    GossipStreamType::PubSub,
+                    bytes.into(),
+                    "IWANT",
+                    // Requesting a message we do not hold.
+                    false,
+                )
                 .await;
             self.record_stage(PubSubStage::Republish, republish_started);
-            send_result?;
+            match &send_result {
+                Ok(PeerSendOutcome::Sent { .. }) => {
+                    let handed_off_at = Instant::now();
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        for msg_id in &requested {
+                            if let Some(entry) = state.outstanding_iwants.get_mut(msg_id) {
+                                if entry.peer == from {
+                                    entry.requested_at = handed_off_at;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(PeerSendOutcome::Deferred) => {
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        for msg_id in &requested {
+                            if let Some(entry) = state.outstanding_iwants.get_mut(msg_id) {
+                                if entry.peer == from {
+                                    entry.retry_pending = true;
+                                }
+                            }
+                        }
+                        if !state.retain_deferred_iwant(from, &requested, Instant::now()) {
+                            for msg_id in &requested {
+                                if state
+                                    .outstanding_iwants
+                                    .get(msg_id)
+                                    .is_some_and(|entry| entry.peer == from)
+                                {
+                                    state.outstanding_iwants.remove(msg_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(PeerSendOutcome::TimedOut | PeerSendOutcome::NotConnected) | Err(_) => {
+                    // No IWANT reached the peer. Release exactly the claims
+                    // made above so a later IHAVE can retry recovery instead
+                    // of remaining suppressed until the stale-request sweep.
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        for msg_id in &requested {
+                            if state
+                                .outstanding_iwants
+                                .get(msg_id)
+                                .is_some_and(|entry| entry.peer == from)
+                            {
+                                state.outstanding_iwants.remove(msg_id);
+                            }
+                        }
+                    }
+                }
+            }
+            send_result.map(|_| ())?;
         }
 
         Ok(())
@@ -7958,14 +9134,31 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
+        self.handle_iwant_admitted_filtered(from, topic, msg_ids, false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn handle_iwant_admitted_filtered(
+        &self,
+        from: PeerId,
+        topic: TopicId,
+        msg_ids: Vec<MessageIdType>,
+        local_origin_only: bool,
+    ) -> Result<bool> {
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
         let dedupe_started = Instant::now();
+        if local_origin_only && !topics.contains_key(&topic) {
+            return Ok(false);
+        }
         let state = topics
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
-        state.touch();
+        if !local_origin_only {
+            state.touch();
+        }
 
         let mut to_send = Vec::new();
         let mut requester_has_cached_message = false;
@@ -7977,7 +9170,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let track_served = !state.stranded_ihave.is_empty() || !state.lazy_withheld.is_empty();
 
         for msg_id in msg_ids {
-            if let Some(cached) = state.get_message(&msg_id) {
+            let cached = if local_origin_only {
+                state.get_local_origin_message(&msg_id)
+            } else {
+                state.get_message(&msg_id)
+            };
+            if let Some(cached) = cached {
                 // Storm-control: a validator-dropped message must never
                 // leave this node, even under IWANT recovery pressure.
                 if cached.dropped {
@@ -7995,6 +9193,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
 
         if requester_has_cached_message {
+            if local_origin_only {
+                state.touch();
+                Self::record_inbound_peer_activity_for_state(
+                    self.stage_stats.as_ref(),
+                    topic,
+                    from,
+                    state,
+                    Instant::now(),
+                    MessageKind::IWant,
+                );
+            }
             // GRAFT only when bounded score-aware maintenance chooses the
             // requester; an IWANT burst must not bypass mesh degree caps.
             state.add_new_peer_lazy(from);
@@ -8015,6 +9224,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // loop (or before an error return) so a stranded retry never
         // treats a failed reply as a completed pull.
         let mut served_ids: Vec<MessageIdType> = Vec::new();
+        let mut deferred_ids: Vec<MessageIdType> = Vec::new();
+        let mut sent_any = false;
         let mut send_err: Option<anyhow::Error> = None;
         // Send EAGER with payloads
         for (msg_id, cached) in to_send {
@@ -8053,14 +9264,30 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
             let send_result = self
-                .send_to_peer_bounded(topic, from, GossipStreamType::PubSub, bytes.into(), "EAGER")
+                .send_to_peer_bounded_outcome(
+                    topic,
+                    from,
+                    GossipStreamType::PubSub,
+                    bytes.into(),
+                    "EAGER",
+                    local_origin_only || cached.local_origin,
+                )
                 .await;
             match send_result {
-                Ok(()) => {
+                Ok(PeerSendOutcome::Sent { .. }) => {
+                    sent_any = true;
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        state
+                            .deferred_eager_replies
+                            .retain(|entry| entry.peer != from || entry.msg_id != msg_id);
+                    }
                     if track_served {
                         served_ids.push(msg_id);
                     }
                 }
+                Ok(PeerSendOutcome::Deferred) => deferred_ids.push(msg_id),
+                Ok(PeerSendOutcome::TimedOut | PeerSendOutcome::NotConnected) => {}
                 Err(e) => {
                     send_err = Some(e);
                     break;
@@ -8069,12 +9296,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
         self.mark_stranded_ihave_served(topic, from, &served_ids)
             .await;
+        if !deferred_ids.is_empty() {
+            let mut topics = self.topics.write_topic(&topic).await;
+            if let Some(state) = topics.get_mut(&topic) {
+                let now = Instant::now();
+                for msg_id in deferred_ids {
+                    let _ = state.retain_deferred_eager_reply(from, msg_id, now);
+                }
+            }
+        }
         self.record_stage(PubSubStage::Republish, republish_started);
         if let Some(e) = send_err {
             return Err(e);
         }
 
-        Ok(())
+        Ok(sent_any)
     }
 
     /// x0x #613 (PR #54 r3 item 2): mark stranded ids as pull-served for
@@ -8231,12 +9467,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         self.stage_stats
                             .record_publish_origin(false, bytes.len(), 1);
                         let _ = self
-                            .send_to_peer_bounded(
+                            .send_to_peer_bounded_with_origin(
                                 topic,
                                 from,
                                 GossipStreamType::PubSub,
                                 bytes.into(),
                                 "EAGER",
+                                // Usually relay traffic, but an AE serve of a
+                                // message this node authored is still our own
+                                // speech and must not be shed for bytes.
+                                cached.local_origin,
                             )
                             .await;
                     }
@@ -8505,6 +9745,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let signing_key = self.signing_key.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
         let outbound_budgets = Arc::clone(&self.outbound_budgets);
+        let egress_limiter = Arc::clone(&self.egress_limiter);
         let send_path = self.send_path_context();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let initial_jitter = deterministic_jitter(
@@ -8544,6 +9785,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             &stage_stats,
                             &outbound_budgets,
                             &send_path,
+                            &egress_limiter,
                         )
                         .await;
                         debug!("PubSub IHAVE flusher stopped by shutdown signal");
@@ -8557,6 +9799,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             &stage_stats,
                             &outbound_budgets,
                             &send_path,
+                            &egress_limiter,
                         )
                         .await;
                     }
@@ -8573,63 +9816,123 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         stage_stats: &Arc<PubSubStageStats>,
         outbound_budgets: &Arc<PeerOutboundBudgets>,
         send_path: &SendPathContext,
+        egress_limiter: &Arc<egress::LeafEgressLimiter>,
     ) {
-        let work: Vec<(TopicId, Vec<MessageIdType>, Vec<PeerId>)> = {
+        let work: Vec<IhaveFlushWork> = {
             let mut topics_guard = topics.write_all().await;
             let mut work = Vec::new();
 
             for shard in topics_guard.iter_mut() {
                 for (topic_id, state) in shard.iter_mut() {
-                    if state.pending_ihave.is_empty() {
-                        continue;
+                    if !state.pending_ihave.is_empty() {
+                        // Issue #42 round 2: SNAPSHOT the batch instead of
+                        // draining it — the ids (and the #59 withheld-eager
+                        // entries) are only consumed once the sends have been
+                        // handed off (see `consume_flushed_ihave_batch`), so an
+                        // aborted flush leaves them in place.
+                        let batch: Vec<MessageIdType> = state
+                            .pending_ihave
+                            .iter()
+                            .take(MAX_IHAVE_BATCH_SIZE)
+                            .copied()
+                            .collect();
+
+                        // x0x #613: stranded-publish pull path. The regular
+                        // flush advertises only to lazy members; merge in the
+                        // unserved direct targets for this batch (the peers the
+                        // stranded EAGER fan-out attempted) so an all-eager
+                        // topic still advertises — otherwise the cached message
+                        // would have no pull path at all. Entries are NOT
+                        // consumed here (a pull can land later); the bounded
+                        // retry removes them.
+                        let mut ihave_targets = state.stranded_ihave_targets_for(&batch);
+                        // #59: merge the LazyForward withheld-eager announce
+                        // targets for this batch (non-consuming snapshot; the
+                        // entries are dropped in `consume_flushed_ihave_batch`
+                        // once the sends are handed off).
+                        for peer in state.lazy_withheld_targets_for(&batch) {
+                            if !ihave_targets.contains(&peer) {
+                                ihave_targets.push(peer);
+                            }
+                        }
+                        for peer in state.lazy_peers.iter().copied() {
+                            if !ihave_targets.contains(&peer) {
+                                ihave_targets.push(peer);
+                            }
+                        }
+                        // Only meaningful when an advert could have been
+                        // byte-deferred, i.e. under ShedNormal.
+                        if egress_limiter.enforcing() {
+                            ihave_targets.retain(|peer| state.ihave_target_pending(&batch, *peer));
+                        }
+                        let local_origin = batch.iter().any(|id| {
+                            state
+                                .message_cache
+                                .lru
+                                .peek(id)
+                                .is_some_and(|cached| cached.message.local_origin)
+                        });
+                        work.push(IhaveFlushWork {
+                            topic: *topic_id,
+                            batch,
+                            targets: ihave_targets,
+                            late_offer: None,
+                            kind: MessageKind::IHave,
+                            local_origin,
+                        });
                     }
 
-                    // Issue #42 round 2: SNAPSHOT the batch instead of
-                    // draining it — the ids (and the #59 withheld-eager
-                    // entries) are only consumed once the sends have been
-                    // handed off (see `consume_flushed_ihave_batch`), so an
-                    // aborted flush leaves them in place.
-                    let batch: Vec<MessageIdType> = state
-                        .pending_ihave
-                        .iter()
-                        .take(MAX_IHAVE_BATCH_SIZE)
-                        .copied()
-                        .collect();
+                    let now = Instant::now();
+                    let late_peers: Vec<_> = state.late_local_offers.keys().copied().collect();
+                    for peer in late_peers {
+                        let Some(offer) = state.late_local_offers.get(&peer).copied() else {
+                            continue;
+                        };
+                        if let Some((batch, cursor)) = state.late_local_offer_batch(peer, now) {
+                            work.push(IhaveFlushWork {
+                                topic: *topic_id,
+                                batch,
+                                targets: vec![peer],
+                                late_offer: Some((peer, offer.cutoff, cursor)),
+                                kind: MessageKind::IHave,
+                                // `late_local_offer_batch` selects only
+                                // `local_origin` cache entries.
+                                local_origin: true,
+                            });
+                        }
+                    }
 
-                    // x0x #613: stranded-publish pull path. The regular
-                    // flush advertises only to lazy members; merge in the
-                    // unserved direct targets for this batch (the peers the
-                    // stranded EAGER fan-out attempted) so an all-eager
-                    // topic still advertises — otherwise the cached message
-                    // would have no pull path at all. Entries are NOT
-                    // consumed here (a pull can land later); the bounded
-                    // retry removes them.
-                    let mut ihave_targets = state.stranded_ihave_targets_for(&batch);
-                    // #59: merge the LazyForward withheld-eager announce
-                    // targets for this batch (non-consuming snapshot; the
-                    // entries are dropped in `consume_flushed_ihave_batch`
-                    // once the sends are handed off).
-                    for peer in state.lazy_withheld_targets_for(&batch) {
-                        if !ihave_targets.contains(&peer) {
-                            ihave_targets.push(peer);
-                        }
+                    state.prune_deferred_iwants(now);
+                    for entry in state.deferred_iwants.iter().cloned() {
+                        work.push(IhaveFlushWork {
+                            topic: *topic_id,
+                            batch: entry.msg_ids,
+                            targets: vec![entry.peer],
+                            late_offer: None,
+                            kind: MessageKind::IWant,
+                            // We are asking for a message we do not hold.
+                            local_origin: false,
+                        });
                     }
-                    for peer in state.lazy_peers.iter().copied() {
-                        if !ihave_targets.contains(&peer) {
-                            ihave_targets.push(peer);
-                        }
-                    }
-                    work.push((*topic_id, batch, ihave_targets));
                 }
             }
 
             work
         };
 
-        for (topic_id, batch, ihave_targets) in work {
+        for IhaveFlushWork {
+            topic: topic_id,
+            batch,
+            targets: ihave_targets,
+            late_offer,
+            kind,
+            local_origin,
+        } in work
+        {
             if ihave_targets.is_empty() {
                 continue;
             }
+            let intended_targets = ihave_targets.clone();
 
             let ihave_payload = match postcard::to_stdvec(&batch) {
                 Ok(bytes) => Bytes::from(bytes),
@@ -8645,7 +9948,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 payload_hash: None,
                 topic: topic_id,
                 msg_id: batch[0],
-                kind: MessageKind::IHave,
+                kind,
                 hop: 0,
                 ttl: 10,
             };
@@ -8673,6 +9976,33 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
 
+            let op = if kind == MessageKind::IWant {
+                "IWANT"
+            } else {
+                "IHAVE"
+            };
+            let flush_priority = send_path.admission.registry().priority_for(&topic_id);
+            let (reserved_targets, budget_deferred) = Self::reserve_recovery_targets(
+                egress_limiter,
+                topic_id,
+                ihave_targets,
+                op,
+                &bytes,
+                local_origin,
+                flush_priority,
+            );
+            let mut reservations = HashMap::new();
+            let mut ihave_targets = Vec::with_capacity(reserved_targets.len());
+            for (peer, reservation) in reserved_targets {
+                ihave_targets.push(peer);
+                if let Some(reservation) = reservation {
+                    reservations.insert(peer, reservation);
+                }
+            }
+            if ihave_targets.is_empty() {
+                continue;
+            }
+
             // X0X-0074: filter IHAVE recipients through admission before
             // claiming attempts. Bulk-classified topics (most production
             // anti-entropy carriers) will have admissions dropped here
@@ -8691,7 +10021,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     state,
                     &topic_id,
                     ihave_targets,
-                    "IHAVE",
+                    op,
                     now,
                 );
                 if admitted.is_empty() {
@@ -8703,8 +10033,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     outbound_budgets,
                     send_path,
                     topic: topic_id,
-                    op: "IHAVE",
-                    send_class: OutboundSendClass::for_op("IHAVE"),
+                    op,
+                    send_class: OutboundSendClass::for_op(op),
                     priority: send_path.admission.registry().priority_for(&topic_id),
                 };
                 // Skip reasons are only consulted by the single-peer
@@ -8731,36 +10061,48 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if !claims.is_empty() {
                 // x0x #380: outbound demand metering for the IHAVE flush
                 // lane. Instrumentation only.
-                stage_stats.record_outbound(
-                    topic_id,
-                    "IHAVE",
-                    bytes.len(),
-                    claims.attempts().len(),
-                );
-                let mut send_tasks = SendTaskSet::with_capacity("IHAVE", claims.attempts().len());
+                stage_stats.record_outbound(topic_id, op, bytes.len(), claims.attempts().len());
+                let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
                 let attempts = claims.attempts().to_vec();
                 let permits = claims.take_permits();
                 for (attempt, permit) in attempts.into_iter().zip(permits) {
+                    let reservation = reservations.remove(&attempt.peer);
                     let transport = Arc::clone(transport);
                     let bytes = bytes.clone();
                     let stage_stats = Arc::clone(stage_stats);
                     let rtt_tracker = Arc::clone(&send_path.rtt_tracker);
+                    let send_egress_limiter = Arc::clone(egress_limiter);
                     let handle = tokio::spawn(async move {
                         let _permit = permit;
                         Self::send_to_peer_with_timeout(
                             transport,
+                            send_egress_limiter,
                             stage_stats,
                             rtt_tracker,
-                            attempt.peer,
-                            GossipStreamType::PubSub,
-                            bytes,
-                            "IHAVE",
+                            PeerSendRequest {
+                                reservation,
+                                topic: topic_id,
+                                peer: attempt.peer,
+                                stream_type: GossipStreamType::PubSub,
+                                bytes,
+                                op,
+                                send_timeout: None,
+                            },
                         )
                         .await
                     });
                     send_tasks.push(attempt, handle);
                 }
                 let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
+                let advertised_peers: Vec<_> = sent
+                    .iter()
+                    .map(|completion| completion.attempt.peer)
+                    .collect();
+                let failed_peers: HashSet<_> = timed_out
+                    .iter()
+                    .chain(not_connected.iter())
+                    .map(|attempt| attempt.peer)
+                    .collect();
                 claims.record_results(sent, timed_out, not_connected).await;
                 // Issue #42 round 2: the send tasks have been handed off —
                 // NOW take the batch out of the topic state. An abort
@@ -8769,7 +10111,40 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // losing it.
                 let mut topics_guard = topics.write_topic(&topic_id).await;
                 if let Some(state) = topics_guard.get_mut(&topic_id) {
-                    state.consume_flushed_ihave_batch(&batch);
+                    if kind == MessageKind::IWant {
+                        let handed_off_at = Instant::now();
+                        for msg_id in &batch {
+                            let remove = state
+                                .outstanding_iwants
+                                .get(msg_id)
+                                .is_some_and(|entry| failed_peers.contains(&entry.peer));
+                            if remove {
+                                state.outstanding_iwants.remove(msg_id);
+                            } else if let Some(entry) = state.outstanding_iwants.get_mut(msg_id) {
+                                if advertised_peers.contains(&entry.peer) {
+                                    entry.retry_pending = false;
+                                    entry.requested_at = handed_off_at;
+                                }
+                            }
+                        }
+                    } else if let Some((peer, cutoff, cursor)) = late_offer {
+                        let late_offer_sent = advertised_peers.contains(&peer);
+                        if late_offer_sent {
+                            state.advance_late_local_offer(peer, cutoff, cursor);
+                        }
+                    } else {
+                        for peer in advertised_peers {
+                            state.record_ihave_handoff(&batch, peer);
+                            state.record_stranded_ihave_advertised(&batch, peer);
+                        }
+                        let all_handed_off = !egress_limiter.enforcing()
+                            || intended_targets
+                                .iter()
+                                .all(|peer| !state.ihave_target_pending(&batch, *peer));
+                        if budget_deferred.is_empty() && all_handed_off {
+                            state.consume_flushed_ihave_batch(&batch);
+                        }
+                    }
                 }
                 drop(topics_guard);
             }
@@ -8778,6 +10153,234 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // paths uniformly via the explicit list rather than relying
             // on per-completion release.
             release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+        }
+        Self::flush_deferred_eager_replies(
+            topics,
+            transport,
+            signing_key,
+            stage_stats,
+            outbound_budgets,
+            send_path,
+            egress_limiter,
+        )
+        .await;
+    }
+
+    async fn flush_deferred_eager_replies(
+        topics: &Arc<ShardedTopicMap>,
+        transport: &Arc<PolicyTransport<T>>,
+        signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
+        stage_stats: &Arc<PubSubStageStats>,
+        outbound_budgets: &Arc<PeerOutboundBudgets>,
+        send_path: &SendPathContext,
+        egress_limiter: &Arc<egress::LeafEgressLimiter>,
+    ) {
+        let work: Vec<_> = {
+            let now = Instant::now();
+            let mut topics_guard = topics.write_all().await;
+            let mut work = Vec::new();
+            for shard in topics_guard.iter_mut() {
+                for (topic, state) in shard.iter_mut() {
+                    state.prune_deferred_eager_replies(now);
+                    for entry in state.deferred_eager_replies.iter().copied() {
+                        work.push((*topic, entry));
+                    }
+                }
+            }
+            work
+        };
+
+        for (topic, entry) in work {
+            // Snapshot only bounded identity metadata above. Re-read the cache
+            // immediately before this attempt so an expiry, validator drop,
+            // or loss of local-origin authority cannot race a stale clone.
+            let cached = {
+                let mut guard = topics.write_topic(&topic).await;
+                let Some(state) = guard.get_mut(&topic) else {
+                    continue;
+                };
+                state.prune_deferred_eager_replies(Instant::now());
+                if !state.deferred_eager_replies.contains(&entry) {
+                    continue;
+                }
+                state
+                    .message_cache
+                    .lru
+                    .peek(&entry.msg_id)
+                    .and_then(|cached| {
+                        let cached = &cached.message;
+                        (!cached.dropped).then(|| cached.clone())
+                    })
+            };
+            let Some(cached) = cached else {
+                continue;
+            };
+            if transport
+                .migration
+                .admit_cache_serve(
+                    topic,
+                    cached.payload.len()
+                        + MESSAGE_CRYPTO_OVERHEAD_BYTES
+                        + MESSAGE_HEADER_OVERHEAD_BYTES,
+                )
+                .is_err()
+                || !forwardable_payload("iwant_serve", &entry.msg_id, &cached.payload)
+            {
+                let mut guard = topics.write_topic(&topic).await;
+                if let Some(state) = guard.get_mut(&topic) {
+                    state
+                        .deferred_eager_replies
+                        .retain(|candidate| *candidate != entry);
+                }
+                continue;
+            }
+            let header_bytes = match postcard::to_stdvec(&cached.header) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    warn!(topic = %LogTopicId::from(topic), "deferred EAGER header serialize failed: {error}");
+                    let mut guard = topics.write_topic(&topic).await;
+                    if let Some(state) = guard.get_mut(&topic) {
+                        state
+                            .deferred_eager_replies
+                            .retain(|candidate| *candidate != entry);
+                    }
+                    continue;
+                }
+            };
+            let signature = match signing_key.sign(&header_bytes) {
+                Ok(signature) => signature,
+                Err(error) => {
+                    warn!(topic = %LogTopicId::from(topic), "deferred EAGER signing failed: {error}");
+                    let mut guard = topics.write_topic(&topic).await;
+                    if let Some(state) = guard.get_mut(&topic) {
+                        state
+                            .deferred_eager_replies
+                            .retain(|candidate| *candidate != entry);
+                    }
+                    continue;
+                }
+            };
+            let message = GossipMessage {
+                header: cached.header.clone(),
+                payload: Some(cached.payload.clone()),
+                signature,
+                public_key: signing_key.public_key().to_vec(),
+            };
+            let bytes = match postcard::to_stdvec(&message).map(Bytes::from) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    warn!(topic = %LogTopicId::from(topic), "deferred EAGER serialize failed: {error}");
+                    let mut guard = topics.write_topic(&topic).await;
+                    if let Some(state) = guard.get_mut(&topic) {
+                        state
+                            .deferred_eager_replies
+                            .retain(|candidate| *candidate != entry);
+                    }
+                    continue;
+                }
+            };
+            let (reserved, _) = Self::reserve_recovery_targets(
+                egress_limiter,
+                topic,
+                vec![entry.peer],
+                "EAGER",
+                &bytes,
+                cached.local_origin,
+                send_path.admission.registry().priority_for(&topic),
+            );
+            let Some((peer, reservation)) = reserved.into_iter().next() else {
+                continue;
+            };
+            let (attempts, permits, bulk_admitted) = {
+                let now = Instant::now();
+                let mut guard = topics.write_topic(&topic).await;
+                let Some(state) = guard.get_mut(&topic) else {
+                    continue;
+                };
+                let (admitted, bulk) = filter_peers_through_admission_in_state(
+                    send_path,
+                    state,
+                    &topic,
+                    vec![peer],
+                    "EAGER",
+                    now,
+                );
+                let context = SendClaimContext {
+                    stage_stats: stage_stats.as_ref(),
+                    outbound_budgets,
+                    send_path,
+                    topic,
+                    op: "EAGER",
+                    send_class: OutboundSendClass::for_op("EAGER"),
+                    priority: send_path.admission.registry().priority_for(&topic),
+                };
+                let (attempts, permits, _) =
+                    Self::claim_topic_send_attempts_for_state(&context, state, admitted, now);
+                (attempts, permits, bulk)
+            };
+            let mut claims = SendAttemptClaims::new(
+                topic,
+                attempts,
+                permits,
+                Arc::clone(topics),
+                Arc::clone(stage_stats),
+                send_path.clone(),
+            );
+            if !claims.is_empty() {
+                stage_stats.record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
+            }
+            let attempts = claims.attempts().to_vec();
+            let permits = claims.take_permits();
+            let mut tasks = SendTaskSet::with_capacity("EAGER", attempts.len());
+            let mut reservation = reservation;
+            for (attempt, permit) in attempts.into_iter().zip(permits) {
+                let transport = Arc::clone(transport);
+                let stage_stats = Arc::clone(stage_stats);
+                let limiter = Arc::clone(egress_limiter);
+                let rtt_tracker = Arc::clone(&send_path.rtt_tracker);
+                let bytes = bytes.clone();
+                let reservation = reservation.take();
+                let handle = tokio::spawn(async move {
+                    let _permit = permit;
+                    Self::send_to_peer_with_timeout(
+                        transport,
+                        limiter,
+                        stage_stats,
+                        rtt_tracker,
+                        PeerSendRequest {
+                            reservation,
+                            topic,
+                            peer: attempt.peer,
+                            stream_type: GossipStreamType::PubSub,
+                            bytes,
+                            op: "EAGER",
+                            send_timeout: None,
+                        },
+                    )
+                    .await
+                });
+                tasks.push(attempt, handle);
+            }
+            let (sent, timed_out, not_connected) = tasks.collect_results().await;
+            let served_peers: Vec<_> = sent
+                .iter()
+                .map(|completion| completion.attempt.peer)
+                .collect();
+            let terminal = !sent.is_empty() || !timed_out.is_empty() || !not_connected.is_empty();
+            claims.record_results(sent, timed_out, not_connected).await;
+            release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+            if terminal {
+                let mut guard = topics.write_topic(&topic).await;
+                if let Some(state) = guard.get_mut(&topic) {
+                    for peer in served_peers {
+                        state.record_stranded_ihave_served(&entry.msg_id, peer);
+                        state.record_lazy_withheld_served(&entry.msg_id, peer);
+                    }
+                    state
+                        .deferred_eager_replies
+                        .retain(|candidate| *candidate != entry);
+                }
+            }
         }
     }
 
@@ -8820,171 +10423,297 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// `stranded_publishes_recovered_by_pull` (every eager target already
     /// pulled), `stranded_publishes_recovered_by_retry` (≥1 delivery), or
     /// `stranded_publish_retry_failed` (nothing delivered, nothing pulled).
-    /// The message is never retried again.
+    /// Leaf enforcement may revisit deferred targets until the original
+    /// recovery deadline; the iterative state machine keeps that bounded in
+    /// time and stack. Disabled/Full mode remains single-shot.
     async fn retry_stranded_publish(
         ctx: &StrandedRetryContext<T>,
         topic: TopicId,
         msg_id: MessageIdType,
         bytes: Bytes,
     ) {
-        // Re-validate under the topic lock: the cached message must still
-        // be present, and the eager set minus the pull-served peers is
-        // re-read at retry time. The stranded entry's lifecycle ends here.
-        let (retry_targets, any_pulled) = {
-            let mut topics_guard = ctx.topics.write_topic(&topic).await;
-            let Some(state) = topics_guard.get_mut(&topic) else {
-                ctx.stage_stats.record_stranded_publish_cache_miss();
-                return;
+        let recovery_deadline = {
+            let topics_guard = ctx.topics.read_topic(&topic).await;
+            topics_guard
+                .get(&topic)
+                .and_then(|state| state.stranded_retry_expires(&msg_id))
+                .unwrap_or_else(Instant::now)
+        };
+        // Topic is fixed for the whole retry, so resolve its class once.
+        let retry_priority = ctx.send_path.admission.registry().priority_for(&topic);
+        'retry: loop {
+            // Re-validate under the topic lock: the cached message must still
+            // be present, and the eager set minus the pull-served peers is
+            // re-read at retry time. The stranded entry's lifecycle ends here.
+            let (retry_targets, any_pulled, retry_already_delivered) = {
+                let mut topics_guard = ctx.topics.write_topic(&topic).await;
+                let Some(state) = topics_guard.get_mut(&topic) else {
+                    ctx.stage_stats.record_stranded_publish_cache_miss();
+                    return;
+                };
+                if !state.has_message(&msg_id) {
+                    debug!(
+                        msg_id = ?msg_id,
+                        "stranded publish retry skipped: message no longer cached"
+                    );
+                    ctx.stage_stats.record_stranded_publish_cache_miss();
+                    return;
+                }
+                let served = state.stranded_ihave_served_peers(&msg_id).to_vec();
+                let retry_targets: Vec<PeerId> = state
+                    .eager_peers
+                    .iter()
+                    .copied()
+                    .filter(|peer| !served.contains(peer))
+                    .collect();
+                let retry_already_delivered = state
+                    .stranded_ihave
+                    .iter()
+                    .find(|entry| entry.msg_id == msg_id)
+                    .is_some_and(|entry| entry.retry_delivered);
+                (
+                    retry_targets,
+                    !served.is_empty() && !retry_already_delivered,
+                    retry_already_delivered,
+                )
             };
-            if !state.has_message(&msg_id) {
-                debug!(
-                    msg_id = ?msg_id,
-                    "stranded publish retry skipped: message no longer cached"
-                );
-                ctx.stage_stats.record_stranded_publish_cache_miss();
+
+            let (retry_targets, reservations) = if ctx.egress_limiter.enabled() {
+                let mut pending = retry_targets;
+                let mut ready = Vec::new();
+                let mut reservations = HashMap::new();
+                loop {
+                    let (admitted, deferred) = Self::reserve_recovery_targets(
+                        &ctx.egress_limiter,
+                        topic,
+                        pending,
+                        "EAGER",
+                        &bytes,
+                        // This path exists only to retry a stranded *local*
+                        // publish; its one spawn site is
+                        // `publish_local_with_optional_target`.
+                        true,
+                        retry_priority,
+                    );
+                    for (peer, reservation) in admitted {
+                        ready.push(peer);
+                        if let Some(reservation) = reservation {
+                            reservations.insert(peer, reservation);
+                        }
+                    }
+                    if !ready.is_empty()
+                        || deferred.is_empty()
+                        || Instant::now() >= recovery_deadline
+                    {
+                        break (ready, reservations);
+                    }
+                    // Keep only the peers that still lack a reservation. A ready
+                    // peer must never cause another peer's persistent recovery
+                    // intent to be discarded.
+                    pending = deferred;
+                    time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
+                }
+            } else {
+                (retry_targets, HashMap::new())
+            };
+
+            if retry_targets.is_empty() {
+                let mut topics_guard = ctx.topics.write_topic(&topic).await;
+                if let Some(state) = topics_guard.get_mut(&topic) {
+                    state.remove_stranded_ihave(&msg_id);
+                }
+                drop(topics_guard);
+                // Every current eager peer already holds the message (pulled
+                // via IWANT) — or the mesh emptied with nothing pulled. Either
+                // way the retry has nothing to add and is terminal.
+                if retry_already_delivered {
+                    info!(
+                        topic = %LogTopicId::from(topic),
+                        msg_id = ?msg_id,
+                        "stranded publish recovered by bounded per-target retry"
+                    );
+                    ctx.stage_stats.record_stranded_publish_recovered_by_retry();
+                } else if any_pulled {
+                    info!(
+                        topic = %LogTopicId::from(topic),
+                        msg_id = ?msg_id,
+                        "stranded publish recovered by pull path — retry skipped (no duplicate EAGER)"
+                    );
+                    ctx.stage_stats.record_stranded_publish_recovered_by_pull();
+                } else {
+                    debug!(
+                        topic = %LogTopicId::from(topic),
+                        msg_id = ?msg_id,
+                        "stranded publish retry: eager set empty, nothing pulled"
+                    );
+                    ctx.stage_stats.record_stranded_publish_retry_failed();
+                }
                 return;
             }
-            let served = state.stranded_ihave_served_peers(&msg_id).to_vec();
-            let retry_targets: Vec<PeerId> = state
-                .eager_peers
+
+            // Admission → claim. The Bulk guard is built as soon as the bulk
+            // list exists so every later path — including a mid-await drop of
+            // this task — releases exactly once (PR #54 review item 2; same
+            // RAII discipline as `parallel_send_to_peers`).
+            let (attempts, permits, _bulk_guard) = {
+                let now = Instant::now();
+                let mut topics_guard = ctx.topics.write_topic(&topic).await;
+                let Some(state) = topics_guard.get_mut(&topic) else {
+                    ctx.stage_stats.record_stranded_publish_cache_miss();
+                    return;
+                };
+                let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
+                    &ctx.send_path,
+                    state,
+                    &topic,
+                    retry_targets,
+                    "EAGER",
+                    now,
+                );
+                let bulk_guard = BulkAdmissionSetGuard {
+                    armed: true,
+                    bulk_admitted,
+                    admission: Arc::clone(&ctx.send_path.admission),
+                };
+                if admitted.is_empty() {
+                    drop(topics_guard);
+                    if ctx.egress_limiter.enabled() && Instant::now() < recovery_deadline {
+                        time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
+                        continue 'retry;
+                    } else {
+                        let mut topics_guard = ctx.topics.write_topic(&topic).await;
+                        if let Some(state) = topics_guard.get_mut(&topic) {
+                            state.remove_stranded_ihave(&msg_id);
+                        }
+                        ctx.stage_stats.record_stranded_publish_retry_failed();
+                    }
+                    return;
+                }
+                let claim_context = SendClaimContext {
+                    stage_stats: ctx.stage_stats.as_ref(),
+                    outbound_budgets: &ctx.outbound_budgets,
+                    send_path: &ctx.send_path,
+                    topic,
+                    op: "EAGER",
+                    send_class: OutboundSendClass::for_op("EAGER"),
+                    priority: ctx.send_path.admission.registry().priority_for(&topic),
+                };
+                let (attempts, permits, _skips) =
+                    Self::claim_topic_send_attempts_for_state(&claim_context, state, admitted, now);
+                (attempts, permits, bulk_guard)
+            };
+            let mut claims = SendAttemptClaims::new(
+                topic,
+                attempts,
+                permits,
+                Arc::clone(&ctx.topics),
+                Arc::clone(&ctx.stage_stats),
+                ctx.send_path.clone(),
+            );
+
+            if claims.is_empty() {
+                drop(_bulk_guard);
+                if ctx.egress_limiter.enabled() && Instant::now() < recovery_deadline {
+                    time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
+                    continue 'retry;
+                } else {
+                    let mut topics_guard = ctx.topics.write_topic(&topic).await;
+                    if let Some(state) = topics_guard.get_mut(&topic) {
+                        state.remove_stranded_ihave(&msg_id);
+                    }
+                    ctx.stage_stats.record_stranded_publish_retry_failed();
+                }
+                return;
+            }
+
+            // x0x #380: outbound demand metering — instrumentation only.
+            ctx.stage_stats
+                .record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
+            let send_tasks = Self::spawn_bounded_send_tasks(
+                FanoutSendContext {
+                    transport: &ctx.transport,
+                    egress_limiter: &ctx.egress_limiter,
+                    stage_stats: &ctx.stage_stats,
+                    rtt_tracker: &ctx.send_path.rtt_tracker,
+                    topic,
+                    stream_type: GossipStreamType::PubSub,
+                    op: "EAGER",
+                },
+                &mut claims,
+                reservations,
+                bytes.clone(),
+            );
+            let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
+            let succeeded_peers: Vec<_> = sent
+                .iter()
+                .map(|completion| completion.attempt.peer)
+                .collect();
+            let succeeded = succeeded_peers.len();
+            // Maintainer decision (review item 3): Normal-kind retry timeouts
+            // and not-connected failures are dropped — the retry must not
+            // double-count a known-starved window toward
+            // PEER_TIMEOUT_THRESHOLD. RecoveryProbe-kind attempts (claimed when
+            // a peer's suppression expired during the delay) are re-booked
+            // (r3 review item 1): a probe timeout re-suppresses with backoff
+            // without feeding the threshold window, a probe not-connected
+            // failure books the #380 eviction, and either outcome releases
+            // `recovery_probe_in_flight` — dropping it would permanently block
+            // `claim_send_attempt_at` for the peer/topic.
+            let probe_timed_out: Vec<PeerSendAttempt> = timed_out
                 .iter()
                 .copied()
-                .filter(|peer| !served.contains(peer))
+                .flat_map(recovery_probe_timeout)
                 .collect();
-            state.remove_stranded_ihave(&msg_id);
-            (retry_targets, !served.is_empty())
-        };
+            let probe_not_connected: Vec<PeerSendAttempt> = not_connected
+                .iter()
+                .copied()
+                .flat_map(recovery_probe_timeout)
+                .collect();
+            claims
+                .record_results(sent, probe_timed_out, probe_not_connected)
+                .await;
+            drop(_bulk_guard);
 
-        if retry_targets.is_empty() {
-            // Every current eager peer already holds the message (pulled
-            // via IWANT) — or the mesh emptied with nothing pulled. Either
-            // way the retry has nothing to add and is terminal.
-            if any_pulled {
+            let (pending, retry_delivered) = {
+                let mut topics_guard = ctx.topics.write_topic(&topic).await;
+                let Some(state) = topics_guard.get_mut(&topic) else {
+                    return;
+                };
+                for peer in succeeded_peers {
+                    state.record_stranded_retry_delivered(&msg_id, peer);
+                }
+                let served = state.stranded_ihave_served_peers(&msg_id).to_vec();
+                let pending = state.eager_peers.iter().any(|peer| !served.contains(peer));
+                let retry_delivered = state
+                    .stranded_ihave
+                    .iter()
+                    .find(|entry| entry.msg_id == msg_id)
+                    .is_some_and(|entry| entry.retry_delivered);
+                if !pending || Instant::now() >= recovery_deadline {
+                    state.remove_stranded_ihave(&msg_id);
+                }
+                (pending, retry_delivered)
+            };
+            if ctx.egress_limiter.enabled() && pending && Instant::now() < recovery_deadline {
+                time::sleep(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS)).await;
+                continue 'retry;
+            } else if retry_delivered {
                 info!(
                     topic = %LogTopicId::from(topic),
                     msg_id = ?msg_id,
-                    "stranded publish recovered by pull path — retry skipped (no duplicate EAGER)"
+                    succeeded,
+                    "stranded publish recovered by bounded per-target retry"
                 );
-                ctx.stage_stats.record_stranded_publish_recovered_by_pull();
+                ctx.stage_stats.record_stranded_publish_recovered_by_retry();
             } else {
-                debug!(
+                warn!(
                     topic = %LogTopicId::from(topic),
                     msg_id = ?msg_id,
-                    "stranded publish retry: eager set empty, nothing pulled"
+                    "stranded publish retry expired without delivery; anti-entropy remains"
                 );
                 ctx.stage_stats.record_stranded_publish_retry_failed();
             }
             return;
-        }
-
-        // Admission → claim. The Bulk guard is built as soon as the bulk
-        // list exists so every later path — including a mid-await drop of
-        // this task — releases exactly once (PR #54 review item 2; same
-        // RAII discipline as `parallel_send_to_peers`).
-        let (attempts, permits, _bulk_guard) = {
-            let now = Instant::now();
-            let mut topics_guard = ctx.topics.write_topic(&topic).await;
-            let Some(state) = topics_guard.get_mut(&topic) else {
-                ctx.stage_stats.record_stranded_publish_cache_miss();
-                return;
-            };
-            let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
-                &ctx.send_path,
-                state,
-                &topic,
-                retry_targets,
-                "EAGER",
-                now,
-            );
-            let bulk_guard = BulkAdmissionSetGuard {
-                armed: true,
-                bulk_admitted,
-                admission: Arc::clone(&ctx.send_path.admission),
-            };
-            if admitted.is_empty() {
-                ctx.stage_stats.record_stranded_publish_retry_failed();
-                return;
-            }
-            let claim_context = SendClaimContext {
-                stage_stats: ctx.stage_stats.as_ref(),
-                outbound_budgets: &ctx.outbound_budgets,
-                send_path: &ctx.send_path,
-                topic,
-                op: "EAGER",
-                send_class: OutboundSendClass::for_op("EAGER"),
-                priority: ctx.send_path.admission.registry().priority_for(&topic),
-            };
-            let (attempts, permits, _skips) =
-                Self::claim_topic_send_attempts_for_state(&claim_context, state, admitted, now);
-            (attempts, permits, bulk_guard)
-        };
-        let mut claims = SendAttemptClaims::new(
-            topic,
-            attempts,
-            permits,
-            Arc::clone(&ctx.topics),
-            Arc::clone(&ctx.stage_stats),
-            ctx.send_path.clone(),
-        );
-
-        if claims.is_empty() {
-            ctx.stage_stats.record_stranded_publish_retry_failed();
-            return;
-        }
-
-        // x0x #380: outbound demand metering — instrumentation only.
-        ctx.stage_stats
-            .record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
-        let send_tasks = Self::spawn_bounded_send_tasks(
-            &ctx.transport,
-            &ctx.stage_stats,
-            &ctx.send_path.rtt_tracker,
-            &mut claims,
-            GossipStreamType::PubSub,
-            bytes,
-            "EAGER",
-        );
-        let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
-        let succeeded = sent.len();
-        // Maintainer decision (review item 3): Normal-kind retry timeouts
-        // and not-connected failures are dropped — the retry must not
-        // double-count a known-starved window toward
-        // PEER_TIMEOUT_THRESHOLD. RecoveryProbe-kind attempts (claimed when
-        // a peer's suppression expired during the delay) are re-booked
-        // (r3 review item 1): a probe timeout re-suppresses with backoff
-        // without feeding the threshold window, a probe not-connected
-        // failure books the #380 eviction, and either outcome releases
-        // `recovery_probe_in_flight` — dropping it would permanently block
-        // `claim_send_attempt_at` for the peer/topic.
-        let probe_timed_out: Vec<PeerSendAttempt> = timed_out
-            .iter()
-            .copied()
-            .flat_map(recovery_probe_timeout)
-            .collect();
-        let probe_not_connected: Vec<PeerSendAttempt> = not_connected
-            .iter()
-            .copied()
-            .flat_map(recovery_probe_timeout)
-            .collect();
-        claims
-            .record_results(sent, probe_timed_out, probe_not_connected)
-            .await;
-
-        if succeeded > 0 {
-            info!(
-                topic = %LogTopicId::from(topic),
-                msg_id = ?msg_id,
-                succeeded,
-                "stranded publish recovered by bounded retry"
-            );
-            ctx.stage_stats.record_stranded_publish_recovered_by_retry();
-        } else {
-            warn!(
-                topic = %LogTopicId::from(topic),
-                msg_id = ?msg_id,
-                "stranded publish retry failed — terminal (no further retries; anti-entropy remains)"
-            );
-            ctx.stage_stats.record_stranded_publish_retry_failed();
         }
     }
 
@@ -9152,6 +10881,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let signing_key = self.signing_key.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
         let outbound_budgets = Arc::clone(&self.outbound_budgets);
+        let egress_limiter = Arc::clone(&self.egress_limiter);
         let send_path = self.send_path_context();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let initial_jitter = deterministic_jitter(
@@ -9260,6 +10990,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     };
 
                     if let Ok(bytes) = postcard::to_stdvec(&message) {
+                        let bytes: Bytes = bytes.into();
+                        let (mut budgeted, _) = Self::reserve_recovery_targets(
+                            &egress_limiter,
+                            topic_id,
+                            vec![peer],
+                            "ANTI_ENTROPY",
+                            &bytes,
+                            // A digest of ids: no payload custody to protect.
+                            false,
+                            send_path.admission.registry().priority_for(&topic_id),
+                        );
+                        let Some((_, reservation)) = budgeted.pop() else {
+                            continue;
+                        };
                         // X0X-0074: anti-entropy is bulk anti-entropy
                         // protocol traffic — filter through admission
                         // before claiming attempts. Bulk depth released
@@ -9317,23 +11061,29 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         let Some(permit) = claims.take_permits().into_iter().next() else {
                             continue;
                         };
-                        let bytes: Bytes = bytes.into();
                         // x0x #380: outbound demand metering — one claimed
                         // anti-entropy wire send. Instrumentation only.
                         stage_stats.record_outbound(topic_id, "ANTI_ENTROPY", bytes.len(), 1);
                         let send_transport = Arc::clone(&transport);
                         let send_stage_stats = Arc::clone(&stage_stats);
                         let send_rtt_tracker = Arc::clone(&send_path.rtt_tracker);
+                        let send_egress_limiter = Arc::clone(&egress_limiter);
                         let handle = AbortOnDropSendHandle::new(tokio::spawn(async move {
                             let _permit = permit;
                             Self::send_to_peer_with_timeout(
                                 send_transport,
+                                send_egress_limiter,
                                 send_stage_stats,
                                 send_rtt_tracker,
-                                attempt.peer,
-                                GossipStreamType::PubSub,
-                                bytes,
-                                "ANTI_ENTROPY",
+                                PeerSendRequest {
+                                    reservation,
+                                    topic: topic_id,
+                                    peer: attempt.peer,
+                                    stream_type: GossipStreamType::PubSub,
+                                    bytes,
+                                    op: "ANTI_ENTROPY",
+                                    send_timeout: None,
+                                },
                             )
                             .await
                         }));
@@ -9357,6 +11107,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 // x0x #380: eviction, not a timeout sample.
                                 claims
                                     .record_results(Vec::new(), Vec::new(), vec![attempt])
+                                    .await;
+                            }
+                            Ok(Ok(PeerSendOutcome::Deferred)) => {
+                                claims
+                                    .record_results(
+                                        Vec::new(),
+                                        recovery_probe_timeout(attempt),
+                                        Vec::new(),
+                                    )
                                     .await;
                             }
                             Ok(Err(_)) => {
@@ -9406,11 +11165,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
 
+        let known: HashSet<_> = state
+            .eager_peers
+            .iter()
+            .chain(state.lazy_peers.iter())
+            .copied()
+            .collect();
         let now = Instant::now();
         for peer in peers {
             // New peers enter LAZY first; score-aware maintenance chooses the
             // bounded EAGER subset instead of bulk-promoting the full view.
             state.add_new_peer_lazy(peer);
+            if !known.contains(&peer) {
+                state.queue_late_local_offer(peer, now);
+            }
         }
 
         let (pruned, grafted) = state.maintain_degree_at(now);
@@ -9442,10 +11210,28 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .or_insert_with(|| self.new_topic_state());
 
         let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
+        let previously_connected: HashSet<_> = state
+            .eager_peers
+            .iter()
+            .chain(state.lazy_peers.iter())
+            .copied()
+            .collect();
 
         // Remove stale peers (no longer connected) from both sets.
         state.eager_peers.retain(|p| connected_set.contains(p));
         state.lazy_peers.retain(|p| connected_set.contains(p));
+        state
+            .late_local_offers
+            .retain(|peer, _| connected_set.contains(peer));
+        state
+            .outstanding_iwants
+            .retain(|_, entry| connected_set.contains(&entry.peer));
+        state
+            .deferred_iwants
+            .retain(|entry| connected_set.contains(&entry.peer));
+        state
+            .deferred_eager_replies
+            .retain(|entry| connected_set.contains(&entry.peer));
         let removed_cooling = state.clear_disconnected_peer_cooling(&connected_set);
         for peer in removed_cooling {
             self.stage_stats.clear_peer_suppression(topic, peer);
@@ -9457,6 +11243,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let now = Instant::now();
         for peer in connected_set.iter().copied() {
             state.add_new_peer_lazy(peer);
+            if !previously_connected.contains(&peer) {
+                state.queue_late_local_offer(peer, now);
+            }
         }
 
         let (pruned, grafted) = state.maintain_degree_at(now);
@@ -9762,6 +11551,7 @@ mod tests {
             payload: Bytes::from(vec![0u8; payload_len]),
             header: test_header(topic, msg_id),
             dropped: false,
+            local_origin: false,
             inner_proof: None,
         }
     }
@@ -9794,6 +11584,14 @@ mod tests {
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
         send_count: AtomicUsize,
+    }
+
+    struct BlockingInFlightGuard<'a>(&'a AtomicUsize);
+
+    impl Drop for BlockingInFlightGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     impl BlockingTransport {
@@ -10298,6 +12096,7 @@ mod tests {
         ) -> Result<()> {
             self.send_count.fetch_add(1, Ordering::SeqCst);
             let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _in_flight = BlockingInFlightGuard(&self.in_flight);
             self.max_in_flight.fetch_max(current, Ordering::SeqCst);
             let _ = self.started_tx.send(SendRecord {
                 peer,
@@ -10313,7 +12112,6 @@ mod tests {
                 .await
                 .expect("semaphore should stay open");
             permit.forget();
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -11070,6 +12868,1338 @@ mod tests {
         );
     }
 
+    // ---- 504: FanoutCounts stage accounting keeps an empty eager set,
+    // full byte deferral, admission drops, and claim skips distinct ----
+
+    #[tokio::test]
+    async fn fanout_stage_counts_empty_eager_set_is_all_zero() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x61; 32]);
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"no-peers"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(
+            counts,
+            FanoutCounts::default(),
+            "empty membership must be distinguishable from any exclusion"
+        );
+        assert_eq!(counts.candidates, 0);
+        assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 1);
+    }
+
+    #[tokio::test]
+    async fn fanout_stage_counts_full_byte_deferral_is_not_empty_membership() {
+        // The 504 field failure: two eager candidates, both byte-deferred
+        // before any claim. attempted == 0 alone reads as "no peers"; the
+        // stage counts must say candidates == 2, byte_rejected == 2.
+        //
+        // This drives the *forwarded* dispatcher fan-out. It originally drove
+        // `publish_local_with_fanout`, but the opt-in policy added on top of
+        // this stack protects local-origin publishes from byte shedding
+        // outright, so that scenario can no longer produce a deferral — see
+        // `shed_normal_never_drops_critical_or_local_origin_over_budget`,
+        // which asserts exactly that. The subject here is the stage
+        // accounting, which is unchanged on the path where shedding is legal.
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x62; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(test_peer_id(2));
+            state.eager_peers.insert(test_peer_id(3));
+        }
+        // Drain most of a valid bucket first. The publish frame remains below
+        // the configured maximum, but neither candidate can leave the fixed
+        // recovery reserve behind, so both data reservations defer.
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let _drain = pubsub
+            .egress_limiter
+            .try_reserve_data(
+                egress::RecoveryIntentKey {
+                    peer: [0x91; 32],
+                    scope: [0x91; 32],
+                    family: [0x92; 32],
+                    operation: [0x93; 32],
+                },
+                6144,
+                false,
+            )
+            .expect("valid setup reservation drains initial tokens");
+
+        let counts = pubsub
+            .parallel_send_to_peers(
+                topic,
+                vec![test_peer_id(2), test_peer_id(3)],
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"attempt4"),
+                "EAGER",
+                true,
+            )
+            .await
+            .1;
+
+        assert_eq!(counts.candidates, 2);
+        assert_eq!(counts.byte_rejected, 2);
+        assert_eq!(counts.admission_dropped, 0);
+        assert_eq!(counts.claim_skipped, 0);
+        assert_eq!(counts.attempted, 0);
+        assert_eq!(counts.succeeded, 0);
+        assert_eq!(
+            counts.candidates,
+            counts.byte_rejected
+                + counts.admission_dropped
+                + counts.claim_skipped
+                + counts.attempted
+        );
+        assert!(transport.sent_frames().is_empty());
+    }
+
+    /// #504 opt-in policy harness: a topic with one eager peer, a configured
+    /// Leaf byte budget, and the data bucket already drained past its hard
+    /// threshold. Every test below starts over budget, so the only variable
+    /// left is whether policy permits the send to be shed.
+    async fn over_budget_pubsub(
+        priority: TopicPriority,
+        policy: BytePolicy,
+    ) -> (
+        Arc<PlumtreePubSub<RecordingTransport>>,
+        Arc<RecordingTransport>,
+        TopicId,
+        PeerId,
+    ) {
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x5b; 32]);
+        pubsub.admission.registry().register(topic, priority);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(target);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 128 * 1024,
+            burst_bytes: 4 * 1024 * 1024,
+            max_serialized_frame_bytes: 4 * 1024 * 1024,
+            policy,
+        })));
+        // Spend the data allowance down to the recovery reserve, so any
+        // further data frame is over the hard threshold.
+        assert!(
+            pubsub
+                .egress_limiter
+                .try_reserve_data(
+                    egress::RecoveryIntentKey {
+                        peer: [0x91; 32],
+                        scope: [0x91; 32],
+                        family: [0x92; 32],
+                        operation: [0x93; 32],
+                    },
+                    3 * 1024 * 1024,
+                    false,
+                )
+                .is_ok(),
+            "setup must drain the data allowance"
+        );
+        (pubsub, transport, topic, target)
+    }
+
+    async fn fanout_over_budget(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        target: PeerId,
+        forwarded: bool,
+    ) -> FanoutCounts {
+        pubsub
+            .parallel_send_to_peers(
+                topic,
+                vec![target],
+                GossipStreamType::PubSub,
+                Bytes::from(vec![0x7a_u8; 64 * 1024]),
+                "EAGER",
+                forwarded,
+            )
+            .await
+            .1
+    }
+
+    /// The forwarded fan-out detaches accounting, so its send completes in a
+    /// spawned task and `succeeded` is not meaningful there. Delivery is
+    /// observed on the transport instead.
+    async fn wait_for_sent_frames(transport: &RecordingTransport, expected: usize) -> usize {
+        for _ in 0..200 {
+            let sent = transport.sent_frames().len();
+            if sent >= expected {
+                return sent;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        transport.sent_frames().len()
+    }
+
+    /// WHY: a byte budget is an observation instrument until an operator says
+    /// otherwise. The archived #504 stack enforced whenever
+    /// `hard_bytes_per_second != 0`, which meant that merely *measuring*
+    /// egress silently started dropping gossip. If that implicit rule comes
+    /// back, this fan-out is over budget and `byte_rejected` becomes 1.
+    #[tokio::test]
+    async fn observe_only_sheds_nothing_past_the_hard_threshold() {
+        let (pubsub, transport, topic, target) =
+            over_budget_pubsub(TopicPriority::Normal, BytePolicy::ObserveOnly).await;
+        assert!(
+            pubsub.egress_limiter.enabled(),
+            "the budget must be accounting — this test is about policy, not about being off"
+        );
+        assert!(!pubsub.egress_limiter.enforcing());
+
+        let counts = fanout_over_budget(&pubsub, topic, target, true).await;
+
+        assert_eq!(
+            counts.byte_rejected, 0,
+            "ObserveOnly must never deny a send, however far over budget"
+        );
+        // Admission is not delivery. A protected peer admitted without a
+        // reservation is rejected by the transport fence and booked as a
+        // timeout, so the frame never reaches the wire — ObserveOnly would
+        // shed 100% of egress one stage later. Assert the frame was actually
+        // sent and that the fence recorded no violation.
+        assert_eq!(
+            counts.attempted, 1,
+            "the protected peer must reach the transport, not be dropped at the fence"
+        );
+        assert_eq!(
+            wait_for_sent_frames(&transport, 1).await,
+            1,
+            "the protected frame must reach the wire"
+        );
+        assert_eq!(transport.sent_frames()[0].0, target);
+        let snapshot = pubsub.leaf_egress_snapshot();
+        assert_eq!(
+            snapshot.invariant_violations, 0,
+            "a protected send must carry a real reservation, not trip the fence"
+        );
+        assert!(
+            snapshot.charged_bytes >= 64 * 1024,
+            "a protected send is charged, so charged_bytes stays honest"
+        );
+        assert!(
+            snapshot.shed_suppressed >= 1,
+            "the overrun must still be metered — an unobservable ObserveOnly \
+             budget would tell an operator nothing about enabling ShedNormal"
+        );
+    }
+
+    /// WHY: `ShedNormal` buys headroom by dropping relay traffic. It must
+    /// never buy it from the classes whose loss is a hard error (Critical:
+    /// DM inbox and control plane) or from this node's own speech
+    /// (local-origin publishes), because neither is relay load this node can
+    /// decline to carry on someone else's behalf.
+    #[tokio::test]
+    async fn shed_normal_never_drops_critical_or_local_origin_over_budget() {
+        let (critical, critical_transport, topic, target) =
+            over_budget_pubsub(TopicPriority::Critical, BytePolicy::ShedNormal).await;
+        assert!(critical.egress_limiter.enforcing());
+        let forwarded_critical = fanout_over_budget(&critical, topic, target, true).await;
+        assert_eq!(
+            forwarded_critical.byte_rejected, 0,
+            "Critical-class traffic must survive an exhausted byte budget"
+        );
+        assert_eq!(
+            forwarded_critical.attempted, 1,
+            "surviving the gate is not enough — the Critical frame must reach transport"
+        );
+        assert_eq!(
+            wait_for_sent_frames(&critical_transport, 1).await,
+            1,
+            "the Critical frame must be delivered"
+        );
+        assert_eq!(
+            critical.leaf_egress_snapshot().invariant_violations,
+            0,
+            "a protected Critical send must not trip the transport fence"
+        );
+
+        let (normal, normal_transport, topic, target) =
+            over_budget_pubsub(TopicPriority::Normal, BytePolicy::ShedNormal).await;
+        // forwarded = false is the publish path: this node authored the frame.
+        let local_origin = fanout_over_budget(&normal, topic, target, false).await;
+        assert_eq!(
+            local_origin.byte_rejected, 0,
+            "a local-origin publish is not relay load and must not be shed"
+        );
+        assert_eq!(
+            local_origin.succeeded, 1,
+            "the local-origin frame must be delivered, not lost at the fence"
+        );
+        assert_eq!(
+            wait_for_sent_frames(&normal_transport, 1).await,
+            1,
+            "the local-origin frame must reach the wire"
+        );
+        let snapshot = normal.leaf_egress_snapshot();
+        assert_eq!(snapshot.invariant_violations, 0);
+        assert!(
+            snapshot.shed_suppressed >= 1,
+            "protected-but-over-budget sends must be attributable in diagnostics"
+        );
+    }
+
+    /// The headline invariant of the opt-in policy: **under `ObserveOnly`,
+    /// observable send behaviour — what is sent, to whom, and whether it waits
+    /// — is identical to running with no byte budget at all. Only the meters
+    /// differ.**
+    ///
+    /// WHY: `ObserveOnly` is what an operator turns on to *measure* egress
+    /// before deciding whether to shed. If measuring changes behaviour, the
+    /// measurement is worthless and the rollout is unsafe. Two regressions
+    /// this catches, both of which shipped in the reviewed stack: admitting a
+    /// protected peer without a reservation (the transport fence then drops it
+    /// — review F1), and entering the ~4 s waiter loop before checking policy
+    /// (review H1).
+    #[tokio::test]
+    async fn observe_only_send_behaviour_matches_no_budget_at_all() {
+        async fn run(policy: Option<BytePolicy>) -> (usize, Vec<PeerId>, usize) {
+            // The helper configures the policy and drains the bucket past the
+            // hard threshold; `None` then clears the budget entirely, which is
+            // the "no byte budget at all" control.
+            let (pubsub, transport, topic, target) =
+                over_budget_pubsub(TopicPriority::Normal, policy.unwrap_or_default()).await;
+            if policy.is_none() {
+                assert!(pubsub.configure_leaf_egress(None));
+                assert!(!pubsub.egress_limiter.enabled());
+            }
+
+            let started = Instant::now();
+            let counts = fanout_over_budget(&pubsub, topic, target, true).await;
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "no configuration may make the fan-out wait: {elapsed:?}"
+            );
+            let sent = wait_for_sent_frames(&transport, 1).await;
+            let peers: Vec<PeerId> = transport.sent_frames().into_iter().map(|f| f.0).collect();
+            (sent, peers, counts.byte_rejected)
+        }
+
+        let unbudgeted = run(None).await;
+        let observe_only = run(Some(BytePolicy::ObserveOnly)).await;
+        assert_eq!(
+            observe_only, unbudgeted,
+            "ObserveOnly over a saturated budget must send exactly what an \
+             unbudgeted node sends, to the same peer, without deferring"
+        );
+
+        // And the contrast that proves the comparison is not vacuous.
+        let shedding = run(Some(BytePolicy::ShedNormal)).await;
+        assert_ne!(
+            shedding, unbudgeted,
+            "ShedNormal over the same saturated budget must behave differently"
+        );
+
+        // Review R1: the same invariant for the *frame-size* ceiling. The
+        // local-publish path used to pre-check `max_serialized_frame_bytes`
+        // whenever the limiter was merely `enabled()`, so an ObserveOnly node
+        // hard-failed an oversized publish that an unbudgeted node sends. That
+        // also contradicted the reservation layer, which deliberately ignores
+        // the cap for protected sends — a publish is always local-origin, so
+        // the cap could never be policy-correct one stage earlier.
+        async fn publish_oversized(policy: Option<BytePolicy>) -> (bool, usize) {
+            let local = test_peer_id(1);
+            let target = test_peer_id(2);
+            let transport = RecordingTransport::new(local);
+            transport.set_connected_peer_ids(vec![target]);
+            let pubsub = PlumtreePubSub::new_with_task_control(
+                local,
+                Arc::clone(&transport),
+                test_signing_key(),
+                false,
+            );
+            let topic = TopicId::new([0x2f; 32]);
+            pubsub.initialize_topic_peers(topic, vec![target]).await;
+            store_connected_peers_snapshot(
+                pubsub.connected_peers_snapshot.as_ref(),
+                Some(HashSet::from([target])),
+            );
+            if let Some(policy) = policy {
+                assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+                    soft_bytes_per_second: 0,
+                    hard_bytes_per_second: 128 * 1024,
+                    burst_bytes: 4 * 1024 * 1024,
+                    // Far below the frame published next.
+                    max_serialized_frame_bytes: 1024,
+                    policy,
+                })));
+            }
+            let published = pubsub
+                .publish(topic, Bytes::from(vec![0x33_u8; 64 * 1024]))
+                .await
+                .is_ok();
+            (published, wait_for_sent_frames(&transport, 1).await)
+        }
+
+        let unbudgeted_oversized = publish_oversized(None).await;
+        assert!(
+            unbudgeted_oversized.0,
+            "control: an unbudgeted node publishes this frame"
+        );
+        assert_eq!(
+            publish_oversized(Some(BytePolicy::ObserveOnly)).await,
+            unbudgeted_oversized,
+            "ObserveOnly must not reject an oversized publish an unbudgeted node sends"
+        );
+    }
+
+    /// WHY (review F2/F3): the recovery gate used to consult only `enforcing()`,
+    /// so under ShedNormal it would defer IHAVE/IWANT batches on Critical
+    /// topics, deferred-EAGER custody replies serving our own message, and
+    /// stranded-publish retries of our own publish. Protection must be
+    /// structural — a property of the traffic's class and provenance — not an
+    /// accident of how full the bucket happened to be.
+    #[tokio::test]
+    async fn recovery_gate_protects_critical_and_local_origin_structurally() {
+        // Larger than the recovery escrow left after the data drain, so an
+        // unprotected recovery reservation genuinely cannot be charged.
+        let frame = Bytes::from(vec![0x6c_u8; 2 * 1024 * 1024]);
+        let peer = test_peer_id(2);
+
+        for (priority, local_origin, label) in [
+            (TopicPriority::Critical, false, "forwarded Critical"),
+            (TopicPriority::Normal, true, "local-origin Normal"),
+            (TopicPriority::Bulk, true, "local-origin Bulk"),
+        ] {
+            let (pubsub, _transport, topic, _target) =
+                over_budget_pubsub(priority, BytePolicy::ShedNormal).await;
+            let (admitted, deferred) =
+                PlumtreePubSub::<RecordingTransport>::reserve_recovery_targets(
+                    &pubsub.egress_limiter,
+                    topic,
+                    vec![peer],
+                    "IHAVE",
+                    &frame,
+                    local_origin,
+                    priority,
+                );
+            assert!(deferred.is_empty(), "{label} recovery must not be deferred");
+            assert_eq!(admitted.len(), 1);
+            assert!(
+                admitted[0].1.is_some(),
+                "{label} must carry a real reservation, or the transport fence rejects it"
+            );
+        }
+
+        // The counterpart: forwarded ordinary recovery IS still shed, so the
+        // protection above is not simply the feature being off.
+        let (pubsub, _transport, topic, _target) =
+            over_budget_pubsub(TopicPriority::Normal, BytePolicy::ShedNormal).await;
+        let (_admitted, deferred) = PlumtreePubSub::<RecordingTransport>::reserve_recovery_targets(
+            &pubsub.egress_limiter,
+            topic,
+            vec![peer],
+            "IHAVE",
+            &frame,
+            false,
+            TopicPriority::Normal,
+        );
+        assert_eq!(
+            deferred.len(),
+            1,
+            "forwarded ordinary recovery is still shed under ShedNormal"
+        );
+    }
+
+    /// WHY: the opt-in gate must not be a way of quietly disabling the feature
+    /// altogether. Once an operator selects `ShedNormal`, forwarded ordinary
+    /// traffic genuinely is shed at the budget and lands on the existing lazy
+    /// recovery path, with the drop attributed to its wire purpose.
+    #[tokio::test]
+    async fn shed_normal_drops_forwarded_ordinary_traffic_over_budget() {
+        for priority in [TopicPriority::Normal, TopicPriority::Bulk] {
+            let (pubsub, transport, topic, target) =
+                over_budget_pubsub(priority, BytePolicy::ShedNormal).await;
+
+            let counts = fanout_over_budget(&pubsub, topic, target, true).await;
+
+            assert!(
+                transport.sent_frames().is_empty(),
+                "a shed frame must not reach the wire"
+            );
+
+            assert_eq!(
+                counts.byte_rejected,
+                1,
+                "forwarded {} traffic must be shed once the budget is exhausted",
+                priority.as_str()
+            );
+            let snapshot = pubsub.leaf_egress_snapshot();
+            assert_eq!(
+                snapshot.shed_suppressed, 0,
+                "a genuine shed is not a suppressed one"
+            );
+            let eager = snapshot
+                .by_topic_and_purpose
+                .iter()
+                .find(|row| row.topic == topic.to_bytes() && row.purpose == "EAGER")
+                .expect("the shed must be attributed to its wire purpose");
+            assert!(
+                eager.deferred >= 1,
+                "the drop must be metered by reason, not just counted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn critical_eager_progresses_ahead_of_ordinary_recovery_backlog() {
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x65; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(target);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 128 * 1024,
+            burst_bytes: 4 * 1024 * 1024,
+            max_serialized_frame_bytes: 4 * 1024 * 1024,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let _drain = pubsub
+            .egress_limiter
+            .try_reserve_data(
+                egress::RecoveryIntentKey {
+                    peer: [0x81; 32],
+                    scope: [0x81; 32],
+                    family: [0x82; 32],
+                    operation: [0x83; 32],
+                },
+                3 * 1024 * 1024,
+                false,
+            )
+            .expect("setup drains data tokens while retaining recovery reserve");
+        assert!(pubsub
+            .egress_limiter
+            .try_reserve_recovery(
+                egress::RecoveryIntentKey {
+                    peer: [0x84; 32],
+                    scope: [0x84; 32],
+                    family: [0x85; 32],
+                    operation: [0x86; 32],
+                },
+                1024 * 1024,
+            )
+            .is_ok());
+        for index in 0_u16..300 {
+            let mut identity = [0_u8; 32];
+            identity[..2].copy_from_slice(&index.to_le_bytes());
+            let key = egress::RecoveryIntentKey {
+                peer: identity,
+                scope: identity,
+                family: identity,
+                operation: identity,
+            };
+            assert_eq!(
+                pubsub.egress_limiter.try_reserve_recovery(key, 1024 * 1024),
+                Err(egress::ReserveError::Deferred)
+            );
+        }
+        pubsub
+            .egress_limiter
+            .refill_after_for_test(Duration::from_secs(1));
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from(vec![7; 11 * 1024]))
+            .await
+            .expect("Critical EAGER publish remains bounded and succeeds");
+
+        assert_eq!(counts.candidates, 1);
+        assert_eq!(counts.attempted, 1);
+        assert_eq!(counts.succeeded, 1);
+        assert_eq!(transport.send_count_to(target), 1);
+        assert_eq!(
+            pubsub.egress_limiter.snapshot().pending_recovery_intents,
+            300
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_eager_ready_peer_sends_while_other_peer_gate_is_held() {
+        let local = test_peer_id(1);
+        let ready = test_peer_id(2);
+        let stalled = test_peer_id(3);
+        let transport = RecordingTransport::new(local);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x67; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .extend([ready, stalled]);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([ready, stalled])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1024 * 1024,
+            burst_bytes: 4 * 1024 * 1024,
+            max_serialized_frame_bytes: 4 * 1024 * 1024,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let mut held = pubsub
+            .outbound_budgets
+            .try_acquire(
+                stalled,
+                OutboundSendClass::Data,
+                TopicPriority::Critical,
+                Instant::now(),
+            )
+            .expect("hold stalled peer gate");
+        assert!(held.engage_critical_gate(Duration::from_secs(1)).await);
+        let publishing = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                pubsub
+                    .publish_local_with_fanout(topic, Bytes::from_static(b"identity-sized"))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transport.send_count_to(ready) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ready peer sends without waiting for stalled peer");
+        assert_eq!(transport.send_count_to(stalled), 0);
+        drop(held);
+        let counts = tokio::time::timeout(Duration::from_secs(1), publishing)
+            .await
+            .expect("publish completes after gate release")
+            .expect("publish task joins")
+            .expect("publish succeeds");
+        assert_eq!(
+            (counts.candidates, counts.attempted, counts.succeeded),
+            (2, 2, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_critical_publish_cancels_owned_send_and_intent() {
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let (transport, mut started) = BlockingTransport::new(local);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x68; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        pubsub
+            .topics
+            .write_topic(&topic)
+            .await
+            .entry(topic)
+            .or_insert_with(TopicState::new)
+            .eager_peers
+            .insert(target);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1024 * 1024,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let publish = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                pubsub
+                    .publish_local_with_fanout(topic, Bytes::from_static(b"cancel-owned"))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("send enters")
+            .expect("started record");
+        publish.abort();
+        let _ = publish.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while transport.in_flight.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned send is cancelled");
+        assert_eq!(pubsub.egress_limiter.snapshot().pending_recovery_intents, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protected_critical_eager_never_waits_for_budget() {
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let (transport, mut started) = BlockingTransport::new(local);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x69; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        pubsub
+            .topics
+            .write_topic(&topic)
+            .await
+            .entry(topic)
+            .or_insert_with(TopicState::new)
+            .eager_peers
+            .insert(target);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 8192,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let _drain = pubsub
+            .egress_limiter
+            .try_reserve_data(
+                egress::RecoveryIntentKey {
+                    peer: [0x91; 32],
+                    scope: [0x91; 32],
+                    family: [0x92; 32],
+                    operation: [0x93; 32],
+                },
+                6144,
+                false,
+            )
+            .expect("drain leaves only the recovery floor");
+        // #504 opt-in policy: a Critical EAGER is protected, so it must NOT
+        // enter the waiter loop at all. This test previously asserted the
+        // opposite — that the reservation waits and shares the send deadline —
+        // but that is exactly the behaviour review F1 identified as harmful:
+        // waiting for budget that will be granted anyway burns the send's own
+        // deadline, and a wait that timed out returned `Deferred`, which was
+        // then byte-rejected. A dropped Critical message is the hard error the
+        // priority class exists to prevent.
+        let publishing = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                pubsub
+                    .publish_local_with_fanout(topic, Bytes::from_static(b"deadline"))
+                    .await
+            })
+        };
+        // The send enters immediately, without a refill and without the
+        // budget being restored.
+        tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("a protected Critical send must not wait for budget")
+            .expect("started record");
+        assert_eq!(
+            pubsub.egress_limiter.snapshot().pending_recovery_intents,
+            0,
+            "a protected send must not register an escrowed recovery intent"
+        );
+        let snapshot = pubsub.leaf_egress_snapshot();
+        assert_eq!(
+            snapshot.invariant_violations, 0,
+            "the protected send carries a real reservation"
+        );
+        assert!(
+            snapshot.shed_suppressed >= 1,
+            "the overrun is still metered"
+        );
+        transport.release_sends(1);
+        let counts = tokio::time::timeout(Duration::from_secs(5), publishing)
+            .await
+            .expect("publish completes")
+            .expect("publish task joins")
+            .expect("publish result is typed");
+        assert_eq!(counts.byte_rejected, 0, "Critical is never byte-rejected");
+        assert_eq!(counts.attempted, 1);
+    }
+
+    #[tokio::test]
+    async fn fanout_stage_counts_admission_drop_lands_in_its_own_bucket() {
+        // Suspect health with no connected snapshot overrides nothing:
+        // peer admission drops the candidate after byte admission.
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x63; 32]);
+        let target = test_peer_id(2);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(target);
+        }
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Suspect)]),
+        );
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"admission-drop"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 1);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 1);
+        assert_eq!(counts.claim_skipped, 0);
+        assert_eq!(counts.attempted, 0);
+        assert_eq!(transport.send_count_to(target), 0);
+    }
+
+    #[tokio::test]
+    async fn fanout_stage_counts_outbound_budget_claim_skip() {
+        // The peer passes byte + peer admission (connected, healthy, not
+        // cooling) but its single in-flight outbound Data permit is already
+        // held when the claim layer runs: the exclusion happens at claim
+        // time, so it must land in claim_skipped, not admission_dropped.
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x64; 32]);
+        let target = test_peer_id(2);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(target);
+        }
+        // Admitted at the transport-connected evidence probe: the target
+        // is present in the connected snapshot.
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+
+        // Exhaust the peer's single best-effort Data permit and hold it
+        // across the publish: claim's `try_acquire` fails after admission,
+        // so the candidate is shed at claim time.
+        let held = pubsub
+            .outbound_budgets
+            .try_acquire(
+                target,
+                OutboundSendClass::Data,
+                TopicPriority::Normal,
+                Instant::now(),
+            )
+            .expect("first data permit is available");
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"claim-skip"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 1);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 0);
+        assert_eq!(counts.claim_skipped, 1);
+        assert_eq!(counts.attempted, 0);
+        assert_eq!(transport.send_count_to(target), 0);
+
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn critical_fanout_stage_counts_admits_suspect_peer() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x66; 32]);
+        let target = test_peer_id(2);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1024 * 1024,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
+        })));
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(target);
+        }
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(target, PeerHealth::Suspect)]),
+        );
+
+        // Critical bypasses the health admission gate; a connected Suspect
+        // peer must still receive control traffic. Normal coverage stays separate.
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"critical-admits-suspect"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 1);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 0);
+        assert_eq!(counts.claim_skipped, 0);
+        assert_eq!(counts.attempted, 1);
+        assert_eq!(counts.succeeded, 1);
+        assert_eq!(transport.send_count_to(target), 1);
+    }
+
+    #[tokio::test]
+    async fn critical_fanout_stage_counts_claim_queue_overflow() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x67; 32]);
+        let target = test_peer_id(2);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1024 * 1024,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
+        })));
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(target);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        let held: Vec<_> = (0..OUTBOUND_CRITICAL_QUEUE_PER_PEER)
+            .map(|_| {
+                pubsub
+                    .outbound_budgets
+                    .try_acquire(
+                        target,
+                        OutboundSendClass::Data,
+                        TopicPriority::Critical,
+                        Instant::now(),
+                    )
+                    .expect("critical queue has its documented capacity")
+            })
+            .collect();
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"critical-claim-skip"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 1);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 0);
+        assert_eq!(counts.claim_skipped, 1);
+        assert_eq!(counts.attempted, 0);
+        assert_eq!(transport.send_count_to(target), 0);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn fanout_stage_counts_mixed_admission_drop_and_success() {
+        // Two byte-admitted candidates: one drops at peer admission
+        // (Suspect, no connected snapshot), one is connected and gets the
+        // send — proving the buckets stay distinct on a successful path.
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x65; 32]);
+        let healthy = test_peer_id(2);
+        let suspect = test_peer_id(3);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(healthy);
+            state.eager_peers.insert(suspect);
+        }
+        store_peer_health_snapshot(
+            pubsub.peer_health_snapshot.as_ref(),
+            HashMap::from([(suspect, PeerHealth::Suspect)]),
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([healthy])),
+        );
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"mixed"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 2);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 1);
+        assert_eq!(counts.claim_skipped, 0);
+        assert_eq!(counts.attempted, 1);
+        assert_eq!(counts.succeeded, 1);
+        assert_eq!(
+            counts.candidates,
+            counts.byte_rejected
+                + counts.admission_dropped
+                + counts.claim_skipped
+                + counts.attempted
+        );
+        assert_eq!(transport.send_count_to(healthy), 1);
+        assert_eq!(transport.send_count_to(suspect), 0);
+        assert_eq!(pubsub.stage_stats().zero_fanout_publishes, 0);
+    }
+
+    #[tokio::test]
+    async fn targeted_publish_reaches_connected_peer_absent_from_eager_set() {
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![target]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x66; 32]);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+
+        let outcome = pubsub
+            .publish_local_with_target(
+                topic,
+                Bytes::from_static(b"targeted-not-eager"),
+                target,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("targeted publish succeeds");
+
+        assert_eq!(outcome.fanout.candidates, 0);
+        assert_eq!(outcome.target, TargetedPublishOutcome::Sent);
+        assert_eq!(transport.send_count_to(target), 1);
+    }
+
+    #[tokio::test]
+    /// #504 opt-in policy: a targeted send is protected, so it never enters
+    /// the byte waiter loop and never registers a recovery intent. This test
+    /// previously asserted the opposite — that a zero deadline byte-deferred
+    /// the send to `TimedOut` and then cancelled the owned intent. The
+    /// surviving subject, and the reason the test exists, is that this path
+    /// leaks no intent; it is now guaranteed by never creating one.
+    async fn targeted_publish_is_protected_and_leaks_no_recovery_intent() {
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![target]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x67; 32]);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let _drain = pubsub
+            .egress_limiter
+            .try_reserve_data(
+                egress::RecoveryIntentKey {
+                    peer: [0xa1; 32],
+                    scope: [0xa1; 32],
+                    family: [0xa2; 32],
+                    operation: [0xa3; 32],
+                },
+                6144,
+                false,
+            )
+            .expect("drain setup tokens");
+
+        let outcome = pubsub
+            .publish_local_with_target(
+                topic,
+                Bytes::from_static(b"bounded-target"),
+                target,
+                Duration::ZERO,
+            )
+            .await
+            .expect("ordinary publish contract remains successful");
+
+        assert_eq!(
+            outcome.target,
+            TargetedPublishOutcome::Sent,
+            "a targeted send is not shed for bytes"
+        );
+        assert_eq!(transport.send_count_to(target), 1);
+        assert_eq!(
+            pubsub.leaf_egress_snapshot().pending_recovery_intents,
+            0,
+            "a protected send must not register an intent, so none can leak"
+        );
+        assert_eq!(
+            pubsub.leaf_egress_snapshot().invariant_violations,
+            0,
+            "it still carries a real reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_publish_progresses_behind_recovery_backlog_with_same_cached_wire() {
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let ordinary_peer = test_peer_id(3);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![target, ordinary_peer]);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x68; 32]);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target, ordinary_peer])),
+        );
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(ordinary_peer);
+        }
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 16_384,
+            max_serialized_frame_bytes: 16_384,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let _drain = pubsub
+            .egress_limiter
+            .try_reserve_data(
+                egress::RecoveryIntentKey {
+                    peer: [0xb1; 32],
+                    scope: [0xb1; 32],
+                    family: [0xb2; 32],
+                    operation: [0xb3; 32],
+                },
+                12_288,
+                false,
+            )
+            .expect("drain setup tokens while preserving the recovery floor");
+        let older = egress::RecoveryIntentKey {
+            peer: [0xc1; 32],
+            scope: [0xc1; 32],
+            family: [0xc2; 32],
+            operation: [0xc3; 32],
+        };
+        assert_eq!(
+            pubsub.egress_limiter.try_reserve_recovery(older, 5_000),
+            Err(egress::ReserveError::Deferred),
+            "the exact target must begin behind an older uncharged intent"
+        );
+        let charged_before = pubsub.leaf_egress_snapshot().charged_bytes;
+        let payload = Bytes::from_static(b"targeted-after-backlog");
+        let running = {
+            let pubsub = Arc::clone(&pubsub);
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                pubsub
+                    .publish_local_with_target(topic, payload, target, Duration::from_secs(1))
+                    .await
+            })
+        };
+        // #504 opt-in policy: the targeted leg is protected, so it does not
+        // queue behind the backlog — it neither waits nor registers a second
+        // intent. This previously asserted two coexisting intents; the older
+        // backlog intent is now the only one, and the targeted send proceeds
+        // past it rather than behind it.
+        assert_eq!(
+            pubsub.leaf_egress_snapshot().pending_recovery_intents,
+            1,
+            "only the older backlog intent exists; the protected target adds none"
+        );
+        pubsub
+            .egress_limiter
+            .refill_after_for_test(Duration::from_secs(16_384));
+        let outcome = running
+            .await
+            .expect("target task joins")
+            .expect("targeted publish remains bounded and valid");
+
+        assert_eq!(outcome.fanout.candidates, 1, "ordinary fanout is retained");
+        // The ordinary leg of a *local* publish is policy-protected from byte
+        // shedding (#504 opt-in policy), so it is no longer byte-rejected here
+        // even behind the recovery backlog. The subject of this test is the
+        // targeted leg below, which is unaffected.
+        assert_eq!(outcome.fanout.byte_rejected, 0);
+        assert_eq!(outcome.target, TargetedPublishOutcome::Sent);
+        let frames = transport.sent_frames_of_kind_to(target, MessageKind::Eager);
+        assert_eq!(frames.len(), 1);
+        let message: GossipMessage =
+            postcard::from_bytes(&frames[0]).expect("transported frame is the signed message");
+        assert_eq!(message.payload.as_ref(), Some(&payload));
+        let cached = {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .get_mut(&topic)
+                .and_then(|state| state.get_message(&message.header.msg_id))
+                .expect("same message id remains cached")
+        };
+        assert_eq!(
+            postcard::to_stdvec(&cached.header).expect("cached header serializes"),
+            postcard::to_stdvec(&message.header).expect("wire header serializes"),
+            "cached and targeted transport frames retain the identical signed header"
+        );
+        assert_eq!(cached.payload, payload);
+        let after = pubsub.leaf_egress_snapshot();
+        assert!(after.charged_bytes > charged_before);
+        assert!(
+            after.charged_bytes - charged_before <= 16_384,
+            "new charging stays within one configured burst"
+        );
+        assert_eq!(
+            after.pending_recovery_intents, 1,
+            "target ownership is gone while the deliberately older intent remains"
+        );
+        pubsub.egress_limiter.cancel_intent_for_test(older);
+        assert_eq!(pubsub.leaf_egress_snapshot().pending_recovery_intents, 0);
+    }
+
     #[tokio::test]
     async fn test_cooling_floor_preserves_last_eligible_eager_peer() {
         let peer_id = test_peer_id(1);
@@ -11492,6 +14622,106 @@ mod tests {
             dropped_total, 500,
             "every evicted id is counted for the diagnostics surface"
         );
+    }
+
+    #[tokio::test]
+    async fn partial_budget_ihave_flush_preserves_each_recipient_exactly_once() {
+        let local = test_peer_id(1);
+        let peers = [test_peer_id(2), test_peer_id(3)];
+        let topic = TopicId::new([0x51; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(peers.to_vec());
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        pubsub.initialize_topic_peers(topic, peers.to_vec()).await;
+        let msg_id = [0x52; 32];
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            state.eager_peers.clear();
+            state.lazy_peers.extend(peers);
+            state.push_pending_ihave(msg_id);
+        }
+        let payload: Bytes = postcard::to_stdvec(&vec![msg_id])
+            .expect("IHAVE payload")
+            .into();
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id,
+            kind: MessageKind::IHave,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(payload.as_ref()));
+        let frame_len = postcard::to_stdvec(&GossipMessage {
+            signature: pubsub.sign_message(&header),
+            public_key: pubsub.signing_key.public_key().to_vec(),
+            header,
+            payload: Some(payload),
+        })
+        .expect("IHAVE frame")
+        .len();
+        // Exact one-frame burst: the second target must remain pending until
+        // a later refill, independent of signing or scheduler duration.
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: u64::try_from(frame_len).expect("frame size") * 100,
+            burst_bytes: u64::try_from(frame_len).expect("frame size"),
+            max_serialized_frame_bytes: frame_len,
+            policy: BytePolicy::ShedNormal,
+        })));
+
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert_eq!(transport.sent_frames().len(), 1);
+        assert!(!pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .expect("topic state")
+            .pending_ihave
+            .is_empty());
+        pubsub.egress_limiter.refill_one_second_for_test();
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        for peer in peers {
+            assert_eq!(
+                transport
+                    .sent_frames_of_kind_to(peer, MessageKind::IHave)
+                    .len(),
+                1,
+                "each recipient gets one successful IHAVE handoff"
+            );
+        }
+        let topics = pubsub.topics.read_topic(&topic).await;
+        assert!(topics
+            .get(&topic)
+            .expect("topic state")
+            .pending_ihave
+            .is_empty());
     }
 
     /// Issue #62 (x0x #611): with a consumer-configured max eager degree
@@ -14188,6 +17418,7 @@ mod tests {
             &stage_stats,
             &outbound_budgets,
             &send_path,
+            &Arc::new(egress::LeafEgressLimiter::disabled()),
         )
         .await;
 
@@ -15587,6 +18818,7 @@ mod tests {
         let flush_signing_key = Arc::clone(&signing_key);
         let flush_stage_stats = Arc::new(PubSubStageStats::default());
         let flush_outbound_budgets = Arc::new(PeerOutboundBudgets::default());
+        let flush_egress_limiter = Arc::new(egress::LeafEgressLimiter::disabled());
         let flush_rtt_tracker = Arc::new(PerPeerRttTracker::new());
         let flush_peer_health_snapshot = Arc::new(StdRwLock::new(HashMap::new()));
         let flush_connected_peers_snapshot = Arc::new(StdRwLock::new(None));
@@ -15607,6 +18839,7 @@ mod tests {
                 &flush_stage_stats,
                 &flush_outbound_budgets,
                 &flush_send_path,
+                &flush_egress_limiter,
             )
             .await;
         });
@@ -15665,6 +18898,7 @@ mod tests {
         let flush_signing_key = Arc::clone(&signing_key);
         let flush_stage_stats = Arc::clone(&stage_stats);
         let flush_outbound_budgets = Arc::new(PeerOutboundBudgets::default());
+        let flush_egress_limiter = Arc::new(egress::LeafEgressLimiter::disabled());
         let flush_rtt_tracker = Arc::new(PerPeerRttTracker::new());
         let flush_peer_health_snapshot = Arc::new(StdRwLock::new(HashMap::new()));
         let flush_connected_peers_snapshot = Arc::new(StdRwLock::new(None));
@@ -15685,6 +18919,7 @@ mod tests {
                 &flush_stage_stats,
                 &flush_outbound_budgets,
                 &flush_send_path,
+                &flush_egress_limiter,
             )
             .await;
         });
@@ -15850,6 +19085,7 @@ mod tests {
             &stage_stats,
             &Arc::new(PeerOutboundBudgets::default()),
             &send_path,
+            &Arc::new(egress::LeafEgressLimiter::disabled()),
         )
         .await;
 
@@ -15973,7 +19209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ihave_handling() {
+    async fn failed_iwant_send_releases_outstanding_claim() {
         let peer_id = test_peer_id(1);
         let transport = test_transport().await;
         let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
@@ -15987,10 +19223,1433 @@ mod tests {
             .await
             .ok();
 
-        // Verify IWANT was tracked
+        // The UDP test transport has no connection for `from_peer`, so the
+        // request was not delivered and must be eligible for a later IHAVE.
         let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).unwrap();
+        assert!(!state.outstanding_iwants.contains_key(&unknown_msg_id));
+    }
+
+    #[tokio::test]
+    async fn successful_iwant_send_retains_outstanding_claim() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let topic = TopicId::new([1u8; 32]);
+        let from_peer = test_peer_id(2);
+        transport.set_connected_peer_ids(vec![from_peer]);
+        let pubsub = PlumtreePubSub::new(peer_id, transport.clone(), test_signing_key());
+        let unknown_msg_id = [42u8; 32];
+
+        pubsub
+            .handle_ihave(from_peer, topic, vec![unknown_msg_id])
+            .await
+            .expect("IHAVE handling");
+
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
         assert!(state.outstanding_iwants.contains_key(&unknown_msg_id));
+        assert_eq!(transport.send_count_to(from_peer), 1);
+    }
+
+    #[tokio::test]
+    async fn byte_deferred_iwant_retries_once_and_recovers_local_origin_payload() {
+        let publisher_id = test_peer_id(1);
+        let receiver_id = test_peer_id(2);
+        let topic = TopicId::new([0x91; 32]);
+        let publisher_transport = RecordingTransport::new(publisher_id);
+        publisher_transport.set_connected_peer_ids(vec![receiver_id]);
+        let publisher = PlumtreePubSub::new_with_task_control(
+            publisher_id,
+            publisher_transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let payload = Bytes::from_static(b"deferred-iwant-local-origin");
+        let msg_id = publisher.calculate_msg_id(&topic, &payload);
+        publisher
+            .publish_local(topic, payload.clone())
+            .await
+            .expect("publisher caches local origin");
+
+        let receiver_transport = RecordingTransport::new(receiver_id);
+        receiver_transport.set_connected_peer_ids(vec![publisher_id]);
+        let receiver = PlumtreePubSub::new_with_task_control(
+            receiver_id,
+            receiver_transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let mut subscription = receiver.subscribe(topic);
+        let ids = vec![msg_id];
+        let iwant_payload: Bytes = postcard::to_stdvec(&ids).expect("IWANT ids").into();
+        let iwant_frame_len =
+            signed_control_frame(&receiver, topic, MessageKind::IWant, iwant_payload.clone()).len();
+        assert!(receiver.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: u64::try_from(iwant_frame_len).expect("frame size"),
+            max_serialized_frame_bytes: iwant_frame_len,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let drain = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
+            topic,
+            publisher_id,
+            "EAGER",
+            b"consume-recovery-burst",
+        );
+        let _charged = receiver
+            .egress_limiter
+            .reserve_critical_eager(drain, iwant_frame_len, Duration::from_secs(1))
+            .await
+            .expect("competing Critical frame consumes burst");
+
+        let ihave_payload: Bytes = postcard::to_stdvec(&ids).expect("IHAVE ids").into();
+        let ihave = signed_control_frame(&publisher, topic, MessageKind::IHave, ihave_payload);
+        receiver
+            .dispatch_message(publisher_id, None, ihave)
+            .await
+            .expect("valid IHAVE survives byte deferral");
+        assert!(receiver_transport
+            .sent_frames_of_kind_to(publisher_id, MessageKind::IWant)
+            .is_empty());
+        let deferred = receiver
+            .leaf_egress_snapshot()
+            .by_topic_and_purpose
+            .into_iter()
+            .find(|row| row.topic == topic.to_bytes() && row.purpose == "IWANT")
+            .expect("IWANT byte accounting");
+        assert_eq!(deferred.sent_bytes, 0);
+        assert!(deferred.deferred >= 1, "first pull is byte-deferred");
+
+        receiver
+            .egress_limiter
+            .refill_after_for_test(Duration::from_secs(
+                u64::try_from(iwant_frame_len).expect("frame size"),
+            ));
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &receiver.topics,
+            &receiver.transport,
+            &receiver.signing_key,
+            &receiver.stage_stats,
+            &receiver.outbound_budgets,
+            &receiver.send_path_context(),
+            &receiver.egress_limiter,
+        )
+        .await;
+        let iwants = receiver_transport.sent_frames_of_kind_to(publisher_id, MessageKind::IWant);
+        assert_eq!(iwants.len(), 1, "deferred pull retries after refill");
+        assert!(publisher
+            .handle_local_origin_iwant(receiver_id, iwants[0].clone())
+            .await
+            .expect("restricted handler serves retried pull"));
+        let eager = publisher_transport.sent_frames_of_kind_to(receiver_id, MessageKind::Eager);
+        assert_eq!(eager.len(), 1);
+        let eager_message: GossipMessage = postcard::from_bytes(&eager[0]).expect("cached EAGER");
+        assert_eq!(eager_message.header.msg_id, msg_id);
+        assert_eq!(eager_message.payload.as_ref(), Some(&payload));
+        receiver
+            .dispatch_message(publisher_id, None, eager[0].clone())
+            .await
+            .expect("receiver handles cached EAGER");
+        let (delivered_from, delivered_payload) =
+            tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+                .await
+                .expect("subscriber delivery deadline")
+                .expect("subscription remains live");
+        assert_eq!(delivered_from, publisher_id);
+        assert_eq!(delivered_payload, payload);
+
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &receiver.topics,
+            &receiver.transport,
+            &receiver.signing_key,
+            &receiver.stage_stats,
+            &receiver.outbound_budgets,
+            &receiver.send_path_context(),
+            &receiver.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            receiver_transport
+                .sent_frames_of_kind_to(publisher_id, MessageKind::IWant)
+                .len(),
+            1,
+            "successful retry retires deferred custody"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_iwant_custody_expires_with_cache_age_and_disconnects() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x92; 32]);
+        let id = [0x93; 32];
+        let transport = RecordingTransport::new(local);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(local, transport, test_signing_key(), false);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(|| {
+                TopicState::with_cache_config(PubSubCacheConfig {
+                    max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+                    max_bytes_per_topic: 64 * 1024,
+                    max_age: Duration::from_secs(1),
+                })
+            });
+            let requested_at = Instant::now() - Duration::from_secs(2);
+            state.outstanding_iwants.insert(
+                id,
+                OutstandingIwant {
+                    peer,
+                    requested_at,
+                    retry_pending: true,
+                },
+            );
+            state.deferred_iwants.push(DeferredIwant {
+                peer,
+                msg_ids: vec![id],
+                requested_at,
+            });
+        }
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic");
+            assert!(state.outstanding_iwants.is_empty());
+            assert!(state.deferred_iwants.is_empty());
+        }
+
+        let requested_at = Instant::now();
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic");
+            state.outstanding_iwants.insert(
+                id,
+                OutstandingIwant {
+                    peer,
+                    requested_at,
+                    retry_pending: true,
+                },
+            );
+            state.deferred_iwants.push(DeferredIwant {
+                peer,
+                msg_ids: vec![id],
+                requested_at,
+            });
+        }
+        pubsub.set_topic_peers(topic, vec![peer]).await;
+        pubsub.set_topic_peers(topic, Vec::new()).await;
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic");
+        assert!(state.outstanding_iwants.is_empty());
+        assert!(state.deferred_iwants.is_empty());
+    }
+
+    #[test]
+    fn deferred_iwant_batch_stays_byte_stable_after_partial_eager_delivery() {
+        let peer = test_peer_id(2);
+        let first = [0x94; 32];
+        let second = [0x95; 32];
+        let now = Instant::now();
+        let mut state = TopicState::new();
+        for msg_id in [first, second] {
+            state.outstanding_iwants.insert(
+                msg_id,
+                OutstandingIwant {
+                    peer,
+                    requested_at: now,
+                    retry_pending: true,
+                },
+            );
+        }
+        assert!(state.retain_deferred_iwant(peer, &[first, second], now));
+        let original_payload =
+            postcard::to_stdvec(&state.deferred_iwants[0].msg_ids).expect("original IWANT payload");
+
+        state.outstanding_iwants.remove(&first);
+        state.prune_deferred_iwants(now);
+        assert_eq!(state.deferred_iwants[0].msg_ids, vec![first, second]);
+        assert_eq!(
+            postcard::to_stdvec(&state.deferred_iwants[0].msg_ids).expect("retry IWANT payload"),
+            original_payload,
+            "partial EAGER delivery must not change the signed retry frame or escrow key"
+        );
+    }
+
+    #[test]
+    fn deferred_iwant_retained_id_bound_preserves_existing_owner() {
+        let peer = test_peer_id(2);
+        let other = test_peer_id(3);
+        let now = Instant::now();
+        let mut state = TopicState::new();
+        let ids = (0..MAX_DEFERRED_IWANT_IDS)
+            .map(|index| {
+                let mut id = [0_u8; 32];
+                id[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+                state.outstanding_iwants.insert(
+                    id,
+                    OutstandingIwant {
+                        peer,
+                        requested_at: now,
+                        retry_pending: true,
+                    },
+                );
+                id
+            })
+            .collect::<Vec<_>>();
+        assert!(state.retain_deferred_iwant(peer, &ids, now));
+        let overflow = [0xff; 32];
+        state.outstanding_iwants.insert(
+            overflow,
+            OutstandingIwant {
+                peer: other,
+                requested_at: now,
+                retry_pending: true,
+            },
+        );
+        assert!(!state.retain_deferred_iwant(other, &[overflow], now));
+        assert_eq!(state.deferred_iwants.len(), 1);
+        assert_eq!(state.deferred_iwants[0].peer, peer);
+        assert!(state.outstanding_iwants.contains_key(&ids[0]));
+    }
+
+    #[tokio::test]
+    async fn sent_outstanding_iwants_expire_and_release_full_topic_capacity() {
+        let peer = test_peer_id(2);
+        let base = Instant::now();
+        let mut state = TopicState::with_cache_config(PubSubCacheConfig {
+            max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+            max_bytes_per_topic: 64 * 1024,
+            max_age: Duration::from_secs(1),
+        });
+        for index in 0..MAX_IHAVE_BATCH_SIZE {
+            let mut id = [0_u8; 32];
+            id[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+            state.outstanding_iwants.insert(
+                id,
+                OutstandingIwant {
+                    peer,
+                    requested_at: base,
+                    retry_pending: false,
+                },
+            );
+        }
+        state.prune_deferred_iwants(base + Duration::from_millis(999));
+        assert_eq!(state.outstanding_iwants.len(), MAX_IHAVE_BATCH_SIZE);
+
+        state.prune_deferred_iwants(base + Duration::from_millis(1_001));
+        assert!(state.outstanding_iwants.is_empty());
+        let fresh = [0xfe; 32];
+        assert!(state.outstanding_iwants.len() < MAX_IHAVE_BATCH_SIZE);
+        state.outstanding_iwants.insert(
+            fresh,
+            OutstandingIwant {
+                peer,
+                requested_at: base + Duration::from_millis(1_001),
+                retry_pending: false,
+            },
+        );
+        assert!(state.outstanding_iwants.contains_key(&fresh));
+
+        let local = test_peer_id(1);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control_and_cache_config(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+            PubSubCacheConfig {
+                max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+                max_bytes_per_topic: 64 * 1024,
+                max_age: Duration::from_secs(1),
+            },
+        );
+        let topic = TopicId::new([0xfc; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            for index in 0..MAX_IHAVE_BATCH_SIZE {
+                let mut id = [0_u8; 32];
+                id[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+                state.outstanding_iwants.insert(
+                    id,
+                    OutstandingIwant {
+                        peer,
+                        requested_at: Instant::now() - Duration::from_secs(2),
+                        retry_pending: false,
+                    },
+                );
+            }
+        }
+        pubsub
+            .handle_ihave(peer, topic, vec![fresh])
+            .await
+            .expect("fresh IHAVE reclaims expired capacity");
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::IWant)
+                .len(),
+            1
+        );
+        assert!(pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .expect("topic")
+            .outstanding_iwants
+            .contains_key(&fresh));
+    }
+
+    #[test]
+    fn deferred_iwant_attempts_do_not_extend_cache_age_expiry() {
+        let peer = test_peer_id(2);
+        let id = [0xfd; 32];
+        let base = Instant::now();
+        let mut state = TopicState::with_cache_config(PubSubCacheConfig {
+            max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+            max_bytes_per_topic: 64 * 1024,
+            max_age: Duration::from_secs(1),
+        });
+        state.outstanding_iwants.insert(
+            id,
+            OutstandingIwant {
+                peer,
+                requested_at: base,
+                retry_pending: true,
+            },
+        );
+        assert!(state.retain_deferred_iwant(peer, &[id], base));
+
+        state.prune_deferred_iwants(base + Duration::from_millis(500));
+        assert_eq!(
+            state
+                .outstanding_iwants
+                .get(&id)
+                .map(|entry| entry.requested_at),
+            Some(base),
+            "deferred retry scans must not renew the response window"
+        );
+        state.prune_deferred_iwants(base + Duration::from_millis(1_001));
+        assert!(state.outstanding_iwants.is_empty());
+        assert!(state.deferred_iwants.is_empty());
+    }
+
+    fn signed_control_frame(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        kind: MessageKind,
+        payload: Bytes,
+    ) -> Bytes {
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id: [0x55; 32],
+            kind,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(payload.as_ref()));
+        postcard::to_stdvec(&GossipMessage {
+            signature: pubsub.sign_message(&header),
+            public_key: pubsub.signing_key.public_key().to_vec(),
+            header,
+            payload: Some(payload),
+        })
+        .expect("control frame")
+        .into()
+    }
+
+    #[tokio::test]
+    async fn local_origin_iwant_filters_mixed_cache_at_reply_lookup() {
+        let local = test_peer_id(1);
+        let requester = test_peer_id(2);
+        let topic = TopicId::new([0x71; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![requester]);
+        let pubsub = PlumtreePubSub::new(local, transport.clone(), test_signing_key());
+        let local_payload = Bytes::from_static(b"locally-published");
+        let local_id = pubsub.calculate_msg_id(&topic, &local_payload);
+        pubsub
+            .publish_local(topic, local_payload.clone())
+            .await
+            .expect("local publish");
+        let remote_id = [0x72; 32];
+        let dropped_id = [0x73; 32];
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("local topic");
+            state.cache_message(
+                remote_id,
+                Bytes::from_static(b"remote"),
+                test_header(topic, remote_id),
+                false,
+            );
+            state.cache_message(
+                dropped_id,
+                Bytes::from_static(b"dropped-local"),
+                test_header(topic, dropped_id),
+                true,
+            );
+            state.mark_message_dropped(&dropped_id);
+        }
+        assert_eq!(
+            pubsub.locally_originated_cached_topic_ids().await,
+            vec![topic]
+        );
+
+        let requested = vec![remote_id, local_id, [0x74; 32], dropped_id];
+        let payload: Bytes = postcard::to_stdvec(&requested).expect("IWANT ids").into();
+        let frame = signed_control_frame(&pubsub, topic, MessageKind::IWant, payload);
+        assert!(pubsub
+            .handle_local_origin_iwant(requester, frame)
+            .await
+            .expect("verified local-only IWANT"));
+        let eager = transport.sent_messages_of_kind_to(requester, MessageKind::Eager);
+        assert_eq!(eager.len(), 1);
+        assert_eq!(eager[0].header.msg_id, local_id);
+        assert_eq!(eager[0].payload.as_ref(), Some(&local_payload));
+
+        let remote_only: Bytes = postcard::to_stdvec(&vec![remote_id])
+            .expect("remote IWANT")
+            .into();
+        let before_remote_only = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("local topic");
+            (
+                state.message_cache.len(),
+                state.eager_peers.clone(),
+                state.lazy_peers.clone(),
+                state.peer_scores.len(),
+                state.peer_cooling.len(),
+                state.last_activity,
+            )
+        };
+        assert!(!pubsub
+            .handle_local_origin_iwant(
+                requester,
+                signed_control_frame(&pubsub, topic, MessageKind::IWant, remote_only),
+            )
+            .await
+            .expect("valid remote-only IWANT"));
+        assert_eq!(
+            transport
+                .sent_messages_of_kind_to(requester, MessageKind::Eager)
+                .len(),
+            1,
+            "remote cache entry must never be served by the local-only entry point"
+        );
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("local topic");
+        assert_eq!(state.message_cache.len(), before_remote_only.0);
+        assert_eq!(state.eager_peers, before_remote_only.1);
+        assert_eq!(state.lazy_peers, before_remote_only.2);
+        assert_eq!(state.peer_scores.len(), before_remote_only.3);
+        assert_eq!(state.peer_cooling.len(), before_remote_only.4);
+        assert_eq!(state.last_activity, before_remote_only.5);
+    }
+
+    #[tokio::test]
+    async fn local_origin_iwant_unknown_topic_is_read_only() {
+        let local = test_peer_id(1);
+        let requester = test_peer_id(2);
+        let topic = TopicId::new([0x7c; 32]);
+        let transport = RecordingTransport::new(local);
+        let pubsub = PlumtreePubSub::new(local, transport.clone(), test_signing_key());
+        let payload: Bytes = postcard::to_stdvec(&vec![[0x7d; 32]])
+            .expect("unknown id")
+            .into();
+        assert_eq!(pubsub.topics.topic_count().await, 0);
+        assert!(!pubsub
+            .handle_local_origin_iwant(
+                requester,
+                signed_control_frame(&pubsub, topic, MessageKind::IWant, payload),
+            )
+            .await
+            .expect("valid unknown-topic IWANT"));
+        assert_eq!(pubsub.topics.topic_count().await, 0);
+        assert!(transport.sent_frames().is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_eager_peer_receives_local_only_ihave_and_pull_path() {
+        let publisher_id = test_peer_id(1);
+        let receiver_id = test_peer_id(2);
+        let topic = TopicId::new([0x7e; 32]);
+        let publisher_transport = RecordingTransport::new(publisher_id);
+        publisher_transport.set_connected_peer_ids(vec![receiver_id]);
+        let publisher = PlumtreePubSub::new_with_task_control(
+            publisher_id,
+            publisher_transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let payload = Bytes::from_static(b"late-local-history");
+        let local_id = publisher.calculate_msg_id(&topic, &payload);
+        publisher
+            .publish_local(topic, payload.clone())
+            .await
+            .expect("cache local history");
+        {
+            let mut topics = publisher.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("published topic");
+            state.pending_ihave.clear();
+            let remote_id = [0x7f; 32];
+            state.cache_message(
+                remote_id,
+                Bytes::from_static(b"remote-cache"),
+                test_header(topic, remote_id),
+                false,
+            );
+            let dropped_id = [0x80; 32];
+            state.cache_message(
+                dropped_id,
+                Bytes::from_static(b"dropped-local"),
+                test_header(topic, dropped_id),
+                true,
+            );
+            state.mark_message_dropped(&dropped_id);
+        }
+
+        publisher.set_topic_peers(topic, vec![receiver_id]).await;
+        {
+            let topics = publisher.topics.read_topic(&topic).await;
+            assert!(topics
+                .get(&topic)
+                .expect("topic")
+                .eager_peers
+                .contains(&receiver_id));
+        }
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &publisher.topics,
+            &publisher.transport,
+            &publisher.signing_key,
+            &publisher.stage_stats,
+            &publisher.outbound_budgets,
+            &publisher.send_path_context(),
+            &publisher.egress_limiter,
+        )
+        .await;
+        let ihaves = publisher_transport.sent_frames_of_kind_to(receiver_id, MessageKind::IHave);
+        assert_eq!(ihaves.len(), 1, "late peer receives one targeted offer");
+        let offered: GossipMessage = postcard::from_bytes(&ihaves[0]).expect("signed IHAVE");
+        let ids: Vec<MessageIdType> =
+            postcard::from_bytes(offered.payload.as_deref().expect("IHAVE payload"))
+                .expect("IHAVE ids");
+        assert_eq!(
+            ids,
+            vec![local_id],
+            "remote and dropped cache ids stay private"
+        );
+
+        let receiver_transport = RecordingTransport::new(receiver_id);
+        receiver_transport.set_connected_peer_ids(vec![publisher_id]);
+        let receiver = PlumtreePubSub::new_with_task_control(
+            receiver_id,
+            receiver_transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let mut subscription = receiver.subscribe(topic);
+        receiver
+            .dispatch_message(publisher_id, None, ihaves[0].clone())
+            .await
+            .expect("receiver handles signed IHAVE");
+        let iwants = receiver_transport.sent_frames_of_kind_to(publisher_id, MessageKind::IWant);
+        assert_eq!(iwants.len(), 1);
+        let eager_len = {
+            let mut topics = publisher.topics.write_topic(&topic).await;
+            let cached = topics
+                .get_mut(&topic)
+                .expect("topic")
+                .get_local_origin_message(&local_id)
+                .expect("local cached message");
+            postcard::to_stdvec(&GossipMessage {
+                signature: publisher.sign_message(&cached.header),
+                public_key: publisher.signing_key.public_key().to_vec(),
+                header: cached.header,
+                payload: Some(cached.payload),
+            })
+            .expect("EAGER frame")
+            .len()
+        };
+        assert!(publisher.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: u64::try_from(eager_len).expect("frame size"),
+            max_serialized_frame_bytes: eager_len,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let drain = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
+            topic,
+            receiver_id,
+            "EAGER",
+            b"consume-reply-burst",
+        );
+        let _charged = publisher
+            .egress_limiter
+            .reserve_critical_eager(drain, eager_len, Duration::from_secs(1))
+            .await
+            .expect("competing Critical frame consumes reply burst");
+        // #504 opt-in policy: the payload being pulled is this node's OWN
+        // message, so the byte budget may not shed the reply even though the
+        // bucket above is exhausted. This stage used to assert the opposite
+        // (deferral into `deferred_eager_replies`, then a retry on the next
+        // flush); protecting local origin makes that unreachable here. The
+        // subject of the test — the late peer receives the local-only message
+        // through the restricted pull path, charged exactly once — is kept.
+        assert!(publisher
+            .handle_local_origin_iwant(receiver_id, iwants[0].clone())
+            .await
+            .expect("restricted pull of a local-origin payload is served"));
+        {
+            let topics = publisher.topics.read_topic(&topic).await;
+            let replies = &topics.get(&topic).expect("topic").deferred_eager_replies;
+            assert!(
+                replies.is_empty(),
+                "a protected local-origin reply is sent, so nothing enters custody"
+            );
+        }
+        let eager = publisher_transport.sent_messages_of_kind_to(receiver_id, MessageKind::Eager);
+        assert_eq!(eager.len(), 1);
+        assert_eq!(eager[0].payload.as_ref(), Some(&payload));
+        let eager_after_retry = publisher
+            .leaf_egress_snapshot()
+            .by_topic_and_purpose
+            .into_iter()
+            .find(|row| row.topic == topic.to_bytes() && row.purpose == "EAGER")
+            .expect("EAGER byte accounting");
+        assert_eq!(
+            eager_after_retry.sent_bytes,
+            u64::try_from(eager_len).expect("frame size"),
+            "the protected reply is charged exactly once"
+        );
+        let eager_frame = publisher_transport
+            .sent_frames_of_kind_to(receiver_id, MessageKind::Eager)
+            .into_iter()
+            .next()
+            .expect("retried EAGER frame");
+        receiver
+            .dispatch_message(publisher_id, None, eager_frame)
+            .await
+            .expect("receiver handles retried EAGER");
+        let (delivered_from, delivered_payload) =
+            tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+                .await
+                .expect("subscriber delivery deadline")
+                .expect("subscription remains live");
+        assert_eq!(delivered_from, publisher_id);
+        assert_eq!(delivered_payload, payload);
+
+        // The first successful flush advances the cursor. The next scan proves
+        // it complete and removes it; unchanged membership cannot re-add it.
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &publisher.topics,
+            &publisher.transport,
+            &publisher.signing_key,
+            &publisher.stage_stats,
+            &publisher.outbound_budgets,
+            &publisher.send_path_context(),
+            &publisher.egress_limiter,
+        )
+        .await;
+        publisher.set_topic_peers(topic, vec![receiver_id]).await;
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &publisher.topics,
+            &publisher.transport,
+            &publisher.signing_key,
+            &publisher.stage_stats,
+            &publisher.outbound_budgets,
+            &publisher.send_path_context(),
+            &publisher.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            publisher_transport
+                .sent_frames_of_kind_to(receiver_id, MessageKind::IHave)
+                .len(),
+            1,
+            "repeated peer refresh must not resend completed history"
+        );
+        assert_eq!(
+            publisher_transport
+                .sent_frames_of_kind_to(receiver_id, MessageKind::Eager)
+                .len(),
+            1,
+            "successful reply retry retires custody"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_local_offer_disconnect_and_cache_expiry_remove_custody() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x81; 32]);
+        let transport = RecordingTransport::new(local);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(local, transport, test_signing_key(), false);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(|| {
+                TopicState::with_cache_config(PubSubCacheConfig {
+                    max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+                    max_bytes_per_topic: 64 * 1024,
+                    max_age: Duration::from_secs(1),
+                })
+            });
+            let id = [0x82; 32];
+            state.message_cache.insert_at(
+                id,
+                CachedMessage {
+                    payload: Bytes::from_static(b"expired-local"),
+                    header: test_header(topic, id),
+                    dropped: false,
+                    local_origin: true,
+                    inner_proof: None,
+                },
+                Instant::now() - Duration::from_secs(2),
+            );
+            state.late_local_offers.insert(
+                peer,
+                LateLocalOffer {
+                    cutoff: Instant::now(),
+                    cursor: None,
+                },
+            );
+            assert!(state.late_local_offer_batch(peer, Instant::now()).is_none());
+            assert!(state.late_local_offers.is_empty());
+            state.cache_message(
+                [0x83; 32],
+                Bytes::from_static(b"live"),
+                test_header(topic, [0x83; 32]),
+                true,
+            );
+        }
+        pubsub.set_topic_peers(topic, vec![peer]).await;
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            assert!(topics
+                .get(&topic)
+                .expect("topic")
+                .late_local_offers
+                .contains_key(&peer));
+        }
+        pubsub.set_topic_peers(topic, Vec::new()).await;
+        let topics = pubsub.topics.read_topic(&topic).await;
+        assert!(topics
+            .get(&topic)
+            .expect("topic")
+            .late_local_offers
+            .is_empty());
+    }
+
+    /// WHY: `late_local_offers` is a per-peer pagination cursor. Every other
+    /// per-peer custody map in `TopicState` is capped and age-pruned because
+    /// an uncapped one grows with peer *churn* rather than with outstanding
+    /// work — the "record outlives the connection" shape that has bitten this
+    /// codebase before. Without the cap this map grows one entry per peer that
+    /// ever asked, for the life of the topic.
+    ///
+    /// Polls the map itself, not a meter: a meter can be right while the map
+    /// leaks.
+    #[test]
+    fn late_local_offers_stay_bounded_under_peer_churn() {
+        let topic = TopicId::new([0x4d; 32]);
+        let mut state = TopicState::new();
+        let now = Instant::now();
+        state.cache_message(
+            [0x01; 32],
+            Bytes::from_static(b"local"),
+            test_header(topic, [0x01; 32]),
+            true,
+        );
+
+        // Far more distinct peers than the cap, as continuous churn would.
+        for index in 0..(MAX_LATE_LOCAL_OFFERS * 4) {
+            let mut raw = [0_u8; 32];
+            raw[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            state.queue_late_local_offer(PeerId::new(raw), now);
+        }
+        assert!(
+            state.late_local_offers.len() <= MAX_LATE_LOCAL_OFFERS,
+            "peer churn must not grow the offer map without bound: {} entries",
+            state.late_local_offers.len()
+        );
+
+        // An offer whose cutoff has aged past the cache it pages over can
+        // never yield another batch, so it must not be retained either.
+        let aged = now + state.message_cache.max_age + Duration::from_secs(1);
+        state.prune_late_local_offers(aged);
+        assert!(
+            state.late_local_offers.is_empty(),
+            "offers older than the cache they page over must be evicted"
+        );
+    }
+
+    /// WHY: two pulls for the same delivery share one custody entry, so a
+    /// requester that retries cannot multiply the retained replies. The
+    /// authority-ordering half of this test went away with
+    /// `DeferredEagerReply::local_origin_only`: a local-origin reply is
+    /// protected from shedding and so never reaches custody, leaving nothing
+    /// for the two orderings to merge.
+    #[test]
+    fn deferred_eager_reply_deduplicates_repeat_requests() {
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x8f; 32]);
+        let msg_id = [0x90; 32];
+        let now = Instant::now();
+        let mut state = TopicState::new();
+        state.cache_message(
+            msg_id,
+            Bytes::from_static(b"relayed"),
+            test_header(topic, msg_id),
+            false,
+        );
+        for _ in 0..2 {
+            assert!(state.retain_deferred_eager_reply(peer, msg_id, now));
+        }
+        assert_eq!(state.deferred_eager_replies.len(), 1);
+    }
+
+    #[test]
+    fn deferred_eager_reply_custody_is_bounded_and_cache_authorized() {
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x91; 32]);
+        let now = Instant::now();
+        let mut state = TopicState::with_cache_config(PubSubCacheConfig {
+            max_messages_per_topic: NonZeroUsize::new(MAX_DEFERRED_EAGER_REPLIES + 2)
+                .expect("nonzero"),
+            max_bytes_per_topic: (b"overflow".len()
+                + MESSAGE_HEADER_OVERHEAD_BYTES
+                + MESSAGE_CRYPTO_OVERHEAD_BYTES)
+                * (MAX_DEFERRED_EAGER_REPLIES + 2),
+            max_age: Duration::from_secs(1),
+        });
+        for index in 0..MAX_DEFERRED_EAGER_REPLIES {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&u64::try_from(index).expect("bounded index").to_le_bytes());
+            state.cache_message(
+                id,
+                Bytes::from_static(b"local"),
+                test_header(topic, id),
+                true,
+            );
+            assert!(state.retain_deferred_eager_reply(peer, id, now));
+        }
+        let overflow = [0xfe; 32];
+        state.cache_message(
+            overflow,
+            Bytes::from_static(b"overflow"),
+            test_header(topic, overflow),
+            true,
+        );
+        assert_eq!(state.message_cache.len(), MAX_DEFERRED_EAGER_REPLIES + 1);
+        assert!(!state.retain_deferred_eager_reply(peer, overflow, now));
+        assert_eq!(
+            state.deferred_eager_replies.len(),
+            MAX_DEFERRED_EAGER_REPLIES
+        );
+
+        state.prune_deferred_eager_replies(now + Duration::from_millis(999));
+        assert_eq!(
+            state.deferred_eager_replies.len(),
+            MAX_DEFERRED_EAGER_REPLIES
+        );
+        state.prune_deferred_eager_replies(now + Duration::from_millis(1_001));
+        assert!(state.deferred_eager_replies.is_empty());
+
+        // A relay entry whose cache message is still live is retained; pruning
+        // is authorized by the cache, not by provenance. (This previously
+        // asserted the opposite for a `local_origin_only` entry — that filter
+        // went away with the flag, since a local-origin reply is protected and
+        // never reaches custody.)
+        let remote = [0xfd; 32];
+        state.cache_message(
+            remote,
+            Bytes::from_static(b"remote"),
+            test_header(topic, remote),
+            false,
+        );
+        assert!(state.retain_deferred_eager_reply(peer, remote, Instant::now()));
+        state.prune_deferred_eager_replies(Instant::now());
+        assert_eq!(
+            state.deferred_eager_replies.len(),
+            1,
+            "a live relay cache entry keeps its custody"
+        );
+    }
+
+    #[tokio::test]
+    /// The rejected classes are *cache* invalidity — dropped and expired — and
+    /// a disconnected peer. A remote-origin entry used to be a third class,
+    /// rejected by the `local_origin_only` serve-side filter; that filter went
+    /// away with the flag, and a live relay entry is now exactly what this
+    /// custody legitimately serves.
+    async fn deferred_eager_reply_flush_rejects_invalid_cache_and_disconnects() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x92; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let now = Instant::now();
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(|| {
+                TopicState::with_cache_config(PubSubCacheConfig {
+                    max_messages_per_topic: NonZeroUsize::new(8).expect("nonzero"),
+                    max_bytes_per_topic: 64 * 1024,
+                    max_age: Duration::from_secs(1),
+                })
+            });
+            let dropped = [0x93; 32];
+            state.cache_message(
+                dropped,
+                Bytes::from_static(b"dropped"),
+                test_header(topic, dropped),
+                true,
+            );
+            state.mark_message_dropped(&dropped);
+            let expired = [0x95; 32];
+            state.message_cache.insert_at(
+                expired,
+                CachedMessage {
+                    payload: Bytes::from_static(b"expired"),
+                    header: test_header(topic, expired),
+                    dropped: false,
+                    local_origin: true,
+                    inner_proof: None,
+                },
+                now - Duration::from_secs(2),
+            );
+            state.deferred_eager_replies.extend([
+                DeferredEagerReply {
+                    peer,
+                    msg_id: dropped,
+                    requested_at: now,
+                },
+                DeferredEagerReply {
+                    peer,
+                    msg_id: expired,
+                    requested_at: now,
+                },
+            ]);
+        }
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert!(transport.sent_frames().is_empty());
+        assert!(pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .expect("topic")
+            .deferred_eager_replies
+            .is_empty());
+
+        let live = [0x96; 32];
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic");
+            state.cache_message(
+                live,
+                Bytes::from_static(b"live"),
+                test_header(topic, live),
+                true,
+            );
+            assert!(state.retain_deferred_eager_reply(peer, live, Instant::now()));
+        }
+        pubsub.set_topic_peers(topic, vec![peer]).await;
+        pubsub.set_topic_peers(topic, Vec::new()).await;
+        assert!(pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .expect("topic")
+            .deferred_eager_replies
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_eager_reply_success_marks_stranded_pull_served() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x97; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let payload = Bytes::from_static(b"stranded-pull-reply");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            state.cache_message(msg_id, payload, test_header(topic, msg_id), true);
+            state.queue_stranded_ihave(msg_id, &[peer]);
+            assert!(state.retain_deferred_eager_reply(peer, msg_id, Instant::now()));
+        }
+
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len(),
+            1
+        );
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic");
+        assert!(state.deferred_eager_replies.is_empty());
+        assert!(
+            state.stranded_ihave_targets_for(&[msg_id]).is_empty(),
+            "a successful pull reply excludes the peer from later stranded EAGER retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_local_offer_survives_leaf_budget_deferral_then_sends_once() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let topic = TopicId::new([0x84; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let payload = Bytes::from_static(b"deferred-late-history");
+        let id = pubsub.calculate_msg_id(&topic, &payload);
+        pubsub
+            .publish_local(topic, payload)
+            .await
+            .expect("cache local history");
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics.get_mut(&topic).expect("topic").pending_ihave.clear();
+        }
+        pubsub.set_topic_peers(topic, vec![peer]).await;
+
+        let ihave_payload: Bytes = postcard::to_stdvec(&vec![id]).expect("ids").into();
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id: id,
+            kind: MessageKind::IHave,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(ihave_payload.as_ref()));
+        let frame_len = postcard::to_stdvec(&GossipMessage {
+            signature: pubsub.sign_message(&header),
+            public_key: pubsub.signing_key.public_key().to_vec(),
+            header,
+            payload: Some(ihave_payload),
+        })
+        .expect("IHAVE frame")
+        .len();
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: u64::try_from(frame_len).expect("frame size"),
+            burst_bytes: u64::try_from(frame_len).expect("frame size"),
+            max_serialized_frame_bytes: frame_len,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let drain = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
+            topic,
+            peer,
+            "EAGER",
+            b"drain-late-offer",
+        );
+        let _competing_charge = pubsub
+            .egress_limiter
+            .reserve_critical_eager(drain, frame_len, Duration::from_secs(1))
+            .await
+            .expect("competing Critical EAGER consumes the bounded burst");
+
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        // #504 opt-in policy: a late-local-offer page advertises only messages
+        // this node authored (`late_local_offer_batch` filters on
+        // `local_origin`), so the byte budget may not shed it even with the
+        // burst consumed. This stage used to assert a deferral here and a send
+        // on the next flush; the surviving subject is that the offer is sent
+        // exactly once and its cursor then completes.
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::IHave)
+                .len(),
+            1,
+            "a protected local-origin offer is sent despite the exhausted burst"
+        );
+        let purpose = pubsub
+            .leaf_egress_snapshot()
+            .by_topic_and_purpose
+            .into_iter()
+            .find(|row| row.topic == topic.to_bytes() && row.purpose == "IHAVE")
+            .expect("IHAVE accounting");
+        assert_eq!(
+            purpose.sent_bytes,
+            u64::try_from(frame_len).expect("frame size"),
+            "charged exactly once"
+        );
+        assert_eq!(
+            pubsub.leaf_egress_snapshot().invariant_violations,
+            0,
+            "the protected offer carries a real reservation"
+        );
+
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::IHave)
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn local_origin_iwant_rejects_non_iwant_and_malformed_frames() {
+        let local = test_peer_id(1);
+        let requester = test_peer_id(2);
+        let topic = TopicId::new([0x75; 32]);
+        let transport = RecordingTransport::new(local);
+        let pubsub = PlumtreePubSub::new(local, transport, test_signing_key());
+        let ids: Bytes = postcard::to_stdvec(&vec![[0x76; 32]]).expect("ids").into();
+        assert!(pubsub
+            .handle_local_origin_iwant(
+                requester,
+                signed_control_frame(&pubsub, topic, MessageKind::IHave, ids),
+            )
+            .await
+            .is_err());
+        let mut trailing = signed_control_frame(
+            &pubsub,
+            topic,
+            MessageKind::IWant,
+            postcard::to_stdvec(&vec![[0x76; 32]]).expect("ids").into(),
+        )
+        .to_vec();
+        trailing.push(0);
+        assert!(pubsub
+            .handle_local_origin_iwant(requester, trailing.into())
+            .await
+            .is_err());
+        assert!(pubsub
+            .handle_local_origin_iwant(requester, Bytes::from_static(b"malformed"))
+            .await
+            .is_err());
+        assert!(pubsub
+            .handle_local_origin_iwant(
+                requester,
+                signed_control_frame(
+                    &pubsub,
+                    topic,
+                    MessageKind::IWant,
+                    Bytes::from_static(b"bad-id-vector"),
+                ),
+            )
+            .await
+            .is_err());
+        let valid_payload: Bytes = postcard::to_stdvec(&vec![[0x76; 32]]).expect("ids").into();
+        let valid = signed_control_frame(&pubsub, topic, MessageKind::IWant, valid_payload);
+        let mut invalid: GossipMessage = postcard::from_bytes(&valid).expect("signed frame");
+        invalid.signature[0] ^= 1;
+        assert!(pubsub
+            .handle_local_origin_iwant(
+                requester,
+                postcard::to_stdvec(&invalid)
+                    .expect("invalid signature frame")
+                    .into(),
+            )
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn local_origin_custody_survives_echo_but_never_elevates_remote_cache() {
+        let topic = TopicId::new([0x77; 32]);
+        let id = [0x78; 32];
+        let mut state = TopicState::new();
+        state.cache_message(
+            id,
+            Bytes::from_static(b"remote-first"),
+            test_header(topic, id),
+            false,
+        );
+        assert!(!state.get_message(&id).expect("remote entry").local_origin);
+        state.cache_message(
+            id,
+            Bytes::from_static(b"local"),
+            test_header(topic, id),
+            true,
+        );
+        let local_proof = compat::VerifiedInner {
+            author: test_peer_id(3),
+            digest: [0x79; 32],
+            revision: 7,
+        };
+        state.set_inner_proof(id, Some(local_proof.clone()));
+        let inbound_proof = compat::VerifiedInner {
+            author: test_peer_id(4),
+            digest: [0x7a; 32],
+            revision: 8,
+        };
+        if state.cache_message(
+            id,
+            Bytes::from_static(b"wire-echo"),
+            test_header(topic, id),
+            false,
+        ) {
+            state.set_inner_proof(id, Some(inbound_proof));
+        }
+        let cached = state.get_message(&id).expect("promoted local entry");
+        assert!(cached.local_origin);
+        assert_eq!(cached.payload, Bytes::from_static(b"local"));
+        assert_eq!(cached.inner_proof, Some(local_proof));
+    }
+
+    #[test]
+    fn local_origin_query_excludes_dropped_and_expired_entries() {
+        let topic = TopicId::new([0x79; 32]);
+        let dropped_id = [0x7a; 32];
+        let expired_id = [0x7b; 32];
+        let mut state = TopicState::with_cache_config(PubSubCacheConfig {
+            max_messages_per_topic: NonZeroUsize::new(4).expect("nonzero"),
+            max_bytes_per_topic: 64 * 1024,
+            max_age: Duration::from_secs(1),
+        });
+        state.cache_message(
+            dropped_id,
+            Bytes::from_static(b"dropped"),
+            test_header(topic, dropped_id),
+            true,
+        );
+        state.mark_message_dropped(&dropped_id);
+        state.message_cache.insert_at(
+            expired_id,
+            CachedMessage {
+                payload: Bytes::from_static(b"expired"),
+                header: test_header(topic, expired_id),
+                dropped: false,
+                local_origin: true,
+                inner_proof: None,
+            },
+            Instant::now() - Duration::from_secs(2),
+        );
+        assert!(!state.has_live_local_origin());
+        assert!(!state.message_cache.contains(&expired_id));
+    }
+
+    #[tokio::test]
+    async fn leaf_recovery_reservation_reaches_real_transport_send_seam() {
+        let local = test_peer_id(1);
+        let remote = test_peer_id(2);
+        let topic = TopicId::new([9u8; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![remote]);
+        let pubsub = PlumtreePubSub::new(local, transport.clone(), test_signing_key());
+        pubsub.initialize_topic_peers(topic, vec![remote]).await;
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1_000_000,
+            burst_bytes: 4096,
+            max_serialized_frame_bytes: 4096,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let drain_key = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
+            topic, remote, "EAGER", b"drain",
+        );
+        assert!(pubsub
+            .egress_limiter
+            .try_reserve_data(drain_key, 3072, false)
+            .is_ok());
+
+        let frame = Bytes::from(vec![7; 1536]);
+        let outcome = pubsub
+            .send_to_peer_bounded_outcome(
+                topic,
+                remote,
+                GossipStreamType::PubSub,
+                frame.clone(),
+                "IWANT",
+                false,
+            )
+            .await
+            .expect("bounded recovery send");
+        assert!(matches!(outcome, PeerSendOutcome::Sent { .. }));
+        assert_eq!(transport.send_count_to(remote), 1);
+        assert_eq!(transport.sent_frames()[0].2, frame);
+        let snapshot = pubsub.leaf_egress_snapshot();
+        let purpose = snapshot
+            .by_topic_and_purpose
+            .iter()
+            .find(|row| row.topic == topic.to_bytes() && row.purpose == "IWANT")
+            .expect("IWANT accounting");
+        assert_eq!(purpose.demanded_bytes, 1536);
+        assert_eq!(purpose.charged_bytes, 1536);
+        assert_eq!(purpose.sent_bytes, 1536);
+        assert_eq!(purpose.send_failures, 0);
     }
 
     #[tokio::test]
@@ -16394,7 +21053,7 @@ mod tests {
                 hop: 0,
                 ttl: 10,
             };
-            state.cache_message(msg_id, Bytes::from(vec![i as u8]), header);
+            state.cache_message(msg_id, Bytes::from(vec![i as u8]), header, false);
         }
 
         assert_eq!(
@@ -16494,7 +21153,7 @@ mod tests {
                 hop: 0,
                 ttl: 10,
             };
-            state.cache_message(known_msg_id, Bytes::from_static(b"known"), header);
+            state.cache_message(known_msg_id, Bytes::from_static(b"known"), header, false);
             state.last_activity = old_activity;
         }
 
@@ -17259,11 +21918,12 @@ mod tests {
     #[tokio::test]
     async fn test_ihave_iwant_eager_flow_updates_scores() {
         let peer_id = test_peer_id(1);
-        let transport = test_transport().await;
+        let transport = RecordingTransport::new(peer_id);
         let signing_key = test_signing_key();
-        let pubsub = PlumtreePubSub::new(peer_id, transport, signing_key.clone());
+        let pubsub = PlumtreePubSub::new(peer_id, transport.clone(), signing_key.clone());
         let topic = TopicId::new([1u8; 32]);
         let from_peer = test_peer_id(2);
+        transport.set_connected_peer_ids(vec![from_peer]);
 
         let unknown_msg_id = [42u8; 32];
 
@@ -17271,7 +21931,12 @@ mod tests {
         pubsub
             .handle_ihave(from_peer, topic, vec![unknown_msg_id])
             .await
-            .ok();
+            .expect("IHAVE handling");
+        assert_eq!(
+            transport.send_count_to(from_peer),
+            1,
+            "the IWANT must reach the successful transport seam"
+        );
 
         // Verify IWANT request was tracked in score
         {
@@ -19753,6 +24418,7 @@ mod tests {
                 &pubsub.stage_stats,
                 &pubsub.outbound_budgets,
                 &pubsub.send_path_context(),
+                &pubsub.egress_limiter,
             )
             .await;
             for peer in [eager, lazy] {
@@ -19878,6 +24544,7 @@ mod tests {
                 &node_b.stage_stats,
                 &node_b.outbound_budgets,
                 &node_b.send_path_context(),
+                &node_b.egress_limiter,
             )
             .await;
             let b_mid = node_b.stage_stats();

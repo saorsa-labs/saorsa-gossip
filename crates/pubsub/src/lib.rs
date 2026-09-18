@@ -3594,6 +3594,9 @@ struct DeferredEagerReply {
 
 const MAX_DEFERRED_IWANT_IDS: usize = MAX_IHAVE_BATCH_SIZE;
 const MAX_DEFERRED_EAGER_REPLIES: usize = MAX_IHAVE_BATCH_SIZE;
+/// Per-topic cap on outstanding late-local-offer pagination cursors. One entry
+/// per peer being caught up; churn must not grow this without bound.
+const MAX_LATE_LOCAL_OFFERS: usize = MAX_IHAVE_BATCH_SIZE;
 
 struct IhaveFlushWork {
     topic: TopicId,
@@ -4181,9 +4184,30 @@ impl TopicState {
             .any(|(_, entry)| entry.message.local_origin && !entry.message.dropped)
     }
 
+    /// Drop offers older than the cache they page over.
+    ///
+    /// An offer whose cutoff has aged past `max_age` can only select messages
+    /// that are themselves already expired, so it can never produce another
+    /// batch and would otherwise sit in the map until that peer is removed —
+    /// the "record outlives the connection" shape. Mirrors the age pruning its
+    /// siblings `deferred_eager_replies` / `deferred_iwants` already do.
+    fn prune_late_local_offers(&mut self, now: Instant) {
+        let max_age = self.message_cache.max_age;
+        self.late_local_offers
+            .retain(|_, offer| now.saturating_duration_since(offer.cutoff) < max_age);
+    }
+
     fn queue_late_local_offer(&mut self, peer: PeerId, now: Instant) {
         self.message_cache.prune_expired_at(now);
+        self.prune_late_local_offers(now);
         if self.has_live_local_origin() {
+            // Bounded like every other per-peer custody map: an unbounded one
+            // grows with peer churn, not with work outstanding.
+            if self.late_local_offers.len() >= MAX_LATE_LOCAL_OFFERS
+                && !self.late_local_offers.contains_key(&peer)
+            {
+                return;
+            }
             self.late_local_offers
                 .entry(peer)
                 .or_insert(LateLocalOffer {
@@ -19770,6 +19794,49 @@ mod tests {
             .expect("topic")
             .late_local_offers
             .is_empty());
+    }
+
+    /// WHY: `late_local_offers` is a per-peer pagination cursor. Every other
+    /// per-peer custody map in `TopicState` is capped and age-pruned because
+    /// an uncapped one grows with peer *churn* rather than with outstanding
+    /// work — the "record outlives the connection" shape that has bitten this
+    /// codebase before. Without the cap this map grows one entry per peer that
+    /// ever asked, for the life of the topic.
+    ///
+    /// Polls the map itself, not a meter: a meter can be right while the map
+    /// leaks.
+    #[test]
+    fn late_local_offers_stay_bounded_under_peer_churn() {
+        let topic = TopicId::new([0x4d; 32]);
+        let mut state = TopicState::new();
+        let now = Instant::now();
+        state.cache_message(
+            [0x01; 32],
+            Bytes::from_static(b"local"),
+            test_header(topic, [0x01; 32]),
+            true,
+        );
+
+        // Far more distinct peers than the cap, as continuous churn would.
+        for index in 0..(MAX_LATE_LOCAL_OFFERS * 4) {
+            let mut raw = [0_u8; 32];
+            raw[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            state.queue_late_local_offer(PeerId::new(raw), now);
+        }
+        assert!(
+            state.late_local_offers.len() <= MAX_LATE_LOCAL_OFFERS,
+            "peer churn must not grow the offer map without bound: {} entries",
+            state.late_local_offers.len()
+        );
+
+        // An offer whose cutoff has aged past the cache it pages over can
+        // never yield another batch, so it must not be retained either.
+        let aged = now + state.message_cache.max_age + Duration::from_secs(1);
+        state.prune_late_local_offers(aged);
+        assert!(
+            state.late_local_offers.is_empty(),
+            "offers older than the cache they page over must be evicted"
+        );
     }
 
     #[test]

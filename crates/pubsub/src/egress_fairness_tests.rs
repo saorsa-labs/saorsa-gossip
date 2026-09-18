@@ -318,3 +318,101 @@ fn owner_observation_renews_lease_and_abandoned_partial_expires() {
     assert!(limiter.lock_state().ordinary_scopes.is_empty());
     assert!(limiter.lock_state().ordinary_scope_counts.is_empty());
 }
+
+/// WHY: the recovery escrow may exceed the fixed 25% floor so a frame larger
+/// than it can accumulate, but it must not be able to escrow the whole burst.
+/// `data_hard_denied` denies whenever `tokens - bytes < reserve`, so an intent
+/// whose remaining demand approaches `burst_bytes` would make that true for
+/// every data frame, for as long as it is outstanding — and since every
+/// observation renews `last_observed`, a polling owner can hold it there.
+/// The ceiling guarantees data keeps a share of the burst.
+///
+/// NOTE: this bounds the *reserve*. It does not change `charge_ready_recovery`,
+/// which still drains refilled tokens into outstanding intents; that is a
+/// separate mechanism governed by the recovery quantum and slot fairness.
+#[test]
+fn a_large_recovery_intent_cannot_zero_the_data_lane() -> Result<(), &'static str> {
+    const HARD: u64 = 131_072;
+    const BURST: u64 = 4 * 1024 * 1024;
+    let limiter = limiter(HARD, BURST);
+    let start = Instant::now();
+    // Spend the bucket so the whale below registers an intent it cannot
+    // immediately charge, which is what puts escrow into the reserve.
+    drain(&limiter, start, 512 * 1024);
+    let whale = fair_key(9, 20_000);
+    assert!(matches!(
+        limiter.try_reserve_recovery_at(whale, BURST as usize, 1, start),
+        Err(ReserveError::Deferred)
+    ));
+
+    let mut state = limiter.lock_state();
+    let config = state.config.ok_or("configured")?;
+    let outstanding = state
+        .intents
+        .get(&whale)
+        .map(|intent| intent.bytes - intent.charged)
+        .ok_or("the whale intent must be outstanding for this to be a real test")?;
+    assert!(
+        outstanding > BURST / 2,
+        "precondition: the whale escrows more than the ceiling ({outstanding})"
+    );
+
+    let reserve = LeafEgressLimiter::recovery_reserve(&state, &config);
+    assert!(
+        reserve <= BURST / 2,
+        "one intent must not escrow the whole burst: reserve {reserve} of {BURST}"
+    );
+    // Data is therefore still admissible once the bucket holds more than the
+    // capped reserve. Without the cap the reserve would be the whale's full
+    // outstanding demand and this would be denied at any bucket level.
+    state.tokens = BURST;
+    assert!(
+        !LeafEgressLimiter::data_hard_denied(&state, &config, 64 * 1024),
+        "data must be admissible once the bucket exceeds the capped reserve"
+    );
+    Ok(())
+}
+
+/// WHY: `last_observed` is renewed on every observation, so the idle-age sweep
+/// alone can never evict an intent whose owner keeps re-requesting it. The
+/// absolute lifetime is what bounds that.
+///
+/// The hard rate is 1 B/s so the intent can never finish charging and leave on
+/// its own — completion, not eviction, would otherwise be what clears it, and
+/// the test would pass with or without the fix.
+#[test]
+fn a_continuously_renewed_intent_still_ages_out() -> Result<(), &'static str> {
+    const BURST: u64 = 4 * 1024 * 1024;
+    let limiter = limiter(1, BURST);
+    let start = Instant::now();
+    drain(&limiter, start, 512 * 1024);
+    let key = fair_key(4, 30_000);
+    assert!(matches!(
+        limiter.try_reserve_recovery_at(key, BURST as usize, 1, start),
+        Err(ReserveError::Deferred)
+    ));
+    assert!(limiter.lock_state().intents.contains_key(&key));
+
+    // Re-observe well inside the idle window, so the idle sweep never fires.
+    let step = RECOVERY_INTENT_MAX_AGE / 2;
+    let mut now = start;
+    while now.duration_since(start) < RECOVERY_INTENT_MAX_LIFETIME + step {
+        now += step;
+        let _ = limiter.try_reserve_recovery_at(key, BURST as usize, 1, now);
+    }
+    // The owner is still asking, so an intent for this key still exists — but
+    // it must be a *fresh* one. Eviction at the lifetime ceiling drops the old
+    // intent and with it the escrow it had accumulated, so a polling owner
+    // cannot hold escrowed tokens for the life of the process.
+    let created_at = limiter
+        .lock_state()
+        .intents
+        .get(&key)
+        .map(|intent| intent.created_at)
+        .ok_or("the owner is still requesting, so an intent exists")?;
+    assert!(
+        created_at > start,
+        "renewal must not hold one intent, and its escrow, past the absolute lifetime"
+    );
+    Ok(())
+}

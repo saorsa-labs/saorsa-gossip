@@ -25,6 +25,11 @@ const ORDINARY_MAX_INTENTS: usize = DEFAULT_MAX_INTENTS - CRITICAL_MAX_INTENTS;
 const ORDINARY_MAX_WAITERS_PER_PEER: usize = DEFAULT_MAX_WAITERS_PER_PEER - 1;
 const MAX_PURPOSE_ROWS: usize = 1024;
 const RECOVERY_INTENT_MAX_AGE: Duration = Duration::from_secs(super::MAX_CACHE_AGE_SECS);
+/// Absolute ceiling on one intent's lifetime, independent of renewal. Without
+/// it a continuously re-observed intent renews `last_observed` on every poll
+/// and never ages out, holding its escrow indefinitely.
+const RECOVERY_INTENT_MAX_LIFETIME: Duration =
+    Duration::from_secs(super::MAX_CACHE_AGE_SECS.saturating_mul(2));
 const RECOVERY_CRITICAL_SLOTS: u8 = 7;
 const RECOVERY_TOTAL_SLOTS: u8 = RECOVERY_CRITICAL_SLOTS + 1;
 const RECOVERY_MAX_QUANTUM_BYTES: u64 = 16 * 1024;
@@ -121,6 +126,10 @@ impl std::fmt::Display for ReserveError {
 struct Intent {
     bytes: u64,
     last_observed: Instant,
+    /// When this intent first entered the map. `last_observed` is renewed on
+    /// every observation, so an owner that keeps re-requesting the same frame
+    /// can hold its escrow forever; the absolute lifetime bounds that.
+    created_at: Instant,
     order: u64,
     charged: u64,
     class: RecoveryClass,
@@ -486,6 +495,8 @@ impl LeafEgressLimiter {
             .iter()
             .filter(|(_, intent)| {
                 now.saturating_duration_since(intent.last_observed) >= RECOVERY_INTENT_MAX_AGE
+                    || now.saturating_duration_since(intent.created_at)
+                        >= RECOVERY_INTENT_MAX_LIFETIME
             })
             .map(|(key, _)| *key)
             .collect();
@@ -694,7 +705,14 @@ impl LeafEgressLimiter {
             .map_err(|_| ReserveError::WaiterLimit)?;
         {
             let mut state = self.lock_state();
-            let counts = state.waiters_by_peer.entry(peer).or_default();
+            // Read before inserting: `entry().or_default()` on the refusal
+            // path would leave a zero row behind for every peer that ever hit
+            // the limit, keyed by peer and never swept.
+            let counts = state
+                .waiters_by_peer
+                .get(&peer)
+                .copied()
+                .unwrap_or_default();
             let class_count = match class {
                 RecoveryClass::Ordinary => counts.0,
                 RecoveryClass::CriticalEager => counts.1,
@@ -706,6 +724,7 @@ impl LeafEgressLimiter {
             if class_count >= class_limit || counts.0 + counts.1 >= DEFAULT_MAX_WAITERS_PER_PEER {
                 return Err(ReserveError::WaiterLimit);
             }
+            let counts = state.waiters_by_peer.entry(peer).or_default();
             match class {
                 RecoveryClass::Ordinary => counts.0 += 1,
                 RecoveryClass::CriticalEager => counts.1 += 1,
@@ -913,29 +932,36 @@ impl LeafEgressLimiter {
                 .iter()
                 .find(|(candidate, _)| candidate.family == key.family)
                 .map(|(candidate, intent)| (*candidate, *intent));
-            let (order, last_observed, credit, preserved_scope_position) = match inherited {
-                Some((previous_key, previous)) => {
-                    state.intents.remove(&previous_key);
-                    let credit = previous.charged.min(bytes);
-                    let preserve_scope_position = previous.class == RecoveryClass::Ordinary
-                        && class == RecoveryClass::Ordinary
-                        && previous_key.scope == key.scope
-                        && previous.charged < previous.bytes
-                        && credit < bytes;
-                    if previous.class == RecoveryClass::Ordinary
-                        && previous.charged < previous.bytes
-                        && !preserve_scope_position
-                    {
-                        Self::remove_ordinary_pending(&mut state, previous_key.scope);
+            let (order, last_observed, created_at, credit, preserved_scope_position) =
+                match inherited {
+                    Some((previous_key, previous)) => {
+                        state.intents.remove(&previous_key);
+                        let credit = previous.charged.min(bytes);
+                        let preserve_scope_position = previous.class == RecoveryClass::Ordinary
+                            && class == RecoveryClass::Ordinary
+                            && previous_key.scope == key.scope
+                            && previous.charged < previous.bytes
+                            && credit < bytes;
+                        if previous.class == RecoveryClass::Ordinary
+                            && previous.charged < previous.bytes
+                            && !preserve_scope_position
+                        {
+                            Self::remove_ordinary_pending(&mut state, previous_key.scope);
+                        }
+                        (
+                            previous.order,
+                            now,
+                            previous.created_at,
+                            credit,
+                            preserve_scope_position,
+                        )
                     }
-                    (previous.order, now, credit, preserve_scope_position)
-                }
-                None => {
-                    let order = state.next_order;
-                    state.next_order = state.next_order.wrapping_add(1);
-                    (order, now, 0, false)
-                }
-            };
+                    None => {
+                        let order = state.next_order;
+                        state.next_order = state.next_order.saturating_add(1);
+                        (order, now, now, 0, false)
+                    }
+                };
             let class_count = state
                 .intents
                 .values()
@@ -954,6 +980,7 @@ impl LeafEgressLimiter {
                 Intent {
                     bytes,
                     last_observed,
+                    created_at,
                     order,
                     charged: credit,
                     class,

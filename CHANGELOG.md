@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.83] - 2026-09-18
+
+### Added
+
+- **pubsub: optional Leaf egress serialized-byte budgets, enforcement opt-in
+  (#82, x0x#504).** A Leaf node can now account for the serialized bytes it
+  puts on the wire per topic and wire purpose, and — only when an operator
+  asks for it — shed forwarded relay traffic once that budget is exhausted.
+
+  Enforcement is opt-in by construction. `LeafEgressConfig` carries a
+  `BytePolicy`, which defaults to `ObserveOnly`: the budget accounts and
+  meters every send but never denies one, however far over budget. A non-zero
+  `hard_bytes_per_second` on its own therefore never starts dropping gossip —
+  measuring egress is not permitted to change what the node does.
+  **Under `ObserveOnly`, observable send behaviour — what is sent, to whom,
+  and whether it waits — is identical to a node with no budget configured;
+  only the meters differ**, and that invariant is asserted by test against an
+  unbudgeted control.
+
+  `BytePolicy::ShedNormal` enables shedding, and only for *forwarded* Normal
+  and Bulk traffic. Critical-class topics (DM inbox, control plane),
+  locally originated publishes, own-inbox delivery and targeted sends are
+  never shed: they are either this node's own speech or traffic whose loss is
+  a hard error. Protected sends are charged, never wait for budget, and carry
+  a real reservation. Sends the budget would have denied but policy protected
+  are counted in `LeafEgressSnapshot::shed_suppressed`, which is the headroom
+  enabling `ShedNormal` would buy — and the only signal that an `ObserveOnly`
+  budget is being exceeded at all.
+
+  New public API on `saorsa-gossip-pubsub`: `BytePolicy`, `LeafEgressConfig`
+  (with `Default`), `LeafEgressSnapshot`, `LeafEgressPurposeSnapshot`, and
+  `PlumtreePubSub::{configure_leaf_egress, leaf_egress_snapshot}`. No
+  behaviour changes for consumers that do not configure a budget.
+
+- **crdt-sync: deterministic retained OR-Set encoding (#81).** New
+  `OrSet::canonical_retained_wire()` returning `CanonicalRetainedOrSet<T>`, a
+  bincode-layout-compatible retained state that preserves every live tag and
+  tombstone while normalizing local delta-generation bookkeeping. Existing
+  receivers can deserialize it directly as `OrSet<T>`.
+
+### Changed
+
+- **BREAKING (source, struct literals): `pubsub::FanoutCounts` gained four
+  public fields** — `candidates`, `byte_rejected`, `admission_dropped` and
+  `claim_skipped` — so every peer entering a fan-out lands in exactly one
+  bucket and a fully byte-deferred fan-out stays distinguishable from empty
+  membership. Code that constructs `FanoutCounts` with a struct literal, or
+  matches it exhaustively, must be updated; `FanoutCounts` derives `Default`,
+  so `..Default::default()` and field reads are unaffected.
+
+### Known issues
+
+- **Recovery intent admission is first-come-first-served, so a saturated
+  intent map can starve a new target for up to 120 s under `ShedNormal`.**
+  `DEFAULT_MAX_INTENTS` (1024) is enforced with no eviction and no
+  reservation for scopes with no outstanding intent, so while the map is full
+  a newly observed, otherwise-eligible target is refused with
+  `IntentLimit` regardless of available byte budget. The absolute intent
+  lifetime added in this release bounds the exclusion at
+  `2 x MAX_CACHE_AGE_SECS`; it does not make admission fair. This affects
+  only nodes that opt in to `BytePolicy::ShedNormal` under sustained recovery
+  load, and is tracked separately.
+
 ## [0.5.82] - 2026-09-14
 
 ### Fixed

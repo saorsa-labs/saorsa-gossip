@@ -76,6 +76,23 @@ pub struct LeafEgressConfig {
     pub policy: BytePolicy,
 }
 
+impl Default for LeafEgressConfig {
+    /// Accounting off (`hard_bytes_per_second == 0`) and enforcement opt-in.
+    ///
+    /// Exists so a consumer can write `LeafEgressConfig { .. Default::default() }`
+    /// and pick up new fields without a source break, and so the default of
+    /// every field is the inert one.
+    fn default() -> Self {
+        Self {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 0,
+            burst_bytes: 0,
+            max_serialized_frame_bytes: 0,
+            policy: BytePolicy::ObserveOnly,
+        }
+    }
+}
+
 impl LeafEgressConfig {
     fn validate(self) -> Option<Self> {
         if self.hard_bytes_per_second == 0 {
@@ -323,6 +340,13 @@ impl LeafEgressLimiter {
     /// rather than deny. This never waits and never registers a recovery
     /// intent, so a protected send cannot stall on the waiter loop or leave
     /// escrowed residue behind.
+    ///
+    /// `max_serialized_frame_bytes` is deliberately bypassed too. It is a
+    /// byte-budget ceiling, not a protocol limit, so honouring it here would
+    /// reintroduce exactly the drop this path exists to prevent — an oversized
+    /// DM would be silently discarded rather than delivered. An oversized
+    /// protected frame is counted in `shed_suppressed` like any other overrun,
+    /// so the cap being exceeded stays visible.
     ///
     /// Returns `None` only when the limiter is disabled, where an unreserved
     /// send is what the fence expects. A send that the budget *would* have

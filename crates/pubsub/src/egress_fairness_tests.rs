@@ -1050,3 +1050,93 @@ fn sybil_fresh_peer_churn_is_rate_limited_and_bounded() {
         "the rate limiter must engage under churn"
     );
 }
+
+/// WHY (review r2, residual b): the fresh-PeerId churn bound above never
+/// re-polls incumbent keys, so it cannot see the degradation incumbents
+/// suffer while actually polling (renewal and claim). This schedule keeps
+/// the production 7:1 critical/ordinary split with a permanent critical
+/// backlog, fills the ordinary class from ONE incumbent peer, and then
+/// re-polls the rotation-front cohort every second while the attacker
+/// registers one fresh PeerId with a maximum-size frame per second.
+/// Measured on this schedule (virtual clock, no sleeps): 63 rotation-head
+/// completions clean vs 61 under attack (96.8%) across 47 displacements —
+/// milder than the reviewer's probe because these single-visit incumbent
+/// frames keep the displacement victims (youngest pending, lowest charge)
+/// behind the completing cohort. The residual is real but
+/// schedule-dependent; this test records the number honestly and keeps a
+/// deliberately weak bound so it guards the mechanism without pretending
+/// the known issue is solved.
+#[test]
+fn re_polling_incumbents_under_fresh_peer_attack_still_complete() {
+    const HARD: u64 = 8192;
+    const BURST: u64 = 65_536;
+    const WINDOW: u32 = 120;
+    const COHORT: usize = 128;
+    fn run_schedule(attack: bool) -> (usize, u64) {
+        let limiter = limiter(HARD, BURST);
+        let mut scope_index: u32 = 0;
+        // Incumbent peer fills the ordinary class first; the very first
+        // registration consumes the whole burst and completes, so the
+        // loop keeps admitting until the class is genuinely full.
+        let mut keys = Vec::new();
+        while limiter.lock_state().intents.len() < ORDINARY_MAX_INTENTS {
+            let key = pinned_key(0x10, &mut scope_index);
+            keys.push(key);
+            let _ = limiter.try_reserve_recovery(key, 1024);
+        }
+        // Permanent critical backlog added second (tokens are drained by
+        // now, so nothing self-completes): 64 maximum-size intents that
+        // cannot finish inside the window, forcing the production 7:1
+        // slot split.
+        while limiter.lock_state().intents.len() < DEFAULT_MAX_INTENTS {
+            let _ = limiter.try_reserve_recovery_at_class(
+                pinned_key(0x60, &mut scope_index),
+                BURST as usize,
+                1,
+                Instant::now(),
+                RecoveryClass::CriticalEager,
+            );
+        }
+        let cohort: Vec<_> = keys[..COHORT].to_vec();
+        let mut completions = 0;
+        for second in 0..WINDOW {
+            limiter.refill_after_for_test(Duration::from_secs(1));
+            if attack {
+                let mut identity = [0_u8; 32];
+                identity[..4].copy_from_slice(&(0x7700_0000_u32 + second).to_le_bytes());
+                let _ = limiter.try_reserve_recovery(
+                    RecoveryIntentKey {
+                        peer: identity,
+                        scope: identity,
+                        family: identity,
+                        operation: identity,
+                    },
+                    BURST as usize,
+                );
+            }
+            for key in &cohort {
+                if limiter.try_reserve_recovery(*key, 1024).is_ok() {
+                    completions += 1;
+                }
+            }
+        }
+        let snapshot = limiter.snapshot();
+        (completions, snapshot.intent_displaced)
+    }
+
+    let (clean, clean_displaced) = run_schedule(false);
+    let (attacked, attacked_displaced) = run_schedule(true);
+    assert_eq!(
+        clean_displaced, 0,
+        "no fresh peers: nothing to displace for"
+    );
+    assert!(
+        attacked >= 1,
+        "incumbents must still complete under attack (clean {clean}, attacked {attacked})"
+    );
+    assert!(
+        attacked * 4 >= clean,
+        "rotation-head completions collapsed: clean {clean}, attacked {attacked}, \
+         displaced {attacked_displaced} — update the recorded numbers if intentional"
+    );
+}

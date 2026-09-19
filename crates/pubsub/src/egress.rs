@@ -841,6 +841,13 @@ impl LeafEgressLimiter {
                     if let Some(scope) = ordinary_scope {
                         state.ordinary_scope_counts.remove(&scope);
                         state.ordinary_scopes.pop_front();
+                        // Defensive parity with `remove_ordinary_pending`:
+                        // a scope leaving the rotation can no longer hold
+                        // the promotion, and this branch must not become
+                        // the one way to disable promotion forever.
+                        if state.promoted_scope == Some(scope) {
+                            state.promoted_scope = None;
+                        }
                     }
                     continue;
                 }
@@ -1329,15 +1336,21 @@ impl LeafEgressLimiter {
         &self,
         key: RecoveryIntentKey,
         frame_bytes: usize,
+        now: Instant,
     ) -> Result<ByteReservation, ReserveError> {
         let generation = self.lock_state().generation;
         self.try_reserve_recovery_at_class(
             key,
             frame_bytes,
             generation,
-            Instant::now(),
+            now,
             RecoveryClass::CriticalEager,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_promoted_scope_for_test(&self) -> Option<[u8; 32]> {
+        self.lock_state().promoted_scope
     }
 
     #[cfg(test)]

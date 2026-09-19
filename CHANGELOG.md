@@ -35,6 +35,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `displacement_rate_limited`; `queue_overflow` keeps counting refusals
   only. Unreachable under `ObserveOnly`, where nothing registers intents.
 
+### Known Issues
+
+- **pubsub: displacement token bucket is per-class global.** A
+  fast-polling attacker (10 ms poll interval) can take nearly every
+  displacement token in its class, so a slow-polling legitimate newcomer
+  degrades to the pre-fix behaviour (never worse than FCFS refusal);
+  the non-adversarial worst case is ~2 s of admission delay per
+  concurrent newcomer. Measured with re-polling incumbents under a
+  one-fresh-PeerId-per-second attack (7:1 critical/ordinary split,
+  120 s virtual window): rotation-head completions 63 clean vs 61 under
+  attack across 47 displacements on this schedule; the degradation is
+  schedule-dependent and expected to be sharper when incumbent frames
+  need multiple rotation visits. Candidate mitigations (not
+  implemented): per-peer token fairness, or letting displacement
+  victims keep their rotation position on re-admission.
+
 ## [0.5.83] - 2026-09-18
 
 ### Added

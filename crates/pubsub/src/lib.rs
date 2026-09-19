@@ -14734,10 +14734,22 @@ mod tests {
     /// that matter most. Fair-share displacement admits an under-represented
     /// target by displacing the least-work intent of the most-represented
     /// bucket instead of refusing.
+    ///
+    /// The test drives the limiter on a virtual clock (`refill_after_for_test`
+    /// plus an injected `now` for every direct limiter call) and keeps its
+    /// real runtime to a few seconds: intent expiry is measured on the real
+    /// clock, so a slow machine that stretched an earlier 40 s version past
+    /// 60 real seconds could expire the whole background set each sweep,
+    /// re-register ~960 intents per iteration (superlinear blow-up), or
+    /// pass by expiry with zero displacements — a false green. The final
+    /// `intent_displaced >= 1` assert pins the pass to the displacement
+    /// path, not to expiry.
     #[tokio::test]
     async fn continuously_observed_new_ihave_target_enters_full_recovery_admission() {
-        const HARD_RATE: u64 = 128 * 1024;
-        const MAX_FRAME: usize = 4 * 1024 * 1024;
+        // Quantum is HARD_RATE / 8 = 8 KiB, above one IHAVE frame, so a
+        // served target completes in a single ordinary-slot visit.
+        const HARD_RATE: u64 = 64 * 1024;
+        const MAX_FRAME: usize = 64 * 1024;
         const FIELD_WINDOW_SECONDS: u16 = 120;
 
         let local = test_peer_id(1);
@@ -14818,9 +14830,10 @@ mod tests {
                 family: identity,
                 operation: identity,
             };
-            let _ = pubsub
-                .egress_limiter
-                .try_reserve_critical_for_test(key, MAX_FRAME);
+            let _ =
+                pubsub
+                    .egress_limiter
+                    .try_reserve_critical_for_test(key, MAX_FRAME, Instant::now());
             critical_sequence += 1;
         }
 
@@ -14852,6 +14865,7 @@ mod tests {
                     operation: identity,
                 },
                 MAX_FRAME,
+                Instant::now(),
             );
             critical_sequence += 1;
             while pubsub.egress_limiter.snapshot().pending_recovery_intents < 1024 {
@@ -14888,15 +14902,32 @@ mod tests {
             }
         }
 
-        // The ordinary share in this window is about 1.9 MiB, far above one
-        // IHAVE frame. A continuously observed eligible target must therefore
+        // The pass must come through displacement, never through the
+        // background ageing out: a green by expiry would be a false green
+        // for the admission fix (and the expired-everything blow-up this
+        // test used to hit on slow machines).
+        assert!(
+            pubsub.egress_limiter.snapshot().intent_displaced >= 1,
+            "the required target must have been admitted by displacement"
+        );
+        // The ordinary share in this window is about 960 KiB across ~120
+        // ordinary-slot visits of one scope each, far above one IHAVE
+        // frame. A continuously observed eligible target must therefore
         // enter admission and reach the transport despite bounded metadata.
+        let (deque_len, position, req_intents) = pubsub
+            .egress_limiter
+            .ordinary_rotation_probe_for_test(topic.to_bytes());
         assert!(
             transport
                 .sent_frames_of_kind_to(required, MessageKind::IHave)
                 .len()
                 > baseline,
-            "required target was excluded for 120 s despite sufficient byte share"
+            "required target was excluded for 120 s despite sufficient byte share;              displaced={} pending={} rotation={:?}/{deque_len} required={:?} promoted={:?}",
+            pubsub.egress_limiter.snapshot().intent_displaced,
+            pubsub.egress_limiter.snapshot().pending_recovery_intents,
+            position,
+            req_intents,
+            pubsub.egress_limiter.debug_promoted_scope_for_test().map(|s| s[..4].to_vec()),
         );
     }
 

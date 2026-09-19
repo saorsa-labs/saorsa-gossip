@@ -1058,6 +1058,22 @@ impl LeafEgressLimiter {
         self.cancel_intent(key, generation);
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_reserve_critical_for_test(
+        &self,
+        key: RecoveryIntentKey,
+        frame_bytes: usize,
+    ) -> Result<ByteReservation, ReserveError> {
+        let generation = self.lock_state().generation;
+        self.try_reserve_recovery_at_class(
+            key,
+            frame_bytes,
+            generation,
+            Instant::now(),
+            RecoveryClass::CriticalEager,
+        )
+    }
+
     pub(crate) fn validate_reservation(
         &self,
         key: Option<RecoveryIntentKey>,

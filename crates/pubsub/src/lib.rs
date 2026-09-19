@@ -14724,6 +14724,182 @@ mod tests {
             .is_empty());
     }
 
+    /// WHY (recovery-intent admission starvation): intent admission used to
+    /// be first-come-first-served up to the class caps with no eviction, so
+    /// while the map was saturated a newly observed, otherwise-eligible
+    /// IHAVE target was refused with `IntentLimit` no matter how much byte
+    /// budget was available. Under sustained background recovery demand the
+    /// new target was excluded for as long as it took an incumbent intent
+    /// to age out — metadata starvation, worst on exactly the busy relays
+    /// that matter most. Fair-share displacement admits an under-represented
+    /// target by displacing the least-work intent of the most-represented
+    /// bucket instead of refusing.
+    #[tokio::test]
+    async fn continuously_observed_new_ihave_target_enters_full_recovery_admission() {
+        const HARD_RATE: u64 = 128 * 1024;
+        const MAX_FRAME: usize = 4 * 1024 * 1024;
+        const FIELD_WINDOW_SECONDS: u16 = 120;
+
+        let local = test_peer_id(1);
+        let required = test_peer_id(2);
+        let topic = TopicId::new([0xd1; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![required]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        pubsub.initialize_topic_peers(topic, vec![required]).await;
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: HARD_RATE,
+            burst_bytes: MAX_FRAME as u64,
+            max_serialized_frame_bytes: MAX_FRAME,
+            policy: BytePolicy::ShedNormal,
+        })));
+
+        // Positive production-path control: this exact membership and IHAVE
+        // path reaches the required peer when recovery admission has room.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("target topic state");
+            state.eager_peers.clear();
+            state.lazy_peers.insert(required);
+            state.push_pending_ihave([0xd2; 32]);
+        }
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(required, MessageKind::IHave)
+                .len(),
+            1,
+            "control proves target membership, eligibility, and transport send"
+        );
+
+        // Fill the same production recovery admission path with field-scale
+        // 4 MiB families. Twenty-six distinct target identities are retained
+        // in the fixture; the remaining entries model other active topics.
+        let background_frame = Bytes::from(vec![0xa5; MAX_FRAME]);
+        let mut sequence = 0_u32;
+        while pubsub.egress_limiter.snapshot().pending_recovery_intents < 960 {
+            let peer = test_peer_id(10 + (sequence % 26) as u8);
+            let mut scope = [0_u8; 32];
+            scope[..4].copy_from_slice(&sequence.to_le_bytes());
+            let background_topic = TopicId::new(scope);
+            let _ = PlumtreePubSub::<RecordingTransport>::reserve_recovery_targets(
+                &pubsub.egress_limiter,
+                background_topic,
+                vec![peer],
+                "IHAVE",
+                &background_frame,
+                false,
+                TopicPriority::Normal,
+            );
+            sequence += 1;
+        }
+        let mut critical_sequence = 0_u32;
+        while pubsub.egress_limiter.snapshot().pending_recovery_intents < 1024 {
+            let mut identity = [0xc1; 32];
+            identity[..4].copy_from_slice(&critical_sequence.to_le_bytes());
+            let key = egress::RecoveryIntentKey {
+                peer: identity,
+                scope: identity,
+                family: identity,
+                operation: identity,
+            };
+            let _ = pubsub
+                .egress_limiter
+                .try_reserve_critical_for_test(key, MAX_FRAME);
+            critical_sequence += 1;
+        }
+
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .get_mut(&topic)
+                .expect("target topic state")
+                .push_pending_ihave([0xd3; 32]);
+        }
+        let baseline = transport
+            .sent_frames_of_kind_to(required, MessageKind::IHave)
+            .len();
+
+        for _ in 0..FIELD_WINDOW_SECONDS {
+            pubsub
+                .egress_limiter
+                .refill_after_for_test(Duration::from_secs(1));
+
+            // Sustained existing demand takes newly free metadata before the
+            // continuously observed new target is offered by the real flusher.
+            let mut identity = [0xc1; 32];
+            identity[..4].copy_from_slice(&critical_sequence.to_le_bytes());
+            let _ = pubsub.egress_limiter.try_reserve_critical_for_test(
+                egress::RecoveryIntentKey {
+                    peer: identity,
+                    scope: identity,
+                    family: identity,
+                    operation: identity,
+                },
+                MAX_FRAME,
+            );
+            critical_sequence += 1;
+            while pubsub.egress_limiter.snapshot().pending_recovery_intents < 1024 {
+                let peer = test_peer_id(10 + (sequence % 26) as u8);
+                let mut scope = [0_u8; 32];
+                scope[..4].copy_from_slice(&sequence.to_le_bytes());
+                let _ = PlumtreePubSub::<RecordingTransport>::reserve_recovery_targets(
+                    &pubsub.egress_limiter,
+                    TopicId::new(scope),
+                    vec![peer],
+                    "IHAVE",
+                    &background_frame,
+                    false,
+                    TopicPriority::Normal,
+                );
+                sequence += 1;
+            }
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &pubsub.topics,
+                &pubsub.transport,
+                &pubsub.signing_key,
+                &pubsub.stage_stats,
+                &pubsub.outbound_budgets,
+                &pubsub.send_path_context(),
+                &pubsub.egress_limiter,
+            )
+            .await;
+            if transport
+                .sent_frames_of_kind_to(required, MessageKind::IHave)
+                .len()
+                > baseline
+            {
+                break;
+            }
+        }
+
+        // The ordinary share in this window is about 1.9 MiB, far above one
+        // IHAVE frame. A continuously observed eligible target must therefore
+        // enter admission and reach the transport despite bounded metadata.
+        assert!(
+            transport
+                .sent_frames_of_kind_to(required, MessageKind::IHave)
+                .len()
+                > baseline,
+            "required target was excluded for 120 s despite sufficient byte share"
+        );
+    }
+
     /// Issue #62 (x0x #611): with a consumer-configured max eager degree
     /// of 2 (x0x Leaf) the healthy mesh IS two peers, so demoting one of
     /// them locks the topic at degree 1 for at least the 120 s cooldown —

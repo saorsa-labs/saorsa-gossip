@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **pubsub: a disabled Leaf egress limiter now costs zero per-frame mutex
+  acquisitions, zero extra all-shard topic write locks, and bounded
+  late-local-offer catch-up work (relay dispatch latency regression vs
+  0.5.82).** On the 6-node x0x testnet (all relays, limiter disabled via
+  `configure_leaf_egress(None)`), 0.5.83's DM-pair failure rate rose ~2.5×
+  over 0.5.82 (25/240 vs 10/240 interleaved A/B) with no throughput
+  regression — pointing at dispatch-path lock contention, not bytes.
+
+  - `LeafEgressLimiter::enabled`/`enforcing` are now lock-free atomic
+    mirrors written only inside `configure()`; `validate_reservation` and
+    `record_send_outcome` return before touching the state mutex when the
+    limiter is disabled. Previously every outbound frame took the single
+    limiter `Mutex` ≥3 times (enabled/enforcing checks, fence, outcome),
+    serialising dispatch on CPU-saturated 2-vCPU relays. The transport
+    fence's generation check for reservations minted before a reconfigure
+    is unchanged and documented.
+  - The 100 ms IHAVE flush no longer takes a second all-shard `write_all()`
+    for `flush_deferred_eager_replies` when the limiter is disabled —
+    deferred replies cannot exist without it. The IWANT-serve path likewise
+    skips its per-served-message topic write lock when disabled, and
+    `prune_deferred_iwants` early-returns on empty maps.
+  - Late-local-offer catch-up (new in 0.5.83) is bounded: offers under a
+    failure backoff are skipped; at most 4 offers page per flush tick; the
+    LRU scan runs under the narrow per-topic shard lock with sort/sign/send
+    outside it (never under `write_all`); a failed hand-off pages the cursor
+    forward and applies an exponential backoff (1 s → 16 s cap) instead of
+    re-driving scan+MLDSA-sign+send at the 100 ms tick rate;
+    `has_live_local_origin` is O(1) via a maintained cache counter instead
+    of a full LRU scan under the topic write lock.
+  - A failed IWANT send now KEEPS its outstanding claim under an
+    exponential retry backoff (1 s → 16 s cap, ≤8 attempts per 60 s window)
+    instead of releasing it immediately — release let every repeated
+    inbound IHAVE re-request a lost id at arrival rate — while remaining
+    releasable once the backoff expires (0.5.82 held claims forever).
+
+  Instrumented `cfg(test)` counters assert the invariants: with the limiter
+  disabled, publish + inbound IHAVE/IWANT + flush ticks acquire zero limiter
+  mutexes and exactly one `write_all` per tick; late-offer scans never run
+  under `write_all`; each bound has a revert-fail proof.
+
 ## [0.5.83] - 2026-09-18
 
 ### Added

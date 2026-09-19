@@ -4,7 +4,7 @@
 //! reserve the final serialized frame before acquiring transport admission.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -277,10 +277,48 @@ impl ByteReservation {
 #[derive(Debug)]
 pub(crate) struct LeafEgressLimiter {
     state: Mutex<State>,
+    /// Lock-free mirror of `state.config.is_some()`, written only inside
+    /// [`LeafEgressLimiter::configure`] while `state` is held (Release store)
+    /// and read with Acquire on every hot-path consult. A disabled limiter
+    /// must cost zero mutex acquisitions on the outbound frame path — the
+    /// single `state` mutex is contended by every in-flight frame, so even a
+    /// boolean `enabled()` check per frame serialises dispatch under CPU
+    /// saturation.
+    enabled_mirror: AtomicBool,
+    /// Lock-free mirror of
+    /// `state.config.is_some_and(|c| c.policy == BytePolicy::ShedNormal)`,
+    /// same ordering contract as [`Self::enabled_mirror`].
+    enforcing_mirror: AtomicBool,
     ordinary_waiters: Arc<Semaphore>,
     critical_waiters: Arc<Semaphore>,
     counters: EgressCounters,
     purpose_counters: Mutex<HashMap<([u8; 32], &'static str), PurposeCounters>>,
+}
+
+/// # Ordering contract for the lock-free mirrors
+///
+/// Both mirrors are stored (Release) inside [`LeafEgressLimiter::configure`]
+/// while the state mutex is held, and loaded (Acquire) everywhere else. A
+/// reader can observe a new policy one critical section "early" or "late"
+/// relative to another reader, but never a torn mix: both booleans derive
+/// from the single validated config written under the lock, so
+/// `enforcing ⇒ enabled` always holds. A reservation minted under the
+/// previous generation is still handled at the fence exactly as before: once
+/// `enabled_mirror` reads true the fence takes the mutex and compares
+/// generations; a `Some` reservation observed while the mirror still reads
+/// false was necessarily minted before the disable and fails the
+/// `reservation.is_none()` check — the same answer the locked read gave.
+#[cfg(test)]
+pub(crate) static TEST_STATE_MUTEX_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_state_mutex_acquisitions_for_test() {
+    TEST_STATE_MUTEX_ACQUISITIONS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn state_mutex_acquisitions_for_test() -> u64 {
+    TEST_STATE_MUTEX_ACQUISITIONS.load(Ordering::Relaxed)
 }
 
 impl LeafEgressLimiter {
@@ -303,6 +341,8 @@ impl LeafEgressLimiter {
                 ordinary_scopes: VecDeque::new(),
                 ordinary_scope_counts: HashMap::new(),
             }),
+            enabled_mirror: AtomicBool::new(false),
+            enforcing_mirror: AtomicBool::new(false),
             ordinary_waiters: Arc::new(Semaphore::new(ORDINARY_MAX_WAITERS)),
             critical_waiters: Arc::new(Semaphore::new(CRITICAL_MAX_WAITERS)),
             counters: EgressCounters::default(),
@@ -311,13 +351,15 @@ impl LeafEgressLimiter {
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, State> {
+        #[cfg(test)]
+        TEST_STATE_MUTEX_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.lock_state().config.is_some()
+        self.enabled_mirror.load(Ordering::Acquire)
     }
 
     /// Whether an exhausted budget is permitted to actually deny a send.
@@ -328,9 +370,7 @@ impl LeafEgressLimiter {
     /// configuration rather than a decision. Callers still consult per-message
     /// protection (Critical-class, local origin) on top of this.
     pub(crate) fn enforcing(&self) -> bool {
-        self.lock_state()
-            .config
-            .is_some_and(|config| config.policy == BytePolicy::ShedNormal)
+        self.enforcing_mirror.load(Ordering::Acquire)
     }
 
     /// Charge a send that policy protects from shedding, and mint its
@@ -426,6 +466,15 @@ impl LeafEgressLimiter {
         });
         state.recovery_slot = 0;
         state.recovery_slot_remaining = state.recovery_quantum;
+        // Publish the mirrors while the lock is still held (see the ordering
+        // contract above the struct). The early `return true` for an unchanged
+        // config is safe: the mirrors already agree with `state.config`.
+        self.enabled_mirror
+            .store(validated.is_some(), Ordering::Release);
+        self.enforcing_mirror.store(
+            validated.is_some_and(|config| config.policy == BytePolicy::ShedNormal),
+            Ordering::Release,
+        );
         true
     }
 
@@ -1045,24 +1094,29 @@ impl LeafEgressLimiter {
     }
 
     #[cfg(test)]
+    pub(crate) fn cancel_intent_for_test(&self, key: RecoveryIntentKey) {
+        let generation = self.lock_state().generation;
+        self.cancel_intent(key, generation);
+    }
+
+    #[cfg(test)]
     pub(crate) fn refill_after_for_test(&self, elapsed: Duration) {
         let now = Instant::now();
         let mut state = self.lock_state();
         state.last_refill = now.checked_sub(elapsed).unwrap_or(now);
         self.refill(&mut state, now);
     }
-
-    #[cfg(test)]
-    pub(crate) fn cancel_intent_for_test(&self, key: RecoveryIntentKey) {
-        let generation = self.lock_state().generation;
-        self.cancel_intent(key, generation);
-    }
-
     pub(crate) fn validate_reservation(
         &self,
         key: Option<RecoveryIntentKey>,
         reservation: Option<ByteReservation>,
     ) -> bool {
+        // Disabled fast path: no reservation can be minted while the limiter
+        // is off, so `None` is the only valid answer — and the answer the
+        // locked read below would give — without touching the mutex.
+        if !self.enabled_mirror.load(Ordering::Acquire) {
+            return reservation.is_none();
+        }
         let state = self.lock_state();
         if state.config.is_none() {
             return reservation.is_none();
@@ -1085,7 +1139,10 @@ impl LeafEgressLimiter {
         frame_bytes: usize,
         sent: bool,
     ) {
-        if !self.enabled() {
+        // Disabled fast path: there is nothing to account when no budget
+        // exists. Checked via the mirror so a disabled limiter costs zero
+        // mutex acquisitions per outbound frame.
+        if !self.enabled_mirror.load(Ordering::Acquire) {
             return;
         }
         if sent {
@@ -1113,7 +1170,6 @@ impl LeafEgressLimiter {
             entry.send_failures = entry.send_failures.saturating_add(1);
         }
     }
-
     #[cfg(test)]
     fn intent(&self, key: RecoveryIntentKey) -> Option<(u64, Instant)> {
         self.lock_state()

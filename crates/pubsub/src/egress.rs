@@ -33,6 +33,14 @@ const RECOVERY_INTENT_MAX_LIFETIME: Duration =
 const RECOVERY_CRITICAL_SLOTS: u8 = 7;
 const RECOVERY_TOTAL_SLOTS: u8 = RECOVERY_CRITICAL_SLOTS + 1;
 const RECOVERY_MAX_QUANTUM_BYTES: u64 = 16 * 1024;
+/// Displacement token bucket capacity, per class. Displacement is what a
+/// saturated class uses to admit an under-represented peer, and a flow of
+/// fresh PeerIds can invoke it on every poll, so it is rate-limited: a
+/// burst of `DISPLACEMENT_TOKEN_CAPACITY` admissions, then one per
+/// `DISPLACEMENT_REFILL_NANOS_PER_TOKEN` of virtual time. When the bucket
+/// is empty the newcomer is refused with `IntentLimit` exactly as before.
+const DISPLACEMENT_TOKEN_CAPACITY: u64 = 8;
+const DISPLACEMENT_REFILL_NANOS_PER_TOKEN: u64 = 2_000_000_000;
 
 /// What the Leaf serialized-byte budget is allowed to *do* once it is exceeded.
 ///
@@ -175,6 +183,24 @@ struct State {
     recovery_slot_remaining: u64,
     ordinary_scopes: VecDeque<[u8; 32]>,
     ordinary_scope_counts: HashMap<[u8; 32], usize>,
+    /// Displacement token-bucket credit per class, in nanoseconds of
+    /// refill time; one displacement costs
+    /// `DISPLACEMENT_REFILL_NANOS_PER_TOKEN`. Advanced by `refill` on the
+    /// same virtual `now` as the byte bucket, so no new clock reads.
+    displacement_credit: [u64; 2],
+    displacement_last_refill: Instant,
+    /// The one Ordinary scope currently holding the front-of-rotation
+    /// promotion earned by fair-share displacement. At most one is
+    /// outstanding; the next displacement-admitted newcomer joins the back
+    /// until this scope has been served once or left the rotation.
+    promoted_scope: Option<[u8; 32]>,
+    /// Test-only injected clock. When set, every internal `Instant::now()`
+    /// read in this limiter resolves to this value instead, so tests can
+    /// drive token boundaries, slot boundaries, and expiry on a fully
+    /// virtual timeline with no real-time contamination. Production builds
+    /// do not carry the field.
+    #[cfg(test)]
+    virtual_now: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -187,6 +213,8 @@ struct EgressCounters {
     recovery_waited: AtomicU64,
     budget_timeouts: AtomicU64,
     queue_overflow: AtomicU64,
+    intent_displaced: AtomicU64,
+    displacement_rate_limited: AtomicU64,
     invariant_violations: AtomicU64,
     shed_suppressed: AtomicU64,
 }
@@ -238,6 +266,20 @@ pub struct LeafEgressSnapshot {
     pub budget_timeouts: u64,
     /// Recovery intents refused because bounded metadata was full.
     pub queue_overflow: u64,
+    /// Recovery intents displaced to admit a fairer newcomer once a class
+    /// was full. Displacement is the fair-admission escape from the
+    /// first-come-first-served intent caps: a newly observed eligible
+    /// target enters admission immediately instead of waiting up to
+    /// `RECOVERY_INTENT_MAX_LIFETIME` for an incumbent to age out. The
+    /// victim loses its (non-refunding) escrow and re-registers on its
+    /// owner's next poll. `queue_overflow` counts refusals only.
+    pub intent_displaced: u64,
+    /// Displacement attempts that the per-class token bucket refused: the
+    /// fair-share rule wanted to displace but the rate budget was empty,
+    /// so the newcomer got the same `IntentLimit` refusal as a balanced
+    /// class (also counted in `queue_overflow`). Sustained displacement
+    /// is capped at one per 2 s with a burst of 8 per class.
+    pub displacement_rate_limited: u64,
     /// Enabled sends that reached the final transport fence unreserved.
     pub invariant_violations: u64,
     /// Sends the budget would have denied but that policy protected: either
@@ -302,6 +344,13 @@ impl LeafEgressLimiter {
                 recovery_slot_remaining: 1,
                 ordinary_scopes: VecDeque::new(),
                 ordinary_scope_counts: HashMap::new(),
+                displacement_credit: [DISPLACEMENT_TOKEN_CAPACITY
+                    * DISPLACEMENT_REFILL_NANOS_PER_TOKEN; 2],
+                displacement_last_refill: Instant::now(),
+
+                promoted_scope: None,
+                #[cfg(test)]
+                virtual_now: None,
             }),
             ordinary_waiters: Arc::new(Semaphore::new(ORDINARY_MAX_WAITERS)),
             critical_waiters: Arc::new(Semaphore::new(CRITICAL_MAX_WAITERS)),
@@ -314,6 +363,23 @@ impl LeafEgressLimiter {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The limiter's current reading of the clock: the injected virtual
+    /// time when a test set one, the real clock otherwise.
+    fn now_of(_state: &State) -> Instant {
+        #[cfg(test)]
+        {
+            _state.virtual_now.unwrap_or_else(Instant::now)
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
+    fn current_now(&self) -> Instant {
+        Self::now_of(&self.lock_state())
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -367,9 +433,11 @@ impl LeafEgressLimiter {
         relayed: bool,
     ) -> Option<ByteReservation> {
         let mut state = self.lock_state();
-        self.refill(&mut state, Instant::now());
+        let now = Self::now_of(&state);
+        self.refill(&mut state, now);
         let config = state.config?;
         let bytes = u64::try_from(frame_bytes).unwrap_or(u64::MAX);
+
         self.counters
             .demanded_bytes
             .fetch_add(bytes, Ordering::Relaxed);
@@ -421,6 +489,14 @@ impl LeafEgressLimiter {
         state.intents.clear();
         state.ordinary_scopes.clear();
         state.ordinary_scope_counts.clear();
+        state.displacement_credit =
+            [DISPLACEMENT_TOKEN_CAPACITY * DISPLACEMENT_REFILL_NANOS_PER_TOKEN; 2];
+        state.displacement_last_refill = Instant::now();
+        state.promoted_scope = None;
+        #[cfg(test)]
+        {
+            state.virtual_now = None;
+        }
         state.recovery_quantum = validated.map_or(1, |config| {
             (config.hard_bytes_per_second / 8).clamp(1, RECOVERY_MAX_QUANTUM_BYTES)
         });
@@ -459,6 +535,11 @@ impl LeafEgressLimiter {
             recovery_waited: self.counters.recovery_waited.load(Ordering::Relaxed),
             budget_timeouts: self.counters.budget_timeouts.load(Ordering::Relaxed),
             queue_overflow: self.counters.queue_overflow.load(Ordering::Relaxed),
+            intent_displaced: self.counters.intent_displaced.load(Ordering::Relaxed),
+            displacement_rate_limited: self
+                .counters
+                .displacement_rate_limited
+                .load(Ordering::Relaxed),
             invariant_violations: self.counters.invariant_violations.load(Ordering::Relaxed),
             shed_suppressed: self.counters.shed_suppressed.load(Ordering::Relaxed),
             pending_recovery_intents: self.lock_state().intents.len(),
@@ -518,6 +599,21 @@ impl LeafEgressLimiter {
             state.soft_remainder = scaled % 1_000_000_000;
         }
         state.last_refill = now;
+        // Advance the displacement token buckets on the same virtual `now`
+        // as the byte bucket: no new clock reads, and test harnesses that
+        // rewind `last_refill` get the same rewind here.
+        let displacement_elapsed = now
+            .saturating_duration_since(state.displacement_last_refill)
+            .as_nanos();
+        if displacement_elapsed > 0 {
+            let credit_cap = DISPLACEMENT_TOKEN_CAPACITY * DISPLACEMENT_REFILL_NANOS_PER_TOKEN;
+            for credit in &mut state.displacement_credit {
+                *credit = (*credit)
+                    .saturating_add(u64::try_from(displacement_elapsed).unwrap_or(u64::MAX))
+                    .min(credit_cap);
+            }
+            state.displacement_last_refill = now;
+        }
         let expired: Vec<_> = state
             .intents
             .iter()
@@ -546,6 +642,32 @@ impl LeafEgressLimiter {
         *count = count.saturating_add(1);
     }
 
+    /// Register a pending Ordinary scope at the FRONT of the charging
+    /// rotation, for an intent admitted by fair-share displacement.
+    ///
+    /// Admission alone does not fix the observable defect: the ordinary
+    /// rotation serves one scope per slot, so a displacement-admitted
+    /// newcomer that joined the back of a saturated rotation would still
+    /// wait `depth × slot-period` for first service — measured as a
+    /// newcomer entering at position 959 of 960 with zero charged bytes
+    /// after 120 simulated seconds. Handing the front of the rotation to
+    /// the bucket that was under-represented transfers service priority
+    /// the same way displacement transfers the slot.
+    ///
+    /// The promotion is bounded: at most ONE scope may hold it
+    /// (`State::promoted_scope`), it ends as soon as that scope has been
+    /// served once (or leaves the rotation), and the displaced victim
+    /// re-registers through the ordinary back-of-queue path — so it cannot
+    /// retake the front, and a flow of fresh PeerIds cannot monopolise the
+    /// rotation head by being displaced-admitted every second.
+    fn add_ordinary_pending_front(state: &mut State, scope: [u8; 32]) {
+        let count = state.ordinary_scope_counts.entry(scope).or_default();
+        if *count == 0 {
+            state.ordinary_scopes.push_front(scope);
+        }
+        *count = count.saturating_add(1);
+    }
+
     fn remove_ordinary_pending(state: &mut State, scope: [u8; 32]) {
         let remove_scope = if let Some(count) = state.ordinary_scope_counts.get_mut(&scope) {
             *count = count.saturating_sub(1);
@@ -558,6 +680,157 @@ impl LeafEgressLimiter {
             state
                 .ordinary_scopes
                 .retain(|candidate| *candidate != scope);
+            // A scope that left the rotation can no longer hold the
+            // front-of-rotation promotion.
+            if state.promoted_scope == Some(scope) {
+                state.promoted_scope = None;
+            }
+        }
+    }
+
+    /// Spend one displacement token for `class`, if the bucket has one.
+    ///
+    /// The bucket is advanced by `refill` on the limiter's virtual `now`
+    /// (capacity `DISPLACEMENT_TOKEN_CAPACITY`, one token per
+    /// `DISPLACEMENT_REFILL_NANOS_PER_TOKEN`), so no new clock reads. A
+    /// failed spend is the caller's signal to refuse with `IntentLimit`.
+    fn spend_displacement_token(state: &mut State, class: RecoveryClass) -> bool {
+        let index = match class {
+            RecoveryClass::Ordinary => 0,
+            RecoveryClass::CriticalEager => 1,
+        };
+        if state.displacement_credit[index] < DISPLACEMENT_REFILL_NANOS_PER_TOKEN {
+            return false;
+        }
+        state.displacement_credit[index] -= DISPLACEMENT_REFILL_NANOS_PER_TOKEN;
+        true
+    }
+
+    /// Pick the displacement victim, if the strict-imbalance rule fires
+    /// for the newcomer's peer.
+    ///
+    /// There is exactly ONE fairness dimension: the target peer. With a
+    /// single dimension the multiset of per-peer counts strictly improves
+    /// on every displacement (one count falls, one rises to at most the
+    /// fallen one's old value), so cycles are impossible by construction —
+    /// a second dimension had no joint potential function and could
+    /// ping-pong with this one indefinitely.
+    ///
+    /// Both the counts and the candidate set consider only intents that
+    /// are still pending (`charged < bytes`): a fully charged intent is
+    /// only waiting for its owner to claim the reservation, so displacing
+    /// it would burn spent escrow and force the frame to be charged again.
+    ///
+    /// Displacement is admissible only when admitting the newcomer would
+    /// still leave its bucket strictly below the fullest bucket
+    /// (`n_new + 1 < n_max`); after a swap the victim's bucket is at least
+    /// as full as the newcomer's, so the displaced owner can never
+    /// immediately displace the newcomer back.
+    ///
+    /// The victim is the pending intent that loses the least work —
+    /// lowest charged bytes, then YOUNGEST intent (`Reverse(created_at)`,
+    /// then `Reverse(order)`) — taken from the smallest peer id among the
+    /// equally fullest ones. No RNG, no clock reads.
+    fn fairness_victim(
+        per_peer: &HashMap<[u8; 32], usize>,
+        intents: &HashMap<RecoveryIntentKey, Intent>,
+        class: RecoveryClass,
+        newcomer_peer: [u8; 32],
+    ) -> Option<RecoveryIntentKey> {
+        let n_max = *per_peer.values().max()?;
+        let n_new = per_peer.get(&newcomer_peer).copied().unwrap_or(0);
+        if n_new.saturating_add(1) >= n_max {
+            return None;
+        }
+        let victim_peer = per_peer
+            .iter()
+            .filter(|(_, count)| **count == n_max)
+            .map(|(peer, _)| *peer)
+            .min()?;
+        intents
+            .iter()
+            .filter(|(candidate, intent)| {
+                intent.class == class
+                    && intent.charged < intent.bytes
+                    && candidate.peer == victim_peer
+            })
+            .min_by_key(|(_, intent)| {
+                (
+                    intent.charged,
+                    std::cmp::Reverse(intent.created_at),
+                    std::cmp::Reverse(intent.order),
+                )
+            })
+            .map(|(candidate, _)| *candidate)
+    }
+
+    /// Displace one pending intent of the most-represented peer so a
+    /// newcomer from an under-represented peer can be admitted into a
+    /// full class — if the per-class rate budget allows it.
+    ///
+    /// WHY: admission used to be first-come-first-served up to the class
+    /// caps, so a saturated class refused a newly observed eligible target
+    /// with `IntentLimit` for up to `RECOVERY_INTENT_MAX_LIFETIME` —
+    /// metadata starvation unrelated to the byte budget, worst on exactly
+    /// the busy relays that matter most.
+    ///
+    /// Displacement is also a cost other peers pay (the victim's escrow is
+    /// burned and its slot is taken), and fresh PeerIds are free, so an
+    /// attacker can invoke it on every poll. The order below is therefore:
+    /// balance first — a class whose buckets are already fair refuses with
+    /// `IntentLimit` without touching the rate budget — then rate; a
+    /// rule-firing attempt with an empty bucket is also refused with
+    /// `IntentLimit` and counted in both `queue_overflow` and
+    /// `displacement_rate_limited`.
+    ///
+    /// Removal goes through exactly the expiry path's bookkeeping
+    /// (`remove_ordinary_pending` for a pending Ordinary victim) and the
+    /// victim's escrow is abandoned, never refunded, consistent with
+    /// `partial_escrow_replacement_cancel_and_reconfigure_are_non_refunding`.
+    /// The victim's owner observes displacement exactly as it observes
+    /// expiry: the map no longer holds the key, so its next poll
+    /// re-registers a fresh intent and any `IntentGuard` it holds cancels
+    /// a no-op. Displacements are counted in `intent_displaced`.
+    ///
+    /// Returns whether a victim was displaced; the caller then registers
+    /// the newcomer and, for an Ordinary admission with no promotion
+    /// outstanding, takes over the FRONT of the charging rotation (see
+    /// `add_ordinary_pending_front`) so the under-represented bucket also
+    /// receives prompt service. The O(intents) scan runs only on the
+    /// overflow path; the non-full fast path is unchanged, and nothing
+    /// here holds a lock across an await.
+    fn displace_intent_for_fair_admission(
+        &self,
+        state: &mut State,
+        class: RecoveryClass,
+        key: RecoveryIntentKey,
+    ) -> bool {
+        let mut per_peer: HashMap<[u8; 32], usize> = HashMap::new();
+        for (candidate, intent) in &state.intents {
+            if intent.class == class && intent.charged < intent.bytes {
+                *per_peer.entry(candidate.peer).or_insert(0) += 1;
+            }
+        }
+        let Some(victim) = Self::fairness_victim(&per_peer, &state.intents, class, key.peer) else {
+            return false;
+        };
+        if !Self::spend_displacement_token(state, class) {
+            self.counters
+                .displacement_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        match state.intents.remove(&victim) {
+            Some(intent) => {
+                if intent.class == RecoveryClass::Ordinary && intent.charged < intent.bytes {
+                    Self::remove_ordinary_pending(state, victim.scope);
+                }
+                self.counters
+                    .intent_displaced
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            None => false,
         }
     }
 
@@ -601,6 +874,13 @@ impl LeafEgressLimiter {
                     if let Some(scope) = ordinary_scope {
                         state.ordinary_scope_counts.remove(&scope);
                         state.ordinary_scopes.pop_front();
+                        // Defensive parity with `remove_ordinary_pending`:
+                        // a scope leaving the rotation can no longer hold
+                        // the promotion, and this branch must not become
+                        // the one way to disable promotion forever.
+                        if state.promoted_scope == Some(scope) {
+                            state.promoted_scope = None;
+                        }
                     }
                     continue;
                 }
@@ -624,10 +904,32 @@ impl LeafEgressLimiter {
             if class == RecoveryClass::Ordinary && delta == remaining {
                 Self::remove_ordinary_pending(state, key.scope);
             }
+            // The front-of-rotation promotion is NOT released by a
+            // partial charge: a promoted scope that received less than
+            // its full frame in one visit (token or slot boundary) keeps
+            // BOTH the promotion and the front position, otherwise the
+            // newcomer this PR exists to serve is sent to the back of a
+            // ~960-deep rotation on its first partial charge — the same
+            // starvation as no promotion at all. Release happens only
+            // when the scope leaves the pending rotation (fully charged
+            // last intent, claim, expiry, cancellation, displacement, or
+            // configure), all of which flow through
+            // `remove_ordinary_pending`/`configure`.
+            //
+            // Bound: a promoted scope holds the front only while it has
+            // pending bytes, and every pending byte entered through a
+            // rate-limited displacement or a normal admission — so an
+            // attacker pays one displacement token per frame's worth of
+            // front-held bytes (frame ÷ quantum slot visits).
+            let promoted_at_front =
+                class == RecoveryClass::Ordinary && state.promoted_scope == ordinary_scope;
             let scope_empty = ordinary_scope
                 .is_some_and(|scope| !state.ordinary_scope_counts.contains_key(&scope));
             if state.recovery_slot_remaining == 0 {
-                if class == RecoveryClass::Ordinary && !scope_empty {
+                // Slot exhaustion must not rotate the promoted scope to
+                // the back: it stays at the front until fully charged or
+                // gone, so its next slot visit continues the same frame.
+                if class == RecoveryClass::Ordinary && !scope_empty && !promoted_at_front {
                     if let Some(scope) = state.ordinary_scopes.pop_front() {
                         state.ordinary_scopes.push_back(scope);
                     }
@@ -678,7 +980,7 @@ impl LeafEgressLimiter {
         frame_bytes: usize,
         relayed: bool,
     ) -> Result<ByteReservation, ReserveError> {
-        self.try_reserve_data_at(key, frame_bytes, relayed, Instant::now())
+        self.try_reserve_data_at(key, frame_bytes, relayed, self.current_now())
     }
 
     fn try_reserve_data_at(
@@ -824,7 +1126,7 @@ impl LeafEgressLimiter {
                     key,
                     frame_bytes,
                     generation,
-                    Instant::now(),
+                    self.current_now(),
                     class,
                 ) {
                     Ok(reservation) => return Ok(reservation),
@@ -873,7 +1175,7 @@ impl LeafEgressLimiter {
         frame_bytes: usize,
     ) -> Result<ByteReservation, ReserveError> {
         let generation = self.lock_state().generation;
-        self.try_reserve_recovery_at(key, frame_bytes, generation, Instant::now())
+        self.try_reserve_recovery_at(key, frame_bytes, generation, self.current_now())
     }
 
     fn try_reserve_recovery_at(
@@ -924,7 +1226,13 @@ impl LeafEgressLimiter {
                     .get(&key)
                     .is_some_and(|intent| intent.class != RecoveryClass::CriticalEager)
                 {
-                    if critical_count >= CRITICAL_MAX_INTENTS {
+                    if critical_count >= CRITICAL_MAX_INTENTS
+                        && !self.displace_intent_for_fair_admission(
+                            &mut state,
+                            RecoveryClass::CriticalEager,
+                            key,
+                        )
+                    {
                         self.counters.queue_overflow.fetch_add(1, Ordering::Relaxed);
                         return Err(ReserveError::IntentLimit);
                     }
@@ -999,9 +1307,13 @@ impl LeafEgressLimiter {
                 RecoveryClass::Ordinary => ORDINARY_MAX_INTENTS,
                 RecoveryClass::CriticalEager => CRITICAL_MAX_INTENTS,
             };
+            let mut admitted_by_displacement = false;
             if state.intents.len() >= DEFAULT_MAX_INTENTS || class_count >= class_limit {
-                self.counters.queue_overflow.fetch_add(1, Ordering::Relaxed);
-                return Err(ReserveError::IntentLimit);
+                if !self.displace_intent_for_fair_admission(&mut state, class, key) {
+                    self.counters.queue_overflow.fetch_add(1, Ordering::Relaxed);
+                    return Err(ReserveError::IntentLimit);
+                }
+                admitted_by_displacement = true;
             }
             state.intents.insert(
                 key,
@@ -1015,7 +1327,13 @@ impl LeafEgressLimiter {
                 },
             );
             if class == RecoveryClass::Ordinary && credit < bytes && !preserved_scope_position {
-                Self::add_ordinary_pending(&mut state, key.scope);
+                let enters_rotation = !state.ordinary_scope_counts.contains_key(&key.scope);
+                if admitted_by_displacement && enters_rotation && state.promoted_scope.is_none() {
+                    state.promoted_scope = Some(key.scope);
+                    Self::add_ordinary_pending_front(&mut state, key.scope);
+                } else {
+                    Self::add_ordinary_pending(&mut state, key.scope);
+                }
             }
             self.counters
                 .demanded_bytes
@@ -1044,11 +1362,27 @@ impl LeafEgressLimiter {
         }
     }
 
+    /// Advance the injected virtual clock by `elapsed` and run the refill
+    /// at the new virtual time. The byte bucket, the displacement token
+    /// bucket, and the expiry sweep all advance on this one timeline, so a
+    /// test driving the limiter exclusively through this helper and the
+    /// normal entry points sees zero real-time contamination.
+    #[cfg(test)]
+    pub(crate) fn advance_virtual_clock_for_test(&self, elapsed: Duration) {
+        let mut state = self.lock_state();
+        let Some(now) = Self::now_of(&state).checked_add(elapsed) else {
+            return;
+        };
+        state.virtual_now = Some(now);
+        self.refill(&mut state, now);
+    }
+
     #[cfg(test)]
     pub(crate) fn refill_after_for_test(&self, elapsed: Duration) {
         let now = Instant::now();
         let mut state = self.lock_state();
         state.last_refill = now.checked_sub(elapsed).unwrap_or(now);
+        state.displacement_last_refill = now.checked_sub(elapsed).unwrap_or(now);
         self.refill(&mut state, now);
     }
 
@@ -1056,6 +1390,48 @@ impl LeafEgressLimiter {
     pub(crate) fn cancel_intent_for_test(&self, key: RecoveryIntentKey) {
         let generation = self.lock_state().generation;
         self.cancel_intent(key, generation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_reserve_critical_for_test(
+        &self,
+        key: RecoveryIntentKey,
+        frame_bytes: usize,
+    ) -> Result<ByteReservation, ReserveError> {
+        let (generation, now) = {
+            let state = self.lock_state();
+            (state.generation, Self::now_of(&state))
+        };
+        self.try_reserve_recovery_at_class(
+            key,
+            frame_bytes,
+            generation,
+            now,
+            RecoveryClass::CriticalEager,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_promoted_scope_for_test(&self) -> Option<[u8; 32]> {
+        self.lock_state().promoted_scope
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ordinary_rotation_probe_for_test(
+        &self,
+        scope: [u8; 32],
+    ) -> (usize, Option<usize>, Vec<(u64, u64)>) {
+        let state = self.lock_state();
+        (
+            state.ordinary_scopes.len(),
+            state.ordinary_scopes.iter().position(|s| *s == scope),
+            state
+                .intents
+                .iter()
+                .filter(|(key, _)| key.scope == scope)
+                .map(|(_, intent)| (intent.bytes, intent.charged))
+                .collect(),
+        )
     }
 
     pub(crate) fn validate_reservation(

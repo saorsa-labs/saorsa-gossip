@@ -290,8 +290,11 @@ async fn mixed_publish_controls_cache_and_forward_preserve_authors_and_floors() 
         &pubsub.signing_key,
         &pubsub.stage_stats,
         &pubsub.outbound_budgets,
-        &pubsub.send_path_context(),
-        &pubsub.egress_limiter,
+        crate::IhaveFlushEnv {
+            send_path: &pubsub.send_path_context(),
+            egress_limiter: &pubsub.egress_limiter,
+            late_rotation: &mut crate::LateOfferRotation::default(),
+        },
     )
     .await;
     let sent = transport.drain();

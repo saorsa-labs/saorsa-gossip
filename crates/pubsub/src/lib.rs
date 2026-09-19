@@ -3682,10 +3682,60 @@ const MAX_LATE_LOCAL_OFFERS: usize = MAX_IHAVE_BATCH_SIZE;
 /// The backlog drains over subsequent ticks instead.
 const MAX_LATE_LOCAL_OFFERS_PER_FLUSH: usize = 4;
 
-/// Global rotation cursor for the per-tick late-local-offer cap: each flush
-/// advances it by the number of offers taken so the cap walks the sorted
-/// candidate set instead of always serving the same fixed-order head.
-static LATE_OFFER_RR_CURSOR: AtomicUsize = AtomicUsize::new(0);
+/// Ring rank for the bounded under-lock late-offer selection (review r3,
+/// item 2): the 100 ms flush must not materialize every eligible
+/// candidate while ALL shards are write-locked. Candidates are ranked on
+/// a byte-ordered key ring that starts just past the last key served by
+/// the previous tick, so the per-tick window ROTATES across the candidate
+/// set (no late-ordered peer starves until the 60 s sweep) while the
+/// selection retains at most `MAX_LATE_LOCAL_OFFERS_PER_FLUSH`
+/// candidates. Rank order is exactly the old sort-then-`rotate_left`
+/// order — recomputed incrementally, never materializing the full set.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LateOfferRank {
+    /// Candidates at or before the rotation start wrap past the ring
+    /// head, so they sort AFTER every candidate past the start.
+    wrapped: bool,
+    topic: [u8; 32],
+    peer: [u8; 32],
+}
+
+impl LateOfferRank {
+    fn of(topic: TopicId, peer: PeerId, start: Option<&(TopicId, PeerId)>) -> Self {
+        let topic_bytes = topic.to_bytes();
+        let peer_bytes = peer.to_bytes();
+        let wrapped = start.is_some_and(|(start_topic, start_peer)| {
+            (topic_bytes, peer_bytes) <= (start_topic.to_bytes(), start_peer.to_bytes())
+        });
+        Self {
+            wrapped,
+            topic: topic_bytes,
+            peer: peer_bytes,
+        }
+    }
+}
+
+/// Per-flusher rotation state for the bounded late-offer selection: the
+/// key of the last candidate the previous tick served. Owned by the flush
+/// task (flusher-local, not process-global); read and advanced only while
+/// the all-shard `write_all()` is held, so it needs no synchronization of
+/// its own.
+#[derive(Default)]
+struct LateOfferRotation {
+    last_served: Option<(TopicId, PeerId)>,
+}
+
+/// Send-side wiring the 100 ms IHAVE flush needs beyond the topic map,
+/// transport, and signing key (review r3): the send-path context, the
+/// egress limiter, and the flusher-local late-offer rotation travel
+/// together from the flusher task (and from tests driving ticks
+/// directly), and bundling them keeps `flush_ihave_batches` inside
+/// clippy's argument budget.
+struct IhaveFlushEnv<'a> {
+    send_path: &'a SendPathContext,
+    egress_limiter: &'a Arc<egress::LeafEgressLimiter>,
+    late_rotation: &'a mut LateOfferRotation,
+}
 
 struct IhaveFlushWork {
     topic: TopicId,
@@ -5652,6 +5702,11 @@ static TEST_LATE_OFFER_LRU_SCANS: AtomicU64 = AtomicU64::new(0);
 /// zero forever.
 #[cfg(test)]
 static TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL: AtomicU64 = AtomicU64::new(0);
+/// Peak late-offer candidates retained by the under-`write_all` selection
+/// (review r3, item 2) — must never exceed
+/// `MAX_LATE_LOCAL_OFFERS_PER_FLUSH`.
+#[cfg(test)]
+static TEST_LATE_OFFER_MAX_COLLECTED: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 fn reset_topic_contention_instrumentation_for_test() {
@@ -5659,7 +5714,7 @@ fn reset_topic_contention_instrumentation_for_test() {
     TEST_FLUSH_WRITE_ALL_HELD.store(false, Ordering::Relaxed);
     TEST_LATE_OFFER_LRU_SCANS.store(0, Ordering::Relaxed);
     TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL.store(0, Ordering::Relaxed);
-    LATE_OFFER_RR_CURSOR.store(0, Ordering::Relaxed);
+    TEST_LATE_OFFER_MAX_COLLECTED.store(0, Ordering::Relaxed);
 }
 
 struct ShardedTopicMap {
@@ -9148,14 +9203,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 continue;
             }
 
-            // Skip if already requested — with ONE exception, scoped to the
-            // FAILING peer (review r2). A claim held for peer A after A's
-            // send failed suppresses re-requests only from A, until A's
-            // backoff expires; a DIFFERENT peer advertising the id may be
-            // asked immediately (0.5.83 released the claim for exactly
-            // that, but per-id — which also re-asked A at arrival rate).
-            // Failure history carries over for the same peer so the
-            // backoff keeps escalating across its retries.
+            // Skip if already requested (reviews r2 + r3). A claim
+            // suppresses EVERY advertiser while it is HEALTHY — a
+            // takeover is allowed ONLY when the claim is in a failed
+            // state (`retry_not_before` armed, whether or not the backoff
+            // has expired): then a different, untried source is asked at
+            // once (with 15 s Critical deadlines, suppressing a healthy
+            // replacement for up to 16 s would be its own failure mode),
+            // or the same peer retries once its own backoff expires. r2
+            // stole HEALTHY claims too, costing one duplicate IWANT plus a
+            // full payload reply (and an MLDSA verify) per extra
+            // advertiser — the relay contention this PR removes. Failure
+            // history carries over for the same peer so the backoff keeps
+            // escalating across its retries.
             let mut prior_failures = 0_u8;
             if let Some(entry) = state.outstanding_iwants.get(&msg_id) {
                 if entry.peer == from {
@@ -9166,6 +9226,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         continue;
                     }
                     prior_failures = entry.failures;
+                } else if entry.retry_not_before.is_none() {
+                    // Held by a different peer that has not failed this
+                    // id: the healthy claim is never stolen.
+                    continue;
                 }
                 state.outstanding_iwants.remove(&msg_id);
             }
@@ -9288,16 +9352,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 Ok(PeerSendOutcome::TimedOut | PeerSendOutcome::NotConnected) | Err(_) => {
                     // No IWANT reached the peer. Intended semantics (S5,
-                    // review r2): the claim is KEPT for the failing peer
-                    // under an exponential backoff (1, 2, 4, 8, then capped
-                    // at 16 s) rather than released outright — releasing let
-                    // every repeated inbound IHAVE re-request the same lost
-                    // id at arrival rate under load — while a DIFFERENT
-                    // peer advertising the id is never suppressed (see the
-                    // request loop). `requested_at` is deliberately NOT
-                    // refreshed: refreshing re-armed the 60 s age sweep on
-                    // every failure, making the claim's lifetime unbounded;
-                    // the sweep must bound it from the FIRST request.
+                    // reviews r2/r3): the claim is KEPT for the failing
+                    // peer under an exponential backoff (1, 2, 4, 8, then
+                    // capped at 16 s) rather than released outright —
+                    // releasing let every repeated inbound IHAVE
+                    // re-request the same lost id at arrival rate under
+                    // load — while a DIFFERENT peer advertising the id
+                    // takes over as soon as this claim enters its failed
+                    // state (see the request loop). `requested_at` is
+                    // deliberately NOT refreshed: refreshing re-armed the
+                    // 60 s age sweep on every failure, making the claim's
+                    // lifetime unbounded; the sweep must bound it from
+                    // the FIRST request.
                     let mut topics = self.topics.write_topic(&topic).await;
                     if let Some(state) = topics.get_mut(&topic) {
                         let now = Instant::now();
@@ -9965,6 +10031,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             b"pubsub-ihave-flush",
             Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS),
         );
+        // Review r3: flusher-local late-offer rotation state (previously a
+        // process-global cursor). Moved into the task so the bounded
+        // under-lock selection needs no synchronization and concurrent
+        // pubsub instances cannot disturb each other's rotation.
+        let mut late_rotation = LateOfferRotation::default();
 
         // Issue #42: select on the shutdown token at every await point so
         // the flusher terminates on shutdown instead of spinning on
@@ -9996,9 +10067,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             &signing_key,
                             &stage_stats,
                             &outbound_budgets,
-                            &send_path,
-                            &egress_limiter,
-                        )
+                            IhaveFlushEnv {
+                                send_path: &send_path,
+                                egress_limiter: &egress_limiter,
+                                late_rotation: &mut late_rotation,
+                            },)
                         .await;
                         debug!("PubSub IHAVE flusher stopped by shutdown signal");
                         break;
@@ -10010,9 +10083,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             &signing_key,
                             &stage_stats,
                             &outbound_budgets,
-                            &send_path,
-                            &egress_limiter,
-                        )
+                            IhaveFlushEnv {
+                                send_path: &send_path,
+                                egress_limiter: &egress_limiter,
+                                late_rotation: &mut late_rotation,
+                            },)
                         .await;
                     }
                 }
@@ -10020,26 +10095,29 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         });
         self.retain_background_task(handle);
     }
-
     async fn flush_ihave_batches(
         topics: &Arc<ShardedTopicMap>,
         transport: &Arc<PolicyTransport<T>>,
         signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
         stage_stats: &Arc<PubSubStageStats>,
         outbound_budgets: &Arc<PeerOutboundBudgets>,
-        send_path: &SendPathContext,
-        egress_limiter: &Arc<egress::LeafEgressLimiter>,
+        env: IhaveFlushEnv<'_>,
     ) {
         let work: Vec<IhaveFlushWork> = {
             #[cfg(test)]
             TEST_FLUSH_WRITE_ALL_HELD.store(true, Ordering::Relaxed);
             let mut topics_guard = topics.write_all().await;
             let mut work = Vec::new();
-            // Late-local-offer candidates snapshotted here are only cheap map
-            // reads; the LRU scan for their ids happens later under the
+            // Late-local-offer candidates snapshotted here are only cheap
+            // map reads; the LRU scan for their ids happens later under the
             // narrow per-topic lock (see `late_local_offer_keys`), never
-            // while every shard is write-locked.
-            let mut late_candidates: Vec<(TopicId, PeerId, LateLocalOffer)> = Vec::new();
+            // while every shard is write-locked. Review r3, item 2: the
+            // selection itself stays O(cap) — at most
+            // MAX_LATE_LOCAL_OFFERS_PER_FLUSH candidates are ever retained
+            // while the all-shard lock is held (r2 collected every
+            // non-backed-off offer, ≤ 1024 per topic, before truncating
+            // after the drop).
+            let mut late_candidates: Vec<(LateOfferRank, TopicId, PeerId)> = Vec::new();
 
             for shard in topics_guard.iter_mut() {
                 for (topic_id, state) in shard.iter_mut() {
@@ -10081,7 +10159,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         }
                         // Only meaningful when an advert could have been
                         // byte-deferred, i.e. under ShedNormal.
-                        if egress_limiter.enforcing() {
+                        if env.egress_limiter.enforcing() {
                             ihave_targets.retain(|peer| state.ihave_target_pending(&batch, *peer));
                         }
                         let local_origin = batch.iter().any(|id| {
@@ -10102,17 +10180,33 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     }
 
                     let now = Instant::now();
-                    // S3 bounds: offers under a failure backoff are skipped.
-                    // All remaining candidates are collected (cheap map
-                    // reads); the per-tick cap is applied after the lock by
-                    // the round-robin selector below, so a fixed iteration
-                    // order cannot starve late-ordered peers tick after
-                    // tick.
+                    // S3 bounds: offers under a failure backoff are
+                    // skipped. Each remaining candidate is ranked on the
+                    // rotation ring and enters a bounded buffer of at most
+                    // `cap` entries kept sorted by rank — the ring start
+                    // sits just past the last key the previous tick served,
+                    // so the window rotates instead of starving the tail of
+                    // the iteration order.
                     for (&peer, &offer) in state.late_local_offers.iter() {
                         if offer.next_attempt.is_some_and(|t| t > now) {
                             continue;
                         }
-                        late_candidates.push((*topic_id, peer, offer));
+                        let rank = LateOfferRank::of(
+                            *topic_id,
+                            peer,
+                            env.late_rotation.last_served.as_ref(),
+                        );
+                        if late_candidates.len() < MAX_LATE_LOCAL_OFFERS_PER_FLUSH {
+                            let at = late_candidates.partition_point(|(kept, _, _)| *kept <= rank);
+                            late_candidates.insert(at, (rank, *topic_id, peer));
+                        } else if late_candidates
+                            .last()
+                            .is_some_and(|(kept, _, _)| *kept > rank)
+                        {
+                            late_candidates.pop();
+                            let at = late_candidates.partition_point(|(kept, _, _)| *kept <= rank);
+                            late_candidates.insert(at, (rank, *topic_id, peer));
+                        }
                     }
 
                     state.prune_deferred_iwants(now);
@@ -10130,36 +10224,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
             #[cfg(test)]
+            TEST_LATE_OFFER_MAX_COLLECTED
+                .fetch_max(late_candidates.len() as u64, Ordering::Relaxed);
+            // The next tick's ring window starts just past the last
+            // candidate this one served (buffer order == ring order).
+            if let Some((_, topic, peer)) = late_candidates.last().copied() {
+                env.late_rotation.last_served = Some((topic, peer));
+            }
+            #[cfg(test)]
             TEST_FLUSH_WRITE_ALL_HELD.store(false, Ordering::Relaxed);
             drop(topics_guard);
-
-            // Round-robin the per-tick cap across the candidate set
-            // (review r2, item 6): the shards/topics are walked in a fixed
-            // order and `late_local_offers` is a HashMap, so an
-            // always-take-the-first-N selector starves the tail of the
-            // order until the 60 s sweep. Sorting by (topic, peer) makes
-            // the rotation deterministic; the global cursor advances by
-            late_candidates.sort_unstable_by(|left, right| {
-                left.0
-                    .to_bytes()
-                    .cmp(&right.0.to_bytes())
-                    .then_with(|| left.1.to_bytes().cmp(&right.1.to_bytes()))
-            });
-            let total_candidates = late_candidates.len();
-            let take = total_candidates.min(MAX_LATE_LOCAL_OFFERS_PER_FLUSH);
-            if total_candidates > 0 {
-                let start =
-                    LATE_OFFER_RR_CURSOR.fetch_add(take, Ordering::Relaxed) % total_candidates;
-                late_candidates.rotate_left(start);
-            }
-            late_candidates.truncate(take);
 
             // Select each candidate's ids under its OWN topic shard lock.
             // The wire format pins one topic per IHAVE header, so per-topic
             // offers cannot be batched into one frame per peer; the per-tick
             // cap above is what bounds the work instead.
             let mut late_work = Vec::new();
-            for (topic_id, peer, _offer) in late_candidates {
+            for (_, topic_id, peer) in late_candidates {
                 let keys = {
                     let now = Instant::now();
                     let mut guard = topics.write_topic(&topic_id).await;
@@ -10254,9 +10335,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             } else {
                 "IHAVE"
             };
-            let flush_priority = send_path.admission.registry().priority_for(&topic_id);
+            let flush_priority = env.send_path.admission.registry().priority_for(&topic_id);
             let (reserved_targets, budget_deferred) = Self::reserve_recovery_targets(
-                egress_limiter,
+                env.egress_limiter,
                 topic_id,
                 ihave_targets,
                 op,
@@ -10290,7 +10371,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     continue;
                 };
                 let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
-                    send_path,
+                    env.send_path,
                     state,
                     &topic_id,
                     ihave_targets,
@@ -10298,17 +10379,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     now,
                 );
                 if admitted.is_empty() {
-                    release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+                    release_bulk_admissions_free(&env.send_path.admission, &bulk_admitted);
                     continue;
                 }
                 let claim_context = SendClaimContext {
                     stage_stats: stage_stats.as_ref(),
                     outbound_budgets,
-                    send_path,
+                    send_path: env.send_path,
                     topic: topic_id,
                     op,
                     send_class: OutboundSendClass::for_op(op),
-                    priority: send_path.admission.registry().priority_for(&topic_id),
+                    priority: env.send_path.admission.registry().priority_for(&topic_id),
                 };
                 // Skip reasons are only consulted by the single-peer
                 // Critical-control path; this fanout path ignores them.
@@ -10322,7 +10403,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 permits,
                 Arc::clone(topics),
                 Arc::clone(stage_stats),
-                send_path.clone(),
+                env.send_path.clone(),
             );
 
             // X0X-0007: parallel send with per-peer timeout. Was a sequential
@@ -10343,8 +10424,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     let transport = Arc::clone(transport);
                     let bytes = bytes.clone();
                     let stage_stats = Arc::clone(stage_stats);
-                    let rtt_tracker = Arc::clone(&send_path.rtt_tracker);
-                    let send_egress_limiter = Arc::clone(egress_limiter);
+                    let rtt_tracker = Arc::clone(&env.send_path.rtt_tracker);
+                    let send_egress_limiter = Arc::clone(env.egress_limiter);
                     let handle = tokio::spawn(async move {
                         let _permit = permit;
                         Self::send_to_peer_with_timeout(
@@ -10418,7 +10499,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             state.record_ihave_handoff(&batch, peer);
                             state.record_stranded_ihave_advertised(&batch, peer);
                         }
-                        let all_handed_off = !egress_limiter.enforcing()
+                        let all_handed_off = !env.egress_limiter.enforcing()
                             || intended_targets
                                 .iter()
                                 .all(|peer| !state.ihave_target_pending(&batch, *peer));
@@ -10433,7 +10514,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // exactly once. Covers no-claim, partial-claim, and panic
             // paths uniformly via the explicit list rather than relying
             // on per-completion release.
-            release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+            release_bulk_admissions_free(&env.send_path.admission, &bulk_admitted);
         }
         Self::flush_deferred_eager_replies(
             topics,
@@ -10441,8 +10522,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             signing_key,
             stage_stats,
             outbound_budgets,
-            send_path,
-            egress_limiter,
+            env.send_path,
+            env.egress_limiter,
         )
         .await;
     }
@@ -15010,14 +15091,18 @@ mod tests {
             policy: BytePolicy::ShedNormal,
         })));
 
+        let mut late_rotation = LateOfferRotation::default();
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
             &pubsub.topics,
             &pubsub.transport,
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         assert_eq!(transport.sent_frames().len(), 1);
@@ -15036,8 +15121,11 @@ mod tests {
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         for peer in peers {
@@ -15127,14 +15215,18 @@ mod tests {
             state.lazy_peers.insert(required);
             state.push_pending_ihave([0xd2; 32]);
         }
+        let mut late_rotation = LateOfferRotation::default();
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
             &pubsub.topics,
             &pubsub.transport,
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         assert_eq!(
@@ -15233,8 +15325,11 @@ mod tests {
                 &pubsub.signing_key,
                 &pubsub.stage_stats,
                 &pubsub.outbound_budgets,
-                &pubsub.send_path_context(),
-                &pubsub.egress_limiter,
+                IhaveFlushEnv {
+                    send_path: &pubsub.send_path_context(),
+                    egress_limiter: &pubsub.egress_limiter,
+                    late_rotation: &mut late_rotation,
+                },
             )
             .await;
             if transport
@@ -15346,8 +15441,11 @@ mod tests {
                 &pubsub.signing_key,
                 &pubsub.stage_stats,
                 &pubsub.outbound_budgets,
-                &pubsub.send_path_context(),
-                &pubsub.egress_limiter,
+                IhaveFlushEnv {
+                    send_path: &pubsub.send_path_context(),
+                    egress_limiter: &pubsub.egress_limiter,
+                    late_rotation: &mut LateOfferRotation::default(),
+                },
             )
             .await;
         }
@@ -18057,8 +18155,11 @@ mod tests {
             &signing_key,
             &stage_stats,
             &outbound_budgets,
-            &send_path,
-            &Arc::new(egress::LeafEgressLimiter::disabled()),
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &Arc::new(egress::LeafEgressLimiter::disabled()),
+                late_rotation: &mut LateOfferRotation::default(),
+            },
         )
         .await;
 
@@ -19478,8 +19579,11 @@ mod tests {
                 &flush_signing_key,
                 &flush_stage_stats,
                 &flush_outbound_budgets,
-                &flush_send_path,
-                &flush_egress_limiter,
+                IhaveFlushEnv {
+                    send_path: &flush_send_path,
+                    egress_limiter: &flush_egress_limiter,
+                    late_rotation: &mut LateOfferRotation::default(),
+                },
             )
             .await;
         });
@@ -19558,8 +19662,11 @@ mod tests {
                 &flush_signing_key,
                 &flush_stage_stats,
                 &flush_outbound_budgets,
-                &flush_send_path,
-                &flush_egress_limiter,
+                IhaveFlushEnv {
+                    send_path: &flush_send_path,
+                    egress_limiter: &flush_egress_limiter,
+                    late_rotation: &mut LateOfferRotation::default(),
+                },
             )
             .await;
         });
@@ -19724,8 +19831,11 @@ mod tests {
             &signing_key,
             &stage_stats,
             &Arc::new(PeerOutboundBudgets::default()),
-            &send_path,
-            &Arc::new(egress::LeafEgressLimiter::disabled()),
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &Arc::new(egress::LeafEgressLimiter::disabled()),
+                late_rotation: &mut LateOfferRotation::default(),
+            },
         )
         .await;
 
@@ -19978,14 +20088,18 @@ mod tests {
             .refill_after_for_test(Duration::from_secs(
                 u64::try_from(iwant_frame_len).expect("frame size"),
             ));
+        let mut late_rotation = LateOfferRotation::default();
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
             &receiver.topics,
             &receiver.transport,
             &receiver.signing_key,
             &receiver.stage_stats,
             &receiver.outbound_budgets,
-            &receiver.send_path_context(),
-            &receiver.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &receiver.send_path_context(),
+                egress_limiter: &receiver.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         let iwants = receiver_transport.sent_frames_of_kind_to(publisher_id, MessageKind::IWant);
@@ -20017,8 +20131,11 @@ mod tests {
             &receiver.signing_key,
             &receiver.stage_stats,
             &receiver.outbound_budgets,
-            &receiver.send_path_context(),
-            &receiver.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &receiver.send_path_context(),
+                egress_limiter: &receiver.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         assert_eq!(
@@ -20071,8 +20188,11 @@ mod tests {
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut LateOfferRotation::default(),
+            },
         )
         .await;
         {
@@ -20503,14 +20623,18 @@ mod tests {
                 .eager_peers
                 .contains(&receiver_id));
         }
+        let mut late_rotation = LateOfferRotation::default();
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
             &publisher.topics,
             &publisher.transport,
             &publisher.signing_key,
             &publisher.stage_stats,
             &publisher.outbound_budgets,
-            &publisher.send_path_context(),
-            &publisher.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &publisher.send_path_context(),
+                egress_limiter: &publisher.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         let ihaves = publisher_transport.sent_frames_of_kind_to(receiver_id, MessageKind::IHave);
@@ -20632,8 +20756,11 @@ mod tests {
             &publisher.signing_key,
             &publisher.stage_stats,
             &publisher.outbound_budgets,
-            &publisher.send_path_context(),
-            &publisher.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &publisher.send_path_context(),
+                egress_limiter: &publisher.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         publisher.set_topic_peers(topic, vec![receiver_id]).await;
@@ -20643,8 +20770,11 @@ mod tests {
             &publisher.signing_key,
             &publisher.stage_stats,
             &publisher.outbound_budgets,
-            &publisher.send_path_context(),
-            &publisher.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &publisher.send_path_context(),
+                egress_limiter: &publisher.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         assert_eq!(
@@ -20833,6 +20963,8 @@ mod tests {
         reset_topic_contention_instrumentation_for_test();
 
         const FLUSH_TICKS: u64 = 3;
+        // Consecutive ticks of one flusher: share the rotation state.
+        let mut late_rotation = LateOfferRotation::default();
         for _ in 0..FLUSH_TICKS {
             PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
                 &pubsub.topics,
@@ -20840,8 +20972,11 @@ mod tests {
                 &pubsub.signing_key,
                 &pubsub.stage_stats,
                 &pubsub.outbound_budgets,
-                &pubsub.send_path_context(),
-                &pubsub.egress_limiter,
+                IhaveFlushEnv {
+                    send_path: &pubsub.send_path_context(),
+                    egress_limiter: &pubsub.egress_limiter,
+                    late_rotation: &mut late_rotation,
+                },
             )
             .await;
         }
@@ -20869,12 +21004,17 @@ mod tests {
 
     /// S3 invariants for the late-local-offer catch-up under a DISABLED
     /// limiter: the flush caps offers per tick, never scans the LRU under
-    /// `write_all()`, and scans under the narrow per-topic lock only for
-    /// offers actually attempted.
+    /// `write_all()`, scans under the narrow per-topic lock only for
+    /// offers actually attempted, and (review r3, item 2) never retains
+    /// more than the per-tick cap candidates while the all-shard
+    /// `write_all()` is held — with 8 eligible candidates here, the r2
+    /// collect-everything-then-truncate shape peaked at 8.
     ///
     /// Revert-fails: moving the batch selection back inside the write_all
     /// block trips TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL > 0; removing the
-    /// per-tick cap makes the sent IHAVE count exceed the cap.
+    /// per-tick cap makes the sent IHAVE count exceed the cap; restoring
+    /// the r2 collect-everything selection trips the collected-peak
+    /// assert below (8 > 4).
     #[tokio::test]
     async fn late_local_offer_flush_caps_per_tick_and_never_scans_under_write_all() {
         reset_topic_contention_instrumentation_for_test();
@@ -20917,8 +21057,11 @@ mod tests {
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut LateOfferRotation::default(),
+            },
         )
         .await;
 
@@ -20941,19 +21084,31 @@ mod tests {
             MAX_LATE_LOCAL_OFFERS_PER_FLUSH as u64,
             "exactly one narrow-lock scan per attempted offer"
         );
+        assert!(
+            TEST_LATE_OFFER_MAX_COLLECTED.load(Ordering::Relaxed)
+                <= MAX_LATE_LOCAL_OFFERS_PER_FLUSH as u64,
+            "the under-write_all selection must retain at most \
+             {MAX_LATE_LOCAL_OFFERS_PER_FLUSH} candidates (peak {})",
+            TEST_LATE_OFFER_MAX_COLLECTED.load(Ordering::Relaxed)
+        );
     }
 
-    /// Review r2, item 6: the per-tick late-offer cap must ROTATE across
-    /// the candidate set. The shards and topics are walked in a fixed order
-    /// and `late_local_offers` is a HashMap, so an always-take-the-first-N
-    /// selector starves the tail of the order until the 60 s sweep. With
-    /// five multi-page offers (1025 ids each — one page larger than a
-    /// batch, so an attempted offer stays eligible next tick) and a cap of
-    /// 4, tick 2 must start where tick 1 stopped, not serve the same four
-    /// topics again.
+    /// Review r2, item 6 (+ r3 bounded rework): the per-tick late-offer
+    /// cap must ROTATE across the candidate set. The shards and topics
+    /// are walked in a fixed order and `late_local_offers` is a HashMap,
+    /// so an always-take-the-first-N selector starves the tail of the
+    /// order until the 60 s sweep. With five multi-page offers (1025 ids
+    /// each — one page larger than a batch, so an attempted offer stays
+    /// eligible next tick) and a cap of 4, tick 2 must start where tick 1
+    /// stopped, not serve the same four topics again. Since r3 the
+    /// rotation is a flusher-local key ring ranked incrementally under
+    /// `write_all()` (never materializing the full sorted set); the
+    /// rotation state is shared across the two driven ticks below, exactly
+    /// as the flush task shares it across its interval ticks.
     ///
-    /// Revert-fails: pinning the selector to offset 0 makes tick 2 serve
-    /// the same first four sorted topics → the tick-2 set assert fails.
+    /// Revert-fails: pinning the ring start at the head (fresh rotation
+    /// every tick) makes tick 2 serve the same first four sorted topics →
+    /// the tick-2 set assert fails.
     #[tokio::test]
     async fn late_offer_cap_rotates_across_ticks() {
         reset_topic_contention_instrumentation_for_test();
@@ -21024,14 +21179,18 @@ mod tests {
         };
 
         // Tick 1: rotation starts at 0 → the first four sorted topics.
+        let mut late_rotation = LateOfferRotation::default();
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
             &pubsub.topics,
             &pubsub.transport,
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         let tick1 = served_topics(&transport, &topics_peers);
@@ -21044,18 +21203,22 @@ mod tests {
             "tick 1 serves the first four sorted topics"
         );
 
-        // Tick 2: the cursor advanced by 4 → rotation starts at index 4 of
-        // the (still) five eligible offers: the fifth topic, then wrap to
-        // the first three. Attempted offers stay eligible (multi-page), so
-        // a fixed-order selector would repeat the same four here.
+        // Tick 2: the ring start sits just past tick 1's last served
+        // topic → rotation begins at index 4 of the (still) five eligible
+        // offers: the fifth topic, then wrap to the first three.
+        // Attempted offers stay eligible (multi-page), so a fixed-order
+        // selector would repeat the same four here.
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
             &pubsub.topics,
             &pubsub.transport,
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         // Frames 4.. are tick 2's, chronologically (the transport
@@ -21187,14 +21350,18 @@ mod tests {
         );
 
         // First disabled flush: regular work pass + ONE drain pass.
+        let mut late_rotation = LateOfferRotation::default();
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
             &pubsub.topics,
             &pubsub.transport,
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         assert!(pubsub
@@ -21218,8 +21385,11 @@ mod tests {
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         assert_eq!(
@@ -21292,6 +21462,7 @@ mod tests {
             );
         }
 
+        let mut late_rotation = LateOfferRotation::default();
         for _ in 0..5 {
             PlumtreePubSub::<FailingTransport>::flush_ihave_batches(
                 &pubsub.topics,
@@ -21299,8 +21470,11 @@ mod tests {
                 &pubsub.signing_key,
                 &pubsub.stage_stats,
                 &pubsub.outbound_budgets,
-                &pubsub.send_path_context(),
-                &pubsub.egress_limiter,
+                IhaveFlushEnv {
+                    send_path: &pubsub.send_path_context(),
+                    egress_limiter: &pubsub.egress_limiter,
+                    late_rotation: &mut late_rotation,
+                },
             )
             .await;
         }
@@ -21347,8 +21521,11 @@ mod tests {
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         assert_eq!(
@@ -21507,10 +21684,77 @@ mod tests {
             // own first failure rather than inheriting A's.
         }
 
-        // A itself stays suppressed by its own backoff only while the claim
-        // is not A's: here the claim belongs to B, and A re-advertising is
-        // a different-source takeover again — allowed (per-failing-peer
-        // semantics), and bounded by distinct advertisers, not tick rate.
+        // A re-advertising while the claim belongs to B: allowed only
+        // because B's claim is in a failed state (B's send also failed —
+        // the transport fails for every peer), so A is again a fresh,
+        // untried source. While B's claim would have been HEALTHY, A's
+        // IHAVE is suppressed — see the r3 test below.
+    }
+
+    /// Review r3, MUST 1: a HEALTHY claim is never stolen. A is asked for
+    /// an id and the send SUCCEEDS; B then advertises the same id. B must
+    /// NOT be asked — the id already has an in-flight request — otherwise
+    /// every multi-advertiser id costs one duplicate IWANT plus a full
+    /// payload reply (and an MLDSA verify) per extra advertiser.
+    ///
+    /// Revert-fails: restoring the unconditional takeover (removing the
+    /// `retry_not_before.is_none()` healthy-claim guard) sends B the
+    /// duplicate IWANT → the zero assert below reads 1.
+    #[tokio::test]
+    async fn healthy_iwant_claim_not_stolen_by_second_advertiser() {
+        let local = test_peer_id(1);
+        let transport = RecordingTransport::new(local);
+        let topic = TopicId::new([0x95; 32]);
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+        transport.set_connected_peer_ids(vec![peer_a, peer_b]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let id = [0x96; 32];
+
+        // A advertises; the IWANT to A is sent and SUCCEEDS.
+        pubsub
+            .handle_ihave(peer_a, topic, vec![id])
+            .await
+            .expect("IHAVE handling from A");
+        assert_eq!(
+            transport.send_count_to(peer_a),
+            1,
+            "A is asked for the id exactly once"
+        );
+
+        // B advertises the same id while A's claim is healthy (send
+        // handed off, no failure, no backoff): the claim must NOT be
+        // taken over — B would be sent a duplicate IWANT for an id that
+        // is already in flight.
+        pubsub
+            .handle_ihave(peer_b, topic, vec![id])
+            .await
+            .expect("IHAVE handling from B");
+        assert_eq!(
+            transport.send_count_to(peer_b),
+            0,
+            "a healthy claim must not be stolen: 0 IWANTs to B, expected 0"
+        );
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let entry = topics
+                .get(&topic)
+                .expect("topic")
+                .outstanding_iwants
+                .get(&id)
+                .expect("A keeps the claim");
+            assert_eq!(entry.peer, peer_a, "the claim still belongs to A");
+            assert_eq!(entry.failures, 0, "A has not failed");
+            assert_eq!(
+                entry.retry_not_before, None,
+                "the claim is healthy, not in a failed state"
+            );
+        }
     }
 
     /// S5 bound: the exponential schedule (1, 2, 4, 8, capped 16 s)
@@ -21800,8 +22044,11 @@ mod tests {
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut LateOfferRotation::default(),
+            },
         )
         .await;
         assert!(transport.sent_frames().is_empty());
@@ -21878,8 +22125,11 @@ mod tests {
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut LateOfferRotation::default(),
+            },
         )
         .await;
         assert_eq!(
@@ -21960,14 +22210,18 @@ mod tests {
             .await
             .expect("competing Critical EAGER consumes the bounded burst");
 
+        let mut late_rotation = LateOfferRotation::default();
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
             &pubsub.topics,
             &pubsub.transport,
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         // #504 opt-in policy: a late-local-offer page advertises only messages
@@ -22006,8 +22260,11 @@ mod tests {
             &pubsub.signing_key,
             &pubsub.stage_stats,
             &pubsub.outbound_budgets,
-            &pubsub.send_path_context(),
-            &pubsub.egress_limiter,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
         )
         .await;
         assert_eq!(
@@ -25971,8 +26228,11 @@ mod tests {
                 &pubsub.signing_key,
                 &pubsub.stage_stats,
                 &pubsub.outbound_budgets,
-                &pubsub.send_path_context(),
-                &pubsub.egress_limiter,
+                IhaveFlushEnv {
+                    send_path: &pubsub.send_path_context(),
+                    egress_limiter: &pubsub.egress_limiter,
+                    late_rotation: &mut LateOfferRotation::default(),
+                },
             )
             .await;
             for peer in [eager, lazy] {
@@ -26097,8 +26357,11 @@ mod tests {
                 &node_b.signing_key,
                 &node_b.stage_stats,
                 &node_b.outbound_budgets,
-                &node_b.send_path_context(),
-                &node_b.egress_limiter,
+                IhaveFlushEnv {
+                    send_path: &node_b.send_path_context(),
+                    egress_limiter: &node_b.egress_limiter,
+                    late_rotation: &mut LateOfferRotation::default(),
+                },
             )
             .await;
             let b_mid = node_b.stage_stats();

@@ -51,12 +51,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer refreshes `requested_at`, so the 60 s age sweep bounds claim
   lifetime from the FIRST request. Enabled/enforcing now share ONE packed
   `AtomicU8` (a single Release store, so the pair can never be observed
-  torn), an enabled→disabled reconfigure drains stranded deferred custody
-  on the next flush via a residue bit (restoring the zero-overhead steady
-  state), the per-tick late-offer cap rotates round-robin across the
-  sorted candidate set instead of starving late-ordered peers, and
+  torn), an enabled→disabled reconfigure drops stranded deferred custody
+  on the next flush via a residue bit (DROPS it — up to 1024 stranded
+  deferred replies/IWANTs per topic are cleared, NOT served, because
+  serving them would reintroduce exactly the dispatch work the disabled
+  state is forbidden to perform; the senders' bounded retries recover),
+  the per-tick late-offer cap rotates round-robin across the sorted
+  candidate set instead of starving late-ordered peers, and
   advance/backoff page the LIVE offer's cursor (a re-queue between
   snapshot and outcome no longer re-signs the same page every tick).
+
+  Review round 3 (Claude): two r2 regressions fixed. (1) A HEALTHY
+  outstanding IWANT claim is never stolen — an advertiser takeover is
+  allowed only when the current claim is in a failed state
+  (`retry_not_before` armed); previously every extra advertiser of a
+  multi-advertiser id triggered a duplicate IWANT plus a full payload
+  reply (and an MLDSA verify) each. (2) The late-offer selection under
+  the all-shard `write_all()` is O(cap) again: candidates are ranked on
+  a rotating byte-ordered key ring (flusher-local state, replacing the
+  process-global cursor) and at most 4 are ever retained while every
+  shard is write-locked — r2 collected every non-backed-off offer
+  (≤ 1024 per topic) before truncating after the lock drop.
 
   Instrumented `cfg(test)` counters assert the invariants: with the limiter
   disabled, publish + inbound IHAVE/IWANT + flush ticks acquire zero limiter

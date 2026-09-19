@@ -14996,6 +14996,313 @@ mod tests {
             .is_empty());
     }
 
+    /// WHY (recovery-intent admission starvation): intent admission used to
+    /// be first-come-first-served up to the class caps with no eviction, so
+    /// while the map was saturated a newly observed, otherwise-eligible
+    /// IHAVE target was refused with `IntentLimit` no matter how much byte
+    /// budget was available. Under sustained background recovery demand the
+    /// new target was excluded for as long as it took an incumbent intent
+    /// to age out — metadata starvation, worst on exactly the busy relays
+    /// that matter most. Fair-share displacement admits an under-represented
+    /// target by displacing the least-work intent of the most-represented
+    /// bucket instead of refusing.
+    ///
+    /// The limiter runs on a fully injected virtual clock: every internal
+    /// clock read resolves to the injected time, so token boundaries, slot
+    /// boundaries, and expiry all advance on one deterministic timeline with
+    /// zero real-time contamination (an earlier version let a few microseconds
+    /// of real elapsed time shift token boundaries, which could hand the
+    /// promoted target a PARTIAL first charge and, before the promotion rule
+    /// was fixed, send it to the back of the rotation). The scenario is
+    /// parameterised over background-frame scales; the final
+    /// `intent_displaced >= 1` assert pins the pass to the displacement
+    /// path, not to expiry.
+    ///
+    /// WHAT THIS TEST GATES: admission starvation only — a continuously
+    /// observed eligible target must ENTER a saturated class via
+    /// displacement and reach the transport. It does NOT gate the
+    /// promotion rule: with the promotion rule reverted it still passes
+    /// (verified, review r4 evidence matrix), because a
+    /// single-quantum-scale IHAVE frame usually completes on its first
+    /// visit. The promotion rule — partial-charge survival, per-intent
+    /// keying, visit cap, no same-scope inheritance — is gated by
+    /// `promoted_scope_survives_partial_charge_until_fully_charged` and
+    /// `same_scope_fresh_peer_wedge_keeps_incumbents_completing` in
+    /// `egress_fairness_tests.rs`.
+    async fn run_full_admission_reproducer(background_frame: usize, hard_rate: u64, burst: u64) {
+        const FIELD_WINDOW_SECONDS: u16 = 120;
+
+        let local = test_peer_id(1);
+        let required = test_peer_id(2);
+        let topic = TopicId::new([0xd1; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![required]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        pubsub.initialize_topic_peers(topic, vec![required]).await;
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: hard_rate,
+            burst_bytes: burst,
+            max_serialized_frame_bytes: background_frame,
+            policy: BytePolicy::ShedNormal,
+        })));
+        // Anchor the virtual clock at the configured state; from here on
+        // the limiter never reads the real clock.
+        pubsub
+            .egress_limiter
+            .advance_virtual_clock_for_test(Duration::from_millis(0));
+
+        // Positive production-path control: this exact membership and IHAVE
+        // path reaches the required peer when recovery admission has room.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("target topic state");
+            state.eager_peers.clear();
+            state.lazy_peers.insert(required);
+            state.push_pending_ihave([0xd2; 32]);
+        }
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(required, MessageKind::IHave)
+                .len(),
+            1,
+            "control proves target membership, eligibility, and transport send"
+        );
+
+        // Fill the same production recovery admission path with the chosen
+        // background scale. Twenty-six distinct target identities are
+        // retained in the fixture; the remaining entries model other active
+        // topics.
+        let background_frame_bytes = Bytes::from(vec![0xa5; background_frame]);
+        let mut sequence = 0_u32;
+        while pubsub.egress_limiter.snapshot().pending_recovery_intents < 960 {
+            let peer = test_peer_id(10 + (sequence % 26) as u8);
+            let mut scope = [0_u8; 32];
+            scope[..4].copy_from_slice(&sequence.to_le_bytes());
+            let background_topic = TopicId::new(scope);
+            let _ = PlumtreePubSub::<RecordingTransport>::reserve_recovery_targets(
+                &pubsub.egress_limiter,
+                background_topic,
+                vec![peer],
+                "IHAVE",
+                &background_frame_bytes,
+                false,
+                TopicPriority::Normal,
+            );
+            sequence += 1;
+        }
+        let mut critical_sequence = 0_u32;
+        while pubsub.egress_limiter.snapshot().pending_recovery_intents < 1024 {
+            let mut identity = [0xc1; 32];
+            identity[..4].copy_from_slice(&critical_sequence.to_le_bytes());
+            let key = egress::RecoveryIntentKey {
+                peer: identity,
+                scope: identity,
+                family: identity,
+                operation: identity,
+            };
+            let _ = pubsub
+                .egress_limiter
+                .try_reserve_critical_for_test(key, background_frame);
+            critical_sequence += 1;
+        }
+
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .get_mut(&topic)
+                .expect("target topic state")
+                .push_pending_ihave([0xd3; 32]);
+        }
+        let baseline = transport
+            .sent_frames_of_kind_to(required, MessageKind::IHave)
+            .len();
+
+        for _ in 0..FIELD_WINDOW_SECONDS {
+            pubsub
+                .egress_limiter
+                .advance_virtual_clock_for_test(Duration::from_secs(1));
+            // Sustained existing demand takes newly free metadata before the
+            // continuously observed new target is offered by the real flusher.
+            let mut identity = [0xc1; 32];
+            identity[..4].copy_from_slice(&critical_sequence.to_le_bytes());
+            let _ = pubsub.egress_limiter.try_reserve_critical_for_test(
+                egress::RecoveryIntentKey {
+                    peer: identity,
+                    scope: identity,
+                    family: identity,
+                    operation: identity,
+                },
+                background_frame,
+            );
+            critical_sequence += 1;
+            while pubsub.egress_limiter.snapshot().pending_recovery_intents < 1024 {
+                let peer = test_peer_id(10 + (sequence % 26) as u8);
+                let mut scope = [0_u8; 32];
+                scope[..4].copy_from_slice(&sequence.to_le_bytes());
+                let _ = PlumtreePubSub::<RecordingTransport>::reserve_recovery_targets(
+                    &pubsub.egress_limiter,
+                    TopicId::new(scope),
+                    vec![peer],
+                    "IHAVE",
+                    &background_frame_bytes,
+                    false,
+                    TopicPriority::Normal,
+                );
+                sequence += 1;
+            }
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &pubsub.topics,
+                &pubsub.transport,
+                &pubsub.signing_key,
+                &pubsub.stage_stats,
+                &pubsub.outbound_budgets,
+                &pubsub.send_path_context(),
+                &pubsub.egress_limiter,
+            )
+            .await;
+            if transport
+                .sent_frames_of_kind_to(required, MessageKind::IHave)
+                .len()
+                > baseline
+            {
+                break;
+            }
+        }
+
+        // The pass must come through displacement, never through the
+        // background ageing out: a green by expiry would be a false green
+        // for the admission fix.
+        assert!(
+            pubsub.egress_limiter.snapshot().intent_displaced >= 1,
+            "the required target must have been admitted by displacement"
+        );
+        let (deque_len, position, req_intents) = pubsub
+            .egress_limiter
+            .ordinary_rotation_probe_for_test(topic.to_bytes());
+        assert!(
+            transport
+                .sent_frames_of_kind_to(required, MessageKind::IHave)
+                .len()
+                > baseline,
+            "required target was excluded for 120 s despite sufficient byte share; \
+             displaced={} pending={} rotation={:?}/{deque_len} required={:?} promoted={:?}",
+            pubsub.egress_limiter.snapshot().intent_displaced,
+            pubsub.egress_limiter.snapshot().pending_recovery_intents,
+            position,
+            req_intents,
+            pubsub
+                .egress_limiter
+                .debug_promotion_for_test()
+                .map(|(key, visits)| (key.scope[..4].to_vec(), visits)),
+        );
+    }
+
+    /// Original field scale: 4 MiB families at a 128 KiB/s hard rate
+    /// (16 KiB recovery quantum). Ignored by default: the ~1024
+    /// 4 MiB-frame registrations make the debug-profile fill cost minutes
+    /// on a contended machine. Run explicitly with:
+    /// `cargo test -p saorsa-gossip-pubsub --lib -- --ignored continuously_observed`
+    #[tokio::test]
+    #[ignore = "4 MiB-scale fill is minutes-slow in debug; run with --ignored"]
+    async fn continuously_observed_new_ihave_target_enters_full_recovery_admission() {
+        run_full_admission_reproducer(4 * 1024 * 1024, 128 * 1024, 4 * 1024 * 1024).await;
+    }
+
+    /// Mid scale: 64 KiB families at a 64 KiB/s hard rate (8 KiB quantum).
+    #[tokio::test]
+    async fn continuously_observed_new_ihave_target_enters_full_recovery_admission_64k() {
+        run_full_admission_reproducer(64 * 1024, 64 * 1024, 64 * 1024).await;
+    }
+
+    /// Small scale: 8 KiB families at a 64 KiB/s hard rate (8 KiB quantum)
+    /// — the reviewer's near-deterministic partial-charge reproduction.
+    #[tokio::test]
+    async fn continuously_observed_new_ihave_target_enters_full_recovery_admission_8k() {
+        run_full_admission_reproducer(8 * 1024, 64 * 1024, 8 * 1024).await;
+    }
+
+    /// WHY (fair-displacement unreachability): under
+    /// `BytePolicy::ObserveOnly` nothing registers recovery intents —
+    /// recovery sends are policy-protected and go through
+    /// `reserve_protected`, which never waits and never leaves intent
+    /// state behind — so the fair-admission displacement path cannot be
+    /// reached at all. An observing budget must stay a pure observer even
+    /// under load that a shedding node would saturate.
+    #[tokio::test]
+    async fn observe_only_recovery_load_registers_no_intents_or_displacements() {
+        let local = test_peer_id(1);
+        let required = test_peer_id(2);
+        let topic = TopicId::new([0xe1; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![required]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        pubsub.initialize_topic_peers(topic, vec![required]).await;
+        // A hard rate of 1 B/s over an 8 KiB burst: a shedding node is
+        // saturated immediately, so sustained flushes here exercise the
+        // protected lane, not an empty budget.
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ObserveOnly,
+        })));
+
+        for round in 0..4_u8 {
+            {
+                let mut topics = pubsub.topics.write_topic(&topic).await;
+                let state = topics.get_mut(&topic).expect("target topic state");
+                state.eager_peers.clear();
+                state.lazy_peers.insert(required);
+                let mut digest = [0xe2_u8; 32];
+                digest[0] = round + 1;
+                state.push_pending_ihave(digest);
+            }
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &pubsub.topics,
+                &pubsub.transport,
+                &pubsub.signing_key,
+                &pubsub.stage_stats,
+                &pubsub.outbound_budgets,
+                &pubsub.send_path_context(),
+                &pubsub.egress_limiter,
+            )
+            .await;
+        }
+        assert!(
+            !transport
+                .sent_frames_of_kind_to(required, MessageKind::IHave)
+                .is_empty(),
+            "control: the protected ObserveOnly lane still delivers IHAVE"
+        );
+        let snapshot = pubsub.leaf_egress_snapshot();
+        assert_eq!(snapshot.pending_recovery_intents, 0);
+        assert_eq!(snapshot.intent_displaced, 0);
+        assert_eq!(snapshot.displacement_rate_limited, 0);
+        assert_eq!(snapshot.queue_overflow, 0);
+    }
+
     /// Issue #62 (x0x #611): with a consumer-configured max eager degree
     /// of 2 (x0x Leaf) the healthy mesh IS two peers, so demoting one of
     /// them locks the topic at degree 1 for at least the 120 s cooldown —

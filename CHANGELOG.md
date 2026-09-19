@@ -44,6 +44,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     inbound IHAVE re-request a lost id at arrival rate — while remaining
     releasable once the backoff expires (0.5.82 held claims forever).
 
+  Review round 2 (Claude): the IWANT retry backoff is keyed on the FAILING
+  peer only — a different peer advertising the id is asked immediately
+  (with 15 s Critical DM deadlines, suppressing a healthy source for up to
+  16 s was the failure mode this change exists to remove) — and a failure
+  no longer refreshes `requested_at`, so the 60 s age sweep bounds claim
+  lifetime from the FIRST request. Enabled/enforcing now share ONE packed
+  `AtomicU8` (a single Release store, so the pair can never be observed
+  torn), an enabled→disabled reconfigure drains stranded deferred custody
+  on the next flush via a residue bit (restoring the zero-overhead steady
+  state), the per-tick late-offer cap rotates round-robin across the
+  sorted candidate set instead of starving late-ordered peers, and
+  advance/backoff page the LIVE offer's cursor (a re-queue between
+  snapshot and outcome no longer re-signs the same page every tick).
+
   Instrumented `cfg(test)` counters assert the invariants: with the limiter
   disabled, publish + inbound IHAVE/IWANT + flush ticks acquire zero limiter
   mutexes and exactly one `write_all` per tick; late-offer scans never run

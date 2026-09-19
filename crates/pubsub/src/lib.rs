@@ -3618,7 +3618,7 @@ struct LateLocalOffer {
     next_attempt: Option<Instant>,
 }
 
-type LateOfferPage = (PeerId, Instant, (Instant, MessageIdType));
+type LateOfferPage = (PeerId, (Instant, MessageIdType));
 
 #[derive(Clone, Copy)]
 struct OutstandingIwant {
@@ -3681,6 +3681,11 @@ const MAX_LATE_LOCAL_OFFERS: usize = MAX_IHAVE_BATCH_SIZE;
 /// keeps a large catch-up backlog from monopolising a single 100 ms tick.
 /// The backlog drains over subsequent ticks instead.
 const MAX_LATE_LOCAL_OFFERS_PER_FLUSH: usize = 4;
+
+/// Global rotation cursor for the per-tick late-local-offer cap: each flush
+/// advances it by the number of offers taken so the cap walks the sorted
+/// candidate set instead of always serving the same fixed-order head.
+static LATE_OFFER_RR_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 struct IhaveFlushWork {
     topic: TopicId,
@@ -4369,20 +4374,23 @@ impl TopicState {
         Some((eligible.into_iter().map(|(_, id)| id).collect(), last))
     }
 
-    /// Successful hand-off: page the cursor forward and clear the failure
-    /// state — the peer is receiving again.
-    fn advance_late_local_offer(
-        &mut self,
-        peer: PeerId,
-        cutoff: Instant,
-        cursor: (Instant, MessageIdType),
-    ) {
+    /// Successful hand-off: page the LIVE offer's cursor forward and clear
+    /// the failure state — the peer is receiving again.
+    ///
+    /// Deliberately does NOT compare against the snapshot cutoff the batch
+    /// was selected under (review r2, item 7): if the offer was re-queued
+    /// between snapshot and outcome, a cutoff match would silently no-op
+    /// and the same page would be re-signed and re-sent every tick. The
+    /// attempted page is done either way, and cursor keys are
+    /// `(inserted_at, id)` with `inserted_at ≤ cutoff ≤ now`, so paging a
+    /// newer offer past this cursor only ever skips ids that were just
+    /// delivered (success) or just failed to a peer that cannot receive
+    /// them (backoff) — monotonic progress in both cases.
+    fn advance_late_local_offer(&mut self, peer: PeerId, cursor: (Instant, MessageIdType)) {
         if let Some(offer) = self.late_local_offers.get_mut(&peer) {
-            if offer.cutoff == cutoff {
-                offer.cursor = Some(cursor);
-                offer.failures = 0;
-                offer.next_attempt = None;
-            }
+            offer.cursor = Some(cursor);
+            offer.failures = 0;
+            offer.next_attempt = None;
         }
     }
 
@@ -4390,20 +4398,14 @@ impl TopicState {
     /// failed a send cannot receive these ids by re-sending them, and the
     /// pagination is bounded by the cache so the offer terminates — but
     /// back off the next attempt so the failure is not retried at the
-    /// flush-tick rate.
-    fn backoff_late_local_offer(
-        &mut self,
-        peer: PeerId,
-        cutoff: Instant,
-        cursor: (Instant, MessageIdType),
-    ) {
+    /// flush-tick rate. Same live-offer reasoning as
+    /// [`Self::advance_late_local_offer`].
+    fn backoff_late_local_offer(&mut self, peer: PeerId, cursor: (Instant, MessageIdType)) {
         if let Some(offer) = self.late_local_offers.get_mut(&peer) {
-            if offer.cutoff == cutoff {
-                offer.cursor = Some(cursor);
-                offer.failures = offer.failures.saturating_add(1);
-                offer.next_attempt =
-                    Some(Instant::now() + Self::late_local_offer_backoff(offer.failures));
-            }
+            offer.cursor = Some(cursor);
+            offer.failures = offer.failures.saturating_add(1);
+            offer.next_attempt =
+                Some(Instant::now() + Self::late_local_offer_backoff(offer.failures));
         }
     }
 
@@ -5657,6 +5659,7 @@ fn reset_topic_contention_instrumentation_for_test() {
     TEST_FLUSH_WRITE_ALL_HELD.store(false, Ordering::Relaxed);
     TEST_LATE_OFFER_LRU_SCANS.store(0, Ordering::Relaxed);
     TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL.store(0, Ordering::Relaxed);
+    LATE_OFFER_RR_CURSOR.store(0, Ordering::Relaxed);
 }
 
 struct ShardedTopicMap {
@@ -9145,20 +9148,25 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 continue;
             }
 
-            // Skip if already requested. A claim held from a FAILED send is
-            // the exception: it becomes releasable once its retry backoff
-            // expires (see the failure branch below), so a later IHAVE can
-            // re-request it then — and only then. Failure history carries
-            // over so the backoff keeps escalating across retries.
+            // Skip if already requested — with ONE exception, scoped to the
+            // FAILING peer (review r2). A claim held for peer A after A's
+            // send failed suppresses re-requests only from A, until A's
+            // backoff expires; a DIFFERENT peer advertising the id may be
+            // asked immediately (0.5.83 released the claim for exactly
+            // that, but per-id — which also re-asked A at arrival rate).
+            // Failure history carries over for the same peer so the
+            // backoff keeps escalating across its retries.
             let mut prior_failures = 0_u8;
             if let Some(entry) = state.outstanding_iwants.get(&msg_id) {
-                if !entry
-                    .retry_not_before
-                    .is_some_and(|not_before| Instant::now() >= not_before)
-                {
-                    continue;
+                if entry.peer == from {
+                    if entry
+                        .retry_not_before
+                        .is_some_and(|not_before| Instant::now() < not_before)
+                    {
+                        continue;
+                    }
+                    prior_failures = entry.failures;
                 }
-                prior_failures = entry.failures;
                 state.outstanding_iwants.remove(&msg_id);
             }
 
@@ -9279,24 +9287,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     }
                 }
                 Ok(PeerSendOutcome::TimedOut | PeerSendOutcome::NotConnected) | Err(_) => {
-                    // No IWANT reached the peer. Intended semantics (S5):
-                    // the claim is KEPT under an exponential backoff rather
-                    // than released outright. Releasing let every repeated
-                    // inbound IHAVE re-request the same lost id at arrival
-                    // rate under load (a retry storm on saturated relays),
-                    // while 0.5.82's alternative — holding the claim until
-                    // the message arrived — suppressed recovery forever.
-                    // Kept-with-backoff bounds the retry rate (1, 2, 4, 8,
-                    // then capped at 16 s) while still releasable by a later
-                    // IHAVE once the backoff expires; the age sweep in
-                    // `prune_deferred_iwants` still bounds its lifetime.
+                    // No IWANT reached the peer. Intended semantics (S5,
+                    // review r2): the claim is KEPT for the failing peer
+                    // under an exponential backoff (1, 2, 4, 8, then capped
+                    // at 16 s) rather than released outright — releasing let
+                    // every repeated inbound IHAVE re-request the same lost
+                    // id at arrival rate under load — while a DIFFERENT
+                    // peer advertising the id is never suppressed (see the
+                    // request loop). `requested_at` is deliberately NOT
+                    // refreshed: refreshing re-armed the 60 s age sweep on
+                    // every failure, making the claim's lifetime unbounded;
+                    // the sweep must bound it from the FIRST request.
                     let mut topics = self.topics.write_topic(&topic).await;
                     if let Some(state) = topics.get_mut(&topic) {
                         let now = Instant::now();
                         for msg_id in &requested {
                             if let Some(entry) = state.outstanding_iwants.get_mut(msg_id) {
                                 if entry.peer == from {
-                                    entry.requested_at = now;
                                     entry.failures = entry.failures.saturating_add(1);
                                     entry.retry_not_before =
                                         Some(now + iwant_retry_backoff(entry.failures));
@@ -10095,16 +10102,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     }
 
                     let now = Instant::now();
-                    // S3 bounds: offers under a failure backoff are skipped,
-                    // and at most MAX_LATE_LOCAL_OFFERS_PER_FLUSH are paged
-                    // per tick so the per-attempt scan + sign cost cannot
-                    // scale with map size in any single tick.
+                    // S3 bounds: offers under a failure backoff are skipped.
+                    // All remaining candidates are collected (cheap map
+                    // reads); the per-tick cap is applied after the lock by
+                    // the round-robin selector below, so a fixed iteration
+                    // order cannot starve late-ordered peers tick after
+                    // tick.
                     for (&peer, &offer) in state.late_local_offers.iter() {
                         if offer.next_attempt.is_some_and(|t| t > now) {
                             continue;
-                        }
-                        if late_candidates.len() >= MAX_LATE_LOCAL_OFFERS_PER_FLUSH {
-                            break;
                         }
                         late_candidates.push((*topic_id, peer, offer));
                     }
@@ -10127,12 +10133,33 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             TEST_FLUSH_WRITE_ALL_HELD.store(false, Ordering::Relaxed);
             drop(topics_guard);
 
+            // Round-robin the per-tick cap across the candidate set
+            // (review r2, item 6): the shards/topics are walked in a fixed
+            // order and `late_local_offers` is a HashMap, so an
+            // always-take-the-first-N selector starves the tail of the
+            // order until the 60 s sweep. Sorting by (topic, peer) makes
+            // the rotation deterministic; the global cursor advances by
+            late_candidates.sort_unstable_by(|left, right| {
+                left.0
+                    .to_bytes()
+                    .cmp(&right.0.to_bytes())
+                    .then_with(|| left.1.to_bytes().cmp(&right.1.to_bytes()))
+            });
+            let total_candidates = late_candidates.len();
+            let take = total_candidates.min(MAX_LATE_LOCAL_OFFERS_PER_FLUSH);
+            if total_candidates > 0 {
+                let start =
+                    LATE_OFFER_RR_CURSOR.fetch_add(take, Ordering::Relaxed) % total_candidates;
+                late_candidates.rotate_left(start);
+            }
+            late_candidates.truncate(take);
+
             // Select each candidate's ids under its OWN topic shard lock.
             // The wire format pins one topic per IHAVE header, so per-topic
             // offers cannot be batched into one frame per peer; the per-tick
             // cap above is what bounds the work instead.
             let mut late_work = Vec::new();
-            for (topic_id, peer, offer) in late_candidates {
+            for (topic_id, peer, _offer) in late_candidates {
                 let keys = {
                     let now = Instant::now();
                     let mut guard = topics.write_topic(&topic_id).await;
@@ -10155,7 +10182,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     topic: topic_id,
                     batch: eligible.into_iter().map(|(_, id)| id).collect(),
                     targets: vec![peer],
-                    late_offer: Some((peer, offer.cutoff, last)),
+                    late_offer: Some((peer, last)),
                     kind: MessageKind::IHave,
                     // `late_local_offer_keys` selects only `local_origin`
                     // cache entries.
@@ -10373,10 +10400,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 }
                             }
                         }
-                    } else if let Some((peer, cutoff, cursor)) = late_offer {
+                    } else if let Some((peer, cursor)) = late_offer {
                         let late_offer_sent = advertised_peers.contains(&peer);
                         if late_offer_sent {
-                            state.advance_late_local_offer(peer, cutoff, cursor);
+                            state.advance_late_local_offer(peer, cursor);
                         } else {
                             // Failed hand-off: page the cursor FORWARD (a
                             // peer that just failed a send cannot receive
@@ -10384,7 +10411,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             // is bounded by the cache so the offer still
                             // terminates) and back off, so the failure is
                             // never retried at the flush-tick rate.
-                            state.backoff_late_local_offer(peer, cutoff, cursor);
+                            state.backoff_late_local_offer(peer, cursor);
                         }
                     } else {
                         for peer in advertised_peers {
@@ -10433,10 +10460,26 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // deferred an EAGER reply (a `PeerSendOutcome::Deferred` requires
         // it), so this pass must not take its all-shard `write_all()` at
         // all — otherwise every 100 ms flush doubles the all-shard write
-        // lock stalls even though there is nothing to do. Stale entries
-        // from an enabled→disabled reconfigure are bounded (≤1024/topic)
-        // and age out through this prune once the limiter is re-enabled.
+        // lock stalls even though there is nothing to do. The ONE
+        // exception is the transition itself: an enabled→disabled
+        // `configure()` may have stranded custody entries (bounded
+        // ≤1024/topic). The limiter's residue flag marks that state; the
+        // first disabled flush drains them and clears the flag, restoring
+        // the zero-overhead steady state (a plain disabled startup never
+        // sets the flag, so relays pay nothing).
         if !egress_limiter.enabled() {
+            if !egress_limiter.deferred_residue() {
+                return;
+            }
+            {
+                let mut topics_guard = topics.write_all().await;
+                for shard in topics_guard.iter_mut() {
+                    for state in shard.values_mut() {
+                        state.deferred_eager_replies.clear();
+                    }
+                }
+            }
+            egress_limiter.clear_deferred_residue();
             return;
         }
         let work: Vec<_> = {
@@ -12102,6 +12145,9 @@ mod tests {
         connected: Mutex<Vec<PeerId>>,
         /// Total `send_to_peer` invocations, for retry-rate assertions.
         attempts: AtomicU64,
+        /// Artificial latency before the failure, so tests can distinguish
+        /// "state as of request time" from "state as of failure time".
+        delay: Duration,
     }
 
     impl FailingTransport {
@@ -12111,6 +12157,18 @@ mod tests {
                 mode,
                 connected: Mutex::new(Vec::new()),
                 attempts: AtomicU64::new(0),
+                delay: Duration::ZERO,
+            })
+        }
+
+        /// `new` with an artificial per-send delay (see `delay`).
+        fn new_delayed(local_peer: PeerId, mode: SendFailureMode, delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                local_peer,
+                mode,
+                connected: Mutex::new(Vec::new()),
+                attempts: AtomicU64::new(0),
+                delay,
             })
         }
 
@@ -12152,6 +12210,9 @@ mod tests {
             _data: Bytes,
         ) -> Result<()> {
             self.attempts.fetch_add(1, Ordering::Relaxed);
+            if self.delay > Duration::ZERO {
+                tokio::time::sleep(self.delay).await;
+            }
             match self.mode {
                 SendFailureMode::NotConnectedText => Err(anyhow!(
                     "send failed: Endpoint error: Peer not found: PeerId([0, 0, 0])"
@@ -20882,6 +20943,292 @@ mod tests {
         );
     }
 
+    /// Review r2, item 6: the per-tick late-offer cap must ROTATE across
+    /// the candidate set. The shards and topics are walked in a fixed order
+    /// and `late_local_offers` is a HashMap, so an always-take-the-first-N
+    /// selector starves the tail of the order until the 60 s sweep. With
+    /// five multi-page offers (1025 ids each — one page larger than a
+    /// batch, so an attempted offer stays eligible next tick) and a cap of
+    /// 4, tick 2 must start where tick 1 stopped, not serve the same four
+    /// topics again.
+    ///
+    /// Revert-fails: pinning the selector to offset 0 makes tick 2 serve
+    /// the same first four sorted topics → the tick-2 set assert fails.
+    #[tokio::test]
+    async fn late_offer_cap_rotates_across_ticks() {
+        reset_topic_contention_instrumentation_for_test();
+
+        let local = test_peer_id(1);
+        let transport = RecordingTransport::new(local);
+        // No background tasks: the background flusher's own 100 ms ticks
+        // would interleave frames with the two driven below.
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        // Five topics, each with a DISTINCT peer so the frame's destination
+        // identifies the topic; sorted by topic bytes below.
+        let mut topics_peers: Vec<(TopicId, PeerId)> = (0..5u8)
+            .map(|index| (TopicId::new([0xd0 + index; 32]), test_peer_id(index + 2)))
+            .collect();
+        topics_peers.sort_by_key(|(topic, _)| topic.to_bytes());
+        transport.set_connected_peer_ids(topics_peers.iter().map(|(_, peer)| *peer).collect());
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(topics_peers.iter().map(|(_, peer)| *peer).collect()),
+        );
+
+        for (topic, peer) in &topics_peers {
+            pubsub.initialize_topic_peers(*topic, vec![*peer]).await;
+            let mut topics = pubsub.topics.write_topic(topic).await;
+            let state = topics.entry(*topic).or_insert_with(TopicState::new);
+            for index in 0..=(MAX_IHAVE_BATCH_SIZE as u32) {
+                let mut id = [0xd5; 32];
+                id[..4].copy_from_slice(&index.to_le_bytes());
+                state.cache_message(
+                    id,
+                    Bytes::from_static(b"rr-catchup"),
+                    test_header(*topic, id),
+                    true,
+                );
+            }
+            // Capture the cutoff AFTER the inserts so every cached
+            // `inserted_at <= cutoff` and is selectable.
+            let now = Instant::now();
+            state.late_local_offers.insert(
+                *peer,
+                LateLocalOffer {
+                    cutoff: now,
+                    cursor: None,
+                    failures: 0,
+                    next_attempt: None,
+                },
+            );
+        }
+
+        let served_topics = |transport: &RecordingTransport, topics_peers: &[(TopicId, PeerId)]| {
+            let mut served: Vec<TopicId> = transport
+                .sent_frames()
+                .into_iter()
+                .filter_map(|(peer, _, _)| {
+                    topics_peers
+                        .iter()
+                        .find(|(_, candidate)| *candidate == peer)
+                        .map(|(topic, _)| *topic)
+                })
+                .collect();
+            served.sort_by_key(|topic| topic.to_bytes());
+            served
+        };
+
+        // Tick 1: rotation starts at 0 → the first four sorted topics.
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        let tick1 = served_topics(&transport, &topics_peers);
+        assert_eq!(
+            tick1,
+            topics_peers[..4]
+                .iter()
+                .map(|(t, _)| *t)
+                .collect::<Vec<_>>(),
+            "tick 1 serves the first four sorted topics"
+        );
+
+        // Tick 2: the cursor advanced by 4 → rotation starts at index 4 of
+        // the (still) five eligible offers: the fifth topic, then wrap to
+        // the first three. Attempted offers stay eligible (multi-page), so
+        // a fixed-order selector would repeat the same four here.
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        // Frames 4.. are tick 2's, chronologically (the transport
+        // appends in send order); map them by peer WITHOUT re-sorting.
+        let tick2: Vec<TopicId> = transport.sent_frames()[4..]
+            .iter()
+            .filter_map(|(peer, _, _)| {
+                topics_peers
+                    .iter()
+                    .find(|(_, candidate)| candidate == peer)
+                    .map(|(topic, _)| *topic)
+            })
+            .collect();
+
+        let expected2: Vec<TopicId> = vec![
+            topics_peers[4].0,
+            topics_peers[0].0,
+            topics_peers[1].0,
+            topics_peers[2].0,
+        ];
+        assert_eq!(
+            tick2, expected2,
+            "tick 2 must rotate: fifth topic first, then wrap to the head"
+        );
+        assert_eq!(
+            TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL.load(Ordering::Relaxed),
+            0,
+            "rotation still never scans under the all-shard write_all"
+        );
+    }
+
+    /// Review r2, item 7: `advance_late_local_offer` pages the LIVE offer
+    /// forward regardless of the cutoff the batch was selected under. A
+    /// re-queue between snapshot and outcome (new cutoff) must not turn
+    /// the page-forward into a no-op — that re-signed the same page every
+    /// tick.
+    ///
+    /// Revert-fail is compile-level: the reverted method requires a cutoff
+    /// argument, so this call site cannot compile against it.
+    #[test]
+    fn late_offer_advance_applies_to_requeued_offer() {
+        let topic = TopicId::new([0xd8; 32]);
+        let peer = test_peer_id(2);
+        let mut state = TopicState::new();
+        state.cache_message(
+            [0xd9; 32],
+            Bytes::from_static(b"local"),
+            test_header(topic, [0xd9; 32]),
+            true,
+        );
+        // The LIVE offer carries a NEWER cutoff than any snapshot — the
+        // shape a re-queue between snapshot and outcome produces.
+        state.late_local_offers.insert(
+            peer,
+            LateLocalOffer {
+                cutoff: Instant::now(),
+                cursor: None,
+                failures: 3,
+                next_attempt: None,
+            },
+        );
+        let cursor = (Instant::now(), [0xd9; 32]);
+        state.advance_late_local_offer(peer, cursor);
+        {
+            let offer = state.late_local_offers.get(&peer).expect("offer kept");
+            assert_eq!(offer.cursor, Some(cursor), "the live offer pages forward");
+            assert_eq!(offer.failures, 0, "success clears the failure schedule");
+            assert_eq!(offer.next_attempt, None);
+        }
+        state.backoff_late_local_offer(peer, cursor);
+        {
+            let offer = state.late_local_offers.get(&peer).expect("offer kept");
+            assert_eq!(
+                offer.cursor,
+                Some(cursor),
+                "backoff also pages the live offer forward"
+            );
+            assert_eq!(offer.failures, 1);
+            assert!(offer.next_attempt.is_some());
+        }
+    }
+
+    /// Review r2, item 5: an enabled→disabled reconfigure must not strand
+    /// `deferred_eager_replies` in topic state until the limiter is
+    /// re-enabled. The disabling `configure()` arms a residue flag; the
+    /// FIRST disabled flush drains the custody and clears the flag, and
+    /// the steady state stays zero-overhead afterwards.
+    ///
+    /// Revert-fails: without the drain, the entries survive the disabled
+    /// flush and the emptiness assert fails.
+    #[tokio::test]
+    async fn disabling_reconfigure_drains_deferred_eager_replies() {
+        reset_topic_contention_instrumentation_for_test();
+
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0xda; 32]);
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1024 * 1024,
+            burst_bytes: 4 * 1024 * 1024,
+            max_serialized_frame_bytes: 4 * 1024 * 1024,
+            policy: BytePolicy::ObserveOnly,
+        })));
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.deferred_eager_replies.push(DeferredEagerReply {
+                peer,
+                msg_id: [0xdb; 32],
+                requested_at: Instant::now(),
+            });
+        }
+
+        // The disabling transition arms the residue flag.
+        assert!(pubsub.configure_leaf_egress(None));
+        assert!(!pubsub.egress_limiter.enabled());
+        assert!(
+            pubsub.egress_limiter.deferred_residue(),
+            "an enabled→disabled transition must mark possible stranded custody"
+        );
+
+        // First disabled flush: regular work pass + ONE drain pass.
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert!(pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .expect("topic")
+            .deferred_eager_replies
+            .is_empty());
+        assert!(
+            !pubsub.egress_limiter.deferred_residue(),
+            "the drain clears the flag"
+        );
+
+        // Steady state restored: one write_all per tick, no drain.
+        reset_topic_contention_instrumentation_for_test();
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            &pubsub.send_path_context(),
+            &pubsub.egress_limiter,
+        )
+        .await;
+        assert_eq!(
+            TEST_WRITE_ALL_TAKES.load(Ordering::Relaxed),
+            1,
+            "after the drain, a disabled flush takes exactly one write_all again"
+        );
+    }
+
     /// S3(c): a failed late-offer hand-off pages the cursor FORWARD and
     /// backs off — subsequent immediate ticks neither scan nor send for
     /// that offer, and the offer stays live (releasable once the backoff
@@ -21021,7 +21368,16 @@ mod tests {
     async fn failed_iwant_keeps_claim_under_backoff_not_arrival_rate() {
         let local = test_peer_id(1);
         let peer = test_peer_id(2);
-        let transport = FailingTransport::new(local, SendFailureMode::LiveIoError);
+        // The 50 ms send delay separates "request time" from "failure
+        // time": a failure that refreshed `requested_at` would stamp it
+        // ≥50 ms after the request (asserted below), re-arming the 60 s
+        // age sweep on every failure — an unbounded claim lifetime
+        // (review r2, MUST 1).
+        let transport = FailingTransport::new_delayed(
+            local,
+            SendFailureMode::LiveIoError,
+            Duration::from_millis(50),
+        );
         transport.report_connected(vec![peer]);
         let pubsub = PlumtreePubSub::new_with_task_control(
             local,
@@ -21034,9 +21390,10 @@ mod tests {
         let id = [0x91; 32];
 
         // First advertisement: one IWANT attempt, which fails at the transport.
+        let request_started = Instant::now();
         let _ = pubsub.handle_ihave(peer, topic, vec![id]).await;
         assert_eq!(transport.send_attempts(), 1);
-        {
+        let first_requested_at = {
             let topics = pubsub.topics.read_topic(&topic).await;
             let entry = topics
                 .get(&topic)
@@ -21050,11 +21407,16 @@ mod tests {
                 entry.retry_not_before.is_some_and(|t| t > Instant::now()),
                 "a retry backoff must be recorded"
             );
-        }
+            assert!(
+                entry.requested_at < request_started + Duration::from_millis(40),
+                "requested_at must stay at REQUEST time, not be refreshed to                  failure time (the delayed send fails at ≥50 ms) — the 60 s                  sweep must bound the claim from the FIRST request"
+            );
+            entry.requested_at
+        };
 
-        // Re-advertise immediately, many times: backoff suppresses every
-        // re-request (this is the 0.5.83 regression — the release let each
-        // arrival send a fresh IWANT).
+        // Re-advertise immediately, many times: the failing peer's backoff
+        // suppresses every re-request (this is the 0.5.83 regression — the
+        // release let each arrival send a fresh IWANT).
         for _ in 0..25 {
             let _ = pubsub.handle_ihave(peer, topic, vec![id]).await;
         }
@@ -21082,7 +21444,73 @@ mod tests {
                 .get(&id)
                 .expect("claim survives the retried failure");
             assert_eq!(entry.failures, 2, "failures accumulate for the schedule");
+            // The retry re-created the claim (a genuine new request, fresh
+            // requested_at by design); the first-attempt assert above is
+            // what pins "failures never refresh requested_at".
+            let _ = first_requested_at;
         }
+    }
+
+    /// S5 (review r2, MUST 1): the retry backoff is keyed on the FAILING
+    /// peer. Peer A's failed IWANT suppresses re-requests only from A; a
+    /// DIFFERENT peer advertising the same id is asked immediately — with
+    /// 15 s Critical DM deadlines, suppressing a healthy source for up to
+    /// 16 s is exactly the failure mode this PR removes.
+    ///
+    /// Revert-fails: restoring per-id suppression (dropping the
+    /// `entry.peer == from` scope) keeps B suppressed → attempts stay 1.
+    #[tokio::test]
+    async fn different_advertiser_asked_immediately_after_peer_failure() {
+        let local = test_peer_id(1);
+        let failing_peer = test_peer_id(2);
+        let other_peer = test_peer_id(3);
+        let transport = FailingTransport::new(local, SendFailureMode::LiveIoError);
+        transport.report_connected(vec![failing_peer, other_peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x93; 32]);
+        pubsub
+            .initialize_topic_peers(topic, vec![failing_peer, other_peer])
+            .await;
+        let id = [0x94; 32];
+
+        // A advertises; our IWANT to A fails at the transport.
+        let _ = pubsub.handle_ihave(failing_peer, topic, vec![id]).await;
+        assert_eq!(transport.send_attempts(), 1);
+
+        // B advertises the same id 200 ms of loop time later (immediately
+        // here): B is a different, untried source and MUST be asked at
+        // once — not held behind A's backoff.
+        let _ = pubsub.handle_ihave(other_peer, topic, vec![id]).await;
+        assert_eq!(
+            transport.send_attempts(),
+            2,
+            "a different advertiser must be asked immediately after the \
+             failing peer's backoff was armed"
+        );
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let entry = topics
+                .get(&topic)
+                .expect("topic")
+                .outstanding_iwants
+                .get(&id)
+                .expect("B's request holds the claim now");
+            assert_eq!(entry.peer, other_peer);
+            // The transport fails for every peer, so B's own attempt also
+            // records failures=1 — the point is that B was ASKED (the
+            // attempts assert above), with a schedule starting from B's
+            // own first failure rather than inheriting A's.
+        }
+
+        // A itself stays suppressed by its own backoff only while the claim
+        // is not A's: here the claim belongs to B, and A re-advertising is
+        // a different-source takeover again — allowed (per-failing-peer
+        // semantics), and bounded by distinct advertisers, not tick rate.
     }
 
     /// S5 bound: the exponential schedule (1, 2, 4, 8, capped 16 s)

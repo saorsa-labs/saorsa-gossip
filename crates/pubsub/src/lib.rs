@@ -14900,6 +14900,71 @@ mod tests {
         );
     }
 
+    /// WHY (fair-displacement unreachability): under
+    /// `BytePolicy::ObserveOnly` nothing registers recovery intents —
+    /// recovery sends are policy-protected and go through
+    /// `reserve_protected`, which never waits and never leaves intent
+    /// state behind — so the fair-admission displacement path cannot be
+    /// reached at all. An observing budget must stay a pure observer even
+    /// under load that a shedding node would saturate.
+    #[tokio::test]
+    async fn observe_only_recovery_load_registers_no_intents_or_displacements() {
+        let local = test_peer_id(1);
+        let required = test_peer_id(2);
+        let topic = TopicId::new([0xe1; 32]);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![required]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        pubsub.initialize_topic_peers(topic, vec![required]).await;
+        // A hard rate of 1 B/s over an 8 KiB burst: a shedding node is
+        // saturated immediately, so sustained flushes here exercise the
+        // protected lane, not an empty budget.
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ObserveOnly,
+        })));
+
+        for round in 0..4_u8 {
+            {
+                let mut topics = pubsub.topics.write_topic(&topic).await;
+                let state = topics.get_mut(&topic).expect("target topic state");
+                state.eager_peers.clear();
+                state.lazy_peers.insert(required);
+                let mut digest = [0xe2_u8; 32];
+                digest[0] = round + 1;
+                state.push_pending_ihave(digest);
+            }
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &pubsub.topics,
+                &pubsub.transport,
+                &pubsub.signing_key,
+                &pubsub.stage_stats,
+                &pubsub.outbound_budgets,
+                &pubsub.send_path_context(),
+                &pubsub.egress_limiter,
+            )
+            .await;
+        }
+        assert!(
+            !transport
+                .sent_frames_of_kind_to(required, MessageKind::IHave)
+                .is_empty(),
+            "control: the protected ObserveOnly lane still delivers IHAVE"
+        );
+        let snapshot = pubsub.leaf_egress_snapshot();
+        assert_eq!(snapshot.pending_recovery_intents, 0);
+        assert_eq!(snapshot.intent_displaced, 0);
+        assert_eq!(snapshot.queue_overflow, 0);
+    }
+
     /// Issue #62 (x0x #611): with a consumer-configured max eager degree
     /// of 2 (x0x Leaf) the healthy mesh IS two peers, so demoting one of
     /// them locks the topic at degree 1 for at least the 120 s cooldown —

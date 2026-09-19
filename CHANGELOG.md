@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **pubsub: fair recovery-intent admission with bounded displacement.**
+  Intent admission in the Leaf egress limiter was first-come-first-served
+  up to the class caps with no eviction, so while a class was saturated a
+  newly observed, otherwise-eligible IHAVE/IWANT target was refused with
+  `IntentLimit` for up to the 120 s intent lifetime regardless of byte
+  budget — metadata starvation of exactly the new targets a busy relay
+  most needs to start serving. When a class is full, the limiter now
+  admits a newcomer from an under-represented target peer by displacing
+  the least-work still-pending intent (lowest charged bytes, then
+  youngest) of the most-represented peer. There is exactly one fairness
+  dimension — the peer — so the per-peer count multiset strictly
+  improves on every displacement and ping-pong is impossible by
+  construction; a fully charged intent awaiting its owner's claim is
+  never a victim. Displacement is rate-limited by a per-class token
+  bucket (burst 8, then one per 2 s on the limiter's existing virtual
+  clock) because fresh PeerIds are free; an empty bucket refuses with
+  `IntentLimit` as before. A displacement-admitted Ordinary newcomer
+  takes over the front of the ordinary charging rotation until first
+  served — at most one such promotion is outstanding — so admission also
+  means prompt service. Victims are removed through the expiry path's
+  bookkeeping, their escrow stays non-refunding, and their owners
+  observe displacement exactly as they observe expiry. New counters
+  `LeafEgressSnapshot::intent_displaced` and
+  `displacement_rate_limited`; `queue_overflow` keeps counting refusals
+  only. Unreachable under `ObserveOnly`, where nothing registers intents.
+
 ## [0.5.83] - 2026-09-18
 
 ### Added

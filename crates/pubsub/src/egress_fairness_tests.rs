@@ -418,11 +418,11 @@ fn a_continuously_renewed_intent_still_ages_out() -> Result<(), &'static str> {
 }
 
 // ---- Fair-share admission displacement (#504 review) ------------------
-//
-// The tests below pin the displacement contract: strict imbalance drives
-// admission, victims lose the least work, buckets converge instead of
-// thrashing, classes stay isolated, bookkeeping matches a manual recount,
-// and a displacement-admitted newcomer receives prompt service.
+// The tests below pin the revised displacement contract (review r2):
+// a single peer fairness dimension that cannot ping-pong, pending-only
+// candidate counts, youngest-victim tiebreak, a per-class rate budget,
+// bounded front-of-rotation promotion, class isolation, bookkeeping that
+// matches a manual recount, and Sybil-churn bounds on incumbent service.
 
 use std::collections::{HashMap, HashSet};
 
@@ -549,8 +549,9 @@ fn fair_displacement_admits_under_represented_peer_with_timely_service() {
     assert_eq!(limiter.lock_state().intents.len(), 1024);
 
     // The victim is the dominant peer's least-work intent: everything was
-    // charged zero at the same instant, so the oldest order loses.
-    assert!(!limiter.lock_state().intents.contains_key(&dominant[0]));
+    // charged zero at the same instant, so the YOUNGEST registration loses
+    // (Reverse(created_at), then Reverse(order)).
+    assert!(!limiter.lock_state().intents.contains_key(&dominant[599]));
     let dominant_peer = [0x10_u8; 32];
     let newcomer_peer = [0x50_u8; 32];
     let mut per_peer: HashMap<[u8; 32], usize> = HashMap::new();
@@ -654,22 +655,25 @@ fn balanced_full_class_refuses_newcomers_without_displacing() {
 /// admission moves one intent from the fullest peer to the hungry one,
 /// so the gap shrinks by two per admission and displacement stops — and
 /// stays stopped — once the newcomer would no longer be strictly below
-/// the fullest bucket. A displaced peer re-registering while it holds
-/// the maximum is refused, which is what makes ping-pong impossible
-/// rather than merely unlikely.
+/// the fullest bucket. A displaced peer re-registering while it holds the
+/// maximum is refused, which is what makes ping-pong impossible rather
+/// than merely unlikely. Attempts are spaced 2 s of virtual time apart —
+/// the displacement rate limit admits one displacement per 2 s — and the
+/// byte rate is 1 B/s so nothing ever charges and the pending-count
+/// arithmetic stays exact.
 #[test]
 fn alternating_hungry_peers_displace_boundedly_without_thrash() {
-    let limiter = limiter(1024, 4096);
+    let limiter = limiter(1, 4096);
     let start = Instant::now();
     drain(&limiter, start, 512);
     let mut scope_index: u32 = 0;
     let mut dominant = Vec::new();
+    let mut now = start;
     for _ in 0..60 {
         let key = pinned_key(0x10, &mut scope_index);
         dominant.push(key);
         assert!(matches!(
-            limiter
-                .try_reserve_recovery_at_class(key, 512, 1, start, RecoveryClass::CriticalEager,),
+            limiter.try_reserve_recovery_at_class(key, 4096, 1, now, RecoveryClass::CriticalEager,),
             Err(ReserveError::Deferred)
         ));
     }
@@ -677,9 +681,9 @@ fn alternating_hungry_peers_displace_boundedly_without_thrash() {
         assert!(matches!(
             limiter.try_reserve_recovery_at_class(
                 pinned_key(0x20, &mut scope_index),
-                512,
+                4096,
                 1,
-                start,
+                now,
                 RecoveryClass::CriticalEager,
             ),
             Err(ReserveError::Deferred)
@@ -689,11 +693,12 @@ fn alternating_hungry_peers_displace_boundedly_without_thrash() {
     let mut admissions = 0;
     loop {
         assert!(admissions < 200, "displacement must converge, not loop");
+        now += Duration::from_secs(2);
         match limiter.try_reserve_recovery_at_class(
             pinned_key(0x20, &mut scope_index),
-            512,
+            4096,
             1,
-            start,
+            now,
             RecoveryClass::CriticalEager,
         ) {
             Err(ReserveError::Deferred) => admissions += 1,
@@ -702,25 +707,30 @@ fn alternating_hungry_peers_displace_boundedly_without_thrash() {
         }
     }
     // From (60, 4): the i-th admission displaces while (4 + i) < (61 - i),
-    // which holds through i = 28, leaving both peers at 32.
+    // which holds through i = 28, leaving both peers at 32. One attempt
+    // per 2 s of virtual time is exactly the sustained rate limit.
     assert_eq!(admissions, 28);
     let snapshot = limiter.snapshot();
     assert_eq!(snapshot.intent_displaced, 28);
+    assert_eq!(snapshot.displacement_rate_limited, 0);
     assert_eq!(limiter.lock_state().intents.len(), 64);
 
     // The displaced peer cannot displace anything back while it holds the
     // maximum, and repeated polls of the refused key displace nothing new.
+    // Re-poll at the same instant: the virtual clock must stay under the
+    // 60 s idle age so the never-renewed fill is not swept mid-test.
     assert!(matches!(
         limiter.try_reserve_recovery_at_class(
-            dominant[0],
-            512,
+            dominant[59],
+            4096,
             1,
-            start,
+            now,
             RecoveryClass::CriticalEager,
         ),
         Err(ReserveError::IntentLimit)
     ));
     assert_eq!(limiter.snapshot().intent_displaced, 28);
+    assert_eq!(limiter.snapshot().displacement_rate_limited, 0);
 }
 
 /// WHY: the class partitions exist so ordinary pressure cannot silence
@@ -794,17 +804,21 @@ fn ordinary_displacement_never_crosses_class_boundaries() {
             .count()
     };
     assert_eq!(ordinary_before, ordinary_after);
-    assert!(!limiter.lock_state().intents.contains_key(&dominant[0]));
+    assert!(!limiter.lock_state().intents.contains_key(&dominant[599]));
 }
 
-/// WHY: the peer dimension cannot help a starved *scope* when every peer
-/// is at fair share. Ten peers holding 96 intents each is peer-balanced,
-/// but if eight of them concentrate on one topic, that topic holds 768 of
-/// the 960 ordinary slots and a different topic cannot enter admission at
-/// all. The scope dimension displaces from the most-represented scope so
-/// an unserved scope enters even at peer fair share.
+/// WHY (review P0): two fairness dimensions have no joint potential
+/// function, so they could evict each other's owners in a cycle. The
+/// schedule below is the reviewer's probe: eight peers hold 96 intents
+/// each on one hot scope and two peers hold 96 each on unique scopes —
+/// a peer-balanced map. Under the old peer+scope rules, an N
+/// registration (fair-share peer, fresh scope) evicted a hot-scope
+/// intent V via the scope dimension, and V's re-poll evicted N via the
+/// peer dimension: 40 cycles, 80 displacements, zero progress. With the
+/// single peer dimension both attempts are clean refusals — nothing is
+/// evicted, no escrow burns, and charged work never regresses.
 #[test]
-fn scope_dimension_admits_starved_scope_at_peer_fair_share() {
+fn fair_admission_cannot_ping_pong_across_dimensions() {
     let limiter = limiter(1024, 4096);
     let start = Instant::now();
     drain(&limiter, start, 512);
@@ -836,28 +850,41 @@ fn scope_dimension_admits_starved_scope_at_peer_fair_share() {
     }
     assert_eq!(limiter.lock_state().intents.len(), 960);
 
-    // Newcomer from a fair-share peer with a scope that holds nothing.
-    let newcomer = pinned_key(0x10, &mut scope_index);
-    assert!(matches!(
-        limiter.try_reserve_recovery_at(newcomer, 128, 1, start),
-        Err(ReserveError::Deferred)
-    ));
+    // Alternate the two halves of the old cycle: N registers from a
+    // fair-share peer with a fresh scope, then a hot-scope peer
+    // re-registers a fresh operation on the hot scope. Every peer holds
+    // 96 pending intents, so every attempt must be refused.
+    let mut charged_before = limiter.snapshot().charged_bytes;
+    for cycle in 0..40 {
+        let newcomer = pinned_key(0x18, &mut scope_index);
+        assert!(
+            matches!(
+                limiter.try_reserve_recovery_at(newcomer, 128, 1, start),
+                Err(ReserveError::IntentLimit)
+            ),
+            "cycle {cycle}: a fair-share peer must not displace anyone"
+        );
+        seed += 1;
+        let hot = fixed_scope_key(0x10, hot_scope, seed);
+        assert!(
+            matches!(
+                limiter.try_reserve_recovery_at(hot, 128, 1, start),
+                Err(ReserveError::IntentLimit)
+            ),
+            "cycle {cycle}: a max-holder must not displace anyone"
+        );
+        let charged_now = limiter.snapshot().charged_bytes;
+        assert!(
+            charged_now >= charged_before,
+            "cycle {cycle}: charged work must never regress (churn burns escrow)"
+        );
+        charged_before = charged_now;
+    }
     let snapshot = limiter.snapshot();
-    assert_eq!(snapshot.intent_displaced, 1);
-    assert_eq!(snapshot.queue_overflow, 0);
-
-    // The victim came from the hottest scope, and the newcomer's fresh
-    // scope took over the rotation front.
-    let (deque_len, position, _intents) = limiter.ordinary_rotation_probe_for_test(newcomer.scope);
-    assert_eq!(position, Some(0));
-    assert_eq!(deque_len, 194);
-    assert_rotation_bookkeeping_matches(&limiter);
-    let hot_pending = limiter
-        .lock_state()
-        .ordinary_scope_counts
-        .get(&hot_scope)
-        .copied();
-    assert_eq!(hot_pending, Some(767));
+    assert_eq!(snapshot.intent_displaced, 0);
+    assert_eq!(snapshot.displacement_rate_limited, 0);
+    assert_eq!(snapshot.queue_overflow, 80);
+    assert_eq!(limiter.lock_state().intents.len(), 960);
 }
 
 /// WHY: displacement must not strand the victim. Its owner observes
@@ -875,7 +902,7 @@ fn displaced_incumbent_re_enters_and_still_completes() -> Result<(), &'static st
         limiter.try_reserve_recovery_at(pinned_key(0x50, &mut newcomer_scope), 128, 1, start),
         Err(ReserveError::Deferred)
     ));
-    assert!(!limiter.lock_state().intents.contains_key(&dominant[0]));
+    assert!(!limiter.lock_state().intents.contains_key(&dominant[599]));
 
     // While the map is still saturated the victim's re-poll is a clean
     // refusal, identical to what an owner sees after expiry into a full
@@ -883,7 +910,7 @@ fn displaced_incumbent_re_enters_and_still_completes() -> Result<(), &'static st
     // admitted the newcomer now protects the newcomer. It must be a
     // refusal, never a panic or an invariant violation.
     assert!(matches!(
-        limiter.try_reserve_recovery_at(dominant[0], 512, 1, start),
+        limiter.try_reserve_recovery_at(dominant[599], 512, 1, start),
         Err(ReserveError::IntentLimit)
     ));
     assert_eq!(limiter.snapshot().queue_overflow, 1);
@@ -900,7 +927,7 @@ fn displaced_incumbent_re_enters_and_still_completes() -> Result<(), &'static st
     for second in 1..=(sweep + 20) {
         let now = start + Duration::from_secs(second);
         if re_admitted_at.is_none() || victim_done.is_none() {
-            let outcome = limiter.try_reserve_recovery_at(dominant[0], 512, 1, now);
+            let outcome = limiter.try_reserve_recovery_at(dominant[599], 512, 1, now);
             // Admission is either a deferral or — if the emptied rotation
             // and freshly refilled bucket can serve it at once — a
             // completed reservation. Both are re-admission.
@@ -908,7 +935,7 @@ fn displaced_incumbent_re_enters_and_still_completes() -> Result<(), &'static st
                 re_admitted_at = Some(second);
                 if let Err(ReserveError::Deferred) = outcome {
                     let (deque_len, position, intents) =
-                        limiter.ordinary_rotation_probe_for_test(dominant[0].scope);
+                        limiter.ordinary_rotation_probe_for_test(dominant[599].scope);
                     assert_eq!(position, Some(deque_len - 1));
                     assert_eq!(intents, vec![(512, 0)]);
                 }
@@ -936,4 +963,90 @@ fn displaced_incumbent_re_enters_and_still_completes() -> Result<(), &'static st
     assert!(victim_done <= sweep + 20 && survivor_done <= sweep + 20);
     assert_rotation_bookkeeping_matches(&limiter);
     Ok(())
+}
+
+/// WHY (review P1): displacement is a cost the displaced peer pays, and
+/// fresh PeerIds are free, so an attacker that registers one fresh peer
+/// with a maximum-size frame per second can otherwise invoke displacement
+/// on every poll and burn incumbent service. The defense under test is the
+/// pair of bounds from the revised design: the per-class token bucket (8
+/// burst, then one displacement per 2 s of virtual time) and the
+/// single-outstanding front-of-rotation promotion. The same incumbent
+/// schedule runs twice — once with the attack, once without — and the
+/// attacked arm must keep at least half of the untouched arm's completed
+/// intents.
+#[test]
+fn sybil_fresh_peer_churn_is_rate_limited_and_bounded() {
+    const HARD: u64 = 8192;
+    const BURST: u64 = 65_536;
+    const WINDOW: u32 = 120;
+    fn run_schedule(attack: bool) -> (usize, u64, u64) {
+        let limiter = limiter(HARD, BURST);
+        // The incumbent peer fills the ordinary class with one-slot
+        // frames; the first ~64 of them consume the burst and complete,
+        // so the loop keeps admitting until the class is genuinely full.
+        let mut scope_index: u32 = 0;
+        while limiter.lock_state().intents.len() < ORDINARY_MAX_INTENTS {
+            let _ = limiter.try_reserve_recovery(pinned_key(0x10, &mut scope_index), 1024);
+        }
+        for second in 0..WINDOW {
+            limiter.refill_after_for_test(Duration::from_secs(1));
+            if attack {
+                // One fresh PeerId per second, maximum-size frame: it can
+                // never complete within the window, so every admission is
+                // pure cost to the incumbents.
+                let mut identity = [0_u8; 32];
+                identity[..4].copy_from_slice(&(0x5100_0000_u32 + second).to_le_bytes());
+                let _ = limiter.try_reserve_recovery(
+                    RecoveryIntentKey {
+                        peer: identity,
+                        scope: identity,
+                        family: identity,
+                        operation: identity,
+                    },
+                    BURST as usize,
+                );
+            }
+        }
+        // Completed intents stay in the map until claimed, so a scan
+        // counts every incumbent that reached full charge.
+        let completed = {
+            let state = limiter.lock_state();
+            state
+                .intents
+                .values()
+                .filter(|intent| {
+                    intent.class == RecoveryClass::Ordinary
+                        && intent.charged >= intent.bytes
+                        && intent.bytes == 1024
+                })
+                .count()
+        };
+        let snapshot = limiter.snapshot();
+        (
+            completed,
+            snapshot.intent_displaced,
+            snapshot.displacement_rate_limited,
+        )
+    }
+
+    let (clean, clean_displaced, _) = run_schedule(false);
+    let (attacked, displaced, rate_limited) = run_schedule(true);
+    assert_eq!(
+        clean_displaced, 0,
+        "no fresh peers: nothing to displace for"
+    );
+    assert!(
+        attacked * 2 >= clean,
+        "incumbent completions under attack ({attacked}) must be >= 50% of the untouched figure ({clean})"
+    );
+    // 8-token burst plus one per 2 s over the window.
+    assert!(
+        displaced <= DISPLACEMENT_TOKEN_CAPACITY + u64::from(WINDOW) / 2,
+        "displacements ({displaced}) exceed the rate budget"
+    );
+    assert!(
+        rate_limited >= 1,
+        "the rate limiter must engage under churn"
+    );
 }

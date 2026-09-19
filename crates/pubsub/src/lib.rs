@@ -14962,6 +14962,7 @@ mod tests {
         let snapshot = pubsub.leaf_egress_snapshot();
         assert_eq!(snapshot.pending_recovery_intents, 0);
         assert_eq!(snapshot.intent_displaced, 0);
+        assert_eq!(snapshot.displacement_rate_limited, 0);
         assert_eq!(snapshot.queue_overflow, 0);
     }
 

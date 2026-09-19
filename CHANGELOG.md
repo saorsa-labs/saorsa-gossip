@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **pubsub: fair recovery-intent admission with bounded displacement.**
+  Intent admission in the Leaf egress limiter was first-come-first-served
+  up to the class caps with no eviction, so while a class was saturated a
+  newly observed, otherwise-eligible IHAVE/IWANT target was refused with
+  `IntentLimit` for up to the 120 s intent lifetime regardless of byte
+  budget — metadata starvation of exactly the new targets a busy relay
+  most needs to start serving. When a class is full, the limiter now
+  admits a newcomer from an under-represented target peer by displacing
+  the least-work still-pending intent (lowest charged bytes, then
+  youngest) of the most-represented peer. There is exactly one fairness
+  dimension — the peer — so the per-peer count multiset strictly
+  improves on every displacement and ping-pong is impossible by
+  construction; a fully charged intent awaiting its owner's claim is
+  never a victim. Displacement is rate-limited by a per-class token
+  bucket (burst 8, then one per 2 s on the limiter's existing virtual
+  clock) because fresh PeerIds are free; an empty bucket refuses with
+  `IntentLimit` as before. A displacement-admitted Ordinary newcomer
+  takes over the front of the ordinary charging rotation and keeps it
+  until its frame is fully charged or leaves the map — a partial first
+  charge no longer sends it to the back of the rotation. The promotion
+  is keyed to the admitted intent itself (never its topic/scope, so a
+  stream of fresh PeerIds sharing one topic cannot keep it alive
+  through same-scope successors), at most one is outstanding, later
+  newcomers never inherit it, and a hard cap of ceil(frame/quantum) + 1
+  slot visits — counted on every visit to the promoted scope, whichever
+  of its intents the slot serves — bounds every hold to one admitted
+  frame's worth of bytes. Victims are removed through the expiry path's
+  bookkeeping, their escrow stays non-refunding, and their owners
+  observe displacement exactly as they observe expiry. New counters
+  `LeafEgressSnapshot::intent_displaced` and
+  `displacement_rate_limited`; `queue_overflow` keeps counting refusals
+  only. Unreachable under `ObserveOnly`, where nothing registers intents.
+
+### Known Issues
+
+- **pubsub: displacement token bucket is per-class global.** A
+  fast-polling attacker (10 ms poll interval) can take nearly every
+  displacement token in its class, so a slow-polling legitimate newcomer
+  degrades to the pre-fix behaviour (never worse than FCFS refusal);
+  the non-adversarial worst case is ~2 s of admission delay per
+  concurrent newcomer.
+- **pubsub: a promoted scope holds the rotation front for its whole
+  frame.** Promotion now ends only when the promoted frame is fully
+  charged (or leaves the map), which is what makes a partial first
+  charge safe — but it also means each displacement-admitted frame
+  holds the front for frame ÷ quantum ordinary-slot visits. Under a
+  one-fresh-PeerId-per-second attack with re-polling incumbents (7:1
+  critical/ordinary split, virtual clock), rotation-head completions
+  measured 50 clean vs 1 under attack across 32 displacements; the
+  reviewer's probe shape measured 60 → 13 with displacement disabled →
+  2 with displacement enabled. Candidate mitigations (not implemented):
+  per-peer displacement-token fairness, or letting displacement victims
+  keep their rotation position on re-admission.
+
 ## [0.5.83] - 2026-09-18
 
 ### Added

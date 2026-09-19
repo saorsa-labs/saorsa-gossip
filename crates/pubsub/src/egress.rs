@@ -944,14 +944,22 @@ impl LeafEgressLimiter {
             // `promotion_live`, covering claim, expiry, cancellation,
             // displacement and family replacement), or burns its
             // `ceil(bytes/quantum) + 1` visit budget — the hard cap that
-            // bounds every hold to one admitted frame's worth of bytes.
+            // bounds every hold to one admitted frame's worth of bytes,
+            // counted per visit to the promoted scope whichever of its
+            // intents the slot serves.
             if class == RecoveryClass::Ordinary && delta > 0 {
                 if let Some(mut promotion) = state.promoted {
-                    if promotion.key == key {
+                    // The budget counts ANY visit to the promoted scope,
+                    // not only charges of the promoted key itself: a
+                    // lower-order intent in that scope (reachable through
+                    // family-order inheritance) can be the one the slot
+                    // serves, and the hold must still burn down — the front
+                    // must never stay pinned with the cap unspent.
+                    if promotion.key.scope == key.scope {
                         promotion.visits_remaining = promotion.visits_remaining.saturating_sub(1);
                         let fully_charged = state
                             .intents
-                            .get(&key)
+                            .get(&promotion.key)
                             .is_some_and(|intent| intent.charged >= intent.bytes);
                         if fully_charged || promotion.visits_remaining == 0 {
                             state.promoted = None;

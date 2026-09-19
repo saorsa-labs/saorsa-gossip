@@ -1241,3 +1241,124 @@ fn same_scope_fresh_peer_wedge_keeps_incumbents_completing() {
         "same-scope fresh-PeerId wedge must not deny incumbents: clean {clean}, attacked {attacked}"
     );
 }
+
+/// WHY (review r6 hardening): the visit budget decremented only when the
+/// promoted KEY itself was charged. The slot serves the lowest-order
+/// pending intent in the front scope, and a same-scope intent can carry a
+/// LOWER order than the promoted key through family-order inheritance —
+/// so that intent, not the promoted one, could receive every visit while
+/// the budget stayed unspent and the front stayed pinned. The hardened
+/// rule counts ANY visit to the promoted scope. This test builds exactly
+/// that shape: an early dominant-family intent X, a displacement-admitted
+/// promoted newcomer K (fresh scope S), then K2 inheriting X's low order
+/// into scope S — so the slot serves K2, never K — and asserts the hold
+/// still burns down within K's budget.
+///
+/// GATES: the scope-visit decrement (fails when the decrement is keyed to
+/// the promoted intent only).
+#[test]
+fn promotion_budget_counts_visits_to_the_scope_not_the_intent() {
+    // hard 8192 B/s -> 1024 B quantum; one ordinary slot per virtual
+    // second behind a critical backlog.
+    let limiter = limiter(8192, 65_536);
+    limiter.advance_virtual_clock_for_test(Duration::from_millis(0));
+    let mut scope_index: u32 = 0;
+    let mut fill_keys = Vec::new();
+    while limiter.lock_state().intents.len() < ORDINARY_MAX_INTENTS {
+        let key = pinned_key(0x10, &mut scope_index);
+        fill_keys.push(key);
+        let _ = limiter.try_reserve_recovery(key, 2048);
+    }
+    while limiter.lock_state().intents.len() < DEFAULT_MAX_INTENTS {
+        let _ = limiter.try_reserve_recovery_at_class(
+            pinned_key(0x60, &mut scope_index),
+            65_536,
+            1,
+            limiter.current_now(),
+            RecoveryClass::CriticalEager,
+        );
+    }
+    // X: a pending dominant-family intent with a low order. The first
+    // ~32 fill keys self-complete on the burst, and the LAST one is the
+    // displacement victim of K's own admission, so take the
+    // second-to-last: it survives both.
+    let x = fill_keys[fill_keys.len() - 2];
+
+    // K: displacement-admitted newcomer in a fresh scope, frame 2048 ->
+    // budget ceil(2048/1024) + 1 = 3 visits.
+    let mut newcomer_scope: u32 = 600_000;
+    let promoted_key = pinned_key(0x50, &mut newcomer_scope);
+    assert!(matches!(
+        limiter.try_reserve_recovery(promoted_key, 2048),
+        Err(ReserveError::Deferred)
+    ));
+    assert_eq!(
+        limiter.lock_state().promoted.map(|p| p.key),
+        Some(promoted_key)
+    );
+    assert_eq!(
+        limiter.lock_state().promoted.map(|p| p.visits_remaining),
+        Some(3)
+    );
+
+    // K2: a fresh key in the promoted scope whose FAMILY matches X, so it
+    // inherits X's low order and becomes the intent the slot serves — the
+    // promoted key itself is never charged.
+    let mut k2_operation = [0_u8; 32];
+    k2_operation[..8].copy_from_slice(&0xdddd_dddd_u64.to_le_bytes());
+    let k2 = RecoveryIntentKey {
+        peer: [0x70; 32],
+        scope: promoted_key.scope,
+        family: x.family,
+        operation: k2_operation,
+    };
+    assert!(matches!(
+        limiter.try_reserve_recovery(k2, 8192),
+        Err(ReserveError::Deferred)
+    ));
+    // Scope S holds the promoted K (high order) and K2 (inherited low
+    // order): the slot serves K2.
+    let (_, position, intents) = limiter.ordinary_rotation_probe_for_test(promoted_key.scope);
+    assert_eq!(position, Some(0), "the promoted scope holds the front");
+    assert_eq!(intents.len(), 2);
+
+    // Three visits serve K2 (1024 B each of its 8192); the budget burns
+    // down on the third and the hold releases even though the promoted
+    // key itself was never charged.
+    limiter.advance_virtual_clock_for_test(Duration::from_secs(1));
+    assert_eq!(
+        limiter.lock_state().promoted.map(|p| p.visits_remaining),
+        Some(2),
+        "a visit serving K2 must spend the budget"
+    );
+    limiter.advance_virtual_clock_for_test(Duration::from_secs(1));
+    assert_eq!(
+        limiter.lock_state().promoted.map(|p| p.visits_remaining),
+        Some(1)
+    );
+    limiter.advance_virtual_clock_for_test(Duration::from_secs(1));
+    assert_eq!(
+        limiter.lock_state().promoted.map(|p| p.key),
+        None,
+        "the cap must release the hold even when the promoted intent is never charged"
+    );
+    // The promoted key is still pending and untouched; the rotation has
+    // moved on.
+    let credit_promoted = limiter
+        .lock_state()
+        .intents
+        .get(&promoted_key)
+        .map(|i| i.charged);
+    assert_eq!(credit_promoted, Some(0));
+    let (_, position, _) = limiter.ordinary_rotation_probe_for_test(promoted_key.scope);
+    assert_ne!(
+        position,
+        Some(0),
+        "the released scope must rotate away from the front"
+    );
+    assert_eq!(
+        limiter.lock_state().intents.len(),
+        DEFAULT_MAX_INTENTS,
+        "the map stays pinned: inheritance and displacement are slot-neutral"
+    );
+}

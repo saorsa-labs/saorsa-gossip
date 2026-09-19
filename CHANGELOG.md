@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream of fresh PeerIds sharing one topic cannot keep it alive
   through same-scope successors), at most one is outstanding, later
   newcomers never inherit it, and a hard cap of ceil(frame/quantum) + 1
-  slot visits bounds every hold to one admitted frame's worth of
-  bytes. Victims are removed through the expiry path's
+  slot visits — counted on every visit to the promoted scope, whichever
+  of its intents the slot serves — bounds every hold to one admitted
+  frame's worth of bytes. Victims are removed through the expiry path's
   bookkeeping, their escrow stays non-refunding, and their owners
   observe displacement exactly as they observe expiry. New counters
   `LeafEgressSnapshot::intent_displaced` and

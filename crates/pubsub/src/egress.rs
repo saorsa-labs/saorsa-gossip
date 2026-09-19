@@ -194,6 +194,13 @@ struct State {
     /// outstanding; the next displacement-admitted newcomer joins the back
     /// until this scope has been served once or left the rotation.
     promoted_scope: Option<[u8; 32]>,
+    /// Test-only injected clock. When set, every internal `Instant::now()`
+    /// read in this limiter resolves to this value instead, so tests can
+    /// drive token boundaries, slot boundaries, and expiry on a fully
+    /// virtual timeline with no real-time contamination. Production builds
+    /// do not carry the field.
+    #[cfg(test)]
+    virtual_now: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -340,7 +347,10 @@ impl LeafEgressLimiter {
                 displacement_credit: [DISPLACEMENT_TOKEN_CAPACITY
                     * DISPLACEMENT_REFILL_NANOS_PER_TOKEN; 2],
                 displacement_last_refill: Instant::now(),
+
                 promoted_scope: None,
+                #[cfg(test)]
+                virtual_now: None,
             }),
             ordinary_waiters: Arc::new(Semaphore::new(ORDINARY_MAX_WAITERS)),
             critical_waiters: Arc::new(Semaphore::new(CRITICAL_MAX_WAITERS)),
@@ -353,6 +363,23 @@ impl LeafEgressLimiter {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The limiter's current reading of the clock: the injected virtual
+    /// time when a test set one, the real clock otherwise.
+    fn now_of(_state: &State) -> Instant {
+        #[cfg(test)]
+        {
+            _state.virtual_now.unwrap_or_else(Instant::now)
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
+    fn current_now(&self) -> Instant {
+        Self::now_of(&self.lock_state())
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -406,9 +433,11 @@ impl LeafEgressLimiter {
         relayed: bool,
     ) -> Option<ByteReservation> {
         let mut state = self.lock_state();
-        self.refill(&mut state, Instant::now());
+        let now = Self::now_of(&state);
+        self.refill(&mut state, now);
         let config = state.config?;
         let bytes = u64::try_from(frame_bytes).unwrap_or(u64::MAX);
+
         self.counters
             .demanded_bytes
             .fetch_add(bytes, Ordering::Relaxed);
@@ -464,6 +493,10 @@ impl LeafEgressLimiter {
             [DISPLACEMENT_TOKEN_CAPACITY * DISPLACEMENT_REFILL_NANOS_PER_TOKEN; 2];
         state.displacement_last_refill = Instant::now();
         state.promoted_scope = None;
+        #[cfg(test)]
+        {
+            state.virtual_now = None;
+        }
         state.recovery_quantum = validated.map_or(1, |config| {
             (config.hard_bytes_per_second / 8).clamp(1, RECOVERY_MAX_QUANTUM_BYTES)
         });
@@ -871,19 +904,32 @@ impl LeafEgressLimiter {
             if class == RecoveryClass::Ordinary && delta == remaining {
                 Self::remove_ordinary_pending(state, key.scope);
             }
-            // The front-of-rotation promotion ends the first time the
-            // promoted scope is actually served; one bounded head start,
-            // not a permanent override of the rotation.
-            if class == RecoveryClass::Ordinary
-                && delta > 0
-                && state.promoted_scope.is_some_and(|scope| scope == key.scope)
-            {
-                state.promoted_scope = None;
-            }
+            // The front-of-rotation promotion is NOT released by a
+            // partial charge: a promoted scope that received less than
+            // its full frame in one visit (token or slot boundary) keeps
+            // BOTH the promotion and the front position, otherwise the
+            // newcomer this PR exists to serve is sent to the back of a
+            // ~960-deep rotation on its first partial charge — the same
+            // starvation as no promotion at all. Release happens only
+            // when the scope leaves the pending rotation (fully charged
+            // last intent, claim, expiry, cancellation, displacement, or
+            // configure), all of which flow through
+            // `remove_ordinary_pending`/`configure`.
+            //
+            // Bound: a promoted scope holds the front only while it has
+            // pending bytes, and every pending byte entered through a
+            // rate-limited displacement or a normal admission — so an
+            // attacker pays one displacement token per frame's worth of
+            // front-held bytes (frame ÷ quantum slot visits).
+            let promoted_at_front =
+                class == RecoveryClass::Ordinary && state.promoted_scope == ordinary_scope;
             let scope_empty = ordinary_scope
                 .is_some_and(|scope| !state.ordinary_scope_counts.contains_key(&scope));
             if state.recovery_slot_remaining == 0 {
-                if class == RecoveryClass::Ordinary && !scope_empty {
+                // Slot exhaustion must not rotate the promoted scope to
+                // the back: it stays at the front until fully charged or
+                // gone, so its next slot visit continues the same frame.
+                if class == RecoveryClass::Ordinary && !scope_empty && !promoted_at_front {
                     if let Some(scope) = state.ordinary_scopes.pop_front() {
                         state.ordinary_scopes.push_back(scope);
                     }
@@ -934,7 +980,7 @@ impl LeafEgressLimiter {
         frame_bytes: usize,
         relayed: bool,
     ) -> Result<ByteReservation, ReserveError> {
-        self.try_reserve_data_at(key, frame_bytes, relayed, Instant::now())
+        self.try_reserve_data_at(key, frame_bytes, relayed, self.current_now())
     }
 
     fn try_reserve_data_at(
@@ -1080,7 +1126,7 @@ impl LeafEgressLimiter {
                     key,
                     frame_bytes,
                     generation,
-                    Instant::now(),
+                    self.current_now(),
                     class,
                 ) {
                     Ok(reservation) => return Ok(reservation),
@@ -1129,7 +1175,7 @@ impl LeafEgressLimiter {
         frame_bytes: usize,
     ) -> Result<ByteReservation, ReserveError> {
         let generation = self.lock_state().generation;
-        self.try_reserve_recovery_at(key, frame_bytes, generation, Instant::now())
+        self.try_reserve_recovery_at(key, frame_bytes, generation, self.current_now())
     }
 
     fn try_reserve_recovery_at(
@@ -1316,6 +1362,21 @@ impl LeafEgressLimiter {
         }
     }
 
+    /// Advance the injected virtual clock by `elapsed` and run the refill
+    /// at the new virtual time. The byte bucket, the displacement token
+    /// bucket, and the expiry sweep all advance on this one timeline, so a
+    /// test driving the limiter exclusively through this helper and the
+    /// normal entry points sees zero real-time contamination.
+    #[cfg(test)]
+    pub(crate) fn advance_virtual_clock_for_test(&self, elapsed: Duration) {
+        let mut state = self.lock_state();
+        let Some(now) = Self::now_of(&state).checked_add(elapsed) else {
+            return;
+        };
+        state.virtual_now = Some(now);
+        self.refill(&mut state, now);
+    }
+
     #[cfg(test)]
     pub(crate) fn refill_after_for_test(&self, elapsed: Duration) {
         let now = Instant::now();
@@ -1336,9 +1397,11 @@ impl LeafEgressLimiter {
         &self,
         key: RecoveryIntentKey,
         frame_bytes: usize,
-        now: Instant,
     ) -> Result<ByteReservation, ReserveError> {
-        let generation = self.lock_state().generation;
+        let (generation, now) = {
+            let state = self.lock_state();
+            (state.generation, Self::now_of(&state))
+        };
         self.try_reserve_recovery_at_class(
             key,
             frame_bytes,

@@ -14735,21 +14735,17 @@ mod tests {
     /// target by displacing the least-work intent of the most-represented
     /// bucket instead of refusing.
     ///
-    /// The test drives the limiter on a virtual clock (`refill_after_for_test`
-    /// plus an injected `now` for every direct limiter call) and keeps its
-    /// real runtime to a few seconds: intent expiry is measured on the real
-    /// clock, so a slow machine that stretched an earlier 40 s version past
-    /// 60 real seconds could expire the whole background set each sweep,
-    /// re-register ~960 intents per iteration (superlinear blow-up), or
-    /// pass by expiry with zero displacements — a false green. The final
+    /// The limiter runs on a fully injected virtual clock: every internal
+    /// clock read resolves to the injected time, so token boundaries, slot
+    /// boundaries, and expiry all advance on one deterministic timeline with
+    /// zero real-time contamination (an earlier version let a few microseconds
+    /// of real elapsed time shift token boundaries, which could hand the
+    /// promoted target a PARTIAL first charge and, before the promotion rule
+    /// was fixed, send it to the back of the rotation). The scenario is
+    /// parameterised over background-frame scales; the final
     /// `intent_displaced >= 1` assert pins the pass to the displacement
     /// path, not to expiry.
-    #[tokio::test]
-    async fn continuously_observed_new_ihave_target_enters_full_recovery_admission() {
-        // Quantum is HARD_RATE / 8 = 8 KiB, above one IHAVE frame, so a
-        // served target completes in a single ordinary-slot visit.
-        const HARD_RATE: u64 = 64 * 1024;
-        const MAX_FRAME: usize = 64 * 1024;
+    async fn run_full_admission_reproducer(background_frame: usize, hard_rate: u64, burst: u64) {
         const FIELD_WINDOW_SECONDS: u16 = 120;
 
         let local = test_peer_id(1);
@@ -14766,11 +14762,16 @@ mod tests {
         pubsub.initialize_topic_peers(topic, vec![required]).await;
         assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
             soft_bytes_per_second: 0,
-            hard_bytes_per_second: HARD_RATE,
-            burst_bytes: MAX_FRAME as u64,
-            max_serialized_frame_bytes: MAX_FRAME,
+            hard_bytes_per_second: hard_rate,
+            burst_bytes: burst,
+            max_serialized_frame_bytes: background_frame,
             policy: BytePolicy::ShedNormal,
         })));
+        // Anchor the virtual clock at the configured state; from here on
+        // the limiter never reads the real clock.
+        pubsub
+            .egress_limiter
+            .advance_virtual_clock_for_test(Duration::from_millis(0));
 
         // Positive production-path control: this exact membership and IHAVE
         // path reaches the required peer when recovery admission has room.
@@ -14799,10 +14800,11 @@ mod tests {
             "control proves target membership, eligibility, and transport send"
         );
 
-        // Fill the same production recovery admission path with field-scale
-        // 4 MiB families. Twenty-six distinct target identities are retained
-        // in the fixture; the remaining entries model other active topics.
-        let background_frame = Bytes::from(vec![0xa5; MAX_FRAME]);
+        // Fill the same production recovery admission path with the chosen
+        // background scale. Twenty-six distinct target identities are
+        // retained in the fixture; the remaining entries model other active
+        // topics.
+        let background_frame_bytes = Bytes::from(vec![0xa5; background_frame]);
         let mut sequence = 0_u32;
         while pubsub.egress_limiter.snapshot().pending_recovery_intents < 960 {
             let peer = test_peer_id(10 + (sequence % 26) as u8);
@@ -14814,7 +14816,7 @@ mod tests {
                 background_topic,
                 vec![peer],
                 "IHAVE",
-                &background_frame,
+                &background_frame_bytes,
                 false,
                 TopicPriority::Normal,
             );
@@ -14830,10 +14832,9 @@ mod tests {
                 family: identity,
                 operation: identity,
             };
-            let _ =
-                pubsub
-                    .egress_limiter
-                    .try_reserve_critical_for_test(key, MAX_FRAME, Instant::now());
+            let _ = pubsub
+                .egress_limiter
+                .try_reserve_critical_for_test(key, background_frame);
             critical_sequence += 1;
         }
 
@@ -14851,8 +14852,7 @@ mod tests {
         for _ in 0..FIELD_WINDOW_SECONDS {
             pubsub
                 .egress_limiter
-                .refill_after_for_test(Duration::from_secs(1));
-
+                .advance_virtual_clock_for_test(Duration::from_secs(1));
             // Sustained existing demand takes newly free metadata before the
             // continuously observed new target is offered by the real flusher.
             let mut identity = [0xc1; 32];
@@ -14864,8 +14864,7 @@ mod tests {
                     family: identity,
                     operation: identity,
                 },
-                MAX_FRAME,
-                Instant::now(),
+                background_frame,
             );
             critical_sequence += 1;
             while pubsub.egress_limiter.snapshot().pending_recovery_intents < 1024 {
@@ -14877,7 +14876,7 @@ mod tests {
                     TopicId::new(scope),
                     vec![peer],
                     "IHAVE",
-                    &background_frame,
+                    &background_frame_bytes,
                     false,
                     TopicPriority::Normal,
                 );
@@ -14904,16 +14903,11 @@ mod tests {
 
         // The pass must come through displacement, never through the
         // background ageing out: a green by expiry would be a false green
-        // for the admission fix (and the expired-everything blow-up this
-        // test used to hit on slow machines).
+        // for the admission fix.
         assert!(
             pubsub.egress_limiter.snapshot().intent_displaced >= 1,
             "the required target must have been admitted by displacement"
         );
-        // The ordinary share in this window is about 960 KiB across ~120
-        // ordinary-slot visits of one scope each, far above one IHAVE
-        // frame. A continuously observed eligible target must therefore
-        // enter admission and reach the transport despite bounded metadata.
         let (deque_len, position, req_intents) = pubsub
             .egress_limiter
             .ordinary_rotation_probe_for_test(topic.to_bytes());
@@ -14922,13 +14916,37 @@ mod tests {
                 .sent_frames_of_kind_to(required, MessageKind::IHave)
                 .len()
                 > baseline,
-            "required target was excluded for 120 s despite sufficient byte share;              displaced={} pending={} rotation={:?}/{deque_len} required={:?} promoted={:?}",
+            "required target was excluded for 120 s despite sufficient byte share; \
+             displaced={} pending={} rotation={:?}/{deque_len} required={:?} promoted={:?}",
             pubsub.egress_limiter.snapshot().intent_displaced,
             pubsub.egress_limiter.snapshot().pending_recovery_intents,
             position,
             req_intents,
-            pubsub.egress_limiter.debug_promoted_scope_for_test().map(|s| s[..4].to_vec()),
+            pubsub
+                .egress_limiter
+                .debug_promoted_scope_for_test()
+                .map(|s| s[..4].to_vec()),
         );
+    }
+
+    /// Original field scale: 4 MiB families at a 128 KiB/s hard rate
+    /// (16 KiB recovery quantum).
+    #[tokio::test]
+    async fn continuously_observed_new_ihave_target_enters_full_recovery_admission() {
+        run_full_admission_reproducer(4 * 1024 * 1024, 128 * 1024, 4 * 1024 * 1024).await;
+    }
+
+    /// Mid scale: 64 KiB families at a 64 KiB/s hard rate (8 KiB quantum).
+    #[tokio::test]
+    async fn continuously_observed_new_ihave_target_enters_full_recovery_admission_64k() {
+        run_full_admission_reproducer(64 * 1024, 64 * 1024, 64 * 1024).await;
+    }
+
+    /// Small scale: 8 KiB families at a 64 KiB/s hard rate (8 KiB quantum)
+    /// — the reviewer's near-deterministic partial-charge reproduction.
+    #[tokio::test]
+    async fn continuously_observed_new_ihave_target_enters_full_recovery_admission_8k() {
+        run_full_admission_reproducer(8 * 1024, 64 * 1024, 8 * 1024).await;
     }
 
     /// WHY (fair-displacement unreachability): under

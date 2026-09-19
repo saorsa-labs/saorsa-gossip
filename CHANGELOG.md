@@ -26,9 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bucket (burst 8, then one per 2 s on the limiter's existing virtual
   clock) because fresh PeerIds are free; an empty bucket refuses with
   `IntentLimit` as before. A displacement-admitted Ordinary newcomer
-  takes over the front of the ordinary charging rotation until first
-  served — at most one such promotion is outstanding — so admission also
-  means prompt service. Victims are removed through the expiry path's
+  takes over the front of the ordinary charging rotation and keeps it
+  until its frame is fully charged or leaves the map — a partial first
+  charge no longer sends it to the back of the rotation — and at most
+  one such promotion is outstanding, so admission also means prompt
+  service. Victims are removed through the expiry path's
   bookkeeping, their escrow stays non-refunding, and their owners
   observe displacement exactly as they observe expiry. New counters
   `LeafEgressSnapshot::intent_displaced` and
@@ -42,14 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   displacement token in its class, so a slow-polling legitimate newcomer
   degrades to the pre-fix behaviour (never worse than FCFS refusal);
   the non-adversarial worst case is ~2 s of admission delay per
-  concurrent newcomer. Measured with re-polling incumbents under a
-  one-fresh-PeerId-per-second attack (7:1 critical/ordinary split,
-  120 s virtual window): rotation-head completions 63 clean vs 61 under
-  attack across 47 displacements on this schedule; the degradation is
-  schedule-dependent and expected to be sharper when incumbent frames
-  need multiple rotation visits. Candidate mitigations (not
-  implemented): per-peer token fairness, or letting displacement
-  victims keep their rotation position on re-admission.
+  concurrent newcomer.
+- **pubsub: a promoted scope holds the rotation front for its whole
+  frame.** Promotion now ends only when the promoted frame is fully
+  charged (or leaves the map), which is what makes a partial first
+  charge safe — but it also means each displacement-admitted frame
+  holds the front for frame ÷ quantum ordinary-slot visits. Under a
+  one-fresh-PeerId-per-second attack with re-polling incumbents (7:1
+  critical/ordinary split, virtual clock), rotation-head completions
+  measured 50 clean vs 1 under attack across 32 displacements; the
+  reviewer's probe shape measured 60 → 13 with displacement disabled →
+  2 with displacement enabled. Candidate mitigations (not implemented):
+  per-peer displacement-token fairness, or letting displacement victims
+  keep their rotation position on re-admission.
 
 ## [0.5.83] - 2026-09-18
 

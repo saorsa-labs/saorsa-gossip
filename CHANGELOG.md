@@ -28,9 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IntentLimit` as before. A displacement-admitted Ordinary newcomer
   takes over the front of the ordinary charging rotation and keeps it
   until its frame is fully charged or leaves the map — a partial first
-  charge no longer sends it to the back of the rotation — and at most
-  one such promotion is outstanding, so admission also means prompt
-  service. Victims are removed through the expiry path's
+  charge no longer sends it to the back of the rotation. The promotion
+  is keyed to the admitted intent itself (never its topic/scope, so a
+  stream of fresh PeerIds sharing one topic cannot keep it alive
+  through same-scope successors), at most one is outstanding, later
+  newcomers never inherit it, and a hard cap of ceil(frame/quantum) + 1
+  slot visits bounds every hold to one admitted frame's worth of
+  bytes. Victims are removed through the expiry path's
   bookkeeping, their escrow stays non-refunding, and their owners
   observe displacement exactly as they observe expiry. New counters
   `LeafEgressSnapshot::intent_displaced` and

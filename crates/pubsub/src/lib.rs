@@ -14745,6 +14745,18 @@ mod tests {
     /// parameterised over background-frame scales; the final
     /// `intent_displaced >= 1` assert pins the pass to the displacement
     /// path, not to expiry.
+    ///
+    /// WHAT THIS TEST GATES: admission starvation only — a continuously
+    /// observed eligible target must ENTER a saturated class via
+    /// displacement and reach the transport. It does NOT gate the
+    /// promotion rule: with the promotion rule reverted it still passes
+    /// (verified, review r4 evidence matrix), because a
+    /// single-quantum-scale IHAVE frame usually completes on its first
+    /// visit. The promotion rule — partial-charge survival, per-intent
+    /// keying, visit cap, no same-scope inheritance — is gated by
+    /// `promoted_scope_survives_partial_charge_until_fully_charged` and
+    /// `same_scope_fresh_peer_wedge_keeps_incumbents_completing` in
+    /// `egress_fairness_tests.rs`.
     async fn run_full_admission_reproducer(background_frame: usize, hard_rate: u64, burst: u64) {
         const FIELD_WINDOW_SECONDS: u16 = 120;
 
@@ -14924,14 +14936,18 @@ mod tests {
             req_intents,
             pubsub
                 .egress_limiter
-                .debug_promoted_scope_for_test()
-                .map(|s| s[..4].to_vec()),
+                .debug_promotion_for_test()
+                .map(|(key, visits)| (key.scope[..4].to_vec(), visits)),
         );
     }
 
     /// Original field scale: 4 MiB families at a 128 KiB/s hard rate
-    /// (16 KiB recovery quantum).
+    /// (16 KiB recovery quantum). Ignored by default: the ~1024
+    /// 4 MiB-frame registrations make the debug-profile fill cost minutes
+    /// on a contended machine. Run explicitly with:
+    /// `cargo test -p saorsa-gossip-pubsub --lib -- --ignored continuously_observed`
     #[tokio::test]
+    #[ignore = "4 MiB-scale fill is minutes-slow in debug; run with --ignored"]
     async fn continuously_observed_new_ihave_target_enters_full_recovery_admission() {
         run_full_admission_reproducer(4 * 1024 * 1024, 128 * 1024, 4 * 1024 * 1024).await;
     }

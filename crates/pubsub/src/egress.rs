@@ -166,6 +166,17 @@ pub(crate) enum RecoveryClass {
     CriticalEager,
 }
 
+/// One outstanding front-of-rotation promotion, bound to the intent that
+/// earned it. `visits_remaining` is the hard cap: `ceil(bytes / quantum)`
+/// full visits would complete the frame; the `+1` covers a first visit
+/// shortened by a token boundary. Reaching zero releases the hold and
+/// rotates normally regardless of any other state.
+#[derive(Debug, Clone, Copy)]
+struct Promotion {
+    key: RecoveryIntentKey,
+    visits_remaining: u64,
+}
+
 #[derive(Debug)]
 struct State {
     config: Option<LeafEgressConfig>,
@@ -189,11 +200,14 @@ struct State {
     /// same virtual `now` as the byte bucket, so no new clock reads.
     displacement_credit: [u64; 2],
     displacement_last_refill: Instant,
-    /// The one Ordinary scope currently holding the front-of-rotation
-    /// promotion earned by fair-share displacement. At most one is
-    /// outstanding; the next displacement-admitted newcomer joins the back
-    /// until this scope has been served once or left the rotation.
-    promoted_scope: Option<[u8; 32]>,
+    /// The one front-of-rotation promotion earned by fair-share
+    /// displacement, keyed to the exact admitted intent. Released when
+    /// THAT intent is fully charged or leaves the map, or when its visit
+    /// budget (`ceil(bytes/quantum) + 1` slot visits) is exhausted — so
+    /// the hold can never outlive one admitted frame, and a stream of
+    /// fresh PeerIds sharing one topic cannot keep it alive through
+    /// same-scope successors.
+    promoted: Option<Promotion>,
     /// Test-only injected clock. When set, every internal `Instant::now()`
     /// read in this limiter resolves to this value instead, so tests can
     /// drive token boundaries, slot boundaries, and expiry on a fully
@@ -348,7 +362,7 @@ impl LeafEgressLimiter {
                     * DISPLACEMENT_REFILL_NANOS_PER_TOKEN; 2],
                 displacement_last_refill: Instant::now(),
 
-                promoted_scope: None,
+                promoted: None,
                 #[cfg(test)]
                 virtual_now: None,
             }),
@@ -485,14 +499,18 @@ impl LeafEgressLimiter {
         state.soft_tokens = state.tokens;
         state.remainder = 0;
         state.soft_remainder = 0;
-        state.last_refill = Instant::now();
+        // Anchor both refill clocks to the limiter's clock (the injected
+        // one when a test set it), so a reconfigure does not smuggle real
+        // elapsed time into a virtual timeline.
+        let anchor = Self::now_of(&state);
+        state.last_refill = anchor;
         state.intents.clear();
         state.ordinary_scopes.clear();
         state.ordinary_scope_counts.clear();
         state.displacement_credit =
             [DISPLACEMENT_TOKEN_CAPACITY * DISPLACEMENT_REFILL_NANOS_PER_TOKEN; 2];
-        state.displacement_last_refill = Instant::now();
-        state.promoted_scope = None;
+        state.displacement_last_refill = anchor;
+        state.promoted = None;
         #[cfg(test)]
         {
             state.virtual_now = None;
@@ -642,6 +660,27 @@ impl LeafEgressLimiter {
         *count = count.saturating_add(1);
     }
 
+    /// Whether the outstanding promotion is still live: its intent must
+    /// still be in the map and not fully charged, and its visit budget
+    /// must not be exhausted. Stale promotions (claimed, expired,
+    /// cancelled, displaced, or replaced through family inheritance) are
+    /// cleared lazily here, which is what keeps a dead hold from blocking
+    /// the next grant forever without hooking every removal site.
+    fn promotion_live(state: &mut State) -> bool {
+        let Some(promotion) = state.promoted else {
+            return false;
+        };
+        let live = promotion.visits_remaining > 0
+            && state
+                .intents
+                .get(&promotion.key)
+                .is_some_and(|intent| intent.charged < intent.bytes);
+        if !live {
+            state.promoted = None;
+        }
+        live
+    }
+
     /// Register a pending Ordinary scope at the FRONT of the charging
     /// rotation, for an intent admitted by fair-share displacement.
     ///
@@ -654,12 +693,14 @@ impl LeafEgressLimiter {
     /// the bucket that was under-represented transfers service priority
     /// the same way displacement transfers the slot.
     ///
-    /// The promotion is bounded: at most ONE scope may hold it
-    /// (`State::promoted_scope`), it ends as soon as that scope has been
-    /// served once (or leaves the rotation), and the displaced victim
-    /// re-registers through the ordinary back-of-queue path — so it cannot
-    /// retake the front, and a flow of fresh PeerIds cannot monopolise the
-    /// rotation head by being displaced-admitted every second.
+    /// The promotion is bounded: at most ONE intent holds it
+    /// (`State::promoted`), keyed to that intent — not its scope — so a
+    /// stream of same-scope successors cannot inherit or extend the hold.
+    /// It ends when the intent is fully charged, leaves the map, or burns
+    /// its `ceil(bytes/quantum) + 1` visit budget, and the displaced
+    /// victim re-registers through the ordinary back-of-queue path — so it
+    /// cannot retake the front, and an attacker holds the front at most
+    /// one frame's worth of bytes per rate-limited displacement.
     fn add_ordinary_pending_front(state: &mut State, scope: [u8; 32]) {
         let count = state.ordinary_scope_counts.entry(scope).or_default();
         if *count == 0 {
@@ -680,11 +721,6 @@ impl LeafEgressLimiter {
             state
                 .ordinary_scopes
                 .retain(|candidate| *candidate != scope);
-            // A scope that left the rotation can no longer hold the
-            // front-of-rotation promotion.
-            if state.promoted_scope == Some(scope) {
-                state.promoted_scope = None;
-            }
         }
     }
 
@@ -874,13 +910,6 @@ impl LeafEgressLimiter {
                     if let Some(scope) = ordinary_scope {
                         state.ordinary_scope_counts.remove(&scope);
                         state.ordinary_scopes.pop_front();
-                        // Defensive parity with `remove_ordinary_pending`:
-                        // a scope leaving the rotation can no longer hold
-                        // the promotion, and this branch must not become
-                        // the one way to disable promotion forever.
-                        if state.promoted_scope == Some(scope) {
-                            state.promoted_scope = None;
-                        }
                     }
                     continue;
                 }
@@ -904,31 +933,47 @@ impl LeafEgressLimiter {
             if class == RecoveryClass::Ordinary && delta == remaining {
                 Self::remove_ordinary_pending(state, key.scope);
             }
-            // The front-of-rotation promotion is NOT released by a
-            // partial charge: a promoted scope that received less than
-            // its full frame in one visit (token or slot boundary) keeps
-            // BOTH the promotion and the front position, otherwise the
-            // newcomer this PR exists to serve is sent to the back of a
-            // ~960-deep rotation on its first partial charge — the same
-            // starvation as no promotion at all. Release happens only
-            // when the scope leaves the pending rotation (fully charged
-            // last intent, claim, expiry, cancellation, displacement, or
-            // configure), all of which flow through
-            // `remove_ordinary_pending`/`configure`.
-            //
-            // Bound: a promoted scope holds the front only while it has
-            // pending bytes, and every pending byte entered through a
-            // rate-limited displacement or a normal admission — so an
-            // attacker pays one displacement token per frame's worth of
-            // front-held bytes (frame ÷ quantum slot visits).
-            let promoted_at_front =
-                class == RecoveryClass::Ordinary && state.promoted_scope == ordinary_scope;
+            // The promotion is keyed to the admitted INTENT and is NOT
+            // released by a partial charge: a promoted intent that
+            // received less than its full frame in one visit (token or
+            // slot boundary) keeps BOTH the promotion and the front
+            // position, otherwise the newcomer this PR exists to serve is
+            // sent to the back of a ~960-deep rotation on its first
+            // partial charge. Release happens only when THAT intent is
+            // fully charged, leaves the map (validated lazily by
+            // `promotion_live`, covering claim, expiry, cancellation,
+            // displacement and family replacement), or burns its
+            // `ceil(bytes/quantum) + 1` visit budget — the hard cap that
+            // bounds every hold to one admitted frame's worth of bytes.
+            if class == RecoveryClass::Ordinary && delta > 0 {
+                if let Some(mut promotion) = state.promoted {
+                    if promotion.key == key {
+                        promotion.visits_remaining = promotion.visits_remaining.saturating_sub(1);
+                        let fully_charged = state
+                            .intents
+                            .get(&key)
+                            .is_some_and(|intent| intent.charged >= intent.bytes);
+                        if fully_charged || promotion.visits_remaining == 0 {
+                            state.promoted = None;
+                        } else {
+                            state.promoted = Some(promotion);
+                        }
+                    }
+                }
+            }
+            let promoted_at_front = class == RecoveryClass::Ordinary
+                && ordinary_scope.is_some_and(|scope| {
+                    state
+                        .promoted
+                        .is_some_and(|promotion| promotion.key.scope == scope)
+                })
+                && Self::promotion_live(state);
             let scope_empty = ordinary_scope
                 .is_some_and(|scope| !state.ordinary_scope_counts.contains_key(&scope));
             if state.recovery_slot_remaining == 0 {
-                // Slot exhaustion must not rotate the promoted scope to
-                // the back: it stays at the front until fully charged or
-                // gone, so its next slot visit continues the same frame.
+                // Slot exhaustion must not rotate the promoted intent's
+                // scope to the back while the hold is live: its next slot
+                // visit continues the same frame.
                 if class == RecoveryClass::Ordinary && !scope_empty && !promoted_at_front {
                     if let Some(scope) = state.ordinary_scopes.pop_front() {
                         state.ordinary_scopes.push_back(scope);
@@ -1328,8 +1373,17 @@ impl LeafEgressLimiter {
             );
             if class == RecoveryClass::Ordinary && credit < bytes && !preserved_scope_position {
                 let enters_rotation = !state.ordinary_scope_counts.contains_key(&key.scope);
-                if admitted_by_displacement && enters_rotation && state.promoted_scope.is_none() {
-                    state.promoted_scope = Some(key.scope);
+                // The promotion binds to THIS intent only. A second
+                // displacement-admitted newcomer — same scope or not —
+                // does not inherit or extend a live hold; it joins the
+                // rotation at the back like any other registration.
+                if admitted_by_displacement && enters_rotation && !Self::promotion_live(&mut state)
+                {
+                    let visits = bytes.div_ceil(state.recovery_quantum.max(1)) + 1;
+                    state.promoted = Some(Promotion {
+                        key,
+                        visits_remaining: visits,
+                    });
                     Self::add_ordinary_pending_front(&mut state, key.scope);
                 } else {
                     Self::add_ordinary_pending(&mut state, key.scope);
@@ -1412,8 +1466,10 @@ impl LeafEgressLimiter {
     }
 
     #[cfg(test)]
-    pub(crate) fn debug_promoted_scope_for_test(&self) -> Option<[u8; 32]> {
-        self.lock_state().promoted_scope
+    pub(crate) fn debug_promotion_for_test(&self) -> Option<(RecoveryIntentKey, u64)> {
+        self.lock_state()
+            .promoted
+            .map(|promotion| (promotion.key, promotion.visits_remaining))
     }
 
     #[cfg(test)]

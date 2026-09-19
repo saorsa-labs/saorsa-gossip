@@ -971,13 +971,18 @@ fn displaced_incumbent_re_enters_and_still_completes() -> Result<(), &'static st
 /// displacement on every poll. This test pins the two hard bounds — the
 /// per-class token budget (8 burst, then one displacement per 2 s of
 /// virtual time) and the fact that the clean arm displaces nothing — and
-/// records the aggregate completion degradation honestly. Under the r4
-/// promotion rule (front held until the promoted frame is FULLY charged)
-/// each admitted max-size attacker holds the rotation front for
-/// frame/quantum slot visits, so this schedule's aggregate completions
-/// measured 960 clean vs 15 under attack — the documented known issue,
-/// not a regression of the rate bound; the position-sensitive
-/// measurement lives in the rotation-head test below.
+/// records the aggregate completion degradation honestly. Under the
+/// per-intent promotion rule each admitted max-size attacker still holds
+/// the rotation front for its whole frame (frame/quantum slot visits),
+/// so this schedule's aggregate completions measure 960 clean vs ~15
+/// under attack — the documented known issue, not a regression of the
+/// rate bound.
+///
+/// GATES: the displacement token budget and the clean arm's zero
+/// displacements (fails with `spend_displacement_token` disabled). Does
+/// NOT gate the promotion rule — that is gated by
+/// `promoted_scope_survives_partial_charge_until_fully_charged` and
+/// `same_scope_fresh_peer_wedge_keeps_incumbents_completing`.
 #[test]
 fn sybil_fresh_peer_churn_is_rate_limited_and_bounded() {
     const HARD: u64 = 8192;
@@ -1067,6 +1072,12 @@ fn sybil_fresh_peer_churn_is_rate_limited_and_bounded() {
 /// exhaustion does not rotate it. Bound (asserted here): the promoted
 /// frame completes within ceil(frame / quantum) slot visits and then the
 /// promotion is released.
+///
+/// GATES: the promotion rule itself (partial charge must not cost the
+/// front; release on full charge). Verified to FAIL when the promotion
+/// rule is reverted (release-on-any-charge + rotate-on-exhaustion);
+/// the reproducer in lib.rs does NOT gate this rule — it gates admission
+/// starvation only.
 #[test]
 fn promoted_scope_survives_partial_charge_until_fully_charged() {
     // hard 8192 B/s -> 1024 B quantum; a 2048 B frame needs exactly two
@@ -1100,9 +1111,9 @@ fn promoted_scope_survives_partial_charge_until_fully_charged() {
     let snapshot = limiter.snapshot();
     assert_eq!(snapshot.intent_displaced, 1);
     assert_eq!(
-        limiter.lock_state().promoted_scope,
-        Some(newcomer.scope),
-        "admission must promote the under-represented newcomer"
+        limiter.lock_state().promoted.map(|p| p.key),
+        Some(newcomer),
+        "admission must promote the under-represented newcomer, keyed to its intent"
     );
 
     // First visit: the ordinary slot has exactly one quantum of tokens
@@ -1116,8 +1127,8 @@ fn promoted_scope_survives_partial_charge_until_fully_charged() {
         "a partial charge must NOT rotate the promoted scope to the back"
     );
     assert_eq!(
-        limiter.lock_state().promoted_scope,
-        Some(newcomer.scope),
+        limiter.lock_state().promoted.map(|p| p.key),
+        Some(newcomer),
         "a partial charge must NOT release the promotion"
     );
 
@@ -1125,7 +1136,7 @@ fn promoted_scope_survives_partial_charge_until_fully_charged() {
     // visits), the scope leaves the rotation, and the promotion ends.
     limiter.advance_virtual_clock_for_test(Duration::from_secs(1));
     assert_eq!(
-        limiter.lock_state().promoted_scope,
+        limiter.lock_state().promoted.map(|p| p.key),
         None,
         "the promotion ends once the promoted frame is fully charged"
     );
@@ -1142,24 +1153,27 @@ fn promoted_scope_survives_partial_charge_until_fully_charged() {
     assert!(!limiter.lock_state().intents.contains_key(&newcomer));
 }
 
-/// WHY (review r4, residual b): the earlier aggregate measurement could
-/// not fail for position effects (it counted a byte-conserved cohort
-/// total). This version measures ROTATION-HEAD completions — whether the
-/// scope at the front of the rotation at the start of each virtual second
-/// completed and left the rotation during that second — which is exactly
-/// what front-holding displaces. Virtual clock throughout; the window
-/// stays under the 60 s idle sweep. Measured on this schedule (recorded
-/// honestly; the degradation is the documented known issue, and the first
-/// admitted attacker holds the front for its whole max-size frame):
-/// rotation-head completions measured 50 clean vs 1 under attack across
-/// 32 displacements on this schedule.
+/// WHY (review r5 BLOCKER): when the promotion was keyed on the SCOPE
+/// and released only when that scope's pending count reached zero, a
+/// fresh PeerId every 2 s — all sharing ONE topic — kept the front
+/// pinned indefinitely (same-scope successors always left the count
+/// above zero). The reviewer's probe measured a total denial of the
+/// ordinary recovery lane (incumbent completions 1447 clean vs 0
+/// wedged). The r5 rule keys the promotion to the admitted intent, so
+/// successors inherit nothing; this schedule (fresh PeerIds on one
+/// shared scope, incumbents re-polling their cohort) asserts incumbents
+/// keep at least half of their clean-arm completions under the wedge.
+///
+/// GATES: the per-intent promotion keying and visit cap (with the r4
+/// scope-keyed rule reverted, this test wedges to ~0 completions and
+/// fails).
 #[test]
-fn re_polling_incumbents_attack_measures_rotation_head_completions() {
+fn same_scope_fresh_peer_wedge_keeps_incumbents_completing() {
     const HARD: u64 = 8192;
     const BURST: u64 = 65_536;
-    const WINDOW: u32 = 50;
-    const COHORT: usize = 192;
-    fn run_schedule(attack: bool) -> (usize, u64) {
+    const WINDOW: u32 = 120;
+    const COHORT: usize = 128;
+    fn run_schedule(attack: bool) -> usize {
         let limiter = limiter(HARD, BURST);
         limiter.advance_virtual_clock_for_test(Duration::from_millis(0));
         let mut scope_index: u32 = 0;
@@ -1169,6 +1183,7 @@ fn re_polling_incumbents_attack_measures_rotation_head_completions() {
             keys.push(key);
             let _ = limiter.try_reserve_recovery(key, 1024);
         }
+        // Critical backlog for the production 7:1 split.
         while limiter.lock_state().intents.len() < DEFAULT_MAX_INTENTS {
             let _ = limiter.try_reserve_recovery_at_class(
                 pinned_key(0x60, &mut scope_index),
@@ -1179,60 +1194,50 @@ fn re_polling_incumbents_attack_measures_rotation_head_completions() {
             );
         }
         let cohort: Vec<_> = keys[..COHORT].to_vec();
-        let mut head_completions = 0;
-        for second in 0..WINDOW {
-            let front_before = {
-                let state = limiter.lock_state();
-                state.ordinary_scopes.front().copied()
-            };
+        // The wedge: every attacker shares ONE scope; a fresh peer id
+        // every 2 s. Frames are 16 KiB against a 1 KiB quantum, so the
+        // wedge scope's pending count grows (arrivals 0.5/s, front
+        // service drains one intent per 16 s) — under the r4 scope-keyed
+        // rule that count never reaches zero and the front pins; under
+        // the per-intent rule the first hold ends after ~16 visits and
+        // later attackers stop displacing once incumbent claims unpin the
+        // class.
+        let wedge_scope = [0x99_u8; 32];
+        let mut completions = 0;
+        for second in 1..=WINDOW {
             limiter.advance_virtual_clock_for_test(Duration::from_secs(1));
-            if attack {
+            if attack && second % 2 == 0 {
                 let mut identity = [0_u8; 32];
-                identity[..4].copy_from_slice(&(0x7700_0000_u32 + second).to_le_bytes());
+                identity[..4].copy_from_slice(&(0x8800_0000_u32 + second).to_le_bytes());
                 let _ = limiter.try_reserve_recovery(
                     RecoveryIntentKey {
                         peer: identity,
-                        scope: identity,
+                        scope: wedge_scope,
                         family: identity,
                         operation: identity,
                     },
-                    BURST as usize,
+                    16 * 1024,
                 );
             }
-            for key in &cohort {
-                let _ = limiter.try_reserve_recovery(*key, 1024);
+            // Incumbents re-poll their cohort only every 10 s early on
+            // (keeping the class pinned so the attack must displace),
+            // then every second.
+            if second <= 10 && second % 10 != 0 {
+                continue;
             }
-            // A head completion is position-sensitive by construction: the
-            // scope that held the front at the start of the second left
-            // the rotation during it (charged fully and claimed by the
-            // re-polling owner).
-            if let Some(front) = front_before {
-                let drained = {
-                    let state = limiter.lock_state();
-                    !state.ordinary_scope_counts.contains_key(&front)
-                };
-                if drained {
-                    head_completions += 1;
+            for key in &cohort {
+                if limiter.try_reserve_recovery(*key, 1024).is_ok() {
+                    completions += 1;
                 }
             }
         }
-        let snapshot = limiter.snapshot();
-        (head_completions, snapshot.intent_displaced)
+        completions
     }
 
-    let (clean, clean_displaced) = run_schedule(false);
-    let (attacked, attacked_displaced) = run_schedule(true);
-    assert_eq!(
-        clean_displaced, 0,
-        "no fresh peers: nothing to displace for"
-    );
+    let clean = run_schedule(false);
+    let attacked = run_schedule(true);
     assert!(
-        clean >= WINDOW as usize - 10,
-        "clean arm must show ~one head completion per virtual second (got {clean})"
-    );
-    assert!(
-        attacked < clean,
-        "the attack must be visible as a head-completion collapse: clean {clean}, \
-         attacked {attacked}, displaced {attacked_displaced}"
+        attacked * 2 >= clean,
+        "same-scope fresh-PeerId wedge must not deny incumbents: clean {clean}, attacked {attacked}"
     );
 }

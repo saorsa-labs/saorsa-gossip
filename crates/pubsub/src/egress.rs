@@ -346,6 +346,15 @@ pub(crate) struct LeafEgressLimiter {
     critical_waiters: Arc<Semaphore>,
     counters: EgressCounters,
     purpose_counters: Mutex<HashMap<([u8; 32], &'static str), PurposeCounters>>,
+    /// cfg(test), PER INSTANCE (r4): acquisitions of `state` via
+    /// `lock_state()`. The previous process-global static also counted
+    /// every other concurrently running test's limiter under `cargo
+    /// test`'s shared-process threading — nextest's process-per-test had
+    /// hidden that — so the zero-overhead assert read foreign traffic.
+    /// A fresh instance starts at zero, which is all the scoping the
+    /// tests need.
+    #[cfg(test)]
+    state_mutex_acquisitions: AtomicU64,
 }
 
 /// `flags` bit: a config exists (accounting is on).
@@ -357,36 +366,28 @@ const FLAG_ENFORCING: u8 = 1 << 1;
 /// them and clears the bit.
 const FLAG_DEFERRED_RESIDUE: u8 = 1 << 2;
 
-/// # Ordering contract for the lock-free flags byte
-///
-/// The byte is stored (Release) inside [`LeafEgressLimiter::configure`]
-/// while the state mutex is held — as ONE atomic store, so no reader can
-/// ever observe `enforcing` set without `enabled` (the torn state two
-/// separate booleans would allow) — and loaded (Acquire) everywhere else.
-/// A reader can observe a new policy one critical section "early" or
-/// "late" relative to another reader, but never a torn mix. A reservation
-/// minted under the previous generation is still handled at the fence
-/// exactly as before: once the enabled bit reads true the fence takes the
-/// mutex and compares generations; a `Some` reservation observed while the
-/// bit still reads false was necessarily minted before the disable and
-/// fails the `reservation.is_none()` check — the same answer the locked
-/// read gave. The `FLAG_DEFERRED_RESIDUE` bit is set by a disabling
-/// `configure()` and cleared with `fetch_and` by the drain that consumes
-/// the stranded custody, so a clear can never clobber a concurrent
-/// policy change.
-#[cfg(test)]
-pub(crate) static TEST_STATE_MUTEX_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-pub(crate) fn reset_state_mutex_acquisitions_for_test() {
-    TEST_STATE_MUTEX_ACQUISITIONS.store(0, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-pub(crate) fn state_mutex_acquisitions_for_test() -> u64 {
-    TEST_STATE_MUTEX_ACQUISITIONS.load(Ordering::Relaxed)
-}
-
+// # Ordering contract for the lock-free flags byte
+//
+// The byte is stored (Release) inside [`LeafEgressLimiter::configure`]
+// while the state mutex is held — as ONE atomic store, so no reader can
+// ever observe `enforcing` set without `enabled` (the torn state two
+// separate booleans would allow) — and loaded (Acquire) everywhere else.
+// A reader can observe a new policy one critical section "early" or
+// "late" relative to another reader, but never a torn mix. A reservation
+// minted under the previous generation is still handled at the fence
+// exactly as before: once the enabled bit reads true the fence takes the
+// mutex and compares generations; a `Some` reservation observed while the
+// bit still reads false was necessarily minted before the disable and
+// fails the `reservation.is_none()` check — the same answer the locked
+// read gave. The `FLAG_DEFERRED_RESIDUE` bit is set by a disabling
+// `configure()` and cleared with `fetch_and` by the drain that consumes
+// the stranded custody, so a clear can never clobber a concurrent
+// policy change.
+//
+// (Plain comment, not a doc comment: the cfg(test) statics this block
+// also documented were removed in r4 — their per-instance replacements
+// live on the struct — so it no longer terminates at a documentable
+// item.)
 impl LeafEgressLimiter {
     pub(crate) fn disabled() -> Self {
         Self {
@@ -419,15 +420,24 @@ impl LeafEgressLimiter {
             critical_waiters: Arc::new(Semaphore::new(CRITICAL_MAX_WAITERS)),
             counters: EgressCounters::default(),
             purpose_counters: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            state_mutex_acquisitions: AtomicU64::new(0),
         }
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, State> {
         #[cfg(test)]
-        TEST_STATE_MUTEX_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+        self.state_mutex_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// cfg(test): this instance's `lock_state()` acquisition count.
+    #[cfg(test)]
+    pub(crate) fn state_mutex_acquisitions_for_test(&self) -> u64 {
+        self.state_mutex_acquisitions.load(Ordering::Relaxed)
     }
 
     /// The limiter's current reading of the clock: the injected virtual
@@ -446,7 +456,6 @@ impl LeafEgressLimiter {
     fn current_now(&self) -> Instant {
         Self::now_of(&self.lock_state())
     }
-
     pub(crate) fn enabled(&self) -> bool {
         self.flags.load(Ordering::Acquire) & FLAG_ENABLED != 0
     }

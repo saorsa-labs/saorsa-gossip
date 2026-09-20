@@ -39,10 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `has_live_local_origin` is O(1) via a maintained cache counter instead
     of a full LRU scan under the topic write lock.
   - A failed IWANT send now KEEPS its outstanding claim under an
-    exponential retry backoff (1 s → 16 s cap, ≤8 attempts per 60 s window)
-    instead of releasing it immediately — release let every repeated
-    inbound IHAVE re-request a lost id at arrival rate — while remaining
-    releasable once the backoff expires (0.5.82 held claims forever).
+    exponential retry backoff (1 s → 16 s cap, ≤8 attempts per 60 s
+    window PER ADVERTISER — the backoff schedule is keyed on the failing
+    peer, so alternating advertisers can exceed 8 attempts for one id,
+    bounded only by the 60 s claim lifetime from the FIRST request; the
+    same arrival-rate ceiling 0.5.83 had) instead of releasing it
+    immediately — release let every repeated inbound IHAVE re-request a
+    lost id at arrival rate — while remaining releasable once the backoff
+    expires (0.5.82 held claims forever).
 
   Review round 2 (Claude): the IWANT retry backoff is keyed on the FAILING
   peer only — a different peer advertising the id is asked immediately
@@ -73,10 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shard is write-locked — r2 collected every non-backed-off offer
   (≤ 1024 per topic) before truncating after the lock drop.
 
-  Instrumented `cfg(test)` counters assert the invariants: with the limiter
-  disabled, publish + inbound IHAVE/IWANT + flush ticks acquire zero limiter
-  mutexes and exactly one `write_all` per tick; late-offer scans never run
-  under `write_all`; each bound has a revert-fail proof.
+  Review round 4 (CI red under plain `cargo test`): the `cfg(test)`
+  instrumentation counters (limiter state-mutex acquisitions, flush
+  `write_all` takes, the write-all-held flag, late-offer scan counts,
+  collected-peak) were process-global statics, so other concurrently
+  running tests' traffic landed in the same counters (nextest's
+  process-per-test had hidden that). They are now PER INSTANCE — a
+  cfg(test) field on `LeafEgressLimiter` and a cfg(test)
+  `TopicContentionInstrumentation` owned by each `ShardedTopicMap` —
+  and the exact-count tests disable the instance's own background
+  flusher so only the driven ticks are measured.
 
 - **pubsub: fair recovery-intent admission with bounded displacement.**
   Intent admission in the Leaf egress limiter was first-come-first-served

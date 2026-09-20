@@ -4381,14 +4381,24 @@ impl TopicState {
         &mut self,
         peer: PeerId,
         now: Instant,
+        // cfg(test): the owning map's contention counters — threaded in
+        // because the scan-side increments must fire wherever the scan
+        // physically runs (the revert-detection for "selection moved
+        // back inside `write_all()`"), and a per-map counter needs the
+        // map's identity, not a process-global static.
+        #[cfg(test)] contention: &TopicContentionInstrumentation,
     ) -> Option<Vec<(Instant, MessageIdType)>> {
         let offer = *self.late_local_offers.get(&peer)?;
         self.message_cache.prune_expired_at(now);
         #[cfg(test)]
-        crate::TEST_LATE_OFFER_LRU_SCANS.fetch_add(1, Ordering::Relaxed);
+        contention
+            .late_offer_lru_scans
+            .fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
-        if crate::TEST_FLUSH_WRITE_ALL_HELD.load(Ordering::Relaxed) {
-            crate::TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL.fetch_add(1, Ordering::Relaxed);
+        if contention.flush_write_all_held.load(Ordering::Relaxed) {
+            contention
+                .late_offer_scans_under_write_all
+                .fetch_add(1, Ordering::Relaxed);
         }
         let eligible: Vec<_> = self
             .message_cache
@@ -4417,7 +4427,10 @@ impl TopicState {
         peer: PeerId,
         now: Instant,
     ) -> Option<(Vec<MessageIdType>, (Instant, MessageIdType))> {
-        let mut eligible = self.late_local_offer_keys(peer, now)?;
+        // Direct unit tests drive this on a bare TopicState with no map,
+        // so hand the selector throwaway per-call instrumentation.
+        let contention = TopicContentionInstrumentation::default();
+        let mut eligible = self.late_local_offer_keys(peer, now, &contention)?;
         eligible.sort_unstable();
         eligible.truncate(MAX_IHAVE_BATCH_SIZE);
         let last = eligible.last().copied()?;
@@ -5684,37 +5697,33 @@ pub trait PubSub: Send + Sync {
 /// sharding is safe — two workers on different topics never block each other.
 const TOPIC_SHARD_COUNT: usize = 32;
 
-/// Test-only contention instrumentation for the relay-overhead invariants:
-/// counts `ShardedTopicMap::write_all` acquisitions so a test can assert the
-/// disabled-limiter flush takes exactly one all-shard write lock per tick
-/// (the 0.5.82 shape), not two.
+/// cfg(test) contention instrumentation for one [`ShardedTopicMap`],
+/// PER INSTANCE (r4). These were process-global statics before, so under
+/// plain `cargo test` — all tests as threads in one process — every other
+/// concurrently running test's flushes and LRU scans landed in the same
+/// counters and the exact-count asserts read foreign traffic (CI red;
+/// nextest's process-per-test had hidden it). Owned by the map, the
+/// counters see only that map's own flusher and the test's driven calls.
 #[cfg(test)]
-static TEST_WRITE_ALL_TAKES: AtomicU64 = AtomicU64::new(0);
-/// Set by `flush_ihave_batches` while its `write_all()` block is active, so
-/// `late_local_offer_keys` can flag any LRU scan that happens under the
-/// all-shard lock (forbidden: it must run under the narrow per-topic lock).
-#[cfg(test)]
-static TEST_FLUSH_WRITE_ALL_HELD: AtomicBool = AtomicBool::new(false);
-/// Total late-offer LRU scans performed (any lock scope).
-#[cfg(test)]
-static TEST_LATE_OFFER_LRU_SCANS: AtomicU64 = AtomicU64::new(0);
-/// Late-offer LRU scans performed while `write_all()` was held — must stay
-/// zero forever.
-#[cfg(test)]
-static TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL: AtomicU64 = AtomicU64::new(0);
-/// Peak late-offer candidates retained by the under-`write_all` selection
-/// (review r3, item 2) — must never exceed
-/// `MAX_LATE_LOCAL_OFFERS_PER_FLUSH`.
-#[cfg(test)]
-static TEST_LATE_OFFER_MAX_COLLECTED: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-fn reset_topic_contention_instrumentation_for_test() {
-    TEST_WRITE_ALL_TAKES.store(0, Ordering::Relaxed);
-    TEST_FLUSH_WRITE_ALL_HELD.store(false, Ordering::Relaxed);
-    TEST_LATE_OFFER_LRU_SCANS.store(0, Ordering::Relaxed);
-    TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL.store(0, Ordering::Relaxed);
-    TEST_LATE_OFFER_MAX_COLLECTED.store(0, Ordering::Relaxed);
+#[derive(Default)]
+struct TopicContentionInstrumentation {
+    /// disabled-limiter flush takes exactly one all-shard write lock per
+    /// tick (the 0.5.82 shape), not two.
+    write_all_takes: AtomicU64,
+    /// Set by `flush_ihave_batches` while its `write_all()` block is
+    /// active, so `late_local_offer_keys` can flag any LRU scan that
+    /// happens under the all-shard lock (forbidden: it must run under the
+    /// narrow per-topic lock).
+    flush_write_all_held: AtomicBool,
+    /// Total late-offer LRU scans performed (any lock scope).
+    late_offer_lru_scans: AtomicU64,
+    /// Late-offer LRU scans performed while `write_all()` was held — must
+    /// stay zero forever.
+    late_offer_scans_under_write_all: AtomicU64,
+    /// Peak late-offer candidates retained by the under-`write_all`
+    /// selection (review r3, item 2) — must never exceed
+    /// `MAX_LATE_LOCAL_OFFERS_PER_FLUSH`.
+    late_offer_max_collected: AtomicU64,
 }
 
 struct ShardedTopicMap {
@@ -5722,6 +5731,10 @@ struct ShardedTopicMap {
     /// while the topic shard is locked, including asynchronous subscriptions.
     max_eager_degree: AtomicUsize,
     shards: Box<[RwLock<HashMap<TopicId, TopicState>>]>,
+    /// cfg(test): per-instance contention counters (see
+    /// [`TopicContentionInstrumentation`]); absent from production builds.
+    #[cfg(test)]
+    contention: TopicContentionInstrumentation,
 }
 
 impl ShardedTopicMap {
@@ -5738,7 +5751,30 @@ impl ShardedTopicMap {
         Self {
             max_eager_degree: AtomicUsize::new(MAX_EAGER_DEGREE),
             shards,
+            #[cfg(test)]
+            contention: TopicContentionInstrumentation::default(),
         }
+    }
+
+    /// cfg(test): zero this map's contention counters. Per-instance (see
+    /// [`TopicContentionInstrumentation`]), so only the asserting test's
+    /// own map is affected.
+    #[cfg(test)]
+    fn reset_topic_contention_instrumentation_for_test(&self) {
+        let instrumentation = &self.contention;
+        instrumentation.write_all_takes.store(0, Ordering::Relaxed);
+        instrumentation
+            .flush_write_all_held
+            .store(false, Ordering::Relaxed);
+        instrumentation
+            .late_offer_lru_scans
+            .store(0, Ordering::Relaxed);
+        instrumentation
+            .late_offer_scans_under_write_all
+            .store(0, Ordering::Relaxed);
+        instrumentation
+            .late_offer_max_collected
+            .store(0, Ordering::Relaxed);
     }
 
     /// Caller holds the topic shard lock so creation serializes with config updates.
@@ -5788,7 +5824,9 @@ impl ShardedTopicMap {
         &self,
     ) -> Vec<tokio::sync::RwLockWriteGuard<'_, HashMap<TopicId, TopicState>>> {
         #[cfg(test)]
-        TEST_WRITE_ALL_TAKES.fetch_add(1, Ordering::Relaxed);
+        self.contention
+            .write_all_takes
+            .fetch_add(1, Ordering::Relaxed);
         let mut guards = Vec::with_capacity(self.shards.len());
         for shard in &self.shards {
             guards.push(shard.write().await);
@@ -10105,7 +10143,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ) {
         let work: Vec<IhaveFlushWork> = {
             #[cfg(test)]
-            TEST_FLUSH_WRITE_ALL_HELD.store(true, Ordering::Relaxed);
+            topics
+                .contention
+                .flush_write_all_held
+                .store(true, Ordering::Relaxed);
             let mut topics_guard = topics.write_all().await;
             let mut work = Vec::new();
             // Late-local-offer candidates snapshotted here are only cheap
@@ -10224,7 +10265,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
             #[cfg(test)]
-            TEST_LATE_OFFER_MAX_COLLECTED
+            topics
+                .contention
+                .late_offer_max_collected
                 .fetch_max(late_candidates.len() as u64, Ordering::Relaxed);
             // The next tick's ring window starts just past the last
             // candidate this one served (buffer order == ring order).
@@ -10232,7 +10275,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 env.late_rotation.last_served = Some((topic, peer));
             }
             #[cfg(test)]
-            TEST_FLUSH_WRITE_ALL_HELD.store(false, Ordering::Relaxed);
+            topics
+                .contention
+                .flush_write_all_held
+                .store(false, Ordering::Relaxed);
             drop(topics_guard);
 
             // Select each candidate's ids under its OWN topic shard lock.
@@ -10247,7 +10293,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     let Some(state) = guard.get_mut(&topic_id) else {
                         continue;
                     };
-                    state.late_local_offer_keys(peer, now)
+                    state.late_local_offer_keys(
+                        peer,
+                        now,
+                        #[cfg(test)]
+                        &topics.contention,
+                    )
                 };
                 let Some(mut eligible) = keys else {
                     continue;
@@ -20913,14 +20964,22 @@ mod tests {
     /// write_all doubles the take count.
     #[tokio::test]
     async fn disabled_limiter_costs_zero_mutexes_and_one_write_all_per_flush() {
-        egress::reset_state_mutex_acquisitions_for_test();
-        reset_topic_contention_instrumentation_for_test();
-
         let local = test_peer_id(1);
         let peer = test_peer_id(2);
         let transport = RecordingTransport::new(local);
         transport.set_connected_peer_ids(vec![peer]);
-        let pubsub = PlumtreePubSub::new(local, transport.clone(), test_signing_key());
+        // No background tasks: the instrumentation is per-instance, but the
+        // instance's OWN flusher shares this map and limiter — its 100 ms
+        // ticks must not land in the exact-count asserts below (r4: keep
+        // the measured window to the driven ticks only). The frame paths
+        // under test all send inline or via spawned one-shot tasks, none
+        // via the interval flusher.
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
         store_connected_peers_snapshot(
             pubsub.connected_peers_snapshot.as_ref(),
             Some(HashSet::from([peer])),
@@ -20953,14 +21012,16 @@ mod tests {
             .expect("iwant");
 
         assert_eq!(
-            egress::state_mutex_acquisitions_for_test(),
+            pubsub.egress_limiter.state_mutex_acquisitions_for_test(),
             0,
             "disabled limiter must cost zero state-mutex acquisitions on the frame paths"
         );
         // Scope the write_all count to the flush loop itself: setup paths
         // (publish fan-out, peer init) take their own locks; the invariant
         // under test is the flush's per-tick take count.
-        reset_topic_contention_instrumentation_for_test();
+        pubsub
+            .topics
+            .reset_topic_contention_instrumentation_for_test();
 
         const FLUSH_TICKS: u64 = 3;
         // Consecutive ticks of one flusher: share the rotation state.
@@ -20982,12 +21043,16 @@ mod tests {
         }
 
         assert_eq!(
-            TEST_WRITE_ALL_TAKES.load(Ordering::Relaxed),
+            pubsub
+                .topics
+                .contention
+                .write_all_takes
+                .load(Ordering::Relaxed),
             FLUSH_TICKS,
             "a disabled-limiter flush must take exactly one all-shard write_all per tick"
         );
         assert_eq!(
-            egress::state_mutex_acquisitions_for_test(),
+            pubsub.egress_limiter.state_mutex_acquisitions_for_test(),
             0,
             "flush ticks with a disabled limiter must not touch the limiter mutex either"
         );
@@ -21011,17 +21076,23 @@ mod tests {
     /// collect-everything-then-truncate shape peaked at 8.
     ///
     /// Revert-fails: moving the batch selection back inside the write_all
-    /// block trips TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL > 0; removing the
+    /// block trips `late_offer_scans_under_write_all` > 0; removing the
     /// per-tick cap makes the sent IHAVE count exceed the cap; restoring
     /// the r2 collect-everything selection trips the collected-peak
     /// assert below (8 > 4).
     #[tokio::test]
     async fn late_local_offer_flush_caps_per_tick_and_never_scans_under_write_all() {
-        reset_topic_contention_instrumentation_for_test();
-
         let local = test_peer_id(1);
         let transport = RecordingTransport::new(local);
-        let pubsub = PlumtreePubSub::new(local, transport.clone(), test_signing_key());
+        // No background tasks (r4): the instance's own flusher shares this
+        // map, so its ticks must not add scans or IHAVEs to the exact-count
+        // asserts below — the single driven flush below is the whole story.
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            transport.clone(),
+            test_signing_key(),
+            false,
+        );
         let topic = TopicId::new([0x8c; 32]);
         let catchup_peers: Vec<PeerId> = (2..(2 + MAX_LATE_LOCAL_OFFERS_PER_FLUSH as u8 + 4))
             .map(test_peer_id)
@@ -21075,21 +21146,37 @@ mod tests {
             "one flush tick must page at most {MAX_LATE_LOCAL_OFFERS_PER_FLUSH} late offers (got {total_ihave})"
         );
         assert_eq!(
-            TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL.load(Ordering::Relaxed),
+            pubsub
+                .topics
+                .contention
+                .late_offer_scans_under_write_all
+                .load(Ordering::Relaxed),
             0,
             "the late-offer LRU scan must never run under the all-shard write_all"
         );
         assert_eq!(
-            TEST_LATE_OFFER_LRU_SCANS.load(Ordering::Relaxed),
+            pubsub
+                .topics
+                .contention
+                .late_offer_lru_scans
+                .load(Ordering::Relaxed),
             MAX_LATE_LOCAL_OFFERS_PER_FLUSH as u64,
             "exactly one narrow-lock scan per attempted offer"
         );
         assert!(
-            TEST_LATE_OFFER_MAX_COLLECTED.load(Ordering::Relaxed)
+            pubsub
+                .topics
+                .contention
+                .late_offer_max_collected
+                .load(Ordering::Relaxed)
                 <= MAX_LATE_LOCAL_OFFERS_PER_FLUSH as u64,
             "the under-write_all selection must retain at most \
              {MAX_LATE_LOCAL_OFFERS_PER_FLUSH} candidates (peak {})",
-            TEST_LATE_OFFER_MAX_COLLECTED.load(Ordering::Relaxed)
+            pubsub
+                .topics
+                .contention
+                .late_offer_max_collected
+                .load(Ordering::Relaxed)
         );
     }
 
@@ -21111,8 +21198,6 @@ mod tests {
     /// the tick-2 set assert fails.
     #[tokio::test]
     async fn late_offer_cap_rotates_across_ticks() {
-        reset_topic_contention_instrumentation_for_test();
-
         let local = test_peer_id(1);
         let transport = RecordingTransport::new(local);
         // No background tasks: the background flusher's own 100 ms ticks
@@ -21244,7 +21329,11 @@ mod tests {
             "tick 2 must rotate: fifth topic first, then wrap to the head"
         );
         assert_eq!(
-            TEST_LATE_OFFER_SCANS_UNDER_WRITE_ALL.load(Ordering::Relaxed),
+            pubsub
+                .topics
+                .contention
+                .late_offer_scans_under_write_all
+                .load(Ordering::Relaxed),
             0,
             "rotation still never scans under the all-shard write_all"
         );
@@ -21311,8 +21400,6 @@ mod tests {
     /// flush and the emptiness assert fails.
     #[tokio::test]
     async fn disabling_reconfigure_drains_deferred_eager_replies() {
-        reset_topic_contention_instrumentation_for_test();
-
         let local = test_peer_id(1);
         let peer = test_peer_id(2);
         let transport = RecordingTransport::new(local);
@@ -21378,7 +21465,9 @@ mod tests {
         );
 
         // Steady state restored: one write_all per tick, no drain.
-        reset_topic_contention_instrumentation_for_test();
+        pubsub
+            .topics
+            .reset_topic_contention_instrumentation_for_test();
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
             &pubsub.topics,
             &pubsub.transport,
@@ -21393,7 +21482,11 @@ mod tests {
         )
         .await;
         assert_eq!(
-            TEST_WRITE_ALL_TAKES.load(Ordering::Relaxed),
+            pubsub
+                .topics
+                .contention
+                .write_all_takes
+                .load(Ordering::Relaxed),
             1,
             "after the drain, a disabled flush takes exactly one write_all again"
         );
@@ -21408,8 +21501,6 @@ mod tests {
     /// scan count grow with every extra tick below.
     #[tokio::test]
     async fn failed_late_offer_pages_forward_and_backs_off_not_tick_rate() {
-        reset_topic_contention_instrumentation_for_test();
-
         let local = test_peer_id(1);
         let peer = test_peer_id(2);
         let transport = FailingTransport::new(local, SendFailureMode::LiveIoError);
@@ -21485,7 +21576,11 @@ mod tests {
             "only the first tick may attempt the offer; the backoff must suppress the rest"
         );
         assert_eq!(
-            TEST_LATE_OFFER_LRU_SCANS.load(Ordering::Relaxed),
+            pubsub
+                .topics
+                .contention
+                .late_offer_lru_scans
+                .load(Ordering::Relaxed),
             1,
             "backoff blocks even the rescan, not just the send"
         );

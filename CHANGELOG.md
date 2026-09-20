@@ -9,6 +9,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **pubsub: a disabled Leaf egress limiter now costs zero per-frame mutex
+  acquisitions, zero extra all-shard topic write locks, and bounded
+  late-local-offer catch-up work (relay dispatch latency regression vs
+  0.5.82).** On the 6-node x0x testnet (all relays, limiter disabled via
+  `configure_leaf_egress(None)`), 0.5.83's DM-pair failure rate rose ~2.5×
+  over 0.5.82 (25/240 vs 10/240 interleaved A/B) with no throughput
+  regression — pointing at dispatch-path lock contention, not bytes.
+
+  - `LeafEgressLimiter::enabled`/`enforcing` are now lock-free atomic
+    mirrors written only inside `configure()`; `validate_reservation` and
+    `record_send_outcome` return before touching the state mutex when the
+    limiter is disabled. Previously every outbound frame took the single
+    limiter `Mutex` ≥3 times (enabled/enforcing checks, fence, outcome),
+    serialising dispatch on CPU-saturated 2-vCPU relays. The transport
+    fence's generation check for reservations minted before a reconfigure
+    is unchanged and documented.
+  - The 100 ms IHAVE flush no longer takes a second all-shard `write_all()`
+    for `flush_deferred_eager_replies` when the limiter is disabled —
+    deferred replies cannot exist without it. The IWANT-serve path likewise
+    skips its per-served-message topic write lock when disabled, and
+    `prune_deferred_iwants` early-returns on empty maps.
+  - Late-local-offer catch-up (new in 0.5.83) is bounded: offers under a
+    failure backoff are skipped; at most 4 offers page per flush tick; the
+    LRU scan runs under the narrow per-topic shard lock with sort/sign/send
+    outside it (never under `write_all`); a failed hand-off pages the cursor
+    forward and applies an exponential backoff (1 s → 16 s cap) instead of
+    re-driving scan+MLDSA-sign+send at the 100 ms tick rate;
+    `has_live_local_origin` is O(1) via a maintained cache counter instead
+    of a full LRU scan under the topic write lock.
+  - A failed IWANT send now KEEPS its outstanding claim under an
+    exponential retry backoff (1 s → 16 s cap, ≤8 attempts per 60 s
+    window PER ADVERTISER — the backoff schedule is keyed on the failing
+    peer, so alternating advertisers can exceed 8 attempts for one id,
+    bounded only by the 60 s claim lifetime from the FIRST request; the
+    same arrival-rate ceiling 0.5.83 had) instead of releasing it
+    immediately — release let every repeated inbound IHAVE re-request a
+    lost id at arrival rate — while remaining releasable once the backoff
+    expires (0.5.82 held claims forever).
+
+  Review round 2 (Claude): the IWANT retry backoff is keyed on the FAILING
+  peer only — a different peer advertising the id is asked immediately
+  (with 15 s Critical DM deadlines, suppressing a healthy source for up to
+  16 s was the failure mode this change exists to remove) — and a failure
+  no longer refreshes `requested_at`, so the 60 s age sweep bounds claim
+  lifetime from the FIRST request. Enabled/enforcing now share ONE packed
+  `AtomicU8` (a single Release store, so the pair can never be observed
+  torn), an enabled→disabled reconfigure drops stranded deferred custody
+  on the next flush via a residue bit (DROPS it — up to 1024 stranded
+  deferred replies/IWANTs per topic are cleared, NOT served, because
+  serving them would reintroduce exactly the dispatch work the disabled
+  state is forbidden to perform; the senders' bounded retries recover),
+  the per-tick late-offer cap rotates round-robin across the sorted
+  candidate set instead of starving late-ordered peers, and
+  advance/backoff page the LIVE offer's cursor (a re-queue between
+  snapshot and outcome no longer re-signs the same page every tick).
+
+  Review round 3 (Claude): two r2 regressions fixed. (1) A HEALTHY
+  outstanding IWANT claim is never stolen — an advertiser takeover is
+  allowed only when the current claim is in a failed state
+  (`retry_not_before` armed); previously every extra advertiser of a
+  multi-advertiser id triggered a duplicate IWANT plus a full payload
+  reply (and an MLDSA verify) each. (2) The late-offer selection under
+  the all-shard `write_all()` is O(cap) again: candidates are ranked on
+  a rotating byte-ordered key ring (flusher-local state, replacing the
+  process-global cursor) and at most 4 are ever retained while every
+  shard is write-locked — r2 collected every non-backed-off offer
+  (≤ 1024 per topic) before truncating after the lock drop.
+
+  Review round 4 (CI red under plain `cargo test`): the `cfg(test)`
+  instrumentation counters (limiter state-mutex acquisitions, flush
+  `write_all` takes, the write-all-held flag, late-offer scan counts,
+  collected-peak) were process-global statics, so other concurrently
+  running tests' traffic landed in the same counters (nextest's
+  process-per-test had hidden that). They are now PER INSTANCE — a
+  cfg(test) field on `LeafEgressLimiter` and a cfg(test)
+  `TopicContentionInstrumentation` owned by each `ShardedTopicMap` —
+  and the exact-count tests disable the instance's own background
+  flusher so only the driven ticks are measured.
+
 - **pubsub: fair recovery-intent admission with bounded displacement.**
   Intent admission in the Leaf egress limiter was first-come-first-served
   up to the class caps with no eviction, so while a class was saturated a
@@ -276,7 +355,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send tasks have been handed off, so an abort past the shutdown grace
   leaves the batch pending for the next flusher instead of losing it
   (a lost batch was lost delivery until anti-entropy).
->>>>>>> origin/main
 
 ### Changed
 

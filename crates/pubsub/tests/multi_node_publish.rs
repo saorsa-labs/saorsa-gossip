@@ -8,15 +8,21 @@
 //! the real transport (existing inline tests use a mock transport).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Result;
 use bytes::Bytes;
 use saorsa_gossip_identity::MlDsaKeyPair;
-use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
-use saorsa_gossip_transport::testing::connected_pair;
-use saorsa_gossip_transport::{GossipStreamType, GossipTransport, UdpTransportAdapter};
-use saorsa_gossip_types::{PeerId, TopicId};
+use saorsa_gossip_pubsub::{BytePolicy, GossipMessage, LeafEgressConfig, PlumtreePubSub, PubSub};
+use saorsa_gossip_transport::testing::{connected_pair, loopback_star};
+use saorsa_gossip_transport::{
+    AuthenticatedSession, GossipStreamType, GossipTransport, SessionAdmission, UdpTransportAdapter,
+};
+use saorsa_gossip_types::{MessageKind, PeerId, TopicId};
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,7 +32,7 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 /// `pubsub.handle_message`. Other stream types are ignored (membership and
 /// bulk are out of scope for this test).
 fn spawn_pubsub_pump<T>(
-    transport: Arc<UdpTransportAdapter>,
+    transport: Arc<T>,
     pubsub: Arc<PlumtreePubSub<T>>,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -53,6 +59,160 @@ where
             }
         }
     })
+}
+
+#[derive(Clone, Debug)]
+struct FrameRecord {
+    sequence: u64,
+    from: PeerId,
+    to: PeerId,
+    kind: MessageKind,
+    msg_id: [u8; 32],
+    wire_len: usize,
+    payload_hash: Option<[u8; 32]>,
+    control_ids: Vec<[u8; 32]>,
+}
+
+#[derive(Default)]
+struct FrameLedger {
+    next_sequence: AtomicU64,
+    frames: Mutex<Vec<FrameRecord>>,
+    changed: Notify,
+}
+
+impl FrameLedger {
+    fn record(&self, from: PeerId, to: PeerId, stream: GossipStreamType, data: &Bytes) {
+        if stream != GossipStreamType::PubSub {
+            return;
+        }
+        let Ok(message) = postcard::from_bytes::<GossipMessage>(data) else {
+            return;
+        };
+        let payload_hash = message
+            .payload
+            .as_deref()
+            .map(|payload| *blake3::hash(payload).as_bytes());
+        let control_ids = match message.header.kind {
+            MessageKind::IHave | MessageKind::IWant => message
+                .payload
+                .as_deref()
+                .and_then(|payload| postcard::from_bytes(payload).ok())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        self.frames
+            .lock()
+            .expect("frame ledger lock")
+            .push(FrameRecord {
+                sequence,
+                from,
+                to,
+                kind: message.header.kind,
+                msg_id: message.header.msg_id,
+                wire_len: data.len(),
+                payload_hash,
+                control_ids,
+            });
+        self.changed.notify_waiters();
+    }
+
+    fn find(&self, predicate: impl Fn(&FrameRecord) -> bool) -> Option<FrameRecord> {
+        self.frames
+            .lock()
+            .expect("frame ledger lock")
+            .iter()
+            .find(|frame| predicate(frame))
+            .cloned()
+    }
+
+    async fn wait_for(&self, predicate: impl Fn(&FrameRecord) -> bool) -> FrameRecord {
+        loop {
+            let changed = self.changed.notified();
+            if let Some(frame) = self.find(&predicate) {
+                return frame;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct TracingTransport {
+    inner: UdpTransportAdapter,
+    ledger: Arc<FrameLedger>,
+}
+
+impl TracingTransport {
+    fn new(inner: UdpTransportAdapter, ledger: Arc<FrameLedger>) -> Arc<Self> {
+        Arc::new(Self { inner, ledger })
+    }
+}
+
+#[async_trait::async_trait]
+impl GossipTransport for TracingTransport {
+    async fn dial(&self, peer: PeerId, addr: SocketAddr) -> Result<()> {
+        GossipTransport::dial(&self.inner, peer, addr).await
+    }
+
+    async fn dial_bootstrap(&self, addr: SocketAddr) -> Result<PeerId> {
+        GossipTransport::dial_bootstrap(&self.inner, addr).await
+    }
+
+    async fn listen(&self, bind: SocketAddr) -> Result<()> {
+        GossipTransport::listen(&self.inner, bind).await
+    }
+
+    async fn close(&self) -> Result<()> {
+        GossipTransport::close(&self.inner).await
+    }
+
+    async fn send_to_peer(
+        &self,
+        peer: PeerId,
+        stream: GossipStreamType,
+        data: Bytes,
+    ) -> Result<()> {
+        GossipTransport::send_to_peer(&self.inner, peer, stream, data.clone()).await?;
+        self.ledger.record(
+            GossipTransport::local_peer_id(&self.inner),
+            peer,
+            stream,
+            &data,
+        );
+        Ok(())
+    }
+
+    fn authenticated_session(&self, peer: PeerId) -> Option<AuthenticatedSession> {
+        GossipTransport::authenticated_session(&self.inner, peer)
+    }
+
+    async fn send_to_peer_guarded(
+        &self,
+        peer: PeerId,
+        stream: GossipStreamType,
+        admit: SessionAdmission,
+    ) -> Result<()> {
+        let ledger = Arc::clone(&self.ledger);
+        let from = GossipTransport::local_peer_id(&self.inner);
+        let traced_admit: SessionAdmission = Arc::new(move |session| {
+            let data = admit(session)?;
+            ledger.record(from, peer, stream, &data);
+            Ok(data)
+        });
+        GossipTransport::send_to_peer_guarded(&self.inner, peer, stream, traced_admit).await
+    }
+
+    async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+        GossipTransport::receive_message(&self.inner).await
+    }
+
+    async fn connected_peer_ids(&self) -> Vec<PeerId> {
+        GossipTransport::connected_peer_ids(&self.inner).await
+    }
+
+    fn local_peer_id(&self) -> PeerId {
+        GossipTransport::local_peer_id(&self.inner)
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -108,4 +268,206 @@ async fn two_nodes_publish_subscribe_round_trip() {
     let (sender, body) = received;
     assert_eq!(sender, node2_peer, "sender peer id mismatch");
     assert_eq!(body, payload, "payload bytes mismatch");
+}
+
+/// #504: exercise the real loopback transport while proving that a Leaf relay
+/// which defers a Normal EAGER forward retains custody through the exact
+/// IHAVE -> IWANT -> cached EAGER recovery chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real loopback QUIC; run only through isolated Linux CI"]
+async fn leaf_shed_normal_recovers_exact_message_via_ihave_iwant() {
+    timeout(Duration::from_secs(30), async {
+        // loopback_star makes the first transport the hub. Assign that hub to
+        // B so A and C have no direct connection and recovery must cross B.
+        let mut transports = loopback_star(3).await.into_iter();
+        let (b_inner, _) = transports.next().expect("relay transport");
+        let (a_inner, _) = transports.next().expect("origin transport");
+        let (c_inner, _) = transports.next().expect("receiver transport");
+        let (a_peer, b_peer, c_peer) = (a_inner.peer_id(), b_inner.peer_id(), c_inner.peer_id());
+
+        let ledger = Arc::new(FrameLedger::default());
+        let a_transport = TracingTransport::new(a_inner, Arc::clone(&ledger));
+        let b_transport = TracingTransport::new(b_inner, Arc::clone(&ledger));
+        let c_transport = TracingTransport::new(c_inner, Arc::clone(&ledger));
+
+        let node_a = Arc::new(PlumtreePubSub::new(
+            a_peer,
+            Arc::clone(&a_transport),
+            MlDsaKeyPair::generate().expect("origin signing key"),
+        ));
+        let node_b = Arc::new(PlumtreePubSub::new(
+            b_peer,
+            Arc::clone(&b_transport),
+            MlDsaKeyPair::generate().expect("relay signing key"),
+        ));
+        let node_c = Arc::new(PlumtreePubSub::new(
+            c_peer,
+            Arc::clone(&c_transport),
+            MlDsaKeyPair::generate().expect("receiver signing key"),
+        ));
+
+        let topic = TopicId::new([0x50; 32]);
+        let mut relay_observer = node_b.subscribe_ready(topic).await;
+        let mut receiver = node_c.subscribe_ready(topic).await;
+        node_a.initialize_topic_peers(topic, vec![b_peer]).await;
+        node_b
+            .initialize_topic_peers(topic, vec![a_peer, c_peer])
+            .await;
+        node_c.initialize_topic_peers(topic, vec![b_peer]).await;
+
+        let pumps = [
+            spawn_pubsub_pump(Arc::clone(&a_transport), Arc::clone(&node_a)),
+            spawn_pubsub_pump(Arc::clone(&b_transport), Arc::clone(&node_b)),
+            spawn_pubsub_pump(Arc::clone(&c_transport), Arc::clone(&node_c)),
+        ];
+
+        // Measure one real same-sized EAGER frame before enabling the limiter.
+        // ML-DSA signatures and public keys are fixed-size, so this is the
+        // exact burst needed for B to admit one filler of the same length.
+        let calibration = Bytes::from(vec![0x43; 8 * 1024]);
+        let calibration_hash = *blake3::hash(&calibration).as_bytes();
+        node_a
+            .publish(topic, calibration.clone())
+            .await
+            .expect("publish calibration frame");
+        let (_, relay_calibration) = relay_observer
+            .recv()
+            .await
+            .expect("relay observer remains live");
+        assert_eq!(relay_calibration, calibration);
+        let (_, receiver_calibration) = receiver.recv().await.expect("receiver remains live");
+        assert_eq!(receiver_calibration, calibration);
+        let calibration_frame = ledger
+            .wait_for(|frame| {
+                frame.from == b_peer
+                    && frame.to == c_peer
+                    && frame.kind == MessageKind::Eager
+                    && frame.payload_hash == Some(calibration_hash)
+            })
+            .await;
+        let fixed_burst = u64::try_from(calibration_frame.wire_len).expect("wire length fits u64");
+        assert!(node_b.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 2 * 1024,
+            burst_bytes: fixed_burst,
+            max_serialized_frame_bytes: calibration_frame.wire_len,
+            policy: BytePolicy::ShedNormal,
+        })));
+
+        // Consume B's complete fixed burst with one successful Normal relay.
+        // Receipt at C is the barrier proving the charged send completed.
+        let filler = Bytes::from(vec![0x46; 8 * 1024]);
+        let filler_hash = *blake3::hash(&filler).as_bytes();
+        node_a
+            .publish(topic, filler.clone())
+            .await
+            .expect("publish filler");
+        let (_, relay_filler) = relay_observer
+            .recv()
+            .await
+            .expect("relay observer remains live");
+        assert_eq!(relay_filler, filler);
+        let (_, received_filler) = receiver.recv().await.expect("receiver remains live");
+        assert_eq!(received_filler, filler);
+        let filler_forward = ledger
+            .wait_for(|frame| {
+                frame.from == b_peer
+                    && frame.to == c_peer
+                    && frame.kind == MessageKind::Eager
+                    && frame.payload_hash == Some(filler_hash)
+            })
+            .await;
+        let after_filler = node_b.leaf_egress_snapshot();
+        assert_eq!(after_filler.charged_bytes, fixed_burst);
+        assert_eq!(after_filler.sent_bytes, fixed_burst);
+        assert_eq!(after_filler.data_deferred, 0);
+
+        let target = Bytes::from(vec![0x54; 8 * 1024]);
+        let target_hash = *blake3::hash(&target).as_bytes();
+        node_a
+            .publish(topic, target.clone())
+            .await
+            .expect("publish target");
+
+        let origin_eager = ledger
+            .wait_for(|frame| {
+                frame.from == a_peer
+                    && frame.to == b_peer
+                    && frame.kind == MessageKind::Eager
+                    && frame.payload_hash == Some(target_hash)
+            })
+            .await;
+        let target_id = origin_eager.msg_id;
+
+        // B's subscriber proves local admission, but delivery occurs before
+        // the forward limiter. The exact B→C IHAVE below is the post-decision
+        // barrier for reading the deferral counter.
+        let (origin_peer, observed_target) = relay_observer
+            .recv()
+            .await
+            .expect("relay observer remains live");
+        assert_eq!(origin_peer, a_peer);
+        assert_eq!(observed_target, target);
+
+        let ihave = ledger
+            .wait_for(|frame| {
+                frame.from == b_peer
+                    && frame.to == c_peer
+                    && frame.kind == MessageKind::IHave
+                    && frame.control_ids.contains(&target_id)
+            })
+            .await;
+        let after_target = node_b.leaf_egress_snapshot();
+        assert_eq!(
+            after_target.data_deferred, 1,
+            "target EAGER must be shed to lazy recovery"
+        );
+        let iwant = ledger
+            .wait_for(|frame| {
+                frame.from == c_peer
+                    && frame.to == b_peer
+                    && frame.kind == MessageKind::IWant
+                    && frame.control_ids == [target_id]
+            })
+            .await;
+        let recovered = ledger
+            .wait_for(|frame| {
+                frame.from == b_peer
+                    && frame.to == c_peer
+                    && frame.kind == MessageKind::Eager
+                    && frame.msg_id == target_id
+                    && frame.payload_hash == Some(target_hash)
+            })
+            .await;
+
+        let (delivering_peer, delivered) = receiver.recv().await.expect("receiver remains live");
+        assert_eq!(delivering_peer, b_peer);
+        assert_eq!(delivered, target);
+        assert!(
+            filler_forward.sequence < origin_eager.sequence
+                && origin_eager.sequence < ihave.sequence
+                && ihave.sequence < iwant.sequence
+                && iwant.sequence < recovered.sequence,
+            "ledger must retain the exact causal recovery order"
+        );
+
+        let leaf = node_b.leaf_egress_snapshot();
+        assert_eq!(leaf.data_deferred, 1);
+        assert_eq!(leaf.invariant_violations, 0);
+        assert_eq!(leaf.send_failures, 0);
+        assert_eq!(node_b.stage_stats().message_kinds.iwant, 1);
+        assert_eq!(node_c.stage_stats().message_kinds.ihave, 1);
+
+        for pump in pumps {
+            pump.abort();
+        }
+        let _ = node_a.shutdown().await;
+        let _ = node_b.shutdown().await;
+        let _ = node_c.shutdown().await;
+        a_transport.close().await.expect("close origin transport");
+        b_transport.close().await.expect("close relay transport");
+        c_transport.close().await.expect("close receiver transport");
+    })
+    .await
+    .expect("Leaf recovery proof exceeded its outer deadline");
 }

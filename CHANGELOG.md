@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.84] - 2026-09-21
+
 ### Fixed
 
 - **pubsub: a disabled Leaf egress limiter now costs zero per-frame mutex

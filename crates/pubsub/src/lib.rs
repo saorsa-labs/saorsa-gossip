@@ -5221,6 +5221,43 @@ impl TopicState {
         }
     }
 
+    /// Prefer one eligible connected peer without removing any topic member.
+    ///
+    /// When the eager set is full, the lowest-scoring eager peer is demoted to
+    /// lazy before `peer` is promoted. Cooling or otherwise ineligible peers
+    /// are left lazy, and an already-eager preference is an idempotent no-op.
+    fn prefer_eager_peer_at(&mut self, peer: PeerId, now: Instant) -> (usize, usize) {
+        if self.eager_peers.contains(&peer) {
+            return (0, 0);
+        }
+        if !self.lazy_peers.contains(&peer) || !self.is_score_eligible_for_eager_at(peer, now) {
+            return (0, 0);
+        }
+
+        let mut pruned = 0;
+        if self.eager_peers.len() >= self.max_eager_degree {
+            let Some((displaced, _)) = self.scored_eager_peers_at(now).first().copied() else {
+                return (0, 0);
+            };
+            if self.prune_peer(displaced) {
+                pruned = 1;
+            } else {
+                return (0, 0);
+            }
+        }
+
+        if self.graft_peer_at(peer, now) {
+            (pruned, 1)
+        } else {
+            // Eligibility was checked before displacement while holding the
+            // topic write lock, so this is defensive. Restore the displaced
+            // peer through ordinary bounded maintenance rather than leaving
+            // the eager set below its configured target.
+            let (_, restored) = self.maintain_degree_at(now);
+            (pruned, restored)
+        }
+    }
+
     fn add_new_peer_lazy(&mut self, peer: PeerId) -> bool {
         if self.eager_peers.contains(&peer) || self.lazy_peers.contains(&peer) {
             return false;
@@ -11637,6 +11674,26 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// Peers that were previously moved to `lazy_peers` via PRUNE are left
     /// in lazy if they are still connected; otherwise they are removed.
     pub async fn set_topic_peers(&self, topic: TopicId, connected: Vec<PeerId>) {
+        self.set_topic_peers_with_preferred_eager(topic, connected, None)
+            .await;
+    }
+
+    /// Replace a topic's connected membership and prefer one eligible peer as
+    /// eager without removing any other connected peer.
+    ///
+    /// The full `connected` set remains represented as eager or lazy. Existing
+    /// scores, cooling state, suppression diagnostics, and pending recovery
+    /// state are retained for every identity still connected. If `preferred`
+    /// is connected, lazy, and graft-eligible, it atomically replaces the
+    /// lowest-scoring eager peer when the configured eager ceiling is full.
+    /// Cooling or otherwise ineligible preferred peers remain lazy.
+    /// Returns `true` when no preference was requested or it ended eager.
+    pub async fn set_topic_peers_with_preferred_eager(
+        &self,
+        topic: TopicId,
+        connected: Vec<PeerId>,
+        preferred: Option<PeerId>,
+    ) -> bool {
         let rebuild_started = Instant::now();
         debug!(
             topic = ?topic,
@@ -11687,7 +11744,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         }
 
-        let (pruned, grafted) = state.maintain_degree_at(now);
+        let mut pruned = 0;
+        let mut grafted = 0;
+        if let Some(preferred) = preferred.filter(|peer| connected_set.contains(peer)) {
+            let (preferred_pruned, preferred_grafted) = state.prefer_eager_peer_at(preferred, now);
+            pruned += preferred_pruned;
+            grafted += preferred_grafted;
+        }
+        let (maintained_pruned, maintained_grafted) = state.maintain_degree_at(now);
+        pruned += maintained_pruned;
+        grafted += maintained_grafted;
+        let preferred_is_eager = preferred.is_none_or(|peer| state.eager_peers.contains(&peer));
         if pruned > 0 {
             self.stage_stats.record_prunes(pruned);
         }
@@ -11705,6 +11772,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             grafted,
             "Set topic peers"
         );
+        preferred_is_eager
     }
 
     /// Return all topic IDs known to PlumTree (subscribed or pass-through).
@@ -21004,8 +21072,39 @@ mod tests {
             .await
             .expect("ihave");
 
-        // Inbound IWANT for our cached local publish: serves EAGER.
-        let local_id = pubsub.calculate_msg_id(&topic, &Bytes::from_static(b"zero-overhead"));
+        // Negative control for the old test shape: model a recomputation on
+        // the next one-second epoch without touching the host clock. The id
+        // differs from the cached publish and therefore must not serve EAGER.
+        let payload = Bytes::from_static(b"zero-overhead");
+        let payload_hash = blake3::hash(payload.as_ref());
+        let next_epoch_id = MessageHeader::calculate_msg_id(
+            &topic,
+            pubsub.current_epoch().saturating_add(1),
+            &local,
+            payload_hash.as_bytes(),
+        );
+        pubsub
+            .handle_iwant(peer, topic, vec![next_epoch_id])
+            .await
+            .expect("next-epoch iwant");
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len(),
+            1,
+            "recomputed next-epoch id must reproduce the old missing cached serve"
+        );
+
+        // Positive control: an IWANT for our actual cached local publish
+        // serves EAGER. Reading the cached id avoids the old test's race with
+        // the one-second message-id epoch while ML-DSA signing is scheduled.
+        let local_id = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            topics
+                .get(&topic)
+                .and_then(|state| state.message_cache.peek_lru_message_id())
+                .expect("local publish must be cached")
+        };
         pubsub
             .handle_iwant(peer, topic, vec![local_id])
             .await
@@ -21064,6 +21163,20 @@ mod tests {
         assert!(
             sent >= 3,
             "disabled limiter must not change what gets sent: {sent} frames"
+        );
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len(),
+            2,
+            "publish and cached IWANT serve must each send EAGER"
+        );
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::IWant)
+                .len(),
+            1,
+            "unknown IHAVE must send one IWANT"
         );
     }
 
@@ -24516,6 +24629,201 @@ mod tests {
         );
         assert!(state.lazy_peers.contains(&new_peer_a));
         assert!(state.lazy_peers.contains(&new_peer_b));
+    }
+
+    #[tokio::test]
+    async fn preferred_eager_reconcile_retains_full_membership_at_degree_two() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([94u8; 32]);
+        let peers = vec![test_peer_id(2), test_peer_id(3), test_peer_id(4)];
+        pubsub.set_eager_degree_ceiling(2).await;
+
+        pubsub.set_topic_peers(topic, peers.clone()).await;
+        let preferred = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            *topics
+                .get(&topic)
+                .and_then(|state| state.lazy_peers.iter().next())
+                .expect("degree-two mesh leaves one lazy peer")
+        };
+
+        let preferred_applied = pubsub
+            .set_topic_peers_with_preferred_eager(topic, peers.clone(), Some(preferred))
+            .await;
+
+        assert!(preferred_applied);
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        assert_eq!(state.eager_peers.len(), 2);
+        assert_eq!(state.lazy_peers.len(), 1);
+        assert!(state.eager_peers.contains(&preferred));
+        assert!(peers
+            .iter()
+            .all(|peer| state.eager_peers.contains(peer) || state.lazy_peers.contains(peer)));
+    }
+
+    #[tokio::test]
+    async fn repeated_preferred_eager_reconcile_is_idempotent() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([95u8; 32]);
+        let peers = vec![test_peer_id(2), test_peer_id(3), test_peer_id(4)];
+        let preferred = peers[2];
+        pubsub.set_eager_degree_ceiling(2).await;
+
+        let preferred_applied = pubsub
+            .set_topic_peers_with_preferred_eager(topic, peers.clone(), Some(preferred))
+            .await;
+        assert!(preferred_applied);
+        let before = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            (state.eager_peers.clone(), state.lazy_peers.clone())
+        };
+        let stats_before = pubsub.stage_stats().message_kinds;
+
+        let repeated_preference = pubsub
+            .set_topic_peers_with_preferred_eager(topic, peers, Some(preferred))
+            .await;
+
+        assert!(repeated_preference);
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        assert_eq!(state.eager_peers, before.0);
+        assert_eq!(state.lazy_peers, before.1);
+        let stats_after = pubsub.stage_stats().message_kinds;
+        assert_eq!(stats_after.prune, stats_before.prune);
+        assert_eq!(stats_after.graft, stats_before.graft);
+    }
+
+    #[tokio::test]
+    async fn preferred_eager_reconcile_does_not_promote_or_reset_cooling_peer() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([96u8; 32]);
+        let peers = vec![test_peer_id(2), test_peer_id(3), test_peer_id(4)];
+        pubsub.set_eager_degree_ceiling(2).await;
+        pubsub.set_topic_peers(topic, peers.clone()).await;
+        let preferred = {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            let preferred = *state
+                .lazy_peers
+                .iter()
+                .next()
+                .expect("degree-two mesh leaves one lazy peer");
+            let mut cooling = PeerCoolingState::new(Instant::now());
+            cooling.suppressed_until = Some(Instant::now() + Duration::from_secs(60));
+            cooling.timeout_count = 3;
+            state.peer_cooling.insert(preferred, cooling);
+            preferred
+        };
+
+        let preferred_applied = pubsub
+            .set_topic_peers_with_preferred_eager(topic, peers, Some(preferred))
+            .await;
+
+        assert!(!preferred_applied);
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        assert!(state.lazy_peers.contains(&preferred));
+        assert!(!state.eager_peers.contains(&preferred));
+        let cooling = state
+            .peer_cooling
+            .get(&preferred)
+            .expect("cooling state retained");
+        assert_eq!(cooling.timeout_count, 3);
+        assert!(cooling.is_suppressed_at(Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn preferred_eager_reconcile_replaces_disconnected_preference() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([97u8; 32]);
+        let peers = vec![test_peer_id(2), test_peer_id(3), test_peer_id(4)];
+        pubsub.set_eager_degree_ceiling(2).await;
+        pubsub
+            .set_topic_peers_with_preferred_eager(topic, peers.clone(), Some(peers[2]))
+            .await;
+
+        let connected = vec![peers[0], peers[1]];
+        let replacement = peers[1];
+        let preferred = pubsub
+            .set_topic_peers_with_preferred_eager(topic, connected.clone(), Some(replacement))
+            .await;
+
+        assert!(preferred);
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        assert!(state.eager_peers.contains(&replacement));
+        assert_eq!(state.eager_peers.len(), 2);
+        assert!(state.lazy_peers.is_empty());
+        assert!(!state.eager_peers.contains(&peers[2]));
+        assert!(!state.lazy_peers.contains(&peers[2]));
+        assert!(connected
+            .iter()
+            .all(|peer| state.eager_peers.contains(peer)));
+    }
+
+    #[tokio::test]
+    async fn preferred_eager_reconcile_preserves_survivor_iwant_state() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new(peer_id, transport, test_signing_key());
+        let topic = TopicId::new([98u8; 32]);
+        let peers = vec![test_peer_id(2), test_peer_id(3), test_peer_id(4)];
+        let msg_id = [42u8; 32];
+        pubsub.set_eager_degree_ceiling(2).await;
+        pubsub.set_topic_peers(topic, peers.clone()).await;
+        let preferred = {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            let preferred = *state
+                .lazy_peers
+                .iter()
+                .next()
+                .expect("degree-two mesh leaves one lazy peer");
+            state.outstanding_iwants.insert(
+                msg_id,
+                OutstandingIwant {
+                    peer: preferred,
+                    requested_at: Instant::now(),
+                    retry_pending: true,
+                    failures: 2,
+                    retry_not_before: Some(Instant::now() + Duration::from_secs(5)),
+                },
+            );
+            state.deferred_iwants.push(DeferredIwant {
+                peer: preferred,
+                msg_ids: vec![msg_id],
+                requested_at: Instant::now(),
+            });
+            preferred
+        };
+
+        let preferred_applied = pubsub
+            .set_topic_peers_with_preferred_eager(topic, peers, Some(preferred))
+            .await;
+
+        assert!(preferred_applied);
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        let outstanding = state
+            .outstanding_iwants
+            .get(&msg_id)
+            .expect("outstanding IWANT retained");
+        assert_eq!(outstanding.peer, preferred);
+        assert!(outstanding.retry_pending);
+        assert_eq!(outstanding.failures, 2);
+        assert_eq!(state.deferred_iwants.len(), 1);
+        assert_eq!(state.deferred_iwants[0].peer, preferred);
+        assert_eq!(state.deferred_iwants[0].msg_ids, vec![msg_id]);
     }
 
     #[tokio::test]

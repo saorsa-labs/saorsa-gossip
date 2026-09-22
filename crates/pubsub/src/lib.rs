@@ -26,8 +26,11 @@
 
 pub mod admission;
 pub mod compat;
+mod key_cache;
 pub mod peer_scoring;
 pub mod timing;
+
+pub use key_cache::KeyCacheSnapshot;
 
 use crate::compat::PolicyTransport;
 use crate::timing::{AdaptiveCoolingConfig, PerPeerRttTracker};
@@ -349,16 +352,24 @@ enum OutboundWireKind {
     Ihave,
     Iwant,
     AntiEntropy,
+    KeyCacheControl,
 }
 
 impl OutboundWireKind {
-    const ALL: [Self; 4] = [Self::Eager, Self::Ihave, Self::Iwant, Self::AntiEntropy];
+    const ALL: [Self; 5] = [
+        Self::Eager,
+        Self::Ihave,
+        Self::Iwant,
+        Self::AntiEntropy,
+        Self::KeyCacheControl,
+    ];
 
     fn from_op(op: &'static str) -> Self {
         match op {
             "EAGER" => Self::Eager,
             "IHAVE" => Self::Ihave,
             "IWANT" => Self::Iwant,
+            "KEY_CACHE_CONTROL" => Self::KeyCacheControl,
             _ => Self::AntiEntropy,
         }
     }
@@ -369,6 +380,7 @@ impl OutboundWireKind {
             Self::Ihave => "ihave",
             Self::Iwant => "iwant",
             Self::AntiEntropy => "anti_entropy",
+            Self::KeyCacheControl => "key_cache_control",
         }
     }
 
@@ -378,6 +390,7 @@ impl OutboundWireKind {
             Self::Ihave => 1,
             Self::Iwant => 2,
             Self::AntiEntropy => 3,
+            Self::KeyCacheControl => 4,
         }
     }
 }
@@ -386,8 +399,8 @@ impl OutboundWireKind {
 /// the send path; no allocation beyond the one map entry per topic.
 #[derive(Debug, Default)]
 struct OutboundTopicMeter {
-    msgs: [AtomicU64; 4],
-    bytes: [AtomicU64; 4],
+    msgs: [AtomicU64; 5],
+    bytes: [AtomicU64; 5],
 }
 
 /// x0x #380: bounded per-topic outbound meters. Topics beyond the fixed cap
@@ -938,8 +951,8 @@ pub struct PubSubStageStats {
     /// [`OutboundTopicMeters`]).
     outbound_by_topic: OutboundTopicMeters,
     /// x0x #380: aggregate outbound wire msgs+bytes per kind.
-    outbound_kind_msgs: [AtomicU64; 4],
-    outbound_kind_bytes: [AtomicU64; 4],
+    outbound_kind_msgs: [AtomicU64; 5],
+    outbound_kind_bytes: [AtomicU64; 5],
     /// x0x #380: EAGER publish traffic split local vs relay.
     outbound_publish_origin: OutboundPublishOriginMeters,
     suppression_cleanup: SuppressionCleanupStats,
@@ -1288,6 +1301,12 @@ enum PeerSendOutcome {
     /// concurrency policy deferred the work. Recovery callers must not mark
     /// cached data served on this outcome.
     Deferred,
+}
+
+#[derive(Clone, Copy)]
+struct BoundedSendOrigin {
+    local: bool,
+    meter_publish: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2631,6 +2650,15 @@ impl PubSubStageStats {
         bytes_counter.fetch_add(msgs as u64 * bytes_len as u64, Ordering::Relaxed);
     }
 
+    fn record_publish_origin_bytes(&self, local: bool, bytes_len: usize) {
+        let bytes_counter = if local {
+            &self.outbound_publish_origin.local_bytes
+        } else {
+            &self.outbound_publish_origin.relay_bytes
+        };
+        bytes_counter.fetch_add(bytes_len as u64, Ordering::Relaxed);
+    }
+
     fn record_peer_evicted_not_connected(&self) {
         self.peers_evicted_not_connected
             .fetch_add(1, Ordering::Relaxed);
@@ -2847,6 +2875,7 @@ pub struct GossipMessage {
 /// messages. The peek is only worth doing under pressure; do not call it on the
 /// steady-state hot path.
 pub fn peek_message_kind(frame: &[u8]) -> Option<MessageKind> {
+    let frame = frame.strip_prefix(key_cache::WIRE_MARKER).unwrap_or(frame);
     postcard::take_from_bytes::<MessageHeader>(frame)
         .ok()
         .map(|(header, _rest)| header.kind)
@@ -5933,6 +5962,8 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     signing_key: Arc<saorsa_gossip_identity::MlDsaKeyPair>,
     /// Low-overhead timing counters for inbound PubSub processing stages.
     stage_stats: Arc<PubSubStageStats>,
+    /// Verified outer signer keys and negotiated per-session wire capability.
+    key_cache: Arc<Mutex<key_cache::KeyCache>>,
     /// Last complete peer-score diagnostics snapshot.
     ///
     /// Diagnostics readers use `topics.try_read_all()` so they never block the
@@ -6095,10 +6126,235 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         (admitted, deferred)
     }
 
+    fn reserve_recovery_targets_encoded(
+        limiter: &Arc<egress::LeafEgressLimiter>,
+        topic: TopicId,
+        peers: Vec<PeerId>,
+        op: &'static str,
+        encoded: (&HashMap<PeerId, Bytes>, &Bytes),
+        local_origin: bool,
+        priority: TopicPriority,
+    ) -> (Vec<(PeerId, Option<egress::ByteReservation>)>, Vec<PeerId>) {
+        let mut admitted = Vec::new();
+        let mut deferred = Vec::new();
+        for peer in peers {
+            let bytes = encoded.0.get(&peer).unwrap_or(encoded.1);
+            let (mut yes, mut no) = Self::reserve_recovery_targets(
+                limiter,
+                topic,
+                vec![peer],
+                op,
+                bytes,
+                local_origin,
+                priority,
+            );
+            admitted.append(&mut yes);
+            deferred.append(&mut no);
+        }
+        (admitted, deferred)
+    }
+
     /// Trusted local migration configuration; disabled until explicitly registered
     /// and granted. A grant cannot override ADR-012 RejectV1.
     pub fn legacy_migration(&self) -> &Arc<compat::LegacyMigration> {
         &self.transport.migration
+    }
+
+    /// Snapshot of negotiated key-reference wire traffic and bounded recovery.
+    pub fn key_cache_stats(&self) -> KeyCacheSnapshot {
+        self.key_cache
+            .lock()
+            .map(|cache| cache.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Encode before byte admission so every peer is charged for the frame it
+    /// can actually receive. Unknown and granted-legacy peers keep old bytes.
+    fn wire_bytes_for_peer(&self, peer: PeerId, bytes: &Bytes, priority: TopicPriority) -> Bytes {
+        self.transport.wire_bytes_for_peer(peer, bytes, priority)
+    }
+
+    fn spawn_key_cache_control_flusher(&self) {
+        let cache = Arc::clone(&self.key_cache);
+        let transport = Arc::clone(&self.transport);
+        let signing_key = Arc::clone(&self.signing_key);
+        let egress_limiter = Arc::clone(&self.egress_limiter);
+        let stage_stats = Arc::clone(&self.stage_stats);
+        let mut shutdown = self.shutdown_tx.subscribe();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let task = runtime.spawn(async move {
+                let mut tick = time::interval(Duration::from_millis(250));
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() { break; }
+                            continue;
+                        }
+                    }
+                    let sessions = match cache.lock() {
+                        Ok(guard) => guard.sessions(),
+                        Err(_) => break,
+                    };
+                    for session in sessions {
+                        if transport.authenticated_session(session.peer) != Some(session) {
+                            if let Ok(mut guard) = cache.lock() { guard.forget_stale(session); }
+                            continue;
+                        }
+                        loop {
+                            let control = match cache.lock() {
+                                Ok(mut guard) => guard.next_control(session, Instant::now()),
+                                Err(_) => None,
+                            };
+                            let Some(control) = control else { break; };
+                            let result = Self::send_key_cache_control(
+                                &transport, &signing_key, &egress_limiter, &stage_stats,
+                                session, control.clone(),
+                            ).await;
+                            if let Ok(mut guard) = cache.lock() {
+                                guard.control_result(session, &control, result.is_ok());
+                            }
+                            if let Err(error) = result {
+                                debug!(peer = %session.peer, %error, "key-cache control send failed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            if let Ok(mut tasks) = self.background_tasks.lock() {
+                tasks.push(task);
+            }
+        }
+    }
+
+    async fn send_key_cache_control(
+        transport: &Arc<PolicyTransport<T>>,
+        signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
+        egress_limiter: &Arc<egress::LeafEgressLimiter>,
+        stage_stats: &Arc<PubSubStageStats>,
+        session: saorsa_gossip_transport::AuthenticatedSession,
+        control: key_cache::Control,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            transport.authenticated_session(session.peer) == Some(session),
+            "stale key-cache control session"
+        );
+        let payload = key_cache::encode_control(control)?;
+        let mut header = MessageHeader::new(key_cache::control_topic(), MessageKind::Ping, 1);
+        header.seal_payload_hash(Some(&payload));
+        header.msg_id = MessageHeader::calculate_msg_id(
+            &header.topic,
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            &signing_key.peer_id(),
+            blake3::hash(&payload).as_bytes(),
+        );
+        let signature = signing_key.sign(&postcard::to_stdvec(&header)?)?;
+        let message = GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+        let bytes: Bytes = postcard::to_stdvec(&message)?.into();
+        let topic = key_cache::control_topic();
+        let op = "KEY_CACHE_CONTROL";
+        let frame_bytes = bytes.len();
+        let key = Self::recovery_intent_key(topic, session.peer, op, &bytes);
+        // These hop-local controls are already rate limited per session. Charge
+        // their exact serialized bytes as protected egress so negotiation and
+        // miss recovery cannot be silently shed by the Leaf data ceiling.
+        let reservation = egress_limiter.reserve_protected(key, frame_bytes, false);
+        anyhow::ensure!(
+            egress_limiter.validate_reservation(Some(key), reservation),
+            "invalid key-cache control egress reservation"
+        );
+        egress_limiter.record_purpose_demand(topic.to_bytes(), op, frame_bytes, true);
+        stage_stats.record_outbound(topic, op, frame_bytes, 1);
+        let result = transport
+            .inner
+            .send_to_peer_guarded(
+                session.peer,
+                GossipStreamType::PubSub,
+                Arc::new(move |actual| {
+                    anyhow::ensure!(actual == session, "stale key-cache control session");
+                    Ok(bytes.clone())
+                }),
+            )
+            .await;
+        egress_limiter.record_send_outcome(topic.to_bytes(), op, frame_bytes, result.is_ok());
+        result
+    }
+
+    async fn handle_key_cache_control(
+        &self,
+        from: PeerId,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+        message: &GossipMessage,
+    ) -> Result<()> {
+        let session = session
+            .ok_or_else(|| anyhow!("key-cache control requires authenticated provenance"))?;
+        anyhow::ensure!(
+            session.peer == from && self.transport.authenticated_session(from) == Some(session),
+            "stale key-cache control session"
+        );
+        anyhow::ensure!(
+            PeerId::from_pubkey(&message.public_key) == from && message.public_key.len() == 1952,
+            "key-cache control signer is not adjacent peer"
+        );
+        let payload = message
+            .payload
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing key-cache control payload"))?;
+        let control = key_cache::decode_control(payload).inspect_err(|error| {
+            if let Ok(mut cache) = self.key_cache.lock() {
+                cache.malformed_control();
+                if error.to_string().contains("hash mismatch") {
+                    cache.hash_mismatch();
+                }
+            }
+        })?;
+        let replay = {
+            let mut cache = self
+                .key_cache
+                .lock()
+                .map_err(|_| anyhow!("key cache poisoned"))?;
+            cache.observe_session(session, Instant::now());
+            match control {
+                key_cache::Control::Hello { .. } => {
+                    cache.received_hello(session);
+                    Vec::new()
+                }
+                key_cache::Control::Ack { key_ids } => {
+                    cache.acknowledge(session, &key_ids);
+                    Vec::new()
+                }
+                key_cache::Control::Request { key_ids } => {
+                    cache.queue_responses(session, &key_ids);
+                    Vec::new()
+                }
+                key_cache::Control::Response { entries } => {
+                    let mut frames = Vec::new();
+                    for (key_id, key) in entries {
+                        cache.note_verified_key(key_id, key, None);
+                        frames.extend(cache.take_pending(session, key_id));
+                    }
+                    frames
+                }
+            }
+        };
+        for frame in replay {
+            let success = Box::pin(self.dispatch_message(from, Some(session), frame))
+                .await
+                .is_ok();
+            if let Ok(mut cache) = self.key_cache.lock() {
+                cache.replay_result(success);
+            }
+        }
+        Ok(())
     }
 
     /// Receive a frame with its authenticated connection provenance. The caller
@@ -6109,6 +6365,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         session: saorsa_gossip_transport::AuthenticatedSession,
         data: Bytes,
     ) -> Result<()> {
+        if self.transport.authenticated_session(session.peer) == Some(session) {
+            if let Ok(mut cache) = self.key_cache.lock() {
+                cache.observe_session(session, Instant::now());
+            }
+        }
         self.dispatch_message(session.peer, Some(session), data)
             .await
     }
@@ -6193,6 +6454,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
         // Bound registered migration frames before allocating their envelopes.
         if let Ok((header, _)) = postcard::take_from_bytes::<MessageHeader>(&data) {
+            if header.topic == key_cache::control_topic() {
+                key_cache::preflight_legacy_control(&data)?;
+            }
             if self.transport.migration.registered(header.topic) {
                 anyhow::ensure!(
                     data.len() <= 1024 * 1024 + 6000,
@@ -6200,25 +6464,107 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 );
             }
         }
-        // Deserialize the GossipMessage
+        // A v3 frame is only meaningful with authenticated connection
+        // provenance. Resolve its signer before entering the unchanged
+        // application dispatcher; a miss never marks the message seen.
         let decode_started = Instant::now();
-        let decoded: std::result::Result<(GossipMessage, &[u8]), _> =
-            postcard::take_from_bytes(&data);
-        self.record_stage(PubSubStage::Decode, decode_started);
-        let message = match decoded {
-            Ok((message, trailing)) => {
-                anyhow::ensure!(
-                    !self.transport.migration.registered(message.header.topic)
-                        || trailing.is_empty(),
-                    "trailing migration frame bytes"
-                );
-                message
-            }
-            Err(e) => {
+        let message = if key_cache::is_v3(&data) {
+            let session =
+                session.ok_or_else(|| anyhow!("v3 frame requires authenticated provenance"))?;
+            let decoded = key_cache::decode(&data).inspect_err(|error| {
                 self.stage_stats.record_decode_failed();
-                return Err(anyhow!("Failed to deserialize PubSub message: {}", e));
+                if error.to_string().contains("hash mismatch") {
+                    if let Ok(mut cache) = self.key_cache.lock() {
+                        cache.hash_mismatch();
+                    }
+                }
+            })?;
+            match decoded {
+                key_cache::Decoded::Full(message, key_id) => {
+                    if message.header.kind != MessageKind::Eager {
+                        anyhow::ensure!(
+                            key_id == from,
+                            "hop-local v3 control signer is not adjacent peer"
+                        );
+                    }
+                    if let Ok(mut cache) = self.key_cache.lock() {
+                        cache.record_inbound(false, data.len());
+                    }
+                    message
+                }
+                key_cache::Decoded::Ref(mut message, key_id) => {
+                    if message.header.kind != MessageKind::Eager {
+                        anyhow::ensure!(
+                            key_id == from,
+                            "hop-local v3 control signer is not adjacent peer"
+                        );
+                    }
+                    anyhow::ensure!(
+                        self.admission
+                            .registry()
+                            .priority_for(&message.header.topic)
+                            != TopicPriority::Critical,
+                        "Critical frame cannot use key reference"
+                    );
+                    let key = self
+                        .key_cache
+                        .lock()
+                        .map_err(|_| anyhow!("key cache poisoned"))?
+                        .lookup(key_id);
+                    let Some(key) = key else {
+                        if let Ok(mut cache) = self.key_cache.lock() {
+                            cache.record_inbound(true, data.len());
+                            cache.queue_miss(session, key_id, data.clone(), Instant::now());
+                        }
+                        return Ok(());
+                    };
+                    message.public_key = key;
+                    if let Ok(mut cache) = self.key_cache.lock() {
+                        cache.record_inbound(true, data.len());
+                    }
+                    message
+                }
             }
+        } else {
+            let decoded: std::result::Result<(GossipMessage, &[u8]), _> =
+                postcard::take_from_bytes(&data);
+            let (message, trailing) = decoded.map_err(|e| {
+                self.stage_stats.record_decode_failed();
+                anyhow!("Failed to deserialize PubSub message: {e}")
+            })?;
+            anyhow::ensure!(
+                !self.transport.migration.registered(message.header.topic) || trailing.is_empty(),
+                "trailing migration frame bytes"
+            );
+            if message.header.topic == key_cache::control_topic() {
+                anyhow::ensure!(
+                    session.is_some_and(|provenance| provenance.peer == from)
+                        && PeerId::from_pubkey(&message.public_key) == from,
+                    "hop-local control requires adjacent authenticated signer"
+                );
+            }
+            if message.header.topic != key_cache::control_topic() {
+                if let Ok(mut cache) = self.key_cache.lock() {
+                    cache.record_inbound(false, data.len());
+                }
+            }
+            message
         };
+        self.record_stage(PubSubStage::Decode, decode_started);
+
+        anyhow::ensure!(
+            message.header.topic != key_cache::control_topic()
+                || message.header.kind == MessageKind::Ping,
+            "reserved key-cache topic requires Ping"
+        );
+
+        if key_cache::is_v3(&data) && message.header.kind != MessageKind::Eager {
+            anyhow::ensure!(
+                session.is_some_and(|s| s.peer == from)
+                    && PeerId::from_pubkey(&message.public_key) == from,
+                "v3 hop-local signer must be adjacent peer"
+            );
+        }
 
         let topic_id = message.header.topic;
         let msg_kind = message.header.kind;
@@ -6244,6 +6590,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     return Err(anyhow!("Invalid signature on IHAVE message"));
                 }
                 self.transport.migration.ingress(from, session, &message)?;
+                self.note_verified_inbound_key(&message, session);
                 self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
                     .await;
                 // IHAVE payload contains Vec<MessageIdType>
@@ -6271,6 +6618,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     return Err(anyhow!("Invalid signature on IWANT message"));
                 }
                 self.transport.migration.ingress(from, session, &message)?;
+                self.note_verified_inbound_key(&message, session);
                 self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
                     .await;
                 // IWANT payload contains Vec<MessageIdType>
@@ -6300,9 +6648,22 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             _ => {
                 self.transport.migration.ingress(from, session, &message)?;
                 if self.verify_message_signature(&message) {
+                    if topic_id == key_cache::control_topic() {
+                        anyhow::ensure!(
+                            msg_kind == MessageKind::Ping,
+                            "invalid key-cache control kind"
+                        );
+                        self.handle_key_cache_control(from, session, &message)
+                            .await?;
+                        return Ok(());
+                    }
+                    self.note_verified_inbound_key(&message, session);
                     self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
                         .await;
                 } else {
+                    if topic_id == key_cache::control_topic() {
+                        return Err(anyhow!("invalid key-cache control signature"));
+                    }
                     warn!(
                         peer_id = %LogPeerId::from(from),
                         msg_kind = ?msg_kind,
@@ -6315,6 +6676,26 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 );
                 Ok(())
             }
+        }
+    }
+
+    /// Learn an outer signer only after the normal per-kind verification and
+    /// migration admission. In particular, the EAGER pre-verify duplicate
+    /// path must never teach a key or spend another signature verification.
+    fn note_verified_inbound_key(
+        &self,
+        message: &GossipMessage,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+    ) {
+        if message.header.topic == key_cache::control_topic() {
+            return;
+        }
+        if let Ok(mut cache) = self.key_cache.lock() {
+            cache.note_verified_key(
+                PeerId::from_pubkey(&message.public_key),
+                message.public_key.clone(),
+                session,
+            );
         }
     }
 
@@ -6374,7 +6755,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         cache_config: PubSubCacheConfig,
     ) -> Self {
         let signing_key = Arc::new(signing_key);
-        let transport = Arc::new(PolicyTransport::new(transport, Arc::clone(&signing_key)));
+        let mut key_cache_state = key_cache::KeyCache::default();
+        key_cache_state.note_verified_key(
+            signing_key.peer_id(),
+            signing_key.public_key().to_vec(),
+            None,
+        );
+        let key_cache = Arc::new(Mutex::new(key_cache_state));
+        let transport = Arc::new(PolicyTransport::new_with_key_cache(
+            transport,
+            Arc::clone(&signing_key),
+            Arc::clone(&key_cache),
+        ));
         let pubsub = Self {
             topics: Arc::new(ShardedTopicMap::new()),
             peer_id,
@@ -6382,6 +6774,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             transport,
             signing_key,
             stage_stats: Arc::new(PubSubStageStats::default()),
+            key_cache,
             peer_score_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
             topic_cache_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
             outbound_budgets: Arc::new(PeerOutboundBudgets::default()),
@@ -6402,6 +6795,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         };
 
         if start_background_tasks {
+            pubsub.spawn_key_cache_control_flusher();
             pubsub.spawn_ihave_flusher();
             pubsub.spawn_cache_cleaner();
             pubsub.spawn_degree_maintainer();
@@ -7129,9 +7523,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         op: &'static str,
         local_origin: bool,
     ) -> Result<PeerSendOutcome> {
-        self.send_to_peer_bounded_outcome_tracked(topic, peer, stream_type, bytes, op, local_origin)
-            .await
-            .0
+        self.send_to_peer_bounded_outcome_tracked(
+            topic,
+            peer,
+            stream_type,
+            bytes,
+            op,
+            BoundedSendOrigin {
+                local: local_origin,
+                meter_publish: true,
+            },
+        )
+        .await
+        .0
     }
 
     /// `local_origin` marks a frame this node authored (a publish, a targeted
@@ -7144,13 +7548,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         stream_type: GossipStreamType,
         bytes: Bytes,
         op: &'static str,
-        local_origin: bool,
+        origin: BoundedSendOrigin,
     ) -> (Result<PeerSendOutcome>, FanoutPeerStage) {
+        let local_origin = origin.local;
         let operation_started = time::Instant::now();
         let operation_budget = self
             .peer_rtt_tracker
             .adaptive_timeout(&peer, PER_PEER_REPUBLISH_TIMEOUT);
         let priority = self.admission.registry().priority_for(&topic);
+        let bytes = self.wire_bytes_for_peer(peer, &bytes, priority);
         // Reserve serialized recovery/control bytes before touching admission
         // or transport permits. The digest coalesces retries of the same final
         // wire frame without retaining a second payload copy.
@@ -7352,6 +7758,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // x0x #380: outbound demand metering — this bounded path carries
         // exactly one claimed per-peer send. Instrumentation only.
         self.stage_stats.record_outbound(topic, op, bytes.len(), 1);
+        if op == "EAGER" && origin.meter_publish {
+            self.stage_stats
+                .record_publish_origin_bytes(local_origin, bytes.len());
+        }
         let transport = Arc::clone(&self.transport);
         let egress_limiter = Arc::clone(&self.egress_limiter);
         let stage_stats = Arc::clone(&self.stage_stats);
@@ -7900,7 +8310,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         context: FanoutSendContext<'_, T>,
         claims: &mut SendAttemptClaims,
         mut reservations: HashMap<PeerId, egress::ByteReservation>,
-        bytes: Bytes,
+        frames: &HashMap<PeerId, Bytes>,
+        fallback: &Bytes,
     ) -> SendTaskSet {
         let FanoutSendContext {
             transport,
@@ -7917,7 +8328,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         for (attempt, permit) in attempts.into_iter().zip(permits) {
             let transport = Arc::clone(transport);
             let egress_limiter = Arc::clone(egress_limiter);
-            let bytes = bytes.clone();
+            let bytes = frames.get(&attempt.peer).unwrap_or(fallback).clone();
             let stage_stats = Arc::clone(stage_stats);
             let rtt_tracker = Arc::clone(rtt_tracker);
             let reservation = reservations.remove(&attempt.peer);
@@ -7978,6 +8389,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let candidates = peers.len();
         let mut reservations = HashMap::new();
         let priority = self.admission.registry().priority_for(&topic);
+        let frames = self
+            .transport
+            .wire_bytes_for_peers(&peers, &bytes, priority);
         // #504 (review r2): keyed on `enforcing()`, not `enabled()`. This
         // sequential branch exists to order Critical sends against a shedding
         // budget; under ObserveOnly there is nothing to order against, so an
@@ -7991,7 +8405,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         {
             let mut tasks: Vec<FanoutSendFuture<'_>> = Vec::with_capacity(peers.len());
             for peer in peers {
-                let frame = bytes.clone();
+                let frame = frames.get(&peer).unwrap_or(&bytes).clone();
                 tasks.push(Box::pin(async move {
                     let result = self
                         .send_to_peer_bounded_outcome_tracked(
@@ -8000,7 +8414,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             stream_type,
                             frame,
                             op,
-                            !detach_accounting,
+                            BoundedSendOrigin {
+                                local: !detach_accounting,
+                                meter_publish: true,
+                            },
                         )
                         .await;
                     (peer, result)
@@ -8097,7 +8514,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let mut admitted = Vec::with_capacity(peers.len());
             let mut deferred = Vec::new();
             for peer in peers {
-                let key = Self::recovery_intent_key(topic, peer, op, &bytes);
+                let frame = frames.get(&peer).unwrap_or(&bytes);
+                let key = Self::recovery_intent_key(topic, peer, op, frame);
                 // Protection is decided before reserving, not after a denial.
                 // A protected send must never consult the gate at all: it is
                 // charged, it is never denied, and it carries a real
@@ -8105,14 +8523,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 if !shed_eligible {
                     if let Some(reservation) =
                         self.egress_limiter
-                            .reserve_protected(key, bytes.len(), detach_accounting)
+                            .reserve_protected(key, frame.len(), detach_accounting)
                     {
                         reservations.insert(peer, reservation);
                     }
                     self.egress_limiter.record_purpose_demand(
                         topic.to_bytes(),
                         op,
-                        bytes.len(),
+                        frame.len(),
                         true,
                     );
                     admitted.push(peer);
@@ -8120,11 +8538,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 let reserve_result =
                     self.egress_limiter
-                        .try_reserve_data(key, bytes.len(), detach_accounting);
+                        .try_reserve_data(key, frame.len(), detach_accounting);
                 self.egress_limiter.record_purpose_demand(
                     topic.to_bytes(),
                     op,
-                    bytes.len(),
+                    frame.len(),
                     reserve_result.is_ok(),
                 );
                 match reserve_result {
@@ -8135,7 +8553,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     Err(egress::ReserveError::Disabled) => admitted.push(peer),
                     Err(egress::ReserveError::Deferred) => deferred.push(peer),
                     Err(egress::ReserveError::Oversized) => {
-                        warn!(topic = %LogTopicId::from(topic), op, bytes = bytes.len(),
+                        warn!(topic = %LogTopicId::from(topic), op, bytes = frame.len(),
                             "Leaf PubSub frame exceeds configured serialized maximum");
                         deferred.push(peer);
                     }
@@ -8238,8 +8656,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let attempted = claims.attempts().len();
         // x0x #380: outbound demand metering — one wire send per claimed
         // attempt at `bytes.len()` serialized size. Instrumentation only.
-        self.stage_stats
-            .record_outbound(topic, op, bytes.len(), attempted);
+        for attempt in claims.attempts() {
+            let wire_len = frames.get(&attempt.peer).unwrap_or(&bytes).len();
+            self.stage_stats.record_outbound(topic, op, wire_len, 1);
+            if op == "EAGER" {
+                self.stage_stats
+                    .record_publish_origin_bytes(!detach_accounting, wire_len);
+            }
+        }
         // x0x #613: the attempted peer list is returned to the caller so a
         // stranded publish (`attempted > 0, succeeded == 0`) can retain
         // exactly the peers the pull path (self-IHAVE) must target.
@@ -8256,7 +8680,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             },
             &mut claims,
             reservations,
-            bytes,
+            &frames,
+            &bytes,
         );
         if detach_accounting {
             // Dispatcher forward path: detach fan-out result accounting so
@@ -8658,7 +9083,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Sending EAGER fan-out");
         // x0x #380: origin metering — this fan-out carries a LOCALLY
         // originated publish (the rate-cap baseline). Instrumentation only.
-        self.stage_stats.record_publish_origin(true, bytes.len(), 1);
+        self.stage_stats.record_publish_origin(true, 0, 1);
         // Publish path: await accounting (detach_accounting = false) so
         // publish() returns only after its EAGER sends are attempted and
         // outcomes are observable (succeeded is valid here).
@@ -8965,6 +9390,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
 
         self.transport.migration.ingress(from, session, &message)?;
+        self.note_verified_inbound_key(&message, session);
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
@@ -9212,8 +9638,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // re-publish (DeliverOnly / LazyForward with an emptied eager
         // set) must not book relay bytes it never sent.
         if !eager_peers.is_empty() {
-            self.stage_stats
-                .record_publish_origin(false, bytes.len(), 1);
+            self.stage_stats.record_publish_origin(false, 0, 1);
         }
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Forwarding EAGER");
         // Dispatcher forward path: detach accounting (detach_accounting =
@@ -9610,15 +10035,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             };
             let send_result = self
-                .send_to_peer_bounded_outcome(
+                .send_to_peer_bounded_outcome_tracked(
                     topic,
                     from,
                     GossipStreamType::PubSub,
                     bytes.into(),
                     "EAGER",
-                    local_origin_only || cached.local_origin,
+                    // An IWANT serve is demand traffic, not a new relay
+                    // publish; outbound wire bytes are still counted.
+                    BoundedSendOrigin {
+                        local: local_origin_only || cached.local_origin,
+                        meter_publish: false,
+                    },
                 )
-                .await;
+                .await
+                .0;
             match send_result {
                 Ok(PeerSendOutcome::Sent { .. }) => {
                     sent_any = true;
@@ -9715,6 +10146,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             return Err(anyhow!("Invalid signature on anti-entropy message"));
         }
         self.transport.migration.ingress(from, session, &message)?;
+        self.note_verified_inbound_key(&message, session);
         self.record_verified_inbound_from_peer(topic, from, message.header.kind)
             .await;
 
@@ -9815,10 +10247,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         public_key: self.signing_key.public_key().to_vec(),
                     };
                     if let Ok(bytes) = postcard::to_stdvec(&eager_msg) {
-                        // x0x #380: origin metering — serving a cached
-                        // (others') message on request is relay traffic.
+                        // The byte count is booked on the final per-peer
+                        // encoded frame in the bounded send path.
                         self.stage_stats
-                            .record_publish_origin(false, bytes.len(), 1);
+                            .record_publish_origin(cached.local_origin, 0, 1);
                         let _ = self
                             .send_to_peer_bounded_with_origin(
                                 topic,
@@ -10424,12 +10856,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 "IHAVE"
             };
             let flush_priority = env.send_path.admission.registry().priority_for(&topic_id);
-            let (reserved_targets, budget_deferred) = Self::reserve_recovery_targets(
+            let frames = transport.wire_bytes_for_peers(&ihave_targets, &bytes, flush_priority);
+            let (reserved_targets, budget_deferred) = Self::reserve_recovery_targets_encoded(
                 env.egress_limiter,
                 topic_id,
                 ihave_targets,
                 op,
-                &bytes,
+                (&frames, &bytes),
                 local_origin,
                 flush_priority,
             );
@@ -10503,14 +10936,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if !claims.is_empty() {
                 // x0x #380: outbound demand metering for the IHAVE flush
                 // lane. Instrumentation only.
-                stage_stats.record_outbound(topic_id, op, bytes.len(), claims.attempts().len());
+                for attempt in claims.attempts() {
+                    stage_stats.record_outbound(
+                        topic_id,
+                        op,
+                        frames.get(&attempt.peer).unwrap_or(&bytes).len(),
+                        1,
+                    );
+                }
                 let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
                 let attempts = claims.attempts().to_vec();
                 let permits = claims.take_permits();
                 for (attempt, permit) in attempts.into_iter().zip(permits) {
                     let reservation = reservations.remove(&attempt.peer);
                     let transport = Arc::clone(transport);
-                    let bytes = bytes.clone();
+                    let bytes = frames.get(&attempt.peer).unwrap_or(&bytes).clone();
                     let stage_stats = Arc::clone(stage_stats);
                     let rtt_tracker = Arc::clone(&env.send_path.rtt_tracker);
                     let send_egress_limiter = Arc::clone(env.egress_limiter);
@@ -10755,6 +11195,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     continue;
                 }
             };
+            let bytes = transport.wire_bytes_for_peer(
+                entry.peer,
+                &bytes,
+                send_path.admission.registry().priority_for(&topic),
+            );
             let (reserved, _) = Self::reserve_recovery_targets(
                 egress_limiter,
                 topic,
@@ -10804,6 +11249,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             );
             if !claims.is_empty() {
                 stage_stats.record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
+                for _ in claims.attempts() {
+                    stage_stats.record_publish_origin_bytes(cached.local_origin, bytes.len());
+                }
             }
             let attempts = claims.attempts().to_vec();
             let permits = claims.take_permits();
@@ -10954,17 +11402,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 )
             };
 
+            let retry_frames =
+                ctx.transport
+                    .wire_bytes_for_peers(&retry_targets, &bytes, retry_priority);
+
             let (retry_targets, reservations) = if ctx.egress_limiter.enabled() {
                 let mut pending = retry_targets;
                 let mut ready = Vec::new();
                 let mut reservations = HashMap::new();
                 loop {
-                    let (admitted, deferred) = Self::reserve_recovery_targets(
+                    let (admitted, deferred) = Self::reserve_recovery_targets_encoded(
                         &ctx.egress_limiter,
                         topic,
                         pending,
                         "EAGER",
-                        &bytes,
+                        (&retry_frames, &bytes),
                         // This path exists only to retry a stranded *local*
                         // publish; its one spawn site is
                         // `publish_local_with_optional_target`.
@@ -11103,8 +11555,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
 
             // x0x #380: outbound demand metering — instrumentation only.
-            ctx.stage_stats
-                .record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
+            for attempt in claims.attempts() {
+                let wire_len = retry_frames.get(&attempt.peer).unwrap_or(&bytes).len();
+                ctx.stage_stats.record_outbound(topic, "EAGER", wire_len, 1);
+                ctx.stage_stats.record_publish_origin_bytes(true, wire_len);
+            }
             let send_tasks = Self::spawn_bounded_send_tasks(
                 FanoutSendContext {
                     transport: &ctx.transport,
@@ -11117,7 +11572,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 },
                 &mut claims,
                 reservations,
-                bytes.clone(),
+                &retry_frames,
+                &bytes,
             );
             let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
             let succeeded_peers: Vec<_> = sent
@@ -11467,6 +11923,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
                     if let Ok(bytes) = postcard::to_stdvec(&message) {
                         let bytes: Bytes = bytes.into();
+                        let bytes = transport.wire_bytes_for_peer(
+                            peer,
+                            &bytes,
+                            send_path.admission.registry().priority_for(&topic_id),
+                        );
                         let (mut budgeted, _) = Self::reserve_recovery_targets(
                             &egress_limiter,
                             topic_id,
@@ -12005,6 +12466,451 @@ mod tests {
         assert_eq!(peek_message_kind(&[0xff, 0xff, 0xff]), None);
     }
 
+    fn key_cache_eager(
+        key: &saorsa_gossip_identity::MlDsaKeyPair,
+        topic: TopicId,
+        id: u8,
+        payload: &'static [u8],
+    ) -> GossipMessage {
+        let payload = Bytes::from_static(payload);
+        let mut header = MessageHeader::new(topic, MessageKind::Eager, 10);
+        header.msg_id = [id; 32];
+        header.seal_payload_hash(Some(&payload));
+        let signature = key
+            .sign(&postcard::to_stdvec(&header).expect("header"))
+            .expect("signature");
+        GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: key.public_key().to_vec(),
+        }
+    }
+
+    async fn flush_key_cache_control(
+        source: &PlumtreePubSub<RecordingTransport>,
+        destination: &PlumtreePubSub<RecordingTransport>,
+        source_transport: &RecordingTransport,
+        at: Instant,
+    ) -> key_cache::Control {
+        let session = source_transport
+            .authenticated_session(destination.peer_id)
+            .expect("session");
+        let control = source
+            .key_cache
+            .lock()
+            .expect("cache")
+            .next_control(session, at)
+            .expect("queued control");
+        PlumtreePubSub::<RecordingTransport>::send_key_cache_control(
+            &source.transport,
+            &source.signing_key,
+            &source.egress_limiter,
+            &source.stage_stats,
+            session,
+            control.clone(),
+        )
+        .await
+        .expect("send control");
+        source
+            .key_cache
+            .lock()
+            .expect("cache")
+            .control_result(session, &control, true);
+        let wire = source_transport
+            .sent_frames()
+            .last()
+            .expect("control frame")
+            .2
+            .clone();
+        destination
+            .handle_authenticated_message(
+                saorsa_gossip_transport::AuthenticatedSession {
+                    peer: source.peer_id,
+                    generation: 1,
+                },
+                wire,
+            )
+            .await
+            .expect("receive control");
+        control
+    }
+
+    #[tokio::test]
+    async fn key_cache_cold_warm_miss_recovery_and_relay_signers() {
+        let author_key = test_signing_key();
+        let receiver_key = test_signing_key();
+        let relay_key = test_signing_key();
+        let author = author_key.peer_id();
+        let receiver = receiver_key.peer_id();
+        let relay = relay_key.peer_id();
+        let author_transport = RecordingTransport::new(author);
+        let receiver_transport = RecordingTransport::new(receiver);
+        author_transport.set_session(receiver, 1);
+        receiver_transport.set_session(author, 1);
+        receiver_transport.set_session(relay, 1);
+        let a = PlumtreePubSub::new_with_task_control(
+            author,
+            Arc::clone(&author_transport),
+            author_key.clone(),
+            false,
+        );
+        let b = PlumtreePubSub::new_with_task_control(
+            receiver,
+            Arc::clone(&receiver_transport),
+            receiver_key,
+            false,
+        );
+        assert!(a.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 8192,
+            max_serialized_frame_bytes: 8192,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let topic = TopicId::new([0x76; 32]);
+        let mut received = b.subscribe_ready(topic).await;
+        let now = Instant::now();
+        a.key_cache.lock().expect("cache").observe_session(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: receiver,
+                generation: 1,
+            },
+            now,
+        );
+        b.key_cache.lock().expect("cache").observe_session(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            now,
+        );
+        assert!(matches!(
+            flush_key_cache_control(&a, &b, &author_transport, now).await,
+            key_cache::Control::Hello { .. }
+        ));
+        let hello_bytes = author_transport
+            .sent_frames()
+            .last()
+            .expect("Hello wire")
+            .2
+            .len() as u64;
+        let hello_meter = &a.stage_stats.snapshot().outbound_by_kind["key_cache_control"];
+        assert_eq!(hello_meter.msgs, 1);
+        assert_eq!(hello_meter.bytes, hello_bytes);
+        assert_eq!(a.leaf_egress_snapshot().charged_bytes, hello_bytes);
+        assert_eq!(a.leaf_egress_snapshot().sent_bytes, hello_bytes);
+        assert!(matches!(
+            flush_key_cache_control(&b, &a, &receiver_transport, now).await,
+            key_cache::Control::Hello { .. }
+        ));
+
+        let cold = key_cache_eager(&author_key, topic, 1, b"cold");
+        let mut invalid_full = cold.clone();
+        invalid_full.signature[0] ^= 1;
+        let invalid_full = key_cache::encode(&invalid_full, false).expect("invalid full wire");
+        assert!(b
+            .handle_authenticated_message(
+                saorsa_gossip_transport::AuthenticatedSession {
+                    peer: author,
+                    generation: 1
+                },
+                invalid_full,
+            )
+            .await
+            .is_err());
+        assert!(
+            b.key_cache.lock().expect("cache").lookup(author).is_none(),
+            "invalid Full must not populate the key cache"
+        );
+        let cold_wire: Bytes = postcard::to_stdvec(&cold).expect("legacy wire").into();
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            cold_wire.clone(),
+        )
+        .await
+        .expect("cold full delivery");
+        assert_eq!(
+            received.try_recv().expect("cold delivery").1,
+            Bytes::from_static(b"cold")
+        );
+        assert!(matches!(
+            flush_key_cache_control(&b, &a, &receiver_transport, now).await,
+            key_cache::Control::Ack { .. }
+        ));
+
+        let warm = key_cache_eager(&author_key, topic, 2, b"warm");
+        let warm_legacy: Bytes = postcard::to_stdvec(&warm).expect("wire").into();
+        let warm_wire = a.wire_bytes_for_peer(receiver, &warm_legacy, TopicPriority::Normal);
+        assert!(key_cache::is_v3(&warm_wire));
+        assert!(matches!(
+            key_cache::decode(&warm_wire).expect("ref"),
+            key_cache::Decoded::Ref(_, _)
+        ));
+        assert!(warm_wire.len() + 1900 < warm_legacy.len());
+        a.transport
+            .send_to_peer(receiver, GossipStreamType::PubSub, warm_wire.clone())
+            .await
+            .expect("guarded ref send");
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            warm_wire,
+        )
+        .await
+        .expect("warm delivery");
+        assert_eq!(
+            received.try_recv().expect("warm delivery").1,
+            Bytes::from_static(b"warm")
+        );
+
+        let critical_message = key_cache_eager(&author_key, topic, 6, b"critical");
+        let critical_legacy: Bytes = postcard::to_stdvec(&critical_message).expect("wire").into();
+        let critical = a.wire_bytes_for_peer(receiver, &critical_legacy, TopicPriority::Critical);
+        assert!(matches!(
+            key_cache::decode(&critical).expect("critical full"),
+            key_cache::Decoded::Full(_, _)
+        ));
+        b.admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        b.key_cache.lock().expect("cache").evict_key(author);
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            critical,
+        )
+        .await
+        .expect("cold Critical Full delivery");
+        assert_eq!(
+            received.try_recv().expect("Critical delivery").1,
+            Bytes::from_static(b"critical")
+        );
+        assert_eq!(
+            b.key_cache_stats().pending_frames_high_water,
+            0,
+            "Critical bypasses pending recovery"
+        );
+        b.admission
+            .registry()
+            .register(topic, TopicPriority::Normal);
+        let old_peer = PeerId::new([0xaa; 32]);
+        assert_eq!(
+            a.wire_bytes_for_peer(old_peer, &warm_legacy, TopicPriority::Normal),
+            warm_legacy
+        );
+
+        b.key_cache.lock().expect("cache").evict_key(author);
+        let missed = key_cache_eager(&author_key, topic, 3, b"missed");
+        let missed_legacy: Bytes = postcard::to_stdvec(&missed).expect("wire").into();
+        let missed_ref = a.wire_bytes_for_peer(receiver, &missed_legacy, TopicPriority::Normal);
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            missed_ref.clone(),
+        )
+        .await
+        .expect("queued miss");
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            missed_ref,
+        )
+        .await
+        .expect("coalesced miss");
+        assert!(received.try_recv().is_err());
+        assert!(matches!(
+            flush_key_cache_control(&b, &a, &receiver_transport, now + Duration::from_secs(1))
+                .await,
+            key_cache::Control::Request { .. }
+        ));
+        assert!(matches!(
+            flush_key_cache_control(&a, &b, &author_transport, now + Duration::from_secs(1)).await,
+            key_cache::Control::Response { .. }
+        ));
+        assert_eq!(
+            received.try_recv().expect("replayed delivery").1,
+            Bytes::from_static(b"missed")
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "duplicate pending frames deliver once"
+        );
+        assert!(b.key_cache_stats().replay_success >= 1);
+
+        // Ordinary relay forwarding preserves the origin outer signer even
+        // though the authenticated adjacent peer is different.
+        let forwarded = key_cache_eager(&author_key, topic, 4, b"forwarded");
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: relay,
+                generation: 1,
+            },
+            postcard::to_stdvec(&forwarded).expect("wire").into(),
+        )
+        .await
+        .expect("author signed relay forward");
+        assert_eq!(
+            received.try_recv().expect("forwarded delivery").1,
+            Bytes::from_static(b"forwarded")
+        );
+        // IWANT/anti-entropy service re-signs the cached header with the
+        // adjacent server's key while preserving its message ID and payload.
+        let mut served = key_cache_eager(&relay_key, topic, 5, b"served");
+        served.header.msg_id = [0x51; 32];
+        served.signature = relay_key
+            .sign(&postcard::to_stdvec(&served.header).expect("header"))
+            .expect("sign");
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: relay,
+                generation: 1,
+            },
+            postcard::to_stdvec(&served).expect("wire").into(),
+        )
+        .await
+        .expect("server signed service");
+        assert_eq!(
+            received.try_recv().expect("served delivery").1,
+            Bytes::from_static(b"served")
+        );
+
+        // Mixed fan-out uses the exact serialized size of each destination's
+        // Ref/legacy frame in the existing demand and origin meters.
+        a.initialize_topic_peers(topic, vec![receiver, old_peer])
+            .await;
+        let metered = key_cache_eager(&author_key, topic, 7, b"metered");
+        let metered_wire: Bytes = postcard::to_stdvec(&metered).expect("wire").into();
+        let before = a.stage_stats();
+        let (_, counts, _) = a
+            .parallel_send_to_peers(
+                topic,
+                vec![receiver, old_peer],
+                GossipStreamType::PubSub,
+                metered_wire.clone(),
+                "EAGER",
+                false,
+            )
+            .await;
+        assert_eq!(counts.attempted, 2);
+        let sent = author_transport.sent_frames();
+        let newest: Vec<_> = sent.iter().rev().take(2).collect();
+        assert_eq!(newest.len(), 2);
+        let receiver_frame = newest
+            .iter()
+            .find(|entry| entry.0 == receiver)
+            .expect("reference recipient");
+        let old_frame = newest
+            .iter()
+            .find(|entry| entry.0 == old_peer)
+            .expect("legacy recipient");
+        assert!(key_cache::is_v3(&receiver_frame.2));
+        assert_eq!(old_frame.2, metered_wire);
+        let actual_bytes = receiver_frame.2.len() + old_frame.2.len();
+        let after = a.stage_stats();
+        let before_eager = before
+            .outbound_by_kind
+            .get("eager")
+            .map_or(0, |meter| meter.bytes);
+        let after_eager = after
+            .outbound_by_kind
+            .get("eager")
+            .expect("eager meter")
+            .bytes;
+        assert_eq!(after_eager - before_eager, actual_bytes as u64);
+        assert_eq!(
+            after.outbound_publish_origin.local_bytes - before.outbound_publish_origin.local_bytes,
+            actual_bytes as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn key_cache_control_rejects_bad_signature_and_provenance() {
+        let sender_key = test_signing_key();
+        let receiver_key = test_signing_key();
+        let other_key = test_signing_key();
+        let sender = sender_key.peer_id();
+        let receiver = receiver_key.peer_id();
+        let transport = RecordingTransport::new(receiver);
+        transport.set_session(sender, 7);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(receiver, transport, receiver_key, false);
+        let payload = key_cache::encode_control(key_cache::Control::Hello { key_ref_version: 1 })
+            .expect("payload");
+        let mut header = MessageHeader::new(key_cache::control_topic(), MessageKind::Ping, 1);
+        header.seal_payload_hash(Some(&payload));
+        let signature = sender_key
+            .sign(&postcard::to_stdvec(&header).expect("header"))
+            .expect("sign");
+        let good = GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: sender_key.public_key().to_vec(),
+        };
+        let session = saorsa_gossip_transport::AuthenticatedSession {
+            peer: sender,
+            generation: 7,
+        };
+        let wire: Bytes = postcard::to_stdvec(&good).expect("wire").into();
+        assert!(
+            pubsub.handle_message(sender, wire.clone()).await.is_err(),
+            "missing session rejected"
+        );
+        assert!(
+            pubsub
+                .handle_authenticated_message(
+                    saorsa_gossip_transport::AuthenticatedSession {
+                        peer: sender,
+                        generation: 6
+                    },
+                    wire.clone()
+                )
+                .await
+                .is_err(),
+            "stale generation rejected"
+        );
+        let mut invalid = good.clone();
+        invalid.signature[0] ^= 1;
+        assert!(
+            pubsub
+                .handle_authenticated_message(
+                    session,
+                    postcard::to_stdvec(&invalid).expect("wire").into()
+                )
+                .await
+                .is_err(),
+            "invalid outer signature rejected"
+        );
+        let mut wrong_signer = good;
+        wrong_signer.public_key = other_key.public_key().to_vec();
+        wrong_signer.signature = other_key
+            .sign(&postcard::to_stdvec(&wrong_signer.header).expect("header"))
+            .expect("sign");
+        assert!(
+            pubsub
+                .handle_authenticated_message(
+                    session,
+                    postcard::to_stdvec(&wrong_signer).expect("wire").into()
+                )
+                .await
+                .is_err(),
+            "non-adjacent signer rejected"
+        );
+        assert!(!pubsub.key_cache.lock().expect("cache").supports_v3(session));
+    }
+
     fn unsigned_control_message(
         topic: TopicId,
         msg_id: MessageIdType,
@@ -12132,6 +13038,7 @@ mod tests {
 
     struct RecordingTransport {
         local_peer: PeerId,
+        sessions: Mutex<HashMap<PeerId, saorsa_gossip_transport::AuthenticatedSession>>,
         send_counts: Mutex<HashMap<PeerId, usize>>,
         connected_peer_ids: Mutex<Vec<PeerId>>,
         /// #59: every outbound frame in send order — (peer, stream, wire
@@ -12223,6 +13130,7 @@ mod tests {
         fn new(local_peer: PeerId) -> Arc<Self> {
             Arc::new(Self {
                 local_peer,
+                sessions: Mutex::new(HashMap::new()),
                 send_counts: Mutex::new(HashMap::new()),
                 connected_peer_ids: Mutex::new(Vec::new()),
                 frames: Mutex::new(Vec::new()),
@@ -12234,6 +13142,13 @@ mod tests {
                 .connected_peer_ids
                 .lock()
                 .expect("connected peers lock") = peers;
+        }
+
+        fn set_session(&self, peer: PeerId, generation: u64) {
+            self.sessions.lock().expect("sessions lock").insert(
+                peer,
+                saorsa_gossip_transport::AuthenticatedSession { peer, generation },
+            );
         }
 
         fn send_count_to(&self, peer: PeerId) -> usize {
@@ -12306,6 +13221,30 @@ mod tests {
                 .expect("sent frames lock")
                 .push((peer, _stream_type, _data));
             Ok(())
+        }
+
+        fn authenticated_session(
+            &self,
+            peer: PeerId,
+        ) -> Option<saorsa_gossip_transport::AuthenticatedSession> {
+            self.sessions
+                .lock()
+                .expect("sessions lock")
+                .get(&peer)
+                .copied()
+        }
+
+        async fn send_to_peer_guarded(
+            &self,
+            peer: PeerId,
+            stream_type: GossipStreamType,
+            admit: saorsa_gossip_transport::SessionAdmission,
+        ) -> Result<()> {
+            let session = self
+                .authenticated_session(peer)
+                .ok_or_else(|| anyhow!("missing test session"))?;
+            let bytes = admit(session)?;
+            self.send_to_peer(peer, stream_type, bytes).await
         }
 
         async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
@@ -15777,16 +16716,17 @@ mod tests {
             "shutdown must fit the 5 s x0x force-exit budget, took {elapsed:?}"
         );
 
-        // (a) every background task terminated — flusher, cache cleaner,
-        // degree maintainer, anti-entropy, connected-peers refresher — and
+        // (a) every background task terminated — IHAVE and key-cache control
+        // flushers, cache cleaner, degree maintainer, anti-entropy,
+        // connected-peers refresher — and
         // cooperatively: in this scenario every send fails instantly, so a
         // task only misses the grace deadline if it ignored the shutdown
         // token (the abort backstop then masks the spin; this assertion
         // keeps that observable).
         assert_eq!(
             report.joined + report.aborted,
-            5,
-            "all five background tasks must stop on shutdown (joined={}, aborted={})",
+            6,
+            "all six background tasks must stop on shutdown (joined={}, aborted={})",
             report.joined,
             report.aborted
         );
@@ -15932,7 +16872,7 @@ mod tests {
             state.pending_ihave.push_back([66u8; 32]);
         }
         let report = pubsub.shutdown().await;
-        assert_eq!(report.joined + report.aborted, 5);
+        assert_eq!(report.joined + report.aborted, 6);
         assert_eq!(
             report.aborted, 0,
             "final flush must fit the grace on a live transport"
@@ -16050,7 +16990,7 @@ mod tests {
         let report = pubsub.shutdown().await;
         let elapsed = started.elapsed();
 
-        assert_eq!(report.joined + report.aborted, 5);
+        assert_eq!(report.joined + report.aborted, 6);
         assert_eq!(report.aborted, 0);
         assert_eq!(
             transport.send_attempts(),

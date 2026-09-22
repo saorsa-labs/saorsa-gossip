@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **pubsub: negotiated outer ML-DSA key references (#76).** Authenticated
+  peers exchange signed, legacy-decodable Ping controls on a reserved internal
+  topic. A peer receives key references only after a reciprocal capability
+  Hello and an acknowledgement of the exact signer key on that connection
+  generation. Cold and Critical frames carry a full key; a missing reference
+  uses bounded, rate-limited key recovery before normal signature verification
+  and delivery. Unknown and legacy destinations retain their existing v1/v2
+  bytes, while the signed header and application payload (including x0x inner
+  V2 author proofs) are unchanged. Per-peer byte admission and metering use
+  the encoded wire length.
+
 ## [0.5.85] - 2026-09-22
 
 ### Fixed

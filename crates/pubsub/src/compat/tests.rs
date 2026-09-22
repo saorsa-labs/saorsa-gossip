@@ -6,6 +6,21 @@ use saorsa_gossip_legacy_compat_fixture::{
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
+#[test]
+fn reserved_key_cache_topic_cannot_be_registered() {
+    let key = MlDsaKeyPair::generate().unwrap();
+    let policy = LegacyMigration::default();
+    let topic = SignedKvTopic::new(
+        crate::key_cache::CONTROL_DOMAIN,
+        SignedKvFamily::Delta,
+        1,
+        [key.peer_id()],
+    )
+    .unwrap();
+    assert_eq!(topic.topic(), crate::key_cache::control_topic());
+    assert!(policy.register(topic).is_err());
+}
+
 struct FloorFixture {
     path: PathBuf,
     _dir: tempfile::TempDir,

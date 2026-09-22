@@ -21034,8 +21034,9 @@ mod tests {
     async fn disabled_limiter_costs_zero_mutexes_and_one_write_all_per_flush() {
         let local = test_peer_id(1);
         let peer = test_peer_id(2);
+        let requester = test_peer_id(3);
         let transport = RecordingTransport::new(local);
-        transport.set_connected_peer_ids(vec![peer]);
+        transport.set_connected_peer_ids(vec![peer, requester]);
         // No background tasks: the instrumentation is per-instance, but the
         // instance's OWN flusher shares this map and limiter — its 100 ms
         // ticks must not land in the exact-count asserts below (r4: keep
@@ -21050,7 +21051,7 @@ mod tests {
         );
         store_connected_peers_snapshot(
             pubsub.connected_peers_snapshot.as_ref(),
-            Some(HashSet::from([peer])),
+            Some(HashSet::from([peer, requester])),
         );
         assert!(
             !pubsub.egress_limiter.enabled(),
@@ -21072,10 +21073,12 @@ mod tests {
             .await
             .expect("ihave");
 
-        // Inbound IWANT for our cached local publish: serves EAGER.
+        // Inbound IWANT for our cached local publish: serves EAGER. Use an
+        // independent connected requester so this assertion does not race
+        // the spawned publish send's per-peer in-flight claim.
         let local_id = pubsub.calculate_msg_id(&topic, &Bytes::from_static(b"zero-overhead"));
         pubsub
-            .handle_iwant(peer, topic, vec![local_id])
+            .handle_iwant(requester, topic, vec![local_id])
             .await
             .expect("iwant");
 

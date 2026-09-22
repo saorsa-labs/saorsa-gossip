@@ -511,7 +511,7 @@ async fn leaf_shed_normal_recovers_exact_message_via_ihave_iwant() {
                     accounting.0 <= expected.0
                         && accounting.1 <= expected.1
                         && accounting.2 <= expected.2,
-                    "filler accounting exceeded its exact causal target"
+                    "filler accounting exceeded its exact causal target: actual={accounting:?}, expected={expected:?}"
                 );
                 if accounting == expected {
                     break;
@@ -660,7 +660,7 @@ async fn leaf_shed_normal_recovers_exact_message_via_ihave_iwant() {
                     accounting.0 <= expected.0
                         && accounting.1 <= expected.1
                         && accounting.2 <= expected.2,
-                    "recovered EAGER accounting exceeded its exact causal target"
+                    "recovered EAGER accounting exceeded its exact causal target: actual={accounting:?}, expected={expected:?}"
                 );
                 if accounting == expected {
                     break;

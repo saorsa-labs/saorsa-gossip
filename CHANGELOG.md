@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.85] - 2026-09-22
+
+### Fixed
+
+- **pubsub: preserve the full connected topic membership while selecting an
+  eligible preferred eager peer.** The new atomic
+  `set_topic_peers_with_preferred_eager` API keeps every plane-cleared peer
+  eager or lazy, retains scores, cooling, suppression, and IWANT state, and
+  displaces an eager peer to lazy without exceeding the configured eager
+  ceiling. Repeating the same reconciliation is idempotent; absent, cooling,
+  and score-ineligible preferences are not promoted.
+- **pubsub tests: use the message ID actually cached by a local publish.** The
+  disabled-limiter invariant no longer recalculates an ID across the
+  one-second message-ID epoch. A controlled next-epoch negative arm and exact
+  EAGER/IWANT frame assertions retain coverage of all three send phases.
+- **Leaf recovery acceptance: prove shed EAGER recovery through IHAVE/IWANT.**
+  The isolated Linux fixture and custody checks exercise bounded lazy repair
+  without weakening the production admission or byte-budget paths.
+
 ## [0.5.84] - 2026-09-21
 
 ### Fixed

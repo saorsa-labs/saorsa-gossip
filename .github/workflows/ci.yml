@@ -187,7 +187,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, r8 resolved
 
       - name: Assert checkout matches event SHA
         # Default checkout resolves the PR merge ref; GITHUB_SHA is that same
@@ -201,10 +201,10 @@ jobs:
           fi
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, r8 resolved
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, r8 resolved
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-leaf504-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
@@ -212,7 +212,7 @@ jobs:
             ${{ runner.os }}-leaf504-cargo-registry-
 
       - name: Cache cargo git database
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, r8 resolved
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-leaf504-cargo-git-${{ hashFiles('**/Cargo.toml') }}
@@ -235,13 +235,13 @@ jobs:
         run: python3 scripts/ci/stage-x0x-isolation.py --verify-tree
 
       - name: Cache target directory
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, r8 resolved
         with:
           path: target
           key: ${{ runner.os }}-leaf504-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
 
       - name: Install nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2, r8 resolved
         with:
           tool: nextest@0.9.144  # exact pin, same as the audited x0x harness commit
 
@@ -268,7 +268,7 @@ jobs:
 
       - name: Upload isolation custody receipt
         if: always() && steps.collect_custody.outputs.receipt_eligible == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, r8 resolved
         with:
           name: sg-504-isolation-custody
           path: ${{ runner.temp }}/sg-504-custody/custody-receipt.json
@@ -276,7 +276,7 @@ jobs:
 
       - name: Upload staged harness provenance
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, r8 resolved
         with:
           name: sg-504-harness-provenance
           path: ${{ runner.temp }}/sg-504-harness-provenance/manifest.json

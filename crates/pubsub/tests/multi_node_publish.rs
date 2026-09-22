@@ -474,6 +474,10 @@ async fn leaf_shed_normal_recovers_exact_message_via_ihave_iwant() {
             .await;
         assert_eq!(calibration_frame.wire_len, calibration_wire.len());
         let fixed_burst = u64::try_from(calibration_frame.wire_len).expect("wire length fits u64");
+        // Normal data must leave the limiter's recovery reserve intact. A
+        // frame equal to the full burst is therefore denied even after a full
+        // refill; target deferral does not depend on scheduler timing. The
+        // separate recovery path can still send it using natural refill.
         assert!(node_b.configure_leaf_egress(Some(LeafEgressConfig {
             soft_bytes_per_second: 0,
             hard_bytes_per_second: 2 * 1024,
@@ -510,7 +514,7 @@ async fn leaf_shed_normal_recovers_exact_message_via_ihave_iwant() {
             ),
         ];
 
-        // Consume B's complete fixed burst with one successful Normal relay.
+        // Establish a completed full-frame relay and recovery baseline.
         // C proves transport delivery; the exact accounting barrier below
         // separately proves B finished its detached send bookkeeping.
         let filler = Bytes::from(vec![0x46; 8 * 1024]);
@@ -573,7 +577,7 @@ async fn leaf_shed_normal_recovers_exact_message_via_ihave_iwant() {
         let after_filler = node_b.leaf_egress_snapshot();
         assert_eq!(
             filler_forward.wire_len, calibration_frame.wire_len,
-            "the filler consumes one complete calibrated EAGER burst"
+            "the completed filler has one full calibrated EAGER frame"
         );
         let eager_after_filler = eager_accounting(&after_filler);
         assert_eq!(

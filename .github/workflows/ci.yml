@@ -251,7 +251,8 @@ jobs:
           X0X_ISOLATION_ROLE: acceptance
           X0X_RUNTIME_TIMEOUT_SECONDS: 180
         run: |
-          bash scripts/ci/nextest-isolated.sh --package saorsa-gossip-pubsub@0.5.84 \
+          pubsub_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          bash scripts/ci/nextest-isolated.sh --package "saorsa-gossip-pubsub@$pubsub_version" \
             --all-features --test multi_node_publish -- \
             --run-ignored ignored-only --no-tests=fail --test-threads 1 \
             -E 'test(=leaf_shed_normal_recovers_exact_message_via_ihave_iwant)'

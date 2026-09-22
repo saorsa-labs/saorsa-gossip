@@ -173,3 +173,111 @@ jobs:
 
       - name: Check MSRV
         run: cargo check --all-features --all-targets
+
+
+  leaf-protocol-isolation:
+    # #504: dedicated hash-bound Linux fence for the ignored Leaf-protocol
+    # proof (leaf_shed_normal_recovers_exact_message_via_ihave_iwant). The
+    # four x0x harness helpers are NOT SG source: scripts/ci/stage-x0x-isolation.py
+    # retrieves them from one pinned upstream commit, verifies each SHA-256
+    # before anything is executed, and keeps provenance in RUNNER_TEMP.
+    # Exactly ONE acceptance wrapper invocation: the custody collector
+    # rejects a second build-custody scratch (SCRATCH_COUNT).
+    name: Leaf Protocol Isolated Acceptance (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, r8 resolved
+
+      - name: Assert checkout matches event SHA
+        # Default checkout resolves the PR merge ref; GITHUB_SHA is that same
+        # commit. The wrapper's custody must be bound to the actual event SHA,
+        # never to a faked PR head.
+        run: |
+          head="$(git rev-parse HEAD)"
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "::error::checkout HEAD ${head} != GITHUB_SHA ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, r8 resolved
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, r8 resolved
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-leaf504-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-leaf504-cargo-registry-
+
+      - name: Cache cargo git database
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, r8 resolved
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-leaf504-cargo-git-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-leaf504-cargo-git-
+
+      - name: Stage hash-pinned x0x isolation helpers
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: python3 scripts/ci/stage-x0x-isolation.py
+
+      - name: Resolve dependency graph
+        # Cargo.lock is intentionally gitignored in SG; generate it once so
+        # the audited wrapper can hash it and run its locked build.
+        run: cargo generate-lockfile
+
+      - name: Verify staged tree custody
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: python3 scripts/ci/stage-x0x-isolation.py --verify-tree
+
+      - name: Cache target directory
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, r8 resolved
+        with:
+          path: target
+          key: ${{ runner.os }}-leaf504-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2, r8 resolved
+        with:
+          tool: nextest@0.9.144  # exact pin, same as the audited x0x harness commit
+
+      - name: Run isolated Leaf protocol acceptance
+        id: leaf_acceptance
+        env:
+          X0X_ISOLATION_ROLE: acceptance
+          X0X_RUNTIME_TIMEOUT_SECONDS: 180
+        run: |
+          bash scripts/ci/nextest-isolated.sh --package saorsa-gossip-pubsub@0.5.84 \
+            --all-features --test multi_node_publish -- \
+            --run-ignored ignored-only --no-tests=fail --test-threads 1 \
+            -E 'test(=leaf_shed_normal_recovers_exact_message_via_ihave_iwant)'
+
+      - name: Collect isolation custody
+        if: always()
+        id: collect_custody
+        env:
+          X0X_CUSTODY_EXPECT: ${{ steps.leaf_acceptance.outcome }}
+          X0X_CUSTODY_TARGET: multi_node_publish
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_MIN_RUNS: '1'
+        run: python3 scripts/ci/isolation-custody-collect.py "${RUNNER_TEMP}/sg-504-custody"
+
+      - name: Upload isolation custody receipt
+        if: always() && steps.collect_custody.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, r8 resolved
+        with:
+          name: sg-504-isolation-custody
+          path: ${{ runner.temp }}/sg-504-custody/custody-receipt.json
+          if-no-files-found: error
+
+      - name: Upload staged harness provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, r8 resolved
+        with:
+          name: sg-504-harness-provenance
+          path: ${{ runner.temp }}/sg-504-harness-provenance/manifest.json
+          if-no-files-found: error

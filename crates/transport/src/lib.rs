@@ -342,6 +342,21 @@ pub trait GossipTransport: Send + Sync {
     /// Receive a message from any peer on any stream
     async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)>;
 
+    /// Receive a frame with provenance captured from its source connection.
+    /// Legacy transports return `None`; looking up the current peer session
+    /// after dequeue would relabel old queued bytes after a reconnect.
+    async fn receive_message_with_session(
+        &self,
+    ) -> Result<(
+        PeerId,
+        GossipStreamType,
+        bytes::Bytes,
+        Option<AuthenticatedSession>,
+    )> {
+        let (peer, stream, data) = self.receive_message().await?;
+        Ok((peer, stream, data, None))
+    }
+
     /// Return peers with a currently live transport connection.
     ///
     /// The default is empty so transports that cannot report live
@@ -399,6 +414,17 @@ impl<T: GossipTransport + ?Sized> GossipTransport for std::sync::Arc<T> {
         (**self).receive_message().await
     }
 
+    async fn receive_message_with_session(
+        &self,
+    ) -> Result<(
+        PeerId,
+        GossipStreamType,
+        bytes::Bytes,
+        Option<AuthenticatedSession>,
+    )> {
+        (**self).receive_message_with_session().await
+    }
+
     async fn connected_peer_ids(&self) -> Vec<PeerId> {
         (**self).connected_peer_ids().await
     }
@@ -412,6 +438,81 @@ impl<T: GossipTransport + ?Sized> GossipTransport for std::sync::Arc<T> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct LegacyOnlyTransport {
+        live_lookups: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for LegacyOnlyTransport {
+        async fn dial(&self, _: PeerId, _: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(&self, _: SocketAddr) -> Result<PeerId> {
+            Ok(PeerId::new([1; 32]))
+        }
+
+        async fn listen(&self, _: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            _: PeerId,
+            _: GossipStreamType,
+            _: bytes::Bytes,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn authenticated_session(&self, _: PeerId) -> Option<AuthenticatedSession> {
+            self.live_lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(AuthenticatedSession {
+                peer: PeerId::new([1; 32]),
+                generation: 1,
+            })
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)> {
+            Ok((
+                PeerId::new([1; 32]),
+                GossipStreamType::PubSub,
+                bytes::Bytes::from_static(b"legacy"),
+            ))
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            PeerId::new([2; 32])
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_default_and_arc_projection_do_not_invent_provenance() {
+        let legacy = std::sync::Arc::new(LegacyOnlyTransport::default());
+        let direct = GossipTransport::receive_message_with_session(legacy.as_ref())
+            .await
+            .expect("legacy receive");
+        let wrapped = GossipTransport::receive_message_with_session(&legacy)
+            .await
+            .expect("Arc receive");
+        assert_eq!(direct, wrapped);
+        assert_eq!(direct.3, None);
+        assert_eq!(direct.2, bytes::Bytes::from_static(b"legacy"));
+        assert_eq!(
+            legacy
+                .live_lookups
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "receive projection must not look up a post-dequeue session"
+        );
+    }
 
     #[test]
     fn test_stream_type_from_byte_valid() {

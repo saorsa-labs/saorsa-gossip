@@ -2881,6 +2881,39 @@ pub fn peek_message_kind(frame: &[u8]) -> Option<MessageKind> {
         .map(|(header, _rest)| header.kind)
 }
 
+/// Unauthenticated topic/kind inspection of a structurally complete legacy
+/// or SG key-cache v3 PubSub frame. Intended only for pre-dispatch routing,
+/// accounting, and Leaf/relay gates; it never verifies the signature or
+/// authorizes the topic. Always pass accepted bytes to the normal verified
+/// message handler afterward.
+///
+/// The parser skips payload bytes without allocating them, checks fixed
+/// signature/key sizes and exact v3 framing, and applies the existing
+/// 65,536-byte payload cap to the reserved hop-local control topic. Ordinary
+/// legacy trailing bytes remain visible to these gates because the ordinary
+/// legacy dispatcher also tolerates them. `None` means malformed or truncated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InspectedMessageHeader {
+    /// Unverified topic identifier from the signed header.
+    pub topic: TopicId,
+    /// Unverified message kind from the signed header.
+    pub kind: MessageKind,
+    /// Reserved SG key-cache control topic; consumers must leave its handling
+    /// to SG rather than registering it as an application relay topic.
+    pub hop_local_control: bool,
+}
+
+/// Inspect the topic and kind without copying or exposing the v3 wire marker.
+#[must_use]
+pub fn inspect_message_header(frame: &[u8]) -> Option<InspectedMessageHeader> {
+    let (header, hop_local_control) = key_cache::inspect_header(frame).ok()?;
+    Some(InspectedMessageHeader {
+        topic: header.topic,
+        kind: header.kind,
+        hop_local_control,
+    })
+}
+
 /// Anti-entropy reconciliation payload
 ///
 /// Used for periodic set reconciliation between peers to recover
@@ -12464,6 +12497,103 @@ mod tests {
         // Garbage / truncated frame decodes to None, never panics.
         assert_eq!(peek_message_kind(b""), None);
         assert_eq!(peek_message_kind(&[0xff, 0xff, 0xff]), None);
+    }
+
+    #[test]
+    fn inspect_message_header_reads_legacy_and_v3_without_authenticating() {
+        let key = test_signing_key();
+        let topic = TopicId::new([0x41; 32]);
+        let eager = signed_eager_message(&key, topic, [0x52; 32], Bytes::from_static(b"data"));
+        let expected = InspectedMessageHeader {
+            topic,
+            kind: MessageKind::Eager,
+            hop_local_control: false,
+        };
+
+        let legacy = postcard::to_stdvec(&eager).expect("legacy frame");
+        let full = key_cache::encode(&eager, false).expect("v3 full");
+        let reference = key_cache::encode(&eager, true).expect("v3 reference");
+        assert_eq!(inspect_message_header(&legacy), Some(expected));
+        assert_eq!(inspect_message_header(&full), Some(expected));
+        assert_eq!(inspect_message_header(&reference), Some(expected));
+
+        // The ordinary legacy decoder tolerates trailing bytes. A Leaf must
+        // still see the topic and kind and apply its gate before dispatch.
+        let mut trailing_legacy = legacy.clone();
+        trailing_legacy.push(0);
+        assert_eq!(inspect_message_header(&trailing_legacy), Some(expected));
+
+        let control = signed_control_message(
+            &key,
+            key_cache::control_topic(),
+            [0x53; 32],
+            MessageKind::Ping,
+            Bytes::from_static(b"control"),
+        );
+        let expected_control = InspectedMessageHeader {
+            topic: key_cache::control_topic(),
+            kind: MessageKind::Ping,
+            hop_local_control: true,
+        };
+        let legacy_control = postcard::to_stdvec(&control).expect("legacy control");
+        let v3_control = key_cache::encode(&control, false).expect("v3 control shape");
+        assert_eq!(
+            inspect_message_header(&legacy_control),
+            Some(expected_control)
+        );
+        assert_eq!(inspect_message_header(&v3_control), Some(expected_control));
+    }
+
+    #[test]
+    fn inspect_message_header_rejects_truncated_malformed_and_oversized_frames() {
+        let key = test_signing_key();
+        let topic = TopicId::new([0x61; 32]);
+        let eager = signed_eager_message(&key, topic, [0x62; 32], Bytes::from_static(b"data"));
+        let legacy = postcard::to_stdvec(&eager).expect("legacy frame");
+        let full = key_cache::encode(&eager, false).expect("v3 full");
+        assert_eq!(inspect_message_header(b""), None);
+        assert_eq!(inspect_message_header(key_cache::WIRE_MARKER), None);
+        assert_eq!(inspect_message_header(&legacy[..legacy.len() - 1]), None);
+        assert_eq!(inspect_message_header(&full[..full.len() - 1]), None);
+
+        let mut trailing_v3 = full.to_vec();
+        trailing_v3.push(0);
+        assert_eq!(inspect_message_header(&trailing_v3), None);
+
+        // Corrupt the serialized signature length, not its bytes. The
+        // inspector rejects this before a Vec allocation or crypto work.
+        let signature_length_offset = key_cache::WIRE_MARKER.len()
+            + postcard::to_stdvec(&(&eager.header, &eager.payload))
+                .expect("header and payload")
+                .len();
+        let mut bad_length = full.to_vec();
+        bad_length[signature_length_offset] = 0xff;
+        assert_eq!(inspect_message_header(&bad_length), None);
+
+        let oversized_control = signed_control_message(
+            &key,
+            key_cache::control_topic(),
+            [0x63; 32],
+            MessageKind::Ping,
+            Bytes::from(vec![0; key_cache::MAX_KEY_CACHE_CONTROL_BYTES + 1]),
+        );
+        let legacy_control = postcard::to_stdvec(&oversized_control).expect("control frame");
+        let v3_control = key_cache::encode(&oversized_control, false).expect("v3 control shape");
+        assert_eq!(inspect_message_header(&legacy_control), None);
+        assert_eq!(inspect_message_header(&v3_control), None);
+
+        let wrong_kind_control = signed_control_message(
+            &key,
+            key_cache::control_topic(),
+            [0x64; 32],
+            MessageKind::Eager,
+            Bytes::from_static(b"not a control"),
+        );
+        let legacy_wrong_kind = postcard::to_stdvec(&wrong_kind_control).expect("legacy frame");
+        let v3_wrong_kind =
+            key_cache::encode(&wrong_kind_control, false).expect("v3 control shape");
+        assert_eq!(inspect_message_header(&legacy_wrong_kind), None);
+        assert_eq!(inspect_message_header(&v3_wrong_kind), None);
     }
 
     fn key_cache_eager(

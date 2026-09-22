@@ -154,9 +154,17 @@ pub(crate) fn preflight_legacy_control(bytes: &[u8]) -> Result<bool> {
     Ok(true)
 }
 
-fn preflight_v3(body: &[u8]) -> Result<()> {
-    let (_, mut rest) = postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(body)?;
-    take_payload(&mut rest, None)?;
+fn preflight_v3(body: &[u8]) -> Result<saorsa_gossip_types::MessageHeader> {
+    let (header, mut rest) = postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(body)?;
+    let reserved_control = header.topic == control_topic();
+    if reserved_control {
+        ensure!(
+            header.kind == saorsa_gossip_types::MessageKind::Ping,
+            "invalid key-cache control kind"
+        );
+    }
+    let control_cap = reserved_control.then_some(MAX_KEY_CACHE_CONTROL_BYTES);
+    take_payload(&mut rest, control_cap)?;
     take_sized_vec(&mut rest, SIGNATURE_BYTES, "v3 signature")?;
     let variant = take_varint(&mut rest)?;
     ensure!(variant <= 1, "invalid key material tag");
@@ -165,7 +173,31 @@ fn preflight_v3(body: &[u8]) -> Result<()> {
         take_sized_vec(&mut rest, KEY_BYTES, "v3 public key")?;
     }
     ensure!(rest.is_empty(), "trailing key-cache frame bytes");
-    Ok(())
+    Ok(header)
+}
+
+/// Structural, allocation-free inspection for pre-dispatch routing gates.
+/// Authentication and topic policy still belong to the normal dispatcher.
+pub(crate) fn inspect_header(bytes: &[u8]) -> Result<(saorsa_gossip_types::MessageHeader, bool)> {
+    if let Some(body) = bytes.strip_prefix(WIRE_MARKER) {
+        let header = preflight_v3(body)?;
+        let reserved_control = header.topic == control_topic();
+        return Ok((header, reserved_control));
+    }
+
+    let (header, mut rest) =
+        postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(bytes)?;
+    let reserved_control = header.topic == control_topic();
+    if reserved_control {
+        preflight_legacy_control(bytes)?;
+    } else {
+        take_payload(&mut rest, None)?;
+        take_sized_vec(&mut rest, SIGNATURE_BYTES, "legacy signature")?;
+        take_sized_vec(&mut rest, KEY_BYTES, "legacy public key")?;
+        // The existing dispatcher tolerates trailing bytes for ordinary,
+        // unregistered legacy topics. Keep their topic gates active too.
+    }
+    Ok((header, reserved_control))
 }
 
 #[derive(Debug)]
@@ -178,7 +210,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded> {
     let body = bytes
         .strip_prefix(WIRE_MARKER)
         .ok_or_else(|| anyhow!("missing key-cache wire marker"))?;
-    preflight_v3(body)?;
+    let _ = preflight_v3(body)?;
     let (
         WireMessage {
             header,

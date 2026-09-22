@@ -23,7 +23,7 @@ use saorsa_gossip_transport::testing::{connected_pair, loopback_star};
 use saorsa_gossip_transport::{
     AuthenticatedSession, GossipStreamType, GossipTransport, SessionAdmission, UdpTransportAdapter,
 };
-use saorsa_gossip_types::{MessageKind, PeerId, TopicId};
+use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
@@ -393,26 +393,77 @@ async fn leaf_shed_normal_recovers_exact_message_via_ihave_iwant() {
             .await;
         node_c.initialize_topic_peers(topic, vec![b_peer]).await;
 
-        // Measure one real same-sized signed EAGER frame without dispatching
-        // it through B. This consumes the actual A→B transport frame directly,
-        // so no detached B forward can finish after the limiter is enabled and
-        // contaminate the accounting baseline below.
+        // Measure one real same-sized signed EAGER frame without entering any
+        // pubsub cache. A cached calibration could later be replayed by
+        // anti-entropy after the limiter is enabled and become a second Normal
+        // B→C data candidate. This direct production-wire frame has no such
+        // background custody.
         let calibration = Bytes::from(vec![0x43; 8 * 1024]);
         let calibration_hash = *blake3::hash(&calibration).as_bytes();
-        node_a
-            .publish(topic, calibration.clone())
+        let calibration_key = MlDsaKeyPair::generate().expect("calibration signing key");
+        let mut calibration_header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: MessageHeader::calculate_msg_id(
+                &topic,
+                0,
+                &calibration_key.peer_id(),
+                &calibration_hash,
+            ),
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+            payload_hash: None,
+        };
+        calibration_header.seal_payload_hash(Some(&calibration));
+        let calibration_header_bytes =
+            postcard::to_stdvec(&calibration_header).expect("serialize calibration header");
+        let calibration_message = GossipMessage {
+            header: calibration_header,
+            payload: Some(calibration.clone()),
+            signature: calibration_key
+                .sign(&calibration_header_bytes)
+                .expect("sign calibration header"),
+            public_key: calibration_key.public_key().to_vec(),
+        };
+        let calibration_wire: Bytes = postcard::to_stdvec(&calibration_message)
+            .expect("serialize calibration frame")
+            .into();
+        GossipTransport::send_to_peer(
+            a_transport.as_ref(),
+            b_peer,
+            GossipStreamType::PubSub,
+            calibration_wire.clone(),
+        )
             .await
-            .expect("publish calibration frame");
-        let (calibration_from, calibration_stream, calibration_wire) =
+            .expect("send calibration frame");
+        let (calibration_from, calibration_stream, received_calibration_wire) =
             timeout(RECV_TIMEOUT, GossipTransport::receive_message(&b_transport))
                 .await
                 .expect("calibration transport receive timed out")
                 .expect("calibration transport receive");
         assert_eq!(calibration_from, a_peer);
         assert_eq!(calibration_stream, GossipStreamType::PubSub);
-        let calibration_message: GossipMessage =
-            postcard::from_bytes(&calibration_wire).expect("calibration is a signed pubsub frame");
-        assert_eq!(calibration_message.payload.as_ref(), Some(&calibration));
+        assert_eq!(received_calibration_wire, calibration_wire);
+        let received_calibration: GossipMessage = postcard::from_bytes(&calibration_wire)
+            .expect("calibration is a signed pubsub frame");
+        assert_eq!(received_calibration.header.version, 2);
+        assert_eq!(received_calibration.header.topic, topic);
+        assert_eq!(received_calibration.header.kind, MessageKind::Eager);
+        assert_eq!(received_calibration.header.hop, 0);
+        assert_eq!(received_calibration.header.ttl, 10);
+        assert_eq!(received_calibration.payload.as_ref(), Some(&calibration));
+        let received_header_bytes =
+            postcard::to_stdvec(&received_calibration.header).expect("serialize received header");
+        assert!(
+            MlDsaKeyPair::verify(
+                &received_calibration.public_key,
+                &received_header_bytes,
+                &received_calibration.signature,
+            )
+            .expect("verify calibration signature"),
+            "calibration must carry a valid production signature"
+        );
         let calibration_frame = ledger
             .wait_for(|frame| {
                 frame.from == a_peer
@@ -542,7 +593,20 @@ async fn leaf_shed_normal_recovers_exact_message_via_ihave_iwant() {
         assert!(
             after_filler.data_deferred >= before_filler.data_deferred
                 && after_filler.data_deferred <= before_filler.data_deferred + 1,
-            "filler preconditioning may shed at most its one unique Normal data frame"
+            "filler preconditioning may shed at most its one unique Normal data frame: before={}, after={}",
+            before_filler.data_deferred,
+            after_filler.data_deferred,
+        );
+        assert!(
+            ledger
+                .find(|frame| {
+                    frame.from == b_peer
+                        && frame.to == c_peer
+                        && frame.kind == MessageKind::Eager
+                        && frame.payload_hash == Some(calibration_hash)
+                })
+                .is_none(),
+            "direct calibration must never become a B→C pubsub forward"
         );
 
         let target = Bytes::from(vec![0x54; 8 * 1024]);

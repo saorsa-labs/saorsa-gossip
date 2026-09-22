@@ -21034,9 +21034,8 @@ mod tests {
     async fn disabled_limiter_costs_zero_mutexes_and_one_write_all_per_flush() {
         let local = test_peer_id(1);
         let peer = test_peer_id(2);
-        let requester = test_peer_id(3);
         let transport = RecordingTransport::new(local);
-        transport.set_connected_peer_ids(vec![peer, requester]);
+        transport.set_connected_peer_ids(vec![peer]);
         // No background tasks: the instrumentation is per-instance, but the
         // instance's OWN flusher shares this map and limiter — its 100 ms
         // ticks must not land in the exact-count asserts below (r4: keep
@@ -21051,7 +21050,7 @@ mod tests {
         );
         store_connected_peers_snapshot(
             pubsub.connected_peers_snapshot.as_ref(),
-            Some(HashSet::from([peer, requester])),
+            Some(HashSet::from([peer])),
         );
         assert!(
             !pubsub.egress_limiter.enabled(),
@@ -21073,12 +21072,41 @@ mod tests {
             .await
             .expect("ihave");
 
-        // Inbound IWANT for our cached local publish: serves EAGER. Use an
-        // independent connected requester so this assertion does not race
-        // the spawned publish send's per-peer in-flight claim.
-        let local_id = pubsub.calculate_msg_id(&topic, &Bytes::from_static(b"zero-overhead"));
+        // Negative control for the old test shape: model a recomputation on
+        // the next one-second epoch without touching the host clock. The id
+        // differs from the cached publish and therefore must not serve EAGER.
+        let payload = Bytes::from_static(b"zero-overhead");
+        let payload_hash = blake3::hash(payload.as_ref());
+        let next_epoch_id = MessageHeader::calculate_msg_id(
+            &topic,
+            pubsub.current_epoch().saturating_add(1),
+            &local,
+            payload_hash.as_bytes(),
+        );
         pubsub
-            .handle_iwant(requester, topic, vec![local_id])
+            .handle_iwant(peer, topic, vec![next_epoch_id])
+            .await
+            .expect("next-epoch iwant");
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len(),
+            1,
+            "recomputed next-epoch id must reproduce the old missing cached serve"
+        );
+
+        // Positive control: an IWANT for our actual cached local publish
+        // serves EAGER. Reading the cached id avoids the old test's race with
+        // the one-second message-id epoch while ML-DSA signing is scheduled.
+        let local_id = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            topics
+                .get(&topic)
+                .and_then(|state| state.message_cache.peek_lru_message_id())
+                .expect("local publish must be cached")
+        };
+        pubsub
+            .handle_iwant(peer, topic, vec![local_id])
             .await
             .expect("iwant");
 
@@ -21135,6 +21163,20 @@ mod tests {
         assert!(
             sent >= 3,
             "disabled limiter must not change what gets sent: {sent} frames"
+        );
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len(),
+            2,
+            "publish and cached IWANT serve must each send EAGER"
+        );
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::IWant)
+                .len(),
+            1,
+            "unknown IHAVE must send one IWANT"
         );
     }
 

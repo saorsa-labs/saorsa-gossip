@@ -6,6 +6,21 @@ use saorsa_gossip_legacy_compat_fixture::{
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
+#[test]
+fn reserved_key_cache_topic_cannot_be_registered() {
+    let key = MlDsaKeyPair::generate().unwrap();
+    let policy = LegacyMigration::default();
+    let topic = SignedKvTopic::new(
+        crate::key_cache::CONTROL_DOMAIN,
+        SignedKvFamily::Delta,
+        1,
+        [key.peer_id()],
+    )
+    .unwrap();
+    assert_eq!(topic.topic(), crate::key_cache::control_topic());
+    assert!(policy.register(topic).is_err());
+}
+
 struct FloorFixture {
     path: PathBuf,
     _dir: tempfile::TempDir,
@@ -185,6 +200,209 @@ fn node(key: &MlDsaKeyPair) -> (PlumtreePubSub<RecordingTransport>, Arc<Recordin
         ),
         transport,
     )
+}
+
+#[tokio::test]
+async fn plain_legacy_full_counts_final_bytes_without_counting_control_or_invalid_wire() {
+    let key = MlDsaKeyPair::generate().unwrap();
+    let transport = RecordingTransport::new(key.peer_id());
+    let cache = Arc::new(Mutex::new(crate::key_cache::KeyCache::default()));
+    let policy = PolicyTransport::new_with_key_cache(
+        Arc::clone(&transport),
+        Arc::new(key.clone()),
+        Arc::clone(&cache),
+    );
+    let peer = PeerId::new([51; 32]);
+    let full = wire(&message(
+        &key,
+        TopicId::from_entity("fixture/plain-full"),
+        MessageKind::Eager,
+        Bytes::from_static(b"ordinary"),
+        2,
+        1,
+    ));
+    policy
+        .send_to_peer(peer, GossipStreamType::PubSub, full.clone())
+        .await
+        .unwrap();
+    let control = wire(&message(
+        &key,
+        crate::key_cache::control_topic(),
+        MessageKind::Ping,
+        Bytes::from_static(b"control"),
+        2,
+        2,
+    ));
+    policy
+        .send_to_peer(peer, GossipStreamType::PubSub, control)
+        .await
+        .unwrap();
+    // Counting is observational; malformed bytes previously passed to the
+    // unregistered direct transport path must not become a new rejection.
+    policy
+        .send_to_peer(
+            peer,
+            GossipStreamType::PubSub,
+            Bytes::from_static(b"unparsed"),
+        )
+        .await
+        .unwrap();
+    let sent = std::mem::take(&mut *transport.sent.lock().unwrap());
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[0].1, full);
+    let stats = cache.lock().unwrap().snapshot();
+    assert_eq!(stats.full_out_frames, 1);
+    assert_eq!(stats.full_out_bytes, full.len() as u64);
+    assert_eq!(stats.ref_out_frames, 0);
+}
+
+#[tokio::test]
+async fn migrated_legacy_full_counts_each_final_variant_and_rejected_guard_counts_nothing() {
+    let key = MlDsaKeyPair::generate().unwrap();
+    let transport = RecordingTransport::new(key.peer_id());
+    let cache = Arc::new(Mutex::new(crate::key_cache::KeyCache::default()));
+    let policy = Arc::new(PolicyTransport::new_with_key_cache(
+        Arc::clone(&transport),
+        Arc::new(key.clone()),
+        Arc::clone(&cache),
+    ));
+    let floor = FloorFixture::new();
+    floor.install(&policy.migration);
+    let topic = register(&policy.migration, &key);
+    let old_peer = PeerId::new([52; 32]);
+    let old_session = transport.connect(old_peer, 1);
+    policy
+        .migration
+        .grant(grant(old_peer, topic, 1), old_session)
+        .unwrap();
+    let modern = wire(&message(
+        &key,
+        topic,
+        MessageKind::Eager,
+        inner(&key, "fixture/kv", b"first"),
+        2,
+        3,
+    ));
+    policy
+        .send_to_peer(old_peer, GossipStreamType::PubSub, modern.clone())
+        .await
+        .unwrap();
+    let first = std::mem::take(&mut *transport.sent.lock().unwrap());
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        postcard::from_bytes::<GossipMessage>(&first[0].1)
+            .unwrap()
+            .header
+            .version,
+        1
+    );
+    assert_ne!(modern.len(), first[0].1.len());
+    let old_final_len = first[0].1.len() as u64;
+    let old_stats = cache.lock().unwrap().snapshot();
+    assert_eq!(old_stats.full_out_frames, 1);
+    assert_eq!(old_stats.full_out_bytes, old_final_len);
+    transport.entered.notified().await;
+
+    let modern_peer = PeerId::new([53; 32]);
+    transport.connect(modern_peer, 1);
+    let legacy = wire(&message(
+        &key,
+        topic,
+        MessageKind::Eager,
+        inner(&key, "fixture/kv", b"second"),
+        1,
+        4,
+    ));
+    policy
+        .send_to_peer(modern_peer, GossipStreamType::PubSub, legacy.clone())
+        .await
+        .unwrap();
+    let second = std::mem::take(&mut *transport.sent.lock().unwrap());
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        postcard::from_bytes::<GossipMessage>(&second[0].1)
+            .unwrap()
+            .header
+            .version,
+        2
+    );
+    assert_ne!(legacy.len(), second[0].1.len());
+    let modern_final_len = second[0].1.len() as u64;
+    let stats = cache.lock().unwrap().snapshot();
+    assert_eq!(stats.full_out_frames, 2);
+    assert_eq!(stats.full_out_bytes, old_final_len + modern_final_len);
+    transport.entered.notified().await;
+
+    transport.block.store(true, Ordering::SeqCst);
+    let pending_policy = Arc::clone(&policy);
+    let pending = tokio::spawn(async move {
+        pending_policy
+            .send_to_peer(old_peer, GossipStreamType::PubSub, modern)
+            .await
+    });
+    transport.entered.notified().await;
+    transport.connect(old_peer, 2);
+    transport.release.notify_one();
+    assert!(pending.await.unwrap().is_err());
+    assert!(transport.sent.lock().unwrap().is_empty());
+    let after_rejection = cache.lock().unwrap().snapshot();
+    assert_eq!(after_rejection.full_out_frames, 2);
+    assert_eq!(
+        after_rejection.full_out_bytes,
+        old_final_len + modern_final_len
+    );
+}
+
+#[tokio::test]
+async fn v3_full_and_ref_accounting_remains_once_per_submitted_frame() {
+    let key = MlDsaKeyPair::generate().unwrap();
+    let transport = RecordingTransport::new(key.peer_id());
+    let cache = Arc::new(Mutex::new(crate::key_cache::KeyCache::default()));
+    let policy = PolicyTransport::new_with_key_cache(
+        Arc::clone(&transport),
+        Arc::new(key.clone()),
+        Arc::clone(&cache),
+    );
+    let peer = PeerId::new([54; 32]);
+    let session = transport.connect(peer, 1);
+    {
+        let mut state = cache.lock().unwrap();
+        state.observe_session(session, Instant::now());
+        state.received_hello(session);
+        state.control_result(
+            session,
+            &crate::key_cache::Control::Hello { key_ref_version: 1 },
+            true,
+        );
+        state.acknowledge(session, &[key.peer_id()]);
+    }
+    let message = message(
+        &key,
+        TopicId::from_entity("fixture/v3-accounting"),
+        MessageKind::Eager,
+        Bytes::from_static(b"v3"),
+        2,
+        5,
+    );
+    let full = crate::key_cache::encode(&message, false).unwrap();
+    let reference = crate::key_cache::encode(&message, true).unwrap();
+    policy
+        .send_to_peer(peer, GossipStreamType::PubSub, full.clone())
+        .await
+        .unwrap();
+    policy
+        .send_to_peer(peer, GossipStreamType::PubSub, reference.clone())
+        .await
+        .unwrap();
+    let sent = std::mem::take(&mut *transport.sent.lock().unwrap());
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].1, full);
+    assert_eq!(sent[1].1, reference);
+    let stats = cache.lock().unwrap().snapshot();
+    assert_eq!(stats.full_out_frames, 1);
+    assert_eq!(stats.full_out_bytes, full.len() as u64);
+    assert_eq!(stats.ref_out_frames, 1);
+    assert_eq!(stats.ref_out_bytes, reference.len() as u64);
 }
 
 // Run the actual published 0.5.66 decoder, independently of current header serde.
@@ -474,8 +692,15 @@ async fn queued_revocation_expiry_reconnect_and_reject_v1_fail_closed() {
         let p = Arc::clone(&policy);
         let t = Arc::clone(&transport);
         let task = tokio::spawn(async move {
-            p.send(t, Arc::new(key), peer, GossipStreamType::PubSub, wire(&m))
-                .await
+            p.send(
+                t,
+                Arc::new(key),
+                None,
+                peer,
+                GossipStreamType::PubSub,
+                wire(&m),
+            )
+            .await
         });
         transport.entered.notified().await;
         match case {

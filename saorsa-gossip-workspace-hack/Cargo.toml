@@ -9,18 +9,18 @@ path = "src/lib.rs"
 
 ### BEGIN HAKARI SECTION
 [dependencies]
+base64 = { version = "0.23" }
 bytes = { version = "1", features = ["serde"] }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
 curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 digest = { version = "0.10", features = ["mac", "std"] }
-either = { version = "1", features = ["use_std"] }
+either = { version = "1", default-features = false, features = ["use_std"] }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 getrandom = { version = "0.2", default-features = false, features = ["std"] }
-hashbrown = { version = "0.16" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2" }
@@ -31,6 +31,7 @@ rand_core-3b31131e45eafb45 = { package = "rand_core", version = "0.6", default-f
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive"] }
+slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 subtle = { version = "2", features = ["const-generics"] }
 thiserror = { version = "2" }
@@ -47,6 +48,6 @@ zeroize = { version = "1", features = ["derive"] }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 proc-macro2 = { version = "1" }
 quote = { version = "1" }
-syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+syn = { version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 
 ### END HAKARI SECTION

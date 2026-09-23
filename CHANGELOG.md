@@ -5,9 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
 ## [0.5.85] - 2026-09-22
+
+### Added
+
+- **pubsub: negotiated outer ML-DSA key references (#76).** Authenticated
+  peers exchange signed, legacy-decodable Ping controls on a reserved internal
+  topic. A peer receives key references only after a reciprocal capability
+  Hello and an acknowledgement of the exact signer key on that connection
+  generation. Cold and Critical frames carry a full key; a missing reference
+  uses bounded, rate-limited key recovery before normal signature verification
+  and delivery. Reference frames a receiver's own priority table disagrees
+  with (Normal at the sender, Critical here) are counted
+  (`key_cache_stats().critical_ref_mismatches`) and resolved through the same
+  cache path instead of being dropped, and Response entries no session asked
+  for are dropped and counted
+  (`key_cache_stats().unsolicited_response_keys`) so they cannot evict
+  resolved keys. Unknown and legacy destinations retain their existing v1/v2
+  bytes, while the signed header and application payload (including x0x inner
+  V2 author proofs) are unchanged. Per-peer byte admission and metering use
+  the encoded wire length.
+
+### Changed
+
+- **pubsub: `outbound_publish_origin.local_bytes` / `relay_bytes` changed
+  meaning — per-peer-attempt wire bytes, not once-per-publish serialized
+  bytes.** Each attempted peer send now adds that destination's encoded frame
+  length (reference and legacy frames differ per destination), so one publish
+  fanned out to N peers shifts these meters by roughly N× the serialized
+  size. x0x meter consumers must not read them as per-publish volumes.
 
 ### Fixed
 

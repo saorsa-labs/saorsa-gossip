@@ -113,12 +113,12 @@ impl UdpTransportAdapterConfig {
 pub struct UdpTransportAdapter {
     /// Holding the previous connection prevents stable-id address reuse; each
     /// replacement gets a monotonic process-local generation, never a pointer token.
-    authenticated_sessions: std::sync::Mutex<AuthenticatedSessions>,
+    authenticated_sessions: Arc<std::sync::Mutex<AuthenticatedSessions>>,
     /// The underlying ant-quic P2P node
     node: Arc<Node>,
     /// Incoming message channel (bounded for backpressure)
-    recv_tx: mpsc::Sender<(GossipPeerId, GossipStreamType, Bytes)>,
-    recv_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(GossipPeerId, GossipStreamType, Bytes)>>>,
+    recv_tx: mpsc::Sender<ReceivedFrame>,
+    recv_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<ReceivedFrame>>>,
     /// Local peer ID (ant-quic format)
     ant_peer_id: AntPeerId,
     /// Local peer ID (gossip format)
@@ -137,17 +137,65 @@ pub struct UdpTransportAdapter {
     peer_send_locks: Arc<RwLock<HashMap<GossipPeerId, Arc<Mutex<()>>>>>,
 }
 
+type ReceivedFrame = (
+    GossipPeerId,
+    GossipStreamType,
+    Bytes,
+    Option<crate::AuthenticatedSession>,
+);
+
+struct SessionEntry {
+    /// Retain the old handle so a new connection cannot reuse its stable id.
+    connection: ant_quic::high_level::Connection,
+    ant_generation: u64,
+    token: crate::AuthenticatedSession,
+    last_used: Instant,
+}
+
 #[derive(Default)]
 struct AuthenticatedSessions {
     next: u64,
-    peers: HashMap<
-        GossipPeerId,
-        (
-            ant_quic::high_level::Connection,
-            crate::AuthenticatedSession,
-            Instant,
-        ),
-    >,
+    peers: HashMap<GossipPeerId, SessionEntry>,
+}
+
+fn source_generation_matches(source: u64, current: Option<u64>) -> bool {
+    // ant-quic stamps constrained/non-QUIC ingress with this sentinel.
+    source != u64::MAX && current == Some(source)
+}
+
+fn stamped_receive_session(
+    source: u64,
+    before: Option<u64>,
+    registered: Option<(u64, crate::AuthenticatedSession)>,
+    after: Option<u64>,
+) -> Option<crate::AuthenticatedSession> {
+    if !source_generation_matches(source, before) || !source_generation_matches(source, after) {
+        return None;
+    }
+    registered.and_then(|(generation, session)| (generation == source).then_some(session))
+}
+
+fn frame_guarded_admission(
+    stream_type: GossipStreamType,
+    expected_generation: u64,
+    actual_generation: u64,
+    expected_session: crate::AuthenticatedSession,
+    current_session: Option<(u64, crate::AuthenticatedSession)>,
+    admit: &crate::SessionAdmission,
+) -> std::result::Result<Vec<u8>, ant_quic::EndpointError> {
+    if actual_generation != expected_generation
+        || current_session != Some((expected_generation, expected_session))
+    {
+        return Err(ant_quic::EndpointError::Connection(
+            "authenticated session changed while queued".to_owned(),
+        ));
+    }
+    let data = admit(expected_session)
+        .map_err(|error| ant_quic::EndpointError::Connection(error.to_string()))?;
+    let mut framed = Vec::with_capacity(1 + data.len());
+    framed.push(stream_type.to_byte());
+    framed.extend_from_slice(&data);
+    Ok(framed)
 }
 
 impl UdpTransportAdapter {
@@ -226,7 +274,9 @@ impl UdpTransportAdapter {
         let (recv_tx, recv_rx) = mpsc::channel(config.channel_capacity);
 
         let transport = Self {
-            authenticated_sessions: std::sync::Mutex::new(AuthenticatedSessions::default()),
+            authenticated_sessions: Arc::new(std::sync::Mutex::new(
+                AuthenticatedSessions::default(),
+            )),
             node: Arc::new(node),
             recv_tx,
             recv_rx: Arc::new(tokio::sync::Mutex::new(recv_rx)),
@@ -427,14 +477,72 @@ impl UdpTransportAdapter {
         Arc::clone(&self.node)
     }
 
+    fn current_session_for_peer(
+        node: &Node,
+        registry: &std::sync::Mutex<AuthenticatedSessions>,
+        max_peers: usize,
+        ant_peer: &AntPeerId,
+    ) -> Option<(u64, crate::AuthenticatedSession)> {
+        if max_peers == 0 {
+            return None;
+        }
+        let ant_generation = node.current_connection_generation(ant_peer)?;
+        if ant_generation == u64::MAX {
+            return None;
+        }
+        let connection = node.inner_endpoint().get_quic_connection(ant_peer).ok()??;
+        if connection.close_reason().is_some()
+            || node.current_connection_generation(ant_peer) != Some(ant_generation)
+        {
+            return None;
+        }
+        let peer = ant_peer_id_to_gossip(ant_peer);
+        let mut sessions = registry.lock().ok()?;
+        if let Some(entry) = sessions.peers.get_mut(&peer) {
+            if entry.connection.stable_id() == connection.stable_id()
+                && entry.ant_generation == ant_generation
+            {
+                entry.last_used = Instant::now();
+                return Some((ant_generation, entry.token));
+            }
+        }
+        let next = sessions.next.checked_add(1)?;
+        sessions
+            .peers
+            .retain(|_, entry| entry.connection.close_reason().is_none());
+        if sessions.peers.len() >= max_peers && !sessions.peers.contains_key(&peer) {
+            let oldest = sessions
+                .peers
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(peer, _)| *peer)?;
+            sessions.peers.remove(&oldest);
+        }
+        sessions.next = next;
+        let token = crate::AuthenticatedSession {
+            peer,
+            generation: next,
+        };
+        sessions.peers.insert(
+            peer,
+            SessionEntry {
+                connection,
+                ant_generation,
+                token,
+                last_used: Instant::now(),
+            },
+        );
+        Some((ant_generation, token))
+    }
+
     /// Spawn background task to receive incoming messages
     ///
     /// This spawns two tasks:
-    /// 1. A receiver task that calls `node.recv()` to receive messages from ALL connected peers
+    /// 1. A receiver task that calls `node.recv_with_generation()` from ALL connected peers
     /// 2. An acceptor task that calls `node.accept()` to track incoming connections
     ///
     /// IMPORTANT: The receiver must start immediately, not wait for accept(), because:
-    /// - `node.recv()` receives from ALL connected peers (both inbound and outbound)
+    /// - `node.recv_with_generation()` receives from all connected peers
     /// - If we only dial out (never receive incoming), we still need to receive messages
     /// - Waiting for accept() would block receiving on outbound-only connections
     fn spawn_receiver(&self) {
@@ -445,13 +553,14 @@ impl UdpTransportAdapter {
         let node_recv = Arc::clone(&self.node);
         let recv_tx = self.recv_tx.clone();
         let peers_recv = Arc::clone(&self.connected_peers);
+        let sessions_recv = Arc::clone(&self.authenticated_sessions);
 
         tokio::spawn(async move {
             info!("Ant-QUIC receiver task started (global message receiver)");
 
             loop {
-                match node_recv.recv().await {
-                    Ok((from_peer_id, data)) => {
+                match node_recv.recv_with_generation().await {
+                    Ok((from_peer_id, source_generation, data)) => {
                         if data.is_empty() {
                             continue;
                         }
@@ -477,11 +586,33 @@ impl UdpTransportAdapter {
                             Bytes::new()
                         };
 
+                        // Stamp provenance before the adapter's own queue or
+                        // any async peer bookkeeping. A frame queued on ant
+                        // generation A must never acquire B's session after a
+                        // reconnect, even if it waits here under backpressure.
+                        let before = node_recv.current_connection_generation(&from_peer_id);
+                        let registered = source_generation_matches(source_generation, before)
+                            .then(|| {
+                                Self::current_session_for_peer(
+                                    &node_recv,
+                                    &sessions_recv,
+                                    max_peers,
+                                    &from_peer_id,
+                                )
+                            })
+                            .flatten();
+                        let after = node_recv.current_connection_generation(&from_peer_id);
+                        let session =
+                            stamped_receive_session(source_generation, before, registered, after);
+
                         // Update peer tracking - only update timestamp if already known
                         update_peer_last_seen(&peers_recv, from_gossip_id).await;
 
                         // Forward to recv channel
-                        if let Err(e) = recv_tx.send((from_gossip_id, stream_type, payload)).await {
+                        if let Err(e) = recv_tx
+                            .send((from_gossip_id, stream_type, payload, session))
+                            .await
+                        {
                             error!("Failed to forward message: {}", e);
                             break;
                         }
@@ -928,47 +1059,13 @@ impl GossipTransport for UdpTransportAdapter {
     }
 
     fn authenticated_session(&self, peer: GossipPeerId) -> Option<crate::AuthenticatedSession> {
-        let connection = self
-            .node
-            .inner_endpoint()
-            .get_quic_connection(&gossip_peer_id_to_ant(&peer))
-            .ok()??;
-        if connection.close_reason().is_some() {
-            return None;
-        }
-        let mut sessions = self.authenticated_sessions.lock().ok()?;
-        if self.config.max_peers == 0 {
-            return None;
-        }
-        if let Some((previous, token, last_used)) = sessions.peers.get_mut(&peer) {
-            if previous.stable_id() == connection.stable_id() {
-                *last_used = Instant::now();
-                return Some(*token);
-            }
-        }
-        let next = sessions.next.checked_add(1)?;
-        // Match connected_peers' LRU convention. Eviction retires the token:
-        // re-admitting even the same live connection gets a fresh generation.
-        sessions
-            .peers
-            .retain(|_, (connection, _, _)| connection.close_reason().is_none());
-        if sessions.peers.len() >= self.config.max_peers && !sessions.peers.contains_key(&peer) {
-            let oldest = sessions
-                .peers
-                .iter()
-                .min_by_key(|(_, (_, _, last_used))| *last_used)
-                .map(|(peer, _)| *peer)?;
-            sessions.peers.remove(&oldest);
-        }
-        sessions.next = next;
-        let session = crate::AuthenticatedSession {
-            peer,
-            generation: sessions.next,
-        };
-        sessions
-            .peers
-            .insert(peer, (connection, session, Instant::now()));
-        Some(session)
+        Self::current_session_for_peer(
+            &self.node,
+            &self.authenticated_sessions,
+            self.config.max_peers,
+            &gossip_peer_id_to_ant(&peer),
+        )
+        .map(|(_, session)| session)
     }
 
     async fn send_to_peer_guarded(
@@ -977,32 +1074,17 @@ impl GossipTransport for UdpTransportAdapter {
         stream_type: GossipStreamType,
         admit: crate::SessionAdmission,
     ) -> Result<()> {
-        // Pin the authenticated connection before queueing. Never reconnect or
-        // retry legacy bytes: a new connection needs a new roster/session grant.
-        let connection = self
-            .node
-            .inner_endpoint()
-            .get_quic_connection(&gossip_peer_id_to_ant(&peer))?
-            .ok_or_else(|| anyhow!("authenticated session unavailable"))?;
-        let session = self
-            .authenticated_session(peer)
-            .ok_or_else(|| anyhow!("authenticated session unavailable"))?;
-        {
-            let sessions = self
-                .authenticated_sessions
-                .lock()
-                .map_err(|_| anyhow!("session registry poisoned"))?;
-            anyhow::ensure!(
-                sessions
-                    .peers
-                    .get(&peer)
-                    .is_some_and(
-                        |(pinned, token, _)| pinned.stable_id() == connection.stable_id()
-                            && *token == session
-                    ),
-                "session changed before queue admission"
-            );
-        }
+        // Capture both token namespaces before queue waits. ant-quic pins the
+        // exact live generation after those waits; its callback runs only
+        // after stream allocation, so policy cannot be admitted early.
+        let ant_peer = gossip_peer_id_to_ant(&peer);
+        let (ant_generation, session) = Self::current_session_for_peer(
+            &self.node,
+            &self.authenticated_sessions,
+            self.config.max_peers,
+            &ant_peer,
+        )
+        .ok_or_else(|| anyhow!("authenticated session unavailable"))?;
         let _send_permit = self
             .send_semaphore
             .acquire()
@@ -1010,20 +1092,28 @@ impl GossipTransport for UdpTransportAdapter {
             .map_err(|_| anyhow!("send semaphore closed"))?;
         let peer_lock = self.peer_send_lock(peer).await;
         let _peer_guard = peer_lock.lock().await;
-        tokio::time::timeout(self.config.send_timeout, async {
-            let mut send = connection.open_uni().await?;
-            anyhow::ensure!(
-                self.authenticated_session(peer) == Some(session),
-                "authenticated session changed while queued"
-            );
-            let data = admit(session)?;
-            let mut framed = Vec::with_capacity(1 + data.len());
-            framed.push(stream_type.to_byte());
-            framed.extend_from_slice(&data);
-            send.write_all(&framed).await?;
-            send.finish()?;
-            Ok::<(), anyhow::Error>(())
-        })
+        tokio::time::timeout(
+            self.config.send_timeout,
+            self.node.send_on_generation_with_admission(
+                &ant_peer,
+                ant_generation,
+                |actual_generation| {
+                    frame_guarded_admission(
+                        stream_type,
+                        ant_generation,
+                        actual_generation,
+                        session,
+                        Self::current_session_for_peer(
+                            &self.node,
+                            &self.authenticated_sessions,
+                            self.config.max_peers,
+                            &ant_peer,
+                        ),
+                        &admit,
+                    )
+                },
+            ),
+        )
         .await??;
         Ok(())
     }
@@ -1153,6 +1243,15 @@ impl GossipTransport for UdpTransportAdapter {
     async fn receive_message(&self) -> Result<(GossipPeerId, GossipStreamType, Bytes)> {
         let mut recv_rx = self.recv_rx.lock().await;
 
+        recv_rx
+            .recv()
+            .await
+            .map(|(peer, stream, data, _)| (peer, stream, data))
+            .ok_or_else(|| anyhow!("Receive channel closed"))
+    }
+
+    async fn receive_message_with_session(&self) -> Result<ReceivedFrame> {
+        let mut recv_rx = self.recv_rx.lock().await;
         recv_rx
             .recv()
             .await
@@ -1407,7 +1506,11 @@ impl TransportAdapter for UdpTransportAdapter {
     async fn recv(&self) -> TransportResult<(GossipPeerId, GossipStreamType, Bytes)> {
         let mut recv_rx = self.recv_rx.lock().await;
 
-        recv_rx.recv().await.ok_or_else(|| TransportError::Closed)
+        recv_rx
+            .recv()
+            .await
+            .map(|(peer, stream, data, _)| (peer, stream, data))
+            .ok_or_else(|| TransportError::Closed)
     }
 
     async fn close(&self) -> TransportResult<()> {
@@ -1462,6 +1565,224 @@ impl TransportAdapter for UdpTransportAdapter {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_source_generation_is_never_relabelled_after_reconnect() {
+        let peer = GossipPeerId::new([7; 32]);
+        let old = crate::AuthenticatedSession {
+            peer,
+            generation: 11,
+        };
+        let new = crate::AuthenticatedSession {
+            peer,
+            generation: 12,
+        };
+        assert_eq!(
+            stamped_receive_session(41, Some(41), Some((41, old)), Some(41)),
+            Some(old)
+        );
+        assert_eq!(
+            stamped_receive_session(41, Some(42), Some((42, new)), Some(42)),
+            None,
+            "old queued bytes cannot acquire the replacement session"
+        );
+        assert_eq!(
+            stamped_receive_session(41, Some(41), Some((42, new)), Some(41)),
+            None,
+            "registry generation must match source generation"
+        );
+        assert_eq!(
+            stamped_receive_session(41, Some(41), Some((41, old)), Some(42)),
+            None,
+            "a reconnect during stamping fails closed"
+        );
+        assert_eq!(
+            stamped_receive_session(
+                u64::MAX,
+                Some(u64::MAX),
+                Some((u64::MAX, new)),
+                Some(u64::MAX)
+            ),
+            None,
+            "constrained or unknown provenance is never authenticated"
+        );
+        assert_eq!(stamped_receive_session(41, Some(41), None, Some(41)), None);
+    }
+
+    #[tokio::test]
+    async fn bounded_receive_queue_preserves_source_stamp_across_reconnect() {
+        let peer = GossipPeerId::new([7; 32]);
+        let old = crate::AuthenticatedSession {
+            peer,
+            generation: 11,
+        };
+        let replacement = crate::AuthenticatedSession {
+            peer,
+            generation: 12,
+        };
+        let (tx, mut rx) = mpsc::channel::<ReceivedFrame>(1);
+        tx.send((
+            peer,
+            GossipStreamType::PubSub,
+            Bytes::from_static(b"first"),
+            Some(old),
+        ))
+        .await
+        .expect("fill bounded queue");
+        let pending = tokio::spawn(async move {
+            tx.send((
+                peer,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"old-generation frame"),
+                stamped_receive_session(41, Some(41), Some((41, old)), Some(41)),
+            ))
+            .await
+            .expect("send pending old-generation frame");
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(rx.recv().await.expect("first frame").3, Some(old));
+        pending.await.expect("pending send completed");
+        let queued = rx.recv().await.expect("pending frame");
+        assert_eq!(queued.2, Bytes::from_static(b"old-generation frame"));
+        assert_eq!(queued.3, Some(old));
+        assert_ne!(queued.3, Some(replacement));
+    }
+
+    #[test]
+    fn guarded_admission_rechecks_both_generations_and_propagates_refusal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let peer = GossipPeerId::new([8; 32]);
+        let old = crate::AuthenticatedSession {
+            peer,
+            generation: 11,
+        };
+        let new = crate::AuthenticatedSession {
+            peer,
+            generation: 12,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let admit: crate::SessionAdmission = Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Ok(Bytes::from_static(b"payload"))
+        });
+        assert!(frame_guarded_admission(
+            GossipStreamType::PubSub,
+            41,
+            42,
+            old,
+            Some((42, new)),
+            &admit
+        )
+        .is_err());
+        assert!(frame_guarded_admission(
+            GossipStreamType::PubSub,
+            41,
+            41,
+            old,
+            Some((42, new)),
+            &admit
+        )
+        .is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let refused: crate::SessionAdmission = Arc::new(|_| anyhow::bail!("grant revoked"));
+        assert!(frame_guarded_admission(
+            GossipStreamType::PubSub,
+            41,
+            41,
+            old,
+            Some((41, old)),
+            &refused
+        )
+        .is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let framed = frame_guarded_admission(
+            GossipStreamType::PubSub,
+            41,
+            41,
+            old,
+            Some((41, old)),
+            &admit,
+        )
+        .expect("valid pinned admission");
+        assert_eq!(
+            framed,
+            [
+                GossipStreamType::PubSub.to_byte(),
+                b'p',
+                b'a',
+                b'y',
+                b'l',
+                b'o',
+                b'a',
+                b'd'
+            ]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "real loopback QUIC; run only through isolated Linux CI"]
+    async fn receive_provenance_rotates_after_real_reconnect() {
+        let (a, a_addr, b, _b_addr) = crate::testing::connected_pair().await;
+        let a_peer = a.peer_id();
+        let b_peer = b.peer_id();
+        let first = a.authenticated_session(b_peer).expect("first session");
+        b.send_to_peer(
+            a_peer,
+            GossipStreamType::PubSub,
+            Bytes::from_static(b"before"),
+        )
+        .await
+        .expect("send before reconnect");
+        let (_, _, first_bytes, first_source) =
+            tokio::time::timeout(Duration::from_secs(5), a.receive_message_with_session())
+                .await
+                .expect("first receive timeout")
+                .expect("first receive");
+        assert_eq!(first_bytes, Bytes::from_static(b"before"));
+        assert_eq!(first_source, Some(first));
+
+        a.node()
+            .disconnect(&gossip_peer_id_to_ant(&b_peer))
+            .await
+            .expect("disconnect old session on A");
+        b.node()
+            .disconnect(&gossip_peer_id_to_ant(&a_peer))
+            .await
+            .expect("disconnect old session on B");
+        let second = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(session) = a.authenticated_session(b_peer) {
+                    if session != first {
+                        break session;
+                    }
+                }
+                let _ = GossipTransport::dial(&b, a_peer, a_addr).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("new authenticated generation timed out");
+        assert_ne!(second, first);
+        b.send_to_peer(
+            a_peer,
+            GossipStreamType::PubSub,
+            Bytes::from_static(b"after"),
+        )
+        .await
+        .expect("send after reconnect");
+        let (_, _, second_bytes, second_source) =
+            tokio::time::timeout(Duration::from_secs(5), a.receive_message_with_session())
+                .await
+                .expect("second receive timeout")
+                .expect("second receive");
+        assert_eq!(second_bytes, Bytes::from_static(b"after"));
+        assert_eq!(second_source, Some(second));
+    }
 
     // ==========================================================================
     // UdpTransportAdapter Creation Tests

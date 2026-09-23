@@ -9,7 +9,7 @@ use anyhow::{anyhow, ensure, Result};
 use bytes::Bytes;
 use saorsa_gossip_identity::MlDsaKeyPair;
 use saorsa_gossip_transport::{AuthenticatedSession, GossipStreamType, GossipTransport};
-use saorsa_gossip_types::{MessageKind, PeerId, TopicId};
+use saorsa_gossip_types::{MessageKind, PeerId, TopicId, TopicPriority};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -381,6 +381,52 @@ pub struct LegacyMigration {
 }
 
 impl LegacyMigration {
+    /// Resolve ADR-012's destination variant before optional key compression.
+    /// A granted legacy destination stays on the established guarded v1 path.
+    pub(crate) fn prepare_key_cache_egress<T: GossipTransport + 'static>(
+        &self,
+        transport: &T,
+        key: &MlDsaKeyPair,
+        peer: PeerId,
+        session: AuthenticatedSession,
+        bytes: &Bytes,
+    ) -> Result<Option<Bytes>> {
+        let (header, _) = postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(bytes)?;
+        if !self.registered(header.topic) {
+            return Ok(Some(bytes.clone()));
+        }
+        let (message, trailing): (GossipMessage, _) = postcard::take_from_bytes(bytes)?;
+        ensure!(trailing.is_empty(), "trailing gossip bytes");
+        self.verify_inner_if_eager(&message)?;
+        let mut s = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("migration policy poisoned"))?;
+        let legacy = s.grants.contains_key(&(peer, header.topic))
+            && transport.authenticated_session(peer) == Some(session)
+            && Self::permitted(&mut s, header.topic, session);
+        if legacy {
+            return Ok(None);
+        }
+        if message.header.version == 2 {
+            return Ok(Some(bytes.clone()));
+        }
+        let wire_digest = *blake3::hash(bytes).as_bytes();
+        Ok(Some(variant(&mut s, &message, 2, key, wire_digest)?))
+    }
+
+    fn modern_allowed(
+        &self,
+        peer: PeerId,
+        session: AuthenticatedSession,
+        topic: TopicId,
+    ) -> Result<bool> {
+        let mut s = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("migration policy poisoned"))?;
+        Ok(!s.grants.contains_key(&(peer, topic)) || !Self::permitted(&mut s, topic, session))
+    }
     /// Install durable floors once; failure leaves normal v2 service available.
     pub fn install_floors(&self, floors: ModernFloors) -> Result<()> {
         let mut s = self
@@ -402,6 +448,10 @@ impl LegacyMigration {
             .lock()
             .map_err(|_| anyhow!("migration policy poisoned"))?;
         let id = topic.topic();
+        ensure!(
+            id != crate::key_cache::control_topic(),
+            "reserved key-cache topic cannot be registered"
+        );
         if let Some(old) = s.topics.get(&id) {
             ensure!(topic.revision > old.revision, "verifier revision replay");
         } else {
@@ -702,12 +752,14 @@ impl LegacyMigration {
         self: &Arc<Self>,
         transport: Arc<T>,
         signing_key: Arc<MlDsaKeyPair>,
+        key_cache: Option<Arc<Mutex<crate::key_cache::KeyCache>>>,
         peer: PeerId,
         stream: GossipStreamType,
         bytes: Bytes,
     ) -> Result<()> {
         let (header, _) = postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(&bytes)?;
         if !self.registered(header.topic) {
+            record_legacy_full_outbound(key_cache.as_ref(), &bytes);
             return transport.send_to_peer(peer, stream, bytes).await;
         }
         let (message, trailing): (GossipMessage, _) = postcard::take_from_bytes(&bytes)?;
@@ -732,6 +784,7 @@ impl LegacyMigration {
         let wire_digest = *blake3::hash(&bytes).as_bytes();
         if legacy {
             let policy = Arc::clone(self);
+            let cache = key_cache.clone();
             transport
                 .send_to_peer_guarded(
                     peer,
@@ -766,6 +819,8 @@ impl LegacyMigration {
                         let out = variant(&mut s, &message, 1, &signing_key, wire_digest)?;
                         let kind = kind_index(message.header.kind)?;
                         s.stats.legacy_egress[kind] = s.stats.legacy_egress[kind].saturating_add(1);
+                        drop(s);
+                        record_legacy_full_outbound(cache.as_ref(), &out);
                         Ok(out)
                     }),
                 )
@@ -781,8 +836,10 @@ impl LegacyMigration {
                         .map_err(|_| anyhow!("migration policy poisoned"))?;
                     variant(&mut s, &message, 2, &signing_key, wire_digest)?
                 };
+                record_legacy_full_outbound(key_cache.as_ref(), &bytes);
                 transport.send_to_peer(peer, stream, bytes).await
             } else {
+                record_legacy_full_outbound(key_cache.as_ref(), &bytes);
                 transport.send_to_peer(peer, stream, bytes).await
             }
         }
@@ -801,6 +858,22 @@ impl LegacyMigration {
             control_work(message)?;
         }
         Ok(())
+    }
+}
+
+/// Mirror inbound legacy Full accounting at the final transport boundary.
+/// Only structurally valid, non-reserved frames count; inspection never changes
+/// admission, and the counter records a submitted attempt, not delivery.
+fn record_legacy_full_outbound(
+    cache: Option<&Arc<Mutex<crate::key_cache::KeyCache>>>,
+    bytes: &Bytes,
+) {
+    let Some(cache) = cache else { return };
+    if !matches!(crate::key_cache::inspect_header(bytes), Ok((_, false))) {
+        return;
+    }
+    if let Ok(mut state) = cache.lock() {
+        state.record_outbound(false, bytes.len());
     }
 }
 
@@ -883,14 +956,142 @@ pub(crate) struct PolicyTransport<T> {
     pub(crate) inner: Arc<T>,
     pub(crate) migration: Arc<LegacyMigration>,
     key: Arc<MlDsaKeyPair>,
+    key_cache: Option<Arc<Mutex<crate::key_cache::KeyCache>>>,
 }
 impl<T> PolicyTransport<T> {
+    #[cfg(test)]
     pub(crate) fn new(inner: Arc<T>, key: Arc<MlDsaKeyPair>) -> Self {
         Self {
             inner,
             migration: Arc::new(LegacyMigration::default()),
             key,
+            key_cache: None,
         }
+    }
+    pub(crate) fn new_with_key_cache(
+        inner: Arc<T>,
+        key: Arc<MlDsaKeyPair>,
+        cache: Arc<Mutex<crate::key_cache::KeyCache>>,
+    ) -> Self {
+        Self {
+            inner,
+            migration: Arc::new(LegacyMigration::default()),
+            key,
+            key_cache: Some(cache),
+        }
+    }
+}
+impl<T: GossipTransport + 'static> PolicyTransport<T> {
+    pub(crate) fn wire_bytes_for_peer(
+        &self,
+        peer: PeerId,
+        bytes: &Bytes,
+        priority: TopicPriority,
+    ) -> Bytes {
+        self.wire_bytes_for_peer_cached(peer, bytes, priority, &mut HashMap::new())
+    }
+
+    pub(crate) fn wire_bytes_for_peers(
+        &self,
+        peers: &[PeerId],
+        bytes: &Bytes,
+        priority: TopicPriority,
+    ) -> HashMap<PeerId, Bytes> {
+        let mut encoded = HashMap::new();
+        peers
+            .iter()
+            .copied()
+            .map(|peer| {
+                (
+                    peer,
+                    self.wire_bytes_for_peer_cached(peer, bytes, priority, &mut encoded),
+                )
+            })
+            .collect()
+    }
+
+    fn wire_bytes_for_peer_cached(
+        &self,
+        peer: PeerId,
+        bytes: &Bytes,
+        priority: TopicPriority,
+        encoded: &mut HashMap<([u8; 32], bool), Bytes>,
+    ) -> Bytes {
+        if crate::key_cache::is_v3(bytes) {
+            return bytes.clone();
+        }
+        let Some(cache) = &self.key_cache else {
+            return bytes.clone();
+        };
+        let Some(session) = self.authenticated_session(peer) else {
+            return bytes.clone();
+        };
+        let supported = match cache.lock() {
+            Ok(mut state) => {
+                state.observe_session(session, Instant::now());
+                state.supports_v3(session)
+            }
+            Err(_) => false,
+        };
+        if !supported {
+            return bytes.clone();
+        }
+        let prepared = match self.migration.prepare_key_cache_egress(
+            self.inner.as_ref(),
+            self.key.as_ref(),
+            peer,
+            session,
+            bytes,
+        ) {
+            Ok(Some(value)) => value,
+            Ok(None) => return bytes.clone(),
+            Err(_) => return bytes.clone(),
+        };
+        let Ok(message) = postcard::from_bytes::<GossipMessage>(&prepared) else {
+            return prepared;
+        };
+        if message.header.topic == crate::key_cache::control_topic() {
+            return prepared;
+        }
+        let signer = PeerId::from_pubkey(&message.public_key);
+        let reference = priority != TopicPriority::Critical
+            && cache
+                .lock()
+                .is_ok_and(|mut state| state.supports_ref(session, signer));
+        let cache_key = (*blake3::hash(&prepared).as_bytes(), reference);
+        if let Some(wire) = encoded.get(&cache_key) {
+            return wire.clone();
+        }
+        let wire = crate::key_cache::encode(&message, reference).unwrap_or(prepared);
+        encoded.insert(cache_key, wire.clone());
+        wire
+    }
+
+    pub(crate) async fn send_v3_guarded(
+        &self,
+        peer: PeerId,
+        session: AuthenticatedSession,
+        stream: GossipStreamType,
+        topic: TopicId,
+        bytes: Bytes,
+    ) -> Result<()> {
+        let migration = Arc::clone(&self.migration);
+        self.inner
+            .send_to_peer_guarded(
+                peer,
+                stream,
+                Arc::new(move |actual| {
+                    ensure!(actual == session, "key-cache session changed before send");
+                    if migration.registered(topic) {
+                        ensure!(
+                            migration.modern_allowed(peer, actual, topic)?,
+                            "legacy grant became active before key-cache send"
+                        );
+                    }
+                    Ok(bytes.clone())
+                }),
+            )
+            .await
     }
 }
 #[async_trait::async_trait]
@@ -925,6 +1126,41 @@ impl<T: GossipTransport + 'static> GossipTransport for PolicyTransport<T> {
         stream: GossipStreamType,
         bytes: Bytes,
     ) -> Result<()> {
+        if crate::key_cache::is_v3(&bytes) {
+            let cache = self
+                .key_cache
+                .as_ref()
+                .ok_or_else(|| anyhow!("key-cache transport state unavailable"))?;
+            let session = self
+                .authenticated_session(peer)
+                .ok_or_else(|| anyhow!("v3 send requires authenticated session"))?;
+            let decoded = crate::key_cache::decode(&bytes)?;
+            let (topic, signer, reference) = match decoded {
+                crate::key_cache::Decoded::Full(message, signer) => {
+                    (message.header.topic, signer, false)
+                }
+                crate::key_cache::Decoded::Ref(message, signer) => {
+                    (message.header.topic, signer, true)
+                }
+            };
+            {
+                let mut state = cache.lock().map_err(|_| anyhow!("key cache poisoned"))?;
+                ensure!(
+                    state.supports_v3(session),
+                    "v3 capability expired before send"
+                );
+                if reference {
+                    ensure!(
+                        state.supports_ref(session, signer),
+                        "key acknowledgement expired before send"
+                    );
+                }
+                state.record_outbound(reference, bytes.len());
+            }
+            return self
+                .send_v3_guarded(peer, session, stream, topic, bytes)
+                .await;
+        }
         let enabled = !self
             .migration
             .state
@@ -933,12 +1169,14 @@ impl<T: GossipTransport + 'static> GossipTransport for PolicyTransport<T> {
             .topics
             .is_empty();
         if !enabled {
+            record_legacy_full_outbound(self.key_cache.as_ref(), &bytes);
             return self.inner.send_to_peer(peer, stream, bytes).await;
         }
         self.migration
             .send(
                 Arc::clone(&self.inner),
                 Arc::clone(&self.key),
+                self.key_cache.clone(),
                 peer,
                 stream,
                 bytes,

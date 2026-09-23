@@ -282,3 +282,132 @@ jobs:
           name: sg-504-harness-provenance
           path: ${{ runner.temp }}/sg-504-harness-provenance/manifest.json
           if-no-files-found: error
+
+  sg76-transport-isolation:
+    # Each matrix leg uses one audited wrapper invocation and one custody
+    # scratch. The runtime tests remain ignored outside this Linux fence.
+    name: SG76 Transport Isolated Acceptance (${{ matrix.case }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: three-node-ref
+            package: saorsa-gossip-pubsub
+            target_kind: test
+            target: multi_node_publish
+            custody_target: multi_node_publish
+            selector: key_cache_three_node_cold_warm_ref_delivery
+          - case: three-node-legacy
+            package: saorsa-gossip-pubsub
+            target_kind: test
+            target: multi_node_publish
+            custody_target: multi_node_publish
+            selector: key_cache_three_node_mixed_legacy_neighbor
+          - case: reconnect-generation
+            package: saorsa-gossip-transport
+            target_kind: lib
+            target: ''
+            custody_target: saorsa_gossip_transport
+            selector: 'udp_transport_adapter::tests::receive_provenance_rotates_after_real_reconnect'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, r8 resolved
+
+      - name: Assert checkout matches event SHA
+        run: |
+          head="$(git rev-parse HEAD)"
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "::error::checkout HEAD ${head} != GITHUB_SHA ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, r8 resolved
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, r8 resolved
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-sg76-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-sg76-cargo-registry-
+
+      - name: Cache cargo git database
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, r8 resolved
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-sg76-cargo-git-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-sg76-cargo-git-
+
+      - name: Stage hash-pinned x0x isolation helpers
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: python3 scripts/ci/stage-x0x-isolation.py
+
+      - name: Resolve dependency graph
+        run: cargo generate-lockfile
+
+      - name: Verify staged tree custody
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: python3 scripts/ci/stage-x0x-isolation.py --verify-tree
+
+      - name: Cache target directory
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, r8 resolved
+        with:
+          path: target
+          key: ${{ runner.os }}-sg76-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2, r8 resolved
+        with:
+          tool: nextest@0.9.144
+
+      - name: Run isolated SG76 selector
+        id: sg76_acceptance
+        env:
+          X0X_ISOLATION_ROLE: acceptance
+          X0X_RUNTIME_TIMEOUT_SECONDS: 180
+          SG76_PACKAGE: ${{ matrix.package }}
+          SG76_TARGET_KIND: ${{ matrix.target_kind }}
+          SG76_TARGET: ${{ matrix.target }}
+          SG76_SELECTOR: ${{ matrix.selector }}
+        run: |
+          package_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          args=(--package "${SG76_PACKAGE}@${package_version}" --all-features)
+          if [ "$SG76_TARGET_KIND" = lib ]; then
+            args+=(--lib)
+          else
+            args+=(--test "$SG76_TARGET")
+          fi
+          bash scripts/ci/nextest-isolated.sh "${args[@]}" -- \
+            --run-ignored ignored-only --no-tests=fail --test-threads 1 \
+            -E "test(=${SG76_SELECTOR})"
+
+      - name: Collect SG76 isolation custody
+        if: always()
+        id: collect_custody
+        env:
+          X0X_CUSTODY_EXPECT: ${{ steps.sg76_acceptance.outcome }}
+          X0X_CUSTODY_TARGET: ${{ matrix.custody_target }}
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_MIN_RUNS: '1'
+        run: python3 scripts/ci/isolation-custody-collect.py "${RUNNER_TEMP}/sg-76-custody"
+
+      - name: Upload SG76 isolation custody receipt
+        if: always() && steps.collect_custody.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, r8 resolved
+        with:
+          name: sg-76-isolation-custody-${{ matrix.case }}
+          path: ${{ runner.temp }}/sg-76-custody/custody-receipt.json
+          if-no-files-found: error
+
+      - name: Upload staged harness provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, r8 resolved
+        with:
+          name: sg-76-harness-provenance-${{ matrix.case }}
+          path: ${{ runner.temp }}/sg-504-harness-provenance/manifest.json
+          if-no-files-found: error

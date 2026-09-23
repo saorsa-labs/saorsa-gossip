@@ -8,7 +8,7 @@
 //! the real transport (existing inline tests use a mock transport).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,9 +19,12 @@ use saorsa_gossip_identity::MlDsaKeyPair;
 use saorsa_gossip_pubsub::{
     BytePolicy, GossipMessage, LeafEgressConfig, LeafEgressSnapshot, PlumtreePubSub, PubSub,
 };
-use saorsa_gossip_transport::testing::{connected_pair, loopback_star};
+use saorsa_gossip_transport::testing::{
+    connected_pair, loopback_from, loopback_star, wait_until_connected,
+};
 use saorsa_gossip_transport::{
     AuthenticatedSession, GossipStreamType, GossipTransport, SessionAdmission, UdpTransportAdapter,
+    UdpTransportAdapterConfig,
 };
 use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
 use tokio::sync::Notify;
@@ -31,8 +34,8 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Spawn a transport→pubsub message pump. Reads all incoming messages on
 /// the transport and dispatches `PubSub` stream-type payloads to
-/// `pubsub.handle_message`. Other stream types are ignored (membership and
-/// bulk are out of scope for this test).
+/// authenticated dispatch only for a receive-time token. Legacy transports
+/// retain the ordinary handler; other stream types are ignored.
 fn spawn_pubsub_pump<T>(
     transport: Arc<T>,
     pubsub: Arc<PlumtreePubSub<T>>,
@@ -42,16 +45,23 @@ where
 {
     tokio::spawn(async move {
         loop {
-            match GossipTransport::receive_message(&transport).await {
-                Ok((sender, GossipStreamType::PubSub, data)) => {
-                    if let Err(err) = pubsub.handle_message(sender, data).await {
+            match GossipTransport::receive_message_with_session(&transport).await {
+                Ok((sender, GossipStreamType::PubSub, data, session)) => {
+                    let handled = match session {
+                        Some(token) if token.peer == sender => {
+                            pubsub.handle_authenticated_message(token, data).await
+                        }
+                        Some(_) => Err(anyhow::anyhow!("mismatched receive provenance peer")),
+                        None => pubsub.handle_message(sender, data).await,
+                    };
+                    if let Err(err) = handled {
                         tracing::warn!(
                             target: "pubsub_test::pump",
                             "handle_message returned error: {err}"
                         );
                     }
                 }
-                Ok((_, _, _)) => {
+                Ok((_, _, _, _)) => {
                     // Non-pubsub stream types are ignored in this test.
                 }
                 Err(err) => {
@@ -110,12 +120,19 @@ fn spawn_traced_pubsub_pump(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match GossipTransport::receive_message(&transport).await {
-                Ok((sender, GossipStreamType::PubSub, data)) => {
+            match GossipTransport::receive_message_with_session(&transport).await {
+                Ok((sender, GossipStreamType::PubSub, data, session)) => {
                     let header = postcard::take_from_bytes::<GossipMessage>(&data)
                         .ok()
                         .map(|(message, _)| message.header);
-                    if let Err(err) = pubsub.handle_message(sender, data).await {
+                    let handled = match session {
+                        Some(token) if token.peer == sender => {
+                            pubsub.handle_authenticated_message(token, data).await
+                        }
+                        Some(_) => Err(anyhow::anyhow!("mismatched receive provenance peer")),
+                        None => pubsub.handle_message(sender, data).await,
+                    };
+                    if let Err(err) = handled {
                         tracing::warn!(
                             target: "pubsub_test::pump",
                             "handle_message returned error: {err}"
@@ -129,7 +146,7 @@ fn spawn_traced_pubsub_pump(
                         });
                     }
                 }
-                Ok((_, _, _)) => {}
+                Ok((_, _, _, _)) => {}
                 Err(err) => {
                     tracing::debug!(target: "pubsub_test::pump", "transport recv ended: {err}");
                     break;
@@ -145,6 +162,7 @@ struct FrameRecord {
     from: PeerId,
     to: PeerId,
     kind: MessageKind,
+    signer: PeerId,
     msg_id: [u8; 32],
     wire_len: usize,
     payload_hash: Option<[u8; 32]>,
@@ -187,6 +205,7 @@ impl FrameLedger {
                 from,
                 to,
                 kind: message.header.kind,
+                signer: PeerId::from_pubkey(&message.public_key),
                 msg_id: message.header.msg_id,
                 wire_len: data.len(),
                 payload_hash,
@@ -218,11 +237,24 @@ impl FrameLedger {
 struct TracingTransport {
     inner: UdpTransportAdapter,
     ledger: Arc<FrameLedger>,
+    legacy_receive: bool,
 }
 
 impl TracingTransport {
     fn new(inner: UdpTransportAdapter, ledger: Arc<FrameLedger>) -> Arc<Self> {
-        Arc::new(Self { inner, ledger })
+        Arc::new(Self {
+            inner,
+            ledger,
+            legacy_receive: false,
+        })
+    }
+
+    fn legacy_receive(inner: UdpTransportAdapter, ledger: Arc<FrameLedger>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            ledger,
+            legacy_receive: true,
+        })
     }
 }
 
@@ -261,7 +293,9 @@ impl GossipTransport for TracingTransport {
     }
 
     fn authenticated_session(&self, peer: PeerId) -> Option<AuthenticatedSession> {
-        GossipTransport::authenticated_session(&self.inner, peer)
+        (!self.legacy_receive)
+            .then(|| GossipTransport::authenticated_session(&self.inner, peer))
+            .flatten()
     }
 
     async fn send_to_peer_guarded(
@@ -282,6 +316,24 @@ impl GossipTransport for TracingTransport {
 
     async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
         GossipTransport::receive_message(&self.inner).await
+    }
+
+    async fn receive_message_with_session(
+        &self,
+    ) -> Result<(
+        PeerId,
+        GossipStreamType,
+        Bytes,
+        Option<AuthenticatedSession>,
+    )> {
+        let (peer, stream, data, session) =
+            GossipTransport::receive_message_with_session(&self.inner).await?;
+        Ok((
+            peer,
+            stream,
+            data,
+            (!self.legacy_receive).then_some(session).flatten(),
+        ))
     }
 
     async fn connected_peer_ids(&self) -> Vec<PeerId> {
@@ -346,6 +398,154 @@ async fn two_nodes_publish_subscribe_round_trip() {
     let (sender, body) = received;
     assert_eq!(sender, node2_peer, "sender peer id mismatch");
     assert_eq!(body, payload, "payload bytes mismatch");
+}
+
+// A real SG76 negotiation needs each adjacent transport identity to match
+// its pubsub signing key. The older loopback helpers deliberately generate
+// their own transport keys and cannot witness signed key-cache controls.
+async fn keyed_star(
+    legacy_receiver: bool,
+) -> (
+    Arc<TracingTransport>,
+    Arc<TracingTransport>,
+    Arc<TracingTransport>,
+    MlDsaKeyPair,
+    MlDsaKeyPair,
+    MlDsaKeyPair,
+    Arc<FrameLedger>,
+) {
+    let (a_key, b_key, c_key) = (
+        MlDsaKeyPair::generate().expect("origin key"),
+        MlDsaKeyPair::generate().expect("relay key"),
+        MlDsaKeyPair::generate().expect("receiver key"),
+    );
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let b = UdpTransportAdapter::with_config(
+        UdpTransportAdapterConfig::new(bind, Vec::new())
+            .with_keypair(b_key.public_key().to_vec(), b_key.secret_key().to_vec()),
+        None,
+    )
+    .await
+    .expect("relay startup");
+    let b_addr = loopback_from(b.node().local_addr().expect("relay address"));
+    let a = UdpTransportAdapter::with_config(
+        UdpTransportAdapterConfig::new(bind, vec![b_addr])
+            .with_keypair(a_key.public_key().to_vec(), a_key.secret_key().to_vec()),
+        None,
+    )
+    .await
+    .expect("origin startup");
+    let c = UdpTransportAdapter::with_config(
+        UdpTransportAdapterConfig::new(bind, vec![b_addr])
+            .with_keypair(c_key.public_key().to_vec(), c_key.secret_key().to_vec()),
+        None,
+    )
+    .await
+    .expect("receiver startup");
+    for node in [&a, &c] {
+        wait_until_connected(node, b.peer_id(), RECV_TIMEOUT).await;
+        wait_until_connected(&b, node.peer_id(), RECV_TIMEOUT).await;
+    }
+    assert_eq!(a.peer_id(), a_key.peer_id());
+    assert_eq!(b.peer_id(), b_key.peer_id());
+    assert_eq!(c.peer_id(), c_key.peer_id());
+    let ledger = Arc::new(FrameLedger::default());
+    let a = TracingTransport::new(a, Arc::clone(&ledger));
+    let b = TracingTransport::new(b, Arc::clone(&ledger));
+    let c = if legacy_receiver {
+        TracingTransport::legacy_receive(c, Arc::clone(&ledger))
+    } else {
+        TracingTransport::new(c, Arc::clone(&ledger))
+    };
+    (a, b, c, a_key, b_key, c_key, ledger)
+}
+
+async fn run_key_cache_three_node(legacy_receiver: bool) {
+    timeout(Duration::from_secs(30), async {
+        let (a, b, c, a_key, b_key, c_key, ledger) = keyed_star(legacy_receiver).await;
+        let (a_peer, b_peer, c_peer) = (a.local_peer_id(), b.local_peer_id(), c.local_peer_id());
+        let node_a = Arc::new(PlumtreePubSub::new(a_peer, Arc::clone(&a), a_key));
+        let node_b = Arc::new(PlumtreePubSub::new(b_peer, Arc::clone(&b), b_key));
+        let node_c = Arc::new(PlumtreePubSub::new(c_peer, Arc::clone(&c), c_key));
+        let pumps = [
+            spawn_pubsub_pump(Arc::clone(&a), Arc::clone(&node_a)),
+            spawn_pubsub_pump(Arc::clone(&b), Arc::clone(&node_b)),
+            spawn_pubsub_pump(Arc::clone(&c), Arc::clone(&node_c)),
+        ];
+        let topic = TopicId::new([0x76; 32]);
+        let mut receiver = node_c.subscribe_ready(topic).await;
+        node_a.initialize_topic_peers(topic, vec![b_peer]).await;
+        node_b
+            .initialize_topic_peers(topic, vec![a_peer, c_peer])
+            .await;
+        node_c.initialize_topic_peers(topic, vec![b_peer]).await;
+
+        // The first message is sent before signer acknowledgement. Repeated
+        // distinct messages allow the 250-ms control flusher to exchange
+        // reciprocal Hello and the verified-key Ack before a warm Ref.
+        for index in 0_u8..12 {
+            let payload = Bytes::from(vec![index; 256]);
+            node_a
+                .publish(topic, payload.clone())
+                .await
+                .expect("publish");
+            let (sender, received) = timeout(RECV_TIMEOUT, receiver.recv())
+                .await
+                .expect("three-node delivery timed out")
+                .expect("receiver channel closed");
+            assert_eq!(sender, b_peer, "receiver observes its adjacent relay");
+            assert_eq!(received, payload);
+            if node_a.key_cache_stats().ref_out_frames > 0
+                && (legacy_receiver
+                    || (node_b.key_cache_stats().ref_out_frames > 0
+                        && node_c.key_cache_stats().ref_in_frames > 0))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(
+            node_a.key_cache_stats().ref_out_frames > 0,
+            "A→B must negotiate a warm reference after verified-key acknowledgement"
+        );
+        if legacy_receiver {
+            assert_eq!(node_c.key_cache_stats().ref_in_frames, 0);
+            assert!(
+                ledger
+                    .find(|frame| {
+                        frame.from == b_peer
+                            && frame.to == c_peer
+                            && frame.kind == MessageKind::Eager
+                            && frame.signer == a_peer
+                    })
+                    .is_some(),
+                "the mixed-version B→C leg retains legacy bytes and the author signer"
+            );
+        } else {
+            assert!(
+                node_b.key_cache_stats().ref_out_frames > 0
+                    && node_c.key_cache_stats().ref_in_frames > 0,
+                "B→C must deliver a warm reference, not only legacy Full"
+            );
+        }
+        for pump in pumps {
+            pump.abort();
+        }
+    })
+    .await
+    .expect("key-cache three-node scenario timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real loopback QUIC; run only through isolated Linux CI"]
+async fn key_cache_three_node_cold_warm_ref_delivery() {
+    run_key_cache_three_node(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real loopback QUIC; run only through isolated Linux CI"]
+async fn key_cache_three_node_mixed_legacy_neighbor() {
+    run_key_cache_three_node(true).await;
 }
 
 /// #504: exercise the real loopback transport while proving that a Leaf relay

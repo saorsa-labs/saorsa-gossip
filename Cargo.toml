@@ -40,10 +40,9 @@ anyhow = "1.0"
 saorsa-pqc = "0.5"
 
 # QUIC transport
-# crates.io 0.27.49 replaces the temporary git pin (ant-quic #271 merge).
-# Still draft: G4/publish not cleared by this alone.
-# TODO(G1): stack ant-quic #272 (recv_with_generation) when ready; currently HOLD.
-ant-quic = "0.27.49"
+# 0.27.53: receive-generation (#272), guarded-send (#298), fatal-send driver
+# retirement (#300), ENOBUFS-transient and Rustls security fixes.
+ant-quic = "0.27.53"
 
 # Shared transport layer
 

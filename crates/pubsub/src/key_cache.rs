@@ -18,7 +18,7 @@ pub(crate) const WIRE_MARKER: &[u8; 6] = b"\xffSGKC\x03";
 pub(crate) const CONTROL_DOMAIN: &str = "saorsa-gossip/key-cache-control/v1";
 pub(crate) const MAX_KEY_CACHE_CONTROL_BYTES: usize = 65_536;
 const CONTROL_MAGIC: [u8; 8] = *b"SGKEYC01";
-const KEY_BYTES: usize = 1_952;
+pub(crate) const KEY_BYTES: usize = 1_952;
 const SIGNATURE_BYTES: usize = 3_309;
 const MAX_CONTROL_ITEMS: usize = 32;
 const MAX_SESSIONS: usize = 1_024;
@@ -331,6 +331,7 @@ fn validate_control(control: &Control) -> Result<()> {
 
 /// Process-local counters for outer-key wire compression and recovery.
 #[derive(Debug, Clone, Default, Serialize)]
+#[non_exhaustive]
 pub struct KeyCacheSnapshot {
     /// Ordinary legacy or v3 full-key frames submitted for outbound transport;
     /// a counted submission can still fail during the transport send.
@@ -377,6 +378,13 @@ pub struct KeyCacheSnapshot {
     pub replay_success: u64,
     /// Pending frames failing replay after key fill.
     pub replay_failure: u64,
+    /// Response keys dropped because no outstanding request matched that
+    /// peer/session — unsolicited keys must never reach the resolved LRU.
+    pub unsolicited_response_keys: u64,
+    /// Inbound reference frames for topics the local registry marks Critical
+    /// while the sender's priority table disagreed; resolved through the
+    /// ordinary cache path instead of being dropped.
+    pub critical_ref_mismatches: u64,
 }
 
 #[derive(Clone)]
@@ -444,15 +452,22 @@ pub(crate) struct KeyCache {
     stats: KeyCacheSnapshot,
 }
 
+/// Build a positive LRU capacity. A zero constant (which none of the call
+/// sites below can be) degrades to a capacity of one instead of panicking,
+/// keeping construction total and `unsafe`-free.
+const fn lru_capacity(capacity: usize) -> NonZeroUsize {
+    match NonZeroUsize::new(capacity) {
+        Some(capacity) => capacity,
+        None => NonZeroUsize::MIN,
+    }
+}
+
 impl Default for KeyCache {
     fn default() -> Self {
         Self {
-            // SAFETY: both capacities are positive constants.
-            resolved: LruCache::new(unsafe { NonZeroUsize::new_unchecked(2048) }),
-            // SAFETY: both capacities are positive constants.
-            acknowledged: LruCache::new(unsafe { NonZeroUsize::new_unchecked(4096) }),
-            // SAFETY: both capacities are positive constants.
-            announced_inbound: LruCache::new(unsafe { NonZeroUsize::new_unchecked(4096) }),
+            resolved: LruCache::new(lru_capacity(2048)),
+            acknowledged: LruCache::new(lru_capacity(4096)),
+            announced_inbound: LruCache::new(lru_capacity(4096)),
             sessions: HashMap::new(),
             pending: HashMap::new(),
             pending_frames: 0,
@@ -581,6 +596,37 @@ impl KeyCache {
                 }
             }
         }
+    }
+
+    /// Accept one `Control::Response` entry for `session`. An entry is
+    /// learnable only while this exact peer/session still has an outstanding
+    /// request for the key (a queued reference miss); anything else is
+    /// unsolicited, counted, and dropped without touching the resolved LRU,
+    /// so a peer cannot evict cached keys by spraying hash-valid entries.
+    pub(crate) fn note_response_key(
+        &mut self,
+        session: AuthenticatedSession,
+        key_id: PeerId,
+        key: Vec<u8>,
+    ) -> bool {
+        if !self
+            .pending
+            .contains_key(&(session.peer, session.generation, key_id))
+        {
+            self.stats.unsolicited_response_keys =
+                self.stats.unsolicited_response_keys.saturating_add(1);
+            return false;
+        }
+        self.note_verified_key(key_id, key, None);
+        true
+    }
+
+    /// Count an inbound reference frame for a topic the local registry marks
+    /// Critical while the sender compressed it to a reference: the two
+    /// priority tables disagreed. The frame still resolves through the
+    /// ordinary cache path rather than being dropped.
+    pub(crate) fn record_critical_ref_mismatch(&mut self) {
+        self.stats.critical_ref_mismatches = self.stats.critical_ref_mismatches.saturating_add(1);
     }
 
     pub(crate) fn lookup(&mut self, key_id: PeerId) -> Option<Vec<u8>> {

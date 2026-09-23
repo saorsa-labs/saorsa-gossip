@@ -6408,8 +6408,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 key_cache::Control::Response { entries } => {
                     let mut frames = Vec::new();
                     for (key_id, key) in entries {
-                        cache.note_verified_key(key_id, key, None);
-                        frames.extend(cache.take_pending(session, key_id));
+                        // Only a key this session actually requested may
+                        // enter the resolved LRU; unsolicited entries are
+                        // counted and dropped so they cannot evict keys we
+                        // are using.
+                        if cache.note_response_key(session, key_id, key) {
+                            frames.extend(cache.take_pending(session, key_id));
+                        }
                     }
                     frames
                 }
@@ -6568,18 +6573,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             "hop-local v3 control signer is not adjacent peer"
                         );
                     }
-                    anyhow::ensure!(
-                        self.admission
-                            .registry()
-                            .priority_for(&message.header.topic)
-                            != TopicPriority::Critical,
-                        "Critical frame cannot use key reference"
-                    );
-                    let key = self
-                        .key_cache
-                        .lock()
-                        .map_err(|_| anyhow!("key cache poisoned"))?
-                        .lookup(key_id);
+                    // The sender compresses to a reference using ITS
+                    // priority table, which can disagree with ours (Normal
+                    // there, Critical here). Hard-rejecting here would
+                    // silently lose the message, so the skew only counts and
+                    // the frame resolves through the ordinary cache path —
+                    // a miss queues the frame and requests the key.
+                    let priority_skew = self
+                        .admission
+                        .registry()
+                        .priority_for(&message.header.topic)
+                        == TopicPriority::Critical;
+                    let key = {
+                        let mut cache = self
+                            .key_cache
+                            .lock()
+                            .map_err(|_| anyhow!("key cache poisoned"))?;
+                        if priority_skew {
+                            cache.record_critical_ref_mismatch();
+                        }
+                        cache.lookup(key_id)
+                    };
                     let Some(key) = key else {
                         if let Ok(mut cache) = self.key_cache.lock() {
                             cache.record_inbound(true, data.len());
@@ -13095,6 +13109,244 @@ mod tests {
             "non-adjacent signer rejected"
         );
         assert!(!pubsub.key_cache.lock().expect("cache").supports_v3(session));
+    }
+
+    #[tokio::test]
+    async fn unsolicited_response_keys_never_evict_cached_entries() {
+        let author_key = test_signing_key();
+        let receiver_key = test_signing_key();
+        let author = author_key.peer_id();
+        let receiver = receiver_key.peer_id();
+        let author_transport = RecordingTransport::new(author);
+        let receiver_transport = RecordingTransport::new(receiver);
+        author_transport.set_session(receiver, 1);
+        receiver_transport.set_session(author, 1);
+        let a = PlumtreePubSub::new_with_task_control(
+            author,
+            Arc::clone(&author_transport),
+            author_key.clone(),
+            false,
+        );
+        let b = PlumtreePubSub::new_with_task_control(
+            receiver,
+            Arc::clone(&receiver_transport),
+            receiver_key,
+            false,
+        );
+        assert!(a.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 128 * 1024,
+            max_serialized_frame_bytes: 128 * 1024,
+            policy: BytePolicy::ShedNormal,
+        })));
+
+        // Fill the receiver's resolved-key LRU to capacity with the
+        // author's key near the least-recently-used position (the
+        // constructor pre-seeds the receiver's own signing key), so any
+        // admitted insertion evicts the author's key.
+        {
+            let mut cache = b.key_cache.lock().expect("cache");
+            cache.note_verified_key(author, author_key.public_key().to_vec(), None);
+            for i in 0..2046u32 {
+                let mut key = i.to_le_bytes().to_vec();
+                key.resize(key_cache::KEY_BYTES, 0);
+                cache.note_verified_key(PeerId::from_pubkey(&key), key, None);
+            }
+        }
+        assert_eq!(b.key_cache_stats().cache_evictions, 0);
+
+        // A Response control the receiver never asked for, carrying 32
+        // hash-valid keys that do not correspond to any pending miss.
+        let entries: Vec<_> = (0..32u32)
+            .map(|i| {
+                let mut key = (0x1000_0000u32 + i).to_le_bytes().to_vec();
+                key.resize(key_cache::KEY_BYTES, 0);
+                let key_id = PeerId::from_pubkey(&key);
+                (key_id, key)
+            })
+            .collect();
+        let poison_id = entries[0].0;
+        PlumtreePubSub::<RecordingTransport>::send_key_cache_control(
+            &a.transport,
+            &a.signing_key,
+            &a.egress_limiter,
+            &a.stage_stats,
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: receiver,
+                generation: 1,
+            },
+            key_cache::Control::Response { entries },
+        )
+        .await
+        .expect("send unsolicited response");
+        let wire = author_transport
+            .sent_frames()
+            .last()
+            .expect("poison control frame")
+            .2
+            .clone();
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            wire,
+        )
+        .await
+        .expect("unsolicited response is well-formed, merely ignored");
+
+        let stats = b.key_cache_stats();
+        assert_eq!(stats.unsolicited_response_keys, 32);
+        assert_eq!(
+            stats.cache_evictions, 0,
+            "unsolicited keys must not evict resolved keys"
+        );
+        assert!(
+            b.key_cache.lock().expect("cache").lookup(author).is_some(),
+            "the least-recently-used entry the spray targeted must survive"
+        );
+        assert!(b
+            .key_cache
+            .lock()
+            .expect("cache")
+            .lookup(poison_id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn priority_skew_refs_from_normal_sender_still_deliver() {
+        let author_key = test_signing_key();
+        let receiver_key = test_signing_key();
+        let author = author_key.peer_id();
+        let receiver = receiver_key.peer_id();
+        let author_transport = RecordingTransport::new(author);
+        let receiver_transport = RecordingTransport::new(receiver);
+        author_transport.set_session(receiver, 1);
+        receiver_transport.set_session(author, 1);
+        let a = PlumtreePubSub::new_with_task_control(
+            author,
+            Arc::clone(&author_transport),
+            author_key.clone(),
+            false,
+        );
+        let b = PlumtreePubSub::new_with_task_control(
+            receiver,
+            Arc::clone(&receiver_transport),
+            receiver_key,
+            false,
+        );
+        let topic = TopicId::new([0x77; 32]);
+        let mut received = b.subscribe_ready(topic).await;
+        let now = Instant::now();
+        a.key_cache.lock().expect("cache").observe_session(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: receiver,
+                generation: 1,
+            },
+            now,
+        );
+        b.key_cache.lock().expect("cache").observe_session(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            now,
+        );
+        assert!(matches!(
+            flush_key_cache_control(&a, &b, &author_transport, now).await,
+            key_cache::Control::Hello { .. }
+        ));
+        assert!(matches!(
+            flush_key_cache_control(&b, &a, &receiver_transport, now).await,
+            key_cache::Control::Hello { .. }
+        ));
+
+        // A cold full-key delivery teaches the receiver the author's key
+        // and acknowledges it back so the sender may compress to refs.
+        let cold = key_cache_eager(&author_key, topic, 1, b"cold");
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            postcard::to_stdvec(&cold).expect("wire").into(),
+        )
+        .await
+        .expect("cold full delivery");
+        assert_eq!(
+            received.try_recv().expect("cold delivery").1,
+            Bytes::from_static(b"cold")
+        );
+        assert!(matches!(
+            flush_key_cache_control(&b, &a, &receiver_transport, now).await,
+            key_cache::Control::Ack { .. }
+        ));
+
+        // Receiver marks the topic Critical; the sender's own table still
+        // says Normal, so its next frame is a key reference.
+        b.admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        b.key_cache.lock().expect("cache").evict_key(author);
+        let skew = key_cache_eager(&author_key, topic, 2, b"skew");
+        let skew_legacy: Bytes = postcard::to_stdvec(&skew).expect("wire").into();
+        let skew_ref = a.wire_bytes_for_peer(receiver, &skew_legacy, TopicPriority::Normal);
+        assert!(matches!(
+            key_cache::decode(&skew_ref).expect("ref"),
+            key_cache::Decoded::Ref(_, _)
+        ));
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            skew_ref,
+        )
+        .await
+        .expect("skewed reference queues a miss instead of being dropped");
+        assert!(
+            received.try_recv().is_err(),
+            "nothing delivers before key recovery"
+        );
+        assert!(matches!(
+            flush_key_cache_control(&b, &a, &receiver_transport, now + Duration::from_secs(1))
+                .await,
+            key_cache::Control::Request { .. }
+        ));
+        assert!(matches!(
+            flush_key_cache_control(&a, &b, &author_transport, now + Duration::from_secs(1)).await,
+            key_cache::Control::Response { .. }
+        ));
+        assert_eq!(
+            received.try_recv().expect("replayed skew delivery").1,
+            Bytes::from_static(b"skew")
+        );
+        assert_eq!(b.key_cache_stats().critical_ref_mismatches, 2);
+
+        // With the key resolved, the next skewed reference delivers
+        // immediately from cache.
+        let warm = key_cache_eager(&author_key, topic, 3, b"skew-warm");
+        let warm_legacy: Bytes = postcard::to_stdvec(&warm).expect("wire").into();
+        let warm_ref = a.wire_bytes_for_peer(receiver, &warm_legacy, TopicPriority::Normal);
+        assert!(matches!(
+            key_cache::decode(&warm_ref).expect("ref"),
+            key_cache::Decoded::Ref(_, _)
+        ));
+        b.handle_authenticated_message(
+            saorsa_gossip_transport::AuthenticatedSession {
+                peer: author,
+                generation: 1,
+            },
+            warm_ref,
+        )
+        .await
+        .expect("cached skew reference resolves");
+        assert_eq!(
+            received.try_recv().expect("warm skew delivery").1,
+            Bytes::from_static(b"skew-warm")
+        );
+        assert_eq!(b.key_cache_stats().critical_ref_mismatches, 3);
     }
 
     fn unsigned_control_message(

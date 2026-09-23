@@ -3662,6 +3662,10 @@ struct LazyWithheldEntry {
     /// Eager peers whose re-publish was withheld by the verdict — the
     /// direct IHAVE announce targets.
     targets: Vec<PeerId>,
+    /// A LazyForward frame may arrive before membership supplies any other
+    /// topic peer. Its still-pending ID also needs an offer to newly added
+    /// eager peers; ordinary deferred-send entries do not.
+    cold_relay: bool,
     /// Targets that already pulled this id via IWANT before the flush
     /// consumed the entry — excluded from re-advertising.
     served: Vec<PeerId>,
@@ -4228,11 +4232,12 @@ impl TopicState {
     /// direct IHAVE announce targets for `msg_id`. Same bounding policy
     /// as `queue_stranded_ihave`: at most `MAX_IHAVE_BATCH_SIZE`
     /// outstanding entries, oldest evicted under sustained pressure.
-    fn queue_lazy_withheld(&mut self, msg_id: MessageIdType, peers: &[PeerId]) {
-        if peers.is_empty() {
+    fn queue_lazy_withheld(&mut self, msg_id: MessageIdType, peers: &[PeerId], cold_relay: bool) {
+        if peers.is_empty() && !cold_relay {
             return;
         }
         if let Some(entry) = self.lazy_withheld.iter_mut().find(|e| e.msg_id == msg_id) {
+            entry.cold_relay |= cold_relay;
             for peer in peers.iter().copied() {
                 if !entry.targets.contains(&peer) {
                     entry.targets.push(peer);
@@ -4247,8 +4252,39 @@ impl TopicState {
         self.lazy_withheld.push(LazyWithheldEntry {
             msg_id,
             targets: peers.to_vec(),
+            cold_relay,
             served: Vec::new(),
         });
+    }
+
+    /// Give only still-pending LazyForward IDs to peers first seen after the
+    /// frame arrived. No cache scan or full-body replay: the ordinary IHAVE
+    /// pull path still decides whether the cached frame is serveable.
+    fn offer_pending_cold_relay_to_new_eager(&mut self, peers: &[PeerId]) {
+        if peers.is_empty() || self.lazy_withheld.is_empty() {
+            return;
+        }
+        let pending: HashSet<MessageIdType> = self.pending_ihave.iter().copied().collect();
+        for entry in &mut self.lazy_withheld {
+            if !entry.cold_relay
+                || !pending.contains(&entry.msg_id)
+                || self
+                    .message_cache
+                    .lru
+                    .peek(&entry.msg_id)
+                    .is_none_or(|cached| cached.message.dropped)
+            {
+                continue;
+            }
+            // A demoted eager peer already receives the ordinary lazy IHAVE;
+            // disconnected peers must not accumulate in the bounded entry.
+            entry.targets.retain(|peer| self.eager_peers.contains(peer));
+            for peer in peers {
+                if !entry.targets.contains(peer) && !entry.served.contains(peer) {
+                    entry.targets.push(*peer);
+                }
+            }
+        }
     }
 
     /// Record that `peer` pulled `msg_id` via IWANT before the flush
@@ -8511,7 +8547,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 if let Ok((message, _)) = postcard::take_from_bytes::<GossipMessage>(&bytes) {
                     let mut topics = self.topics.write_topic(&topic).await;
                     if let Some(state) = topics.get_mut(&topic) {
-                        state.queue_lazy_withheld(message.header.msg_id, &deferred);
+                        state.queue_lazy_withheld(message.header.msg_id, &deferred, false);
                         self.stage_stats
                             .record_lazy_ihave_withheld_peers(deferred.len());
                     }
@@ -8603,7 +8639,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 if let Ok((message, _)) = postcard::take_from_bytes::<GossipMessage>(&bytes) {
                     let mut topics = self.topics.write_topic(&topic).await;
                     if let Some(state) = topics.get_mut(&topic) {
-                        state.queue_lazy_withheld(message.header.msg_id, &deferred);
+                        state.queue_lazy_withheld(message.header.msg_id, &deferred, false);
                         self.stage_stats
                             .record_lazy_ihave_withheld_peers(deferred.len());
                     }
@@ -9603,8 +9639,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // keeps the pull path — the withheld peers become direct IHAVE
         // announce targets, so they still learn the msg_id within one
         // flush and can pull the cached copy via IWANT.
-        if !withheld_eager.is_empty() {
-            state.queue_lazy_withheld(msg_id, &withheld_eager);
+        if validator_action == ValidationAction::LazyForward {
+            state.queue_lazy_withheld(msg_id, &withheld_eager, true);
             self.stage_stats
                 .record_lazy_ihave_withheld_peers(withheld_eager.len());
         }
@@ -12209,6 +12245,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .chain(state.lazy_peers.iter())
             .copied()
             .collect();
+        let previously_eager = state.eager_peers.clone();
 
         // Remove stale peers (no longer connected) from both sets.
         state.eager_peers.retain(|p| connected_set.contains(p));
@@ -12251,6 +12288,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let (maintained_pruned, maintained_grafted) = state.maintain_degree_at(now);
         pruned += maintained_pruned;
         grafted += maintained_grafted;
+        let new_eager: Vec<PeerId> = connected_set
+            .difference(&previously_eager)
+            .filter(|peer| state.eager_peers.contains(*peer))
+            .copied()
+            .collect();
+        state.offer_pending_cold_relay_to_new_eager(&new_eager);
         let preferred_is_eager = preferred.is_none_or(|peer| state.eager_peers.contains(&peer));
         if pruned > 0 {
             self.stage_stats.record_prunes(pruned);
@@ -28094,6 +28137,149 @@ mod tests {
             assert!(
                 b_after.outbound_by_kind["eager"].bytes > b_before.outbound_by_kind["eager"].bytes,
                 "the IWANT serve is the single EAGER send B made"
+            );
+        }
+
+        /// A relay may first learn an unconsumed topic from A's EAGER before
+        /// its membership refresh adds C. C must still get an ID-only offer
+        /// even though degree maintenance promotes it to EAGER.
+        #[tokio::test]
+        async fn cold_lazy_forward_offers_to_new_eager_peer() {
+            let topic = TopicId::new([0xB8; 32]);
+            let a = test_peer_id(10);
+            let b = test_peer_id(11);
+            let c = test_peer_id(12);
+            let transport = RecordingTransport::new(b);
+            transport.set_connected_peer_ids(vec![a, c]);
+            let relay = PlumtreePubSub::new_with_task_control(
+                b,
+                Arc::clone(&transport),
+                test_signing_key(),
+                false,
+            );
+            relay.set_topic_validator(topic, Arc::new(|_, _| ValidationAction::LazyForward));
+
+            let payload = Bytes::from_static(b"cold-relay-first-frame");
+            let msg_id = relay.calculate_msg_id(&topic, &payload);
+            let mut header = MessageHeader {
+                version: 1,
+                payload_hash: None,
+                topic,
+                msg_id,
+                kind: MessageKind::Eager,
+                hop: 0,
+                ttl: 10,
+            };
+            header.seal_payload_hash(Some(payload.as_ref()));
+            let signing_key = test_signing_key();
+            let signature = signing_key
+                .sign(&postcard::to_stdvec(&header).expect("serialize header"))
+                .expect("sign header");
+            relay
+                .handle_eager(
+                    a,
+                    topic,
+                    GossipMessage {
+                        header,
+                        payload: Some(payload),
+                        signature,
+                        public_key: signing_key.public_key().to_vec(),
+                    },
+                )
+                .await
+                .expect("relay admits first EAGER");
+
+            let mut rotation = LateOfferRotation::default();
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &relay.topics,
+                &relay.transport,
+                &relay.signing_key,
+                &relay.stage_stats,
+                &relay.outbound_budgets,
+                IhaveFlushEnv {
+                    send_path: &relay.send_path_context(),
+                    egress_limiter: &relay.egress_limiter,
+                    late_rotation: &mut rotation,
+                },
+            )
+            .await;
+            assert!(
+                transport.sent_frames().is_empty(),
+                "no topic peer was known yet"
+            );
+            {
+                let topics = relay.topics.read_topic(&topic).await;
+                let state = topics.get(&topic).expect("topic");
+                assert!(state.pending_ihave.contains(&msg_id));
+                let entry = state
+                    .lazy_withheld
+                    .iter()
+                    .find(|entry| entry.msg_id == msg_id)
+                    .expect("cold LazyForward custody");
+                assert!(entry.cold_relay);
+                assert!(entry.targets.is_empty());
+            }
+
+            relay.set_topic_peers(topic, vec![a, c]).await;
+            {
+                let topics = relay.topics.read_topic(&topic).await;
+                let state = topics.get(&topic).expect("topic");
+                assert!(
+                    state.eager_peers.contains(&c),
+                    "degree maintenance promotes C"
+                );
+                assert!(!state.lazy_peers.contains(&c));
+                assert!(
+                    state.late_local_offers.is_empty(),
+                    "relayed payload is not local history"
+                );
+            }
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &relay.topics,
+                &relay.transport,
+                &relay.signing_key,
+                &relay.stage_stats,
+                &relay.outbound_budgets,
+                IhaveFlushEnv {
+                    send_path: &relay.send_path_context(),
+                    egress_limiter: &relay.egress_limiter,
+                    late_rotation: &mut rotation,
+                },
+            )
+            .await;
+            let offers = transport.sent_messages_of_kind_to(c, MessageKind::IHave);
+            assert_eq!(
+                offers.len(),
+                1,
+                "new eager peer needs an ID-only cold-relay offer"
+            );
+            let ids: Vec<MessageIdType> =
+                postcard::from_bytes(offers[0].payload.as_deref().expect("IHAVE IDs"))
+                    .expect("decode IHAVE IDs");
+            assert_eq!(ids, vec![msg_id]);
+            assert!(transport
+                .sent_messages_of_kind_to(c, MessageKind::Eager)
+                .is_empty());
+            relay.set_topic_peers(topic, vec![a, c]).await;
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &relay.topics,
+                &relay.transport,
+                &relay.signing_key,
+                &relay.stage_stats,
+                &relay.outbound_budgets,
+                IhaveFlushEnv {
+                    send_path: &relay.send_path_context(),
+                    egress_limiter: &relay.egress_limiter,
+                    late_rotation: &mut rotation,
+                },
+            )
+            .await;
+            assert_eq!(
+                transport
+                    .sent_messages_of_kind_to(c, MessageKind::IHave)
+                    .len(),
+                1,
+                "unchanged membership must not re-offer consumed cold history"
             );
         }
 

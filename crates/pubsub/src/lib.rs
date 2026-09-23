@@ -7099,6 +7099,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         snapshot
     }
 
+    /// Snapshot only the bounded per-topic outbound meters.
+    ///
+    /// This is the same map included in [`Self::stage_stats`], without
+    /// collecting peer scores, cache state, and admission diagnostics for
+    /// callers that sample outbound demand frequently. It includes every
+    /// metered topic, whether or not the caller currently subscribes to it.
+    pub fn outbound_by_topic_stats(&self) -> BTreeMap<String, OutboundTopicMeterSnapshot> {
+        self.stage_stats.outbound_by_topic.snapshot()
+    }
+
     /// X0X-0074: registry + telemetry surface for substrate-level
     /// admission control. Applications register topic priorities on this
     /// handle at startup; counters and per-peer bulk-queue depths are
@@ -13852,6 +13862,11 @@ mod tests {
         assert!(
             topic_meter.eager.msgs >= 1 && topic_meter.eager.bytes > 0,
             "per-topic eager meter must move, got {topic_meter:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(pubsub.outbound_by_topic_stats()).expect("typed snapshot"),
+            serde_json::to_value(&snapshot.outbound_by_topic).expect("full snapshot topic meters"),
+            "outbound-only accessor must match the existing diagnostics map"
         );
         assert_eq!(
             snapshot.outbound_publish_origin.local_msgs, 1,

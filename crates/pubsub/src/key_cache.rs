@@ -332,9 +332,10 @@ fn validate_control(control: &Control) -> Result<()> {
 /// Process-local counters for outer-key wire compression and recovery.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct KeyCacheSnapshot {
-    /// Full-key frames submitted for outbound transport.
+    /// Ordinary legacy or v3 full-key frames submitted for outbound transport;
+    /// a counted submission can still fail during the transport send.
     pub full_out_frames: u64,
-    /// Serialized bytes in outbound full-key frames.
+    /// Final serialized bytes in outbound full-key frame submissions.
     pub full_out_bytes: u64,
     /// Reference frames submitted for outbound transport.
     pub ref_out_frames: u64,

@@ -752,12 +752,14 @@ impl LegacyMigration {
         self: &Arc<Self>,
         transport: Arc<T>,
         signing_key: Arc<MlDsaKeyPair>,
+        key_cache: Option<Arc<Mutex<crate::key_cache::KeyCache>>>,
         peer: PeerId,
         stream: GossipStreamType,
         bytes: Bytes,
     ) -> Result<()> {
         let (header, _) = postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(&bytes)?;
         if !self.registered(header.topic) {
+            record_legacy_full_outbound(key_cache.as_ref(), &bytes);
             return transport.send_to_peer(peer, stream, bytes).await;
         }
         let (message, trailing): (GossipMessage, _) = postcard::take_from_bytes(&bytes)?;
@@ -782,6 +784,7 @@ impl LegacyMigration {
         let wire_digest = *blake3::hash(&bytes).as_bytes();
         if legacy {
             let policy = Arc::clone(self);
+            let cache = key_cache.clone();
             transport
                 .send_to_peer_guarded(
                     peer,
@@ -816,6 +819,8 @@ impl LegacyMigration {
                         let out = variant(&mut s, &message, 1, &signing_key, wire_digest)?;
                         let kind = kind_index(message.header.kind)?;
                         s.stats.legacy_egress[kind] = s.stats.legacy_egress[kind].saturating_add(1);
+                        drop(s);
+                        record_legacy_full_outbound(cache.as_ref(), &out);
                         Ok(out)
                     }),
                 )
@@ -831,8 +836,10 @@ impl LegacyMigration {
                         .map_err(|_| anyhow!("migration policy poisoned"))?;
                     variant(&mut s, &message, 2, &signing_key, wire_digest)?
                 };
+                record_legacy_full_outbound(key_cache.as_ref(), &bytes);
                 transport.send_to_peer(peer, stream, bytes).await
             } else {
+                record_legacy_full_outbound(key_cache.as_ref(), &bytes);
                 transport.send_to_peer(peer, stream, bytes).await
             }
         }
@@ -851,6 +858,22 @@ impl LegacyMigration {
             control_work(message)?;
         }
         Ok(())
+    }
+}
+
+/// Mirror inbound legacy Full accounting at the final transport boundary.
+/// Only structurally valid, non-reserved frames count; inspection never changes
+/// admission, and the counter records a submitted attempt, not delivery.
+fn record_legacy_full_outbound(
+    cache: Option<&Arc<Mutex<crate::key_cache::KeyCache>>>,
+    bytes: &Bytes,
+) {
+    let Some(cache) = cache else { return };
+    if !matches!(crate::key_cache::inspect_header(bytes), Ok((_, false))) {
+        return;
+    }
+    if let Ok(mut state) = cache.lock() {
+        state.record_outbound(false, bytes.len());
     }
 }
 
@@ -1146,12 +1169,14 @@ impl<T: GossipTransport + 'static> GossipTransport for PolicyTransport<T> {
             .topics
             .is_empty();
         if !enabled {
+            record_legacy_full_outbound(self.key_cache.as_ref(), &bytes);
             return self.inner.send_to_peer(peer, stream, bytes).await;
         }
         self.migration
             .send(
                 Arc::clone(&self.inner),
                 Arc::clone(&self.key),
+                self.key_cache.clone(),
                 peer,
                 stream,
                 bytes,

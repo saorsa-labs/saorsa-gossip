@@ -40,10 +40,9 @@ anyhow = "1.0"
 saorsa-pqc = "0.5"
 
 # QUIC transport
-# Temporary feature pin for receive-generation (#272), guarded-send (#298),
-# and their reviewed composition with ant-quic's security fixes (#299).
-# Replace with the registry release before production adoption.
-ant-quic = { git = "https://github.com/saorsa-labs/ant-quic.git", rev = "72822d2d271af9ebe23fc49cdfd961d31b70c6be" }
+# 0.27.53: receive-generation (#272), guarded-send (#298), fatal-send driver
+# retirement (#300), ENOBUFS-transient and Rustls security fixes.
+ant-quic = "0.27.53"
 
 # Shared transport layer
 

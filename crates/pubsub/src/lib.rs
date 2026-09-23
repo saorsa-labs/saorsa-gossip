@@ -9059,6 +9059,29 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             None
         };
 
+        // Serialize ONCE (the wire bytes are identical for every peer). The
+        // previous version awaited each `send_to_peer` sequentially, which
+        // pinned the dispatcher behind the slowest peer in the EAGER set
+        // (X0X-0006 measured this at ~73% of dispatcher wall-clock). Now the
+        // sends run concurrently with a per-peer `PER_PEER_REPUBLISH_TIMEOUT`
+        // budget so a single stuck peer cannot pin the whole loop. The
+        // 2026-04-25 OOM-on-spawn issue stays addressed: this is a bounded
+        // concurrent send (one task per peer that completes within the
+        // budget), not a fire-and-forget spawn that can accumulate.
+        let bytes: Bytes = match leaf_wire_bytes {
+            Some(bytes) => bytes,
+            None => postcard::to_stdvec(&_message)
+                .map(Bytes::from)
+                .map_err(|error| {
+                    warn!(msg_id = ?msg_id, "EAGER serialize failed: {error}");
+                    error
+                })?,
+        };
+        // x0x #613: retain the serialized wire bytes for the bounded
+        // single-shot stranded retry (below). A `Bytes` clone is a
+        // refcount bump; it is only consumed when the fan-out strands.
+        let retry_bytes = bytes.clone();
+
         let mut topics = self.topics.write_topic(&topic).await;
         let state = topics
             .entry(topic)
@@ -9089,30 +9112,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         // Send EAGER to eager_peers
         let eager_peers: Vec<PeerId> = state.eager_peers.iter().copied().collect();
-        drop(topics); // Release lock before network I/O
 
-        // Serialize ONCE (the wire bytes are identical for every peer). The
-        // previous version awaited each `send_to_peer` sequentially, which
-        // pinned the dispatcher behind the slowest peer in the EAGER set
-        // (X0X-0006 measured this at ~73% of dispatcher wall-clock). Now the
-        // sends run concurrently with a per-peer `PER_PEER_REPUBLISH_TIMEOUT`
-        // budget so a single stuck peer cannot pin the whole loop. The
-        // 2026-04-25 OOM-on-spawn issue stays addressed: this is a bounded
-        // concurrent send (one task per peer that completes within the
-        // budget), not a fire-and-forget spawn that can accumulate.
-        let bytes: Bytes = match leaf_wire_bytes {
-            Some(bytes) => bytes,
-            None => postcard::to_stdvec(&_message)
-                .map(Bytes::from)
-                .map_err(|error| {
-                    warn!(msg_id = ?msg_id, "EAGER serialize failed: {error}");
-                    error
-                })?,
-        };
-        // x0x #613: retain the serialized wire bytes for the bounded
-        // single-shot stranded retry (below). A `Bytes` clone is a
-        // refcount bump; it is only consumed when the fan-out strands.
-        let retry_bytes = bytes.clone();
+        // Local subscribers receive only after admission, serialization,
+        // cache, and replay state are ready, but before remote send awaits.
+        // Synchronous channel sends add no await to the topic lock hold.
+        debug!(
+            target: "sg.payload.trace",
+            stage = "publish_self_deliver",
+            msg_id = %msg_id_hex8(&msg_id),
+            len = payload.len(),
+            zero_tail = payload_zero_tail(&payload),
+        );
+        let data = (self.peer_id, payload);
+        state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
+
+        drop(topics); // Release lock before network I/O
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Sending EAGER fan-out");
         // x0x #380: origin metering — this fan-out carries a LOCALLY
         // originated publish (the rate-cap baseline). Instrumentation only.
@@ -9208,17 +9222,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 state.queue_stranded_ihave(msg_id, &attempted_peers);
                 self.stage_stats.record_stranded_publish_ihave_queued();
             }
-
-            // Deliver to local subscribers
-            debug!(
-                target: "sg.payload.trace",
-                stage = "publish_self_deliver",
-                msg_id = %msg_id_hex8(&msg_id),
-                len = payload.len(),
-                zero_tail = payload_zero_tail(&payload),
-            );
-            let data = (self.peer_id, payload);
-            state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
         }
 
         // x0x #613 mitigation 2: bounded retry. After two full per-peer
@@ -17991,6 +17994,207 @@ mod tests {
         assert!(received.is_ok());
         let (_, payload) = received.unwrap().unwrap();
         assert_eq!(payload, data);
+    }
+
+    #[tokio::test]
+    async fn local_publish_delivers_to_subscriber_while_eager_send_is_parked() {
+        // SG 802 regression: local subscriber delivery must not wait for
+        // the remote EAGER fan-out. The eager send parks inside the
+        // transport (release semaphore, zero permits), so the publish
+        // future cannot pass the fan-out join — yet the local subscriber
+        // must already hold the exact payload. Under the pre-fix ordering
+        // (deliver after `tokio::join!`) the bounded recv below times out,
+        // so this test fails on that mutation.
+        let local = test_peer_id(1);
+        let eager = test_peer_id(2);
+        let (transport, mut started_rx) = BlockingTransport::new(local);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x80; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .entry(topic)
+                .or_insert_with(TopicState::new)
+                .eager_peers
+                .insert(eager);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([eager])),
+        );
+        let mut subscriber = pubsub.subscribe_ready(topic).await;
+
+        let publishing = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                pubsub
+                    .publish_local_with_fanout(topic, Bytes::from_static(b"local-first"))
+                    .await
+            })
+        };
+
+        // Deterministic barrier: the eager send has entered the transport
+        // and is parked on the release semaphore; the publish future cannot
+        // progress past the fan-out join.
+        let _record = tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("eager send enters the transport")
+            .expect("started channel stays open");
+        assert!(
+            !publishing.is_finished(),
+            "publish must still be parked behind the remote send"
+        );
+
+        // The local subscriber is served BEFORE the parked remote send
+        // resolves.
+        let (origin, payload) = tokio::time::timeout(Duration::from_millis(200), subscriber.recv())
+            .await
+            .expect("local delivery must not wait for the parked remote peer")
+            .expect("subscriber channel stays open");
+        assert_eq!(origin, local, "local origin is the publisher itself");
+        assert_eq!(payload, Bytes::from_static(b"local-first"));
+
+        // Release the parked peer: the existing fan-out accounting contract
+        // is unchanged by the earlier local delivery.
+        transport.release_sends(1);
+        let counts = tokio::time::timeout(Duration::from_secs(5), publishing)
+            .await
+            .expect("publish completes after the peer is released")
+            .expect("publish task joins")
+            .expect("publish succeeds");
+        assert_eq!(
+            (counts.candidates, counts.attempted, counts.succeeded),
+            (1, 1, 1),
+            "ordinary fan-out accounting is unchanged by early local delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_publish_delivers_to_subscriber_while_targeted_send_is_parked() {
+        // Same guarantee for the targeted leg of publish_local_with_target:
+        // local subscribers are served before the targeted send settles,
+        // and the target outcome contract survives the reordering.
+        let local = test_peer_id(1);
+        let target = test_peer_id(2);
+        let (transport, mut started_rx) = BlockingTransport::new(local);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let topic = TopicId::new([0x82; 32]);
+        // No eager peers: the targeted send is the only remote leg, so only
+        // the target itself can be holding the pre-fix join open.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics.entry(topic).or_insert_with(TopicState::new);
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([target])),
+        );
+        let mut subscriber = pubsub.subscribe_ready(topic).await;
+
+        let publishing = {
+            let pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                pubsub
+                    .publish_local_with_target(
+                        topic,
+                        Bytes::from_static(b"targeted-local-first"),
+                        target,
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+
+        let _record = tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("targeted send enters the transport")
+            .expect("started channel stays open");
+        assert!(
+            !publishing.is_finished(),
+            "publish must still be parked behind the targeted send"
+        );
+
+        let (origin, payload) = tokio::time::timeout(Duration::from_millis(200), subscriber.recv())
+            .await
+            .expect("local delivery must not wait for the parked targeted send")
+            .expect("subscriber channel stays open");
+        assert_eq!(origin, local, "local origin is the publisher itself");
+        assert_eq!(payload, Bytes::from_static(b"targeted-local-first"));
+
+        transport.release_sends(1);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), publishing)
+            .await
+            .expect("publish completes after the target is released")
+            .expect("publish task joins")
+            .expect("publish succeeds");
+        assert_eq!(
+            outcome.target,
+            TargetedPublishOutcome::Sent,
+            "targeted outcome contract is unchanged"
+        );
+        assert_eq!(
+            outcome.fanout.candidates, 0,
+            "no eager peers were configured for this topic"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_local_publish_delivers_nothing_to_subscribers() {
+        // Negative control for the early-delivery ordering: admission
+        // (verify_inner) still runs BEFORE local delivery, so a rejected
+        // publish returns Err, never touches the subscriber channels and
+        // never reaches the transport.
+        let local = test_peer_id(1);
+        let (transport, _started_rx) = BlockingTransport::new(local);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        ));
+        let author = test_peer_id(3);
+        let policy = crate::compat::SignedKvTopic::new(
+            "sg802-kv-delta",
+            crate::compat::SignedKvFamily::Delta,
+            1,
+            [author],
+        )
+        .expect("signed-KV topic policy constructs");
+        let topic = policy.topic();
+        pubsub
+            .legacy_migration()
+            .register(policy)
+            .expect("policy registers");
+        let mut subscriber = pubsub.subscribe_ready(topic).await;
+
+        // The payload is not a topic-bound V3 inner envelope, so
+        // verify_inner rejects the publish outright.
+        let rejected = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"not-a-v3-envelope"))
+            .await;
+        assert!(
+            rejected.is_err(),
+            "non-V3 payload on a signed-KV topic must be rejected"
+        );
+        assert!(
+            subscriber.try_recv().is_err(),
+            "a rejected publish must not deliver to local subscribers"
+        );
+        assert_eq!(
+            transport.send_count(),
+            0,
+            "a rejected publish must not reach the transport"
+        );
     }
 
     #[tokio::test]

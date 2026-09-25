@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.86] - 2026-09-25
+
+### Added
+
+- **pubsub: per-topic preferred eager peer sets (#101, for x0x#890).** A new
+  atomic API sets up to 8 preferred eager peers per topic, deduplicated and
+  replaced on each call. The full connected lazy plane is kept. Preferred peers
+  are protected from lowest-score eviction through periodic maintenance and
+  lazy-shedding rebalance, and from Plumtree duplicate-driven demotion. The
+  health/cooling veto stays authoritative. The topic-local eager ceiling is
+  max(configured, retained preferred) and is restored when the set is cleared.
+  Topics without a preferred set behave as before. The existing single-peer API
+  now keeps its preference instead of applying it once.
+
 ## [0.5.85] - 2026-09-22
 
 ### Added

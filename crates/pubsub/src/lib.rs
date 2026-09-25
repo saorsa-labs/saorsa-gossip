@@ -156,6 +156,8 @@ const ANTI_ENTROPY_INTERVAL_SECS: u64 = 30;
 /// Target eager peer degree (6-8)
 const MIN_EAGER_DEGREE: usize = 6;
 const MAX_EAGER_DEGREE: usize = 12;
+/// Maximum number of preferred eager peers supplied by a topic owner.
+const MAX_PREFERRED_EAGER_PEERS: usize = 8;
 
 /// Per-peer budget for an EAGER republish / IHAVE flush send.
 ///
@@ -3818,7 +3820,12 @@ struct IhaveFlushWork {
 struct TopicState {
     /// Spanning tree peers (forward EAGER)
     eager_peers: HashSet<PeerId>,
-    /// Instance-configured maximum; always nonzero (zero selects stock bounds).
+    /// Ordered preference for eligible connected eager peers. This does not
+    /// own membership: every connected peer remains in eager or lazy.
+    preferred_eager_peers: Vec<PeerId>,
+    /// Instance ceiling restored when this topic's preferences are cleared.
+    configured_max_eager_degree: usize,
+    /// Effective ceiling, raised only for this topic's preferred peers.
     max_eager_degree: usize,
     /// Stranded-publish self-IHAVE state (x0x #613): message ids whose
     /// local EAGER fan-out was attempted at ≥1 peer but succeeded at none.
@@ -3890,6 +3897,12 @@ struct TopicState {
 }
 
 impl TopicState {
+    fn refresh_preferred_eager_ceiling(&mut self) {
+        self.max_eager_degree = self
+            .configured_max_eager_degree
+            .max(self.preferred_eager_peers.len());
+    }
+
     fn prune_deferred_eager_replies(&mut self, now: Instant) {
         self.message_cache.prune_expired_at(now);
         let cache = &self.message_cache;
@@ -3992,6 +4005,8 @@ impl TopicState {
     fn with_cache_config(cache_config: PubSubCacheConfig) -> Self {
         Self {
             eager_peers: HashSet::new(),
+            preferred_eager_peers: Vec::new(),
+            configured_max_eager_degree: MAX_EAGER_DEGREE,
             max_eager_degree: MAX_EAGER_DEGREE,
             lazy_peers: HashSet::new(),
             message_cache: BoundedMessageCache::new(
@@ -4840,7 +4855,11 @@ impl TopicState {
             // All existing eager peers are suppressed. Make room before rescue
             // so even this last-delivery-path promotion respects the ceiling.
             if self.eager_peers.len() >= self.max_eager_degree {
-                if let Some((worst, _)) = self.scored_eager_peers_at(now).first().copied() {
+                if let Some((worst, _)) = self
+                    .scored_eager_peers_at(now)
+                    .into_iter()
+                    .find(|(peer, _)| !self.is_healthy_preferred_at(*peer, now))
+                {
                     self.prune_peer(worst);
                 }
             }
@@ -5334,7 +5353,11 @@ impl TopicState {
 
         let mut pruned = 0;
         if self.eager_peers.len() >= self.max_eager_degree {
-            let Some((displaced, _)) = self.scored_eager_peers_at(now).first().copied() else {
+            let Some((displaced, _)) = self
+                .scored_eager_peers_at(now)
+                .into_iter()
+                .find(|(candidate, _)| !self.is_healthy_preferred_at(*candidate, now))
+            else {
                 return (0, 0);
             };
             if self.prune_peer(displaced) {
@@ -5356,6 +5379,27 @@ impl TopicState {
         }
     }
 
+    fn is_healthy_preferred_at(&self, peer: PeerId, now: Instant) -> bool {
+        self.preferred_eager_peers.contains(&peer) && self.is_score_eligible_for_eager_at(peer, now)
+    }
+
+    fn apply_preferred_eager_at(&mut self, now: Instant) -> (usize, usize) {
+        let mut pruned = 0;
+        let mut grafted = 0;
+        for peer in self.preferred_eager_peers.clone() {
+            if self.eager_peers.contains(&peer) && !self.is_score_eligible_for_eager_at(peer, now) {
+                if self.prune_peer(peer) {
+                    pruned += 1;
+                }
+            } else {
+                let (peer_pruned, peer_grafted) = self.prefer_eager_peer_at(peer, now);
+                pruned += peer_pruned;
+                grafted += peer_grafted;
+            }
+        }
+        (pruned, grafted)
+    }
+
     fn add_new_peer_lazy(&mut self, peer: PeerId) -> bool {
         if self.eager_peers.contains(&peer) || self.lazy_peers.contains(&peer) {
             return false;
@@ -5375,18 +5419,27 @@ impl TopicState {
     }
 
     fn maintain_degree_at(&mut self, now: Instant) -> (usize, usize) {
-        let mut pruned = 0;
-        let mut grafted = 0;
+        let (mut pruned, mut grafted) = self.apply_preferred_eager_at(now);
 
         if self.eager_peers.len() > self.max_eager_degree {
             // Demote lowest-scoring eager peers.
             let to_demote = self.eager_peers.len() - self.max_eager_degree;
-            let peers: Vec<PeerId> = self
+            let mut peers: Vec<PeerId> = self
                 .scored_eager_peers_at(now)
                 .iter()
+                .filter(|(peer, _)| !self.is_healthy_preferred_at(*peer, now))
                 .take(to_demote)
                 .map(|(p, _)| *p)
                 .collect();
+            if peers.len() < to_demote {
+                peers.extend(
+                    self.scored_eager_peers_at(now)
+                        .into_iter()
+                        .filter(|(peer, _)| self.is_healthy_preferred_at(*peer, now))
+                        .take(to_demote - peers.len())
+                        .map(|(peer, _)| peer),
+                );
+            }
             for peer in peers {
                 if self.prune_peer(peer) {
                     pruned += 1;
@@ -5402,6 +5455,7 @@ impl TopicState {
             let scored_lazy = self.scored_lazy_peers_at(now);
             let mut peers: Vec<PeerId> = scored_lazy
                 .iter()
+                .filter(|(peer, _)| !self.preferred_eager_peers.contains(peer))
                 .filter(|(_, score)| *score >= PEER_SCORE_EAGER_MIN)
                 .take(to_promote)
                 .map(|(p, _)| *p)
@@ -5409,6 +5463,7 @@ impl TopicState {
             if peers.len() < to_promote {
                 for (peer, _) in scored_lazy
                     .iter()
+                    .filter(|(peer, _)| !self.preferred_eager_peers.contains(peer))
                     .filter(|(_, score)| *score < PEER_SCORE_EAGER_MIN)
                 {
                     peers.push(*peer);
@@ -5447,7 +5502,12 @@ impl TopicState {
         }
         self.last_opportunistic_graft = Some(now);
 
-        let mut scored_eager = self.scored_eager_peers_at(now).into_iter();
+        let scored_eager: Vec<_> = self
+            .scored_eager_peers_at(now)
+            .into_iter()
+            .filter(|(peer, _)| !self.is_healthy_preferred_at(*peer, now))
+            .collect();
+        let mut scored_eager = scored_eager.into_iter();
         let mut scored_lazy = self
             .scored_lazy_peers_at(now)
             .into_iter()
@@ -5915,7 +5975,8 @@ impl ShardedTopicMap {
     /// Caller holds the topic shard lock so creation serializes with config updates.
     fn new_topic_state(&self, cache_config: PubSubCacheConfig) -> TopicState {
         let mut state = TopicState::with_cache_config(cache_config);
-        state.max_eager_degree = self.max_eager_degree.load(Ordering::Relaxed);
+        state.configured_max_eager_degree = self.max_eager_degree.load(Ordering::Relaxed);
+        state.refresh_preferred_eager_ceiling();
         state
     }
 
@@ -7070,7 +7131,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let now = Instant::now();
         for shard in shards.iter_mut() {
             for state in shard.values_mut() {
-                state.max_eager_degree = maximum;
+                state.configured_max_eager_degree = maximum;
+                state.refresh_preferred_eager_ceiling();
                 let (pruned, grafted) = state.maintain_degree_at(now);
                 self.stage_stats.record_prunes(pruned);
                 self.stage_stats.record_grafts(grafted);
@@ -9407,14 +9469,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         //   never seed an entry, and it cannot suppress a genuine message
         //   (the genuine copy is already cached and delivered).
         // - Every effect below is keyed on `from`, which the transport
-        //   has already authenticated, and only penalises that sender:
-        //   `prune_peer(from)` demotes the peer that claimed a msg_id we
-        //   already hold. An attacker cannot use this to prune a
-        //   *legitimate* eager peer — the prune lands on whoever sent the
-        //   frame. A legitimate peer relaying a genuine duplicate hits
-        //   exactly the prune it hits today on the verified path (a
-        //   duplicate's outer signature is the publisher's, not the
-        //   relay's, so verification never identified the relay anyway).
+        //   has already authenticated. A duplicate normally demotes its
+        //   sender, but a healthy preferred eager peer retains its role;
+        //   cooling or score veto removes that protection. An attacker
+        //   cannot use this path to prune a different legitimate peer.
         // - Peer-benefiting bookkeeping is withheld from the unverified
         //   frame: `record_inbound_peer_activity_for_state` (recency
         //   score, mesh-side cooling clear, send-side suppression clear)
@@ -9456,8 +9514,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     .filter(|state| state.has_message(&msg_id))
                 {
                     state.touch();
-                    // PRUNE: move sender from eager to lazy
-                    if state.prune_peer(from) {
+                    // Keep healthy preferred eager peers stable across
+                    // duplicate paths; score/cooling veto remains decisive.
+                    if !state.is_healthy_preferred_at(from, Instant::now())
+                        && state.prune_peer(from)
+                    {
                         self.stage_stats.record_prune();
                         // X0X-0071 P3b: a prune bumps the (topic, peer)
                         // delivery deficit — sticky across a later re-graft.
@@ -9509,8 +9570,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 Instant::now(),
                 message.header.kind,
             );
-            // PRUNE: move sender from eager to lazy
-            if state.prune_peer(from) {
+            // A healthy preferred sender stays eager on duplicate receipt.
+            if !state.is_healthy_preferred_at(from, Instant::now()) && state.prune_peer(from) {
                 self.stage_stats.record_prune();
                 // X0X-0071 P3b: a prune bumps the (topic, peer) delivery
                 // deficit — sticky across a later re-graft.
@@ -12235,6 +12296,44 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .await;
     }
 
+    /// Atomically replace this topic's preferred eager peers, retaining at
+    /// most eight distinct identities in caller order. Preferences only
+    /// choose among existing connected members; they never replace the mesh
+    /// membership supplied by [`Self::set_topic_peers`]. A cooling or
+    /// score-ineligible peer remains lazy until it recovers. An empty slice
+    /// removes all preference protection and restores the configured degree
+    /// ceiling. The effective ceiling rises only for this topic to fit the
+    /// retained preferences. Returns the retained count, which may exceed
+    /// the number currently eager when peers are disconnected or vetoed.
+    pub async fn set_topic_preferred_eager_set(&self, topic: TopicId, peers: &[PeerId]) -> usize {
+        let mut topics = self.topics.write_topic(&topic).await;
+        let state = topics
+            .entry(topic)
+            .or_insert_with(|| self.new_topic_state());
+        state.preferred_eager_peers.clear();
+        for peer in peers {
+            if state.preferred_eager_peers.len() >= MAX_PREFERRED_EAGER_PEERS {
+                break;
+            }
+            if !state.preferred_eager_peers.contains(peer) {
+                state.preferred_eager_peers.push(*peer);
+            }
+        }
+        state.refresh_preferred_eager_ceiling();
+        let now = Instant::now();
+        let previously_eager = state.eager_peers.clone();
+        let (pruned, grafted) = state.maintain_degree_at(now);
+        let new_eager: Vec<_> = state
+            .eager_peers
+            .difference(&previously_eager)
+            .copied()
+            .collect();
+        state.offer_pending_cold_relay_to_new_eager(&new_eager);
+        self.stage_stats.record_prunes(pruned);
+        self.stage_stats.record_grafts(grafted);
+        state.preferred_eager_peers.len()
+    }
+
     /// Replace a topic's connected membership and prefer one eligible peer as
     /// eager without removing any other connected peer.
     ///
@@ -12243,7 +12342,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// state are retained for every identity still connected. If `preferred`
     /// is connected, lazy, and graft-eligible, it atomically replaces the
     /// lowest-scoring eager peer when the configured eager ceiling is full.
-    /// Cooling or otherwise ineligible preferred peers remain lazy.
+    /// Cooling or otherwise ineligible preferred peers remain lazy. `Some`
+    /// replaces the persistent preferred set with this one peer; `None`
+    /// preserves the current set during a normal membership refresh.
     /// Returns `true` when no preference was requested or it ended eager.
     pub async fn set_topic_peers_with_preferred_eager(
         &self,
@@ -12302,16 +12403,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         }
 
-        let mut pruned = 0;
-        let mut grafted = 0;
-        if let Some(preferred) = preferred.filter(|peer| connected_set.contains(peer)) {
-            let (preferred_pruned, preferred_grafted) = state.prefer_eager_peer_at(preferred, now);
-            pruned += preferred_pruned;
-            grafted += preferred_grafted;
+        if let Some(preferred) = preferred {
+            state.preferred_eager_peers.clear();
+            state.preferred_eager_peers.push(preferred);
+            state.refresh_preferred_eager_ceiling();
         }
-        let (maintained_pruned, maintained_grafted) = state.maintain_degree_at(now);
-        pruned += maintained_pruned;
-        grafted += maintained_grafted;
+        let (pruned, grafted) = state.maintain_degree_at(now);
         let new_eager: Vec<PeerId> = connected_set
             .difference(&previously_eager)
             .filter(|peer| state.eager_peers.contains(*peer))
@@ -21662,6 +21759,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_keeps_healthy_preferred_eager_but_veto_allows_demote() {
+        let local = test_peer_id(1);
+        let sender = test_peer_id(2);
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(local, test_transport().await, signing_key.clone());
+        let topic = TopicId::new([103u8; 32]);
+        pubsub.initialize_topic_peers(topic, vec![sender]).await;
+        pubsub.set_topic_preferred_eager_set(topic, &[sender]).await;
+        let payload = Bytes::from_static(b"preferred-duplicate");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        let header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let signature = signing_key
+            .sign(&postcard::to_stdvec(&header).expect("serialize header"))
+            .expect("sign header");
+        let message = GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+        pubsub
+            .handle_eager(sender, topic, message.clone())
+            .await
+            .expect("first message");
+        let prunes_before = pubsub.stage_stats().message_kinds.prune;
+        pubsub
+            .handle_eager(sender, topic, message.clone())
+            .await
+            .expect("healthy preferred duplicate");
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert!(state.eager_peers.contains(&sender));
+            assert!(!state.lazy_peers.contains(&sender));
+        }
+        assert_eq!(pubsub.stage_stats().message_kinds.prune, prunes_before);
+
+        {
+            let now = Instant::now();
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            let mut low_score = PeerScore::new_at(now);
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                low_score.record_outbound_send_timeout_at(now);
+            }
+            state.peer_scores.insert(sender, low_score);
+        }
+        pubsub
+            .handle_eager(sender, topic, message)
+            .await
+            .expect("vetoed preferred duplicate");
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        assert!(state.lazy_peers.contains(&sender));
+        assert_eq!(pubsub.stage_stats().message_kinds.prune, prunes_before + 1);
+    }
+
+    #[tokio::test]
     async fn failed_iwant_send_keeps_claim_under_backoff() {
         let peer_id = test_peer_id(1);
         let transport = test_transport().await;
@@ -26353,6 +26516,219 @@ mod tests {
         assert!(connected
             .iter()
             .all(|peer| state.eager_peers.contains(peer)));
+    }
+
+    #[test]
+    fn preferred_set_survives_refresh_and_repeated_full_mesh_maintenance() {
+        let mut state = TopicState::new();
+        let now = Instant::now();
+        let preferred = [test_peer_id(2), test_peer_id(3)];
+        let ordinary = [test_peer_id(4), test_peer_id(5)];
+        state.configured_max_eager_degree = 2;
+        state.max_eager_degree = 2;
+        state.preferred_eager_peers = preferred.to_vec();
+        state
+            .eager_peers
+            .extend([preferred[0], preferred[1], ordinary[0]]);
+        state.lazy_peers.insert(ordinary[1]);
+        for (peer, responses) in [
+            (preferred[0], 4),
+            (preferred[1], 6),
+            (ordinary[0], 8),
+            (ordinary[1], 10),
+        ] {
+            let mut score = PeerScore::new_at(now);
+            score.iwant_requests = 10;
+            score.iwant_responses = responses;
+            state.peer_scores.insert(peer, score);
+        }
+        assert!(state.peer_score_at(preferred[0], now) >= PEER_SCORE_EAGER_MIN);
+        assert!(state.peer_score_at(preferred[0], now) < state.peer_score_at(ordinary[0], now));
+
+        let (pruned, grafted) = state.maintain_degree_at(now);
+        assert_eq!((pruned, grafted), (1, 0));
+        let stable_eager: HashSet<_> = preferred.into_iter().collect();
+        assert_eq!(state.eager_peers, stable_eager);
+        assert!(ordinary.iter().all(|peer| state.lazy_peers.contains(peer)));
+
+        for tick in 1..=8 {
+            let tick_now = now + OPPORTUNISTIC_GRAFT_INTERVAL * tick;
+            for score in state.peer_scores.values_mut() {
+                score.record_seen_at(tick_now);
+            }
+            let before = state.eager_peers.clone();
+            let (pruned, grafted) = state.maintain_degree_at(tick_now);
+            assert_eq!((pruned, grafted), (0, 0), "tick {tick} churned the mesh");
+            assert_eq!(
+                state.eager_peers, before,
+                "tick {tick} changed eager membership"
+            );
+            assert_eq!(state.eager_peers, stable_eager);
+        }
+    }
+
+    #[test]
+    fn over_ceiling_sheds_nonpreferred_before_healthy_preferred() {
+        let mut state = TopicState::new();
+        let now = Instant::now();
+        let preferred = test_peer_id(11);
+        let others = [test_peer_id(12), test_peer_id(13)];
+        state.configured_max_eager_degree = 2;
+        state.max_eager_degree = 2;
+        state.preferred_eager_peers.push(preferred);
+        state.eager_peers.extend([preferred, others[0], others[1]]);
+        for (peer, responses) in [(preferred, 4), (others[0], 7), (others[1], 10)] {
+            let mut score = PeerScore::new_at(now);
+            score.iwant_requests = 10;
+            score.iwant_responses = responses;
+            state.peer_scores.insert(peer, score);
+        }
+        let (pruned, grafted) = state.maintain_degree_at(now);
+        assert_eq!((pruned, grafted), (1, 0));
+        assert!(state.eager_peers.contains(&preferred));
+        assert!(state.eager_peers.contains(&others[1]));
+        assert!(state.lazy_peers.contains(&others[0]));
+    }
+
+    #[test]
+    fn low_score_preferred_is_not_low_degree_fallback() {
+        let mut state = TopicState::new();
+        let now = Instant::now();
+        let eager = test_peer_id(21);
+        let vetoed_preferred = test_peer_id(22);
+        let fallback = test_peer_id(23);
+        state.configured_max_eager_degree = 2;
+        state.max_eager_degree = 2;
+        state.preferred_eager_peers.push(vetoed_preferred);
+        state.eager_peers.insert(eager);
+        state.lazy_peers.extend([vetoed_preferred, fallback]);
+        let mut vetoed_score = PeerScore::new_at(now);
+        vetoed_score.iwant_requests = 10;
+        vetoed_score.iwant_responses = 0;
+        state.peer_scores.insert(vetoed_preferred, vetoed_score);
+        let mut fallback_score = PeerScore::new_at(now);
+        fallback_score.iwant_requests = 10;
+        fallback_score.iwant_responses = 0;
+        fallback_score.record_outbound_send_timeout_at(now);
+        state.peer_scores.insert(fallback, fallback_score);
+        assert!(state.peer_score_at(vetoed_preferred, now) < PEER_SCORE_EAGER_MIN);
+        assert!(state.peer_score_at(fallback, now) < state.peer_score_at(vetoed_preferred, now));
+        let (pruned, grafted) = state.maintain_degree_at(now);
+        assert_eq!((pruned, grafted), (0, 1));
+        assert!(state.lazy_peers.contains(&vetoed_preferred));
+        assert!(state.eager_peers.contains(&fallback));
+    }
+
+    #[tokio::test]
+    async fn preferred_set_veto_and_replacement_are_authoritative() {
+        let local = test_peer_id(1);
+        let pubsub = PlumtreePubSub::new(local, RecordingTransport::new(local), test_signing_key());
+        let topic = TopicId::new([100u8; 32]);
+        let peers = [test_peer_id(2), test_peer_id(3), test_peer_id(4)];
+        pubsub.set_eager_degree_ceiling(2).await;
+        pubsub.set_topic_peers(topic, peers.to_vec()).await;
+        let preferred = peers[2];
+        pubsub
+            .set_topic_preferred_eager_set(topic, &[preferred])
+            .await;
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            assert!(state.eager_peers.contains(&preferred));
+            let now = Instant::now();
+            let mut cooling = PeerCoolingState::new(now);
+            cooling.suppressed_until = Some(now + Duration::from_secs(60));
+            state.peer_cooling.insert(preferred, cooling);
+            state.maintain_degree_at(now);
+            assert!(state.lazy_peers.contains(&preferred));
+            assert!(!state.eager_peers.contains(&preferred));
+            state.peer_cooling.remove(&preferred);
+            state.maintain_degree_at(now);
+            assert!(state.eager_peers.contains(&preferred));
+            let mut low_score = PeerScore::new_at(now);
+            for _ in 0..PEER_TIMEOUT_THRESHOLD {
+                low_score.record_outbound_send_timeout_at(now);
+            }
+            state.peer_scores.insert(preferred, low_score);
+            state.maintain_degree_at(now);
+            assert!(state.lazy_peers.contains(&preferred));
+            state.peer_scores.remove(&preferred);
+            state.maintain_degree_at(now);
+            assert!(state.eager_peers.contains(&preferred));
+        }
+        pubsub
+            .set_topic_preferred_eager_set(topic, &[peers[0]])
+            .await;
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        assert_eq!(state.preferred_eager_peers, vec![peers[0]]);
+        assert!(!state.is_healthy_preferred_at(preferred, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn preferred_set_eight_peer_ceiling_is_topic_local_and_reversible() {
+        let local = test_peer_id(1);
+        let pubsub = PlumtreePubSub::new(local, RecordingTransport::new(local), test_signing_key());
+        let preferred_topic = TopicId::new([101u8; 32]);
+        let ordinary_topic = TopicId::new([102u8; 32]);
+        let peers: Vec<_> = (2..=10).map(test_peer_id).collect();
+        pubsub.set_eager_degree_ceiling(6).await;
+        pubsub.set_topic_peers(preferred_topic, peers.clone()).await;
+        pubsub.set_topic_peers(ordinary_topic, peers.clone()).await;
+        assert_eq!(
+            pubsub
+                .set_topic_preferred_eager_set(preferred_topic, &peers[..8])
+                .await,
+            8
+        );
+        {
+            let topics = pubsub.topics.read_topic(&preferred_topic).await;
+            let state = topics.get(&preferred_topic).expect("preferred topic");
+            assert_eq!(state.max_eager_degree, 8);
+            assert_eq!(state.eager_peers.len(), 8);
+            assert!(peers[..8]
+                .iter()
+                .all(|peer| state.eager_peers.contains(peer)));
+            assert!(state.lazy_peers.contains(&peers[8]));
+        }
+        {
+            let topics = pubsub.topics.read_topic(&ordinary_topic).await;
+            let state = topics.get(&ordinary_topic).expect("ordinary topic");
+            assert_eq!(state.max_eager_degree, 6);
+            assert_eq!(state.eager_peers.len(), 6);
+        }
+        pubsub
+            .set_topic_preferred_eager_set(preferred_topic, &[])
+            .await;
+        let topics = pubsub.topics.read_topic(&preferred_topic).await;
+        let state = topics.get(&preferred_topic).expect("preferred topic");
+        assert_eq!(state.max_eager_degree, 6);
+        assert_eq!(state.eager_peers.len(), 6);
+        assert!(state.preferred_eager_peers.is_empty());
+    }
+
+    #[test]
+    fn no_preferred_set_keeps_score_driven_replacement() {
+        let mut state = TopicState::new();
+        let now = Instant::now();
+        let low = test_peer_id(40);
+        let better = test_peer_id(90);
+        for i in 0..MIN_EAGER_DEGREE {
+            state.eager_peers.insert(test_peer_id(40 + i as u8));
+        }
+        let mut low_score = PeerScore::new_at(now);
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            low_score.record_outbound_send_timeout_at(now);
+        }
+        state.peer_scores.insert(low, low_score);
+        state.lazy_peers.insert(better);
+        let mut better_score = PeerScore::new_at(now);
+        better_score.record_delivery();
+        state.peer_scores.insert(better, better_score);
+        assert!(state.preferred_eager_peers.is_empty());
+        state.maintain_degree_at(now);
+        assert!(state.lazy_peers.contains(&low));
+        assert!(state.eager_peers.contains(&better));
     }
 
     #[tokio::test]

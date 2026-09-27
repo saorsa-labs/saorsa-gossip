@@ -282,6 +282,15 @@ const OUTBOUND_CRITICAL_DATA_PERMITS_PER_PEER: usize = 1;
 /// Per-peer concurrent Normal/Bulk EAGER/data sends allowed beside Critical.
 const OUTBOUND_BEST_EFFORT_DATA_PERMITS_PER_PEER: usize = 1;
 
+/// Issue #104: per-peer concurrent Normal/Bulk EAGER/data sends reserved for
+/// this node's OWN frames (local publishes, their stranded retry, targeted
+/// legs and IWANT serves of local-origin messages). Relayed traffic uses the
+/// best-effort lane above and can never occupy this one, so a relay burst —
+/// each send holding its permit for the whole 1.5-10 s adaptive timeout —
+/// cannot claim-skip every eager peer of a local publish. Same #504 rule as
+/// the byte budget: forwarding must not be what silences our own speech.
+const OUTBOUND_LOCAL_DATA_PERMITS_PER_PEER: usize = 1;
+
 /// Per-peer concurrent control sends allowed beside one data send.
 const OUTBOUND_CONTROL_PERMITS_PER_PEER: usize = 2;
 
@@ -812,7 +821,18 @@ pub struct FanoutCounts {
     pub admission_dropped: usize,
     /// Admitted candidates that acquired no send claim (transport-
     /// disconnected, cooling at claim time, exhausted outbound budget).
+    /// Issue #104: `claim_skipped == claim_skipped_disconnected +
+    /// claim_skipped_cooling + claim_skipped_budget`.
     pub claim_skipped: usize,
+    /// Claim-skipped because the transport reported the peer disconnected.
+    pub claim_skipped_disconnected: usize,
+    /// Claim-skipped because the peer was cooling at claim time (suppressed
+    /// with no bypass slot due, or a recovery probe already in flight).
+    pub claim_skipped_cooling: usize,
+    /// Claim-skipped because the peer's outbound permit was busy (local
+    /// saturation: best-effort/local-origin lane in use, or the Critical
+    /// FIFO gate full).
+    pub claim_skipped_budget: usize,
     /// Number of peers the message was dispatched toward.
     pub attempted: usize,
     /// Number of those peers that confirmed receipt before this call returned.
@@ -939,6 +959,14 @@ pub struct PubSubStageStats {
     /// `ValidationAction::LazyForward` verdict withheld — the IHAVE
     /// announce fan-out that replaces those eager sends.
     lazy_ihave_withheld_peers: AtomicU64,
+    /// Issue #104: cumulative per-reason claim skips on local publishes
+    /// (the [`FanoutCounts`] `claim_skipped_*` fields, summed).
+    publish_claim_skipped_disconnected: AtomicU64,
+    publish_claim_skipped_cooling: AtomicU64,
+    publish_claim_skipped_budget: AtomicU64,
+    /// Issue #104: cumulative claim-skipped eager peers of local publishes
+    /// queued as direct IHAVE announce targets for the next flush.
+    claim_skip_ihave_queued_peers: AtomicU64,
     /// Topic-set evictions after a definitive transport "peer not connected"
     /// failure (x0x #380). Unlike timeouts these feed no cooling — the peer
     /// simply leaves the topic's eager/lazy sets until the transport reports
@@ -1223,6 +1251,20 @@ pub struct PubSubStageStatsSnapshot {
     /// `ValidationAction::LazyForward` verdict withheld, advertised to
     /// via IHAVE instead (the announce fan-out).
     pub lazy_ihave_withheld_peers: u64,
+    /// Issue #104: cumulative local-publish eager peers claim-skipped
+    /// because the transport reported them disconnected.
+    pub publish_claim_skipped_disconnected: u64,
+    /// Issue #104: cumulative local-publish eager peers claim-skipped
+    /// because they were cooling at claim time.
+    pub publish_claim_skipped_cooling: u64,
+    /// Issue #104: cumulative local-publish eager peers claim-skipped
+    /// because their outbound permit was busy (local saturation).
+    pub publish_claim_skipped_budget: u64,
+    /// Issue #104: cumulative claim-skipped local-publish eager peers
+    /// queued as direct IHAVE announce targets, so a fully skipped publish
+    /// is still announced within one flush instead of waiting for
+    /// anti-entropy.
+    pub claim_skip_ihave_queued_peers: u64,
     /// Topic-set evictions after a definitive transport "peer not connected"
     /// failure (x0x #380) — eviction, not cooling; see
     /// [`PubSubStageStats`] for the interpretation.
@@ -1315,8 +1357,16 @@ struct BoundedSendOrigin {
 enum FanoutPeerStage {
     ByteRejected,
     AdmissionDropped,
-    ClaimSkipped,
+    ClaimSkipped(ClaimSkipReason),
     Attempted,
+}
+
+/// Issue #104: why an admitted peer acquired no send claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimSkipReason {
+    TransportDisconnected,
+    Cooling,
+    Budget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1379,11 +1429,16 @@ static NEXT_BUDGET_SLOT_ID: AtomicU64 = AtomicU64::new(1);
 struct InFlightDataSlot {
     slot_id: BudgetSlotId,
     priority: TopicPriority,
+    /// Issue #104: the slot occupies the local-origin lane rather than the
+    /// shared best-effort (relay) lane.
+    local_origin: bool,
 }
 
 struct PeerOutboundBudgetEntry {
     critical_data_in_flight: usize,
     best_effort_data_in_flight: usize,
+    /// Issue #104: in-flight Normal/Bulk data sends of local-origin frames.
+    local_data_in_flight: usize,
     control_in_flight: usize,
     /// One entry per in-flight Data permit. Critical and Normal/Bulk use
     /// separate lanes (X0X-0074c); each slot records which lane it occupies so
@@ -1397,6 +1452,7 @@ impl PeerOutboundBudgetEntry {
         Self {
             critical_data_in_flight: 0,
             best_effort_data_in_flight: 0,
+            local_data_in_flight: 0,
             control_in_flight: 0,
             data_slots: Vec::new(),
             last_used: now,
@@ -1406,6 +1462,7 @@ impl PeerOutboundBudgetEntry {
     fn is_idle_at(&self, now: Instant) -> bool {
         self.critical_data_in_flight == 0
             && self.best_effort_data_in_flight == 0
+            && self.local_data_in_flight == 0
             && self.control_in_flight == 0
             && self.data_slots.is_empty()
             && now.saturating_duration_since(self.last_used) > OUTBOUND_BUDGET_REAP_AFTER
@@ -1581,19 +1638,38 @@ impl PeerOutboundBudgets {
         }
     }
 
-    /// Try to reserve an outbound permit for `peer`.
-    ///
-    /// Critical Data sends are serialized per-peer by the FIFO Critical gate
-    /// (X0X-0074d): `try_reserve` is non-blocking and bounds the queue, and the
-    /// send task later [`CriticalReservation::engage`]s to wait for the single
-    /// in-flight permit. Normal and Bulk Data share a separate best-effort lane;
-    /// Control has its own. `None` means: Critical queue overflow (caller records
-    /// a hard error) or best-effort/control lane exhausted.
+    /// Test shorthand: [`Self::try_acquire_for_origin`] on the relay-origin
+    /// (shared best-effort) lane.
+    #[cfg(test)]
     fn try_acquire(
         self: &Arc<Self>,
         peer: PeerId,
         class: OutboundSendClass,
         priority: TopicPriority,
+        now: Instant,
+    ) -> Option<OutboundSendPermit> {
+        self.try_acquire_for_origin(peer, class, priority, false, now)
+    }
+
+    /// Try to reserve an outbound permit for `peer`.
+    ///
+    /// Critical Data sends are serialized per-peer by the FIFO Critical gate
+    /// (X0X-0074d): `try_reserve` is non-blocking and bounds the queue, and the
+    /// send task later [`CriticalReservation::engage`]s to wait for the single
+    /// in-flight permit. Normal and Bulk Data use a separate best-effort lane;
+    /// Control has its own. `None` means: Critical queue overflow (caller records
+    /// a hard error) or best-effort/local-origin/control lane exhausted.
+    ///
+    /// Issue #104: a `local_origin` Normal/Bulk Data send takes the peer's
+    /// dedicated local-origin permit instead of the shared best-effort
+    /// (relay) one, so relayed traffic cannot starve this node's own
+    /// publishes. Critical Data (FIFO gate) and Control ignore `local_origin`.
+    fn try_acquire_for_origin(
+        self: &Arc<Self>,
+        peer: PeerId,
+        class: OutboundSendClass,
+        priority: TopicPriority,
+        local_origin: bool,
         now: Instant,
     ) -> Option<OutboundSendPermit> {
         // Critical Data: reserve a FIFO queue slot before touching the budget
@@ -1617,6 +1693,9 @@ impl PeerOutboundBudgets {
         let exhausted = match class {
             // Critical is bounded by the gate above, not the in-flight lane.
             OutboundSendClass::Data if priority == TopicPriority::Critical => false,
+            OutboundSendClass::Data if local_origin => {
+                entry.local_data_in_flight >= OUTBOUND_LOCAL_DATA_PERMITS_PER_PEER
+            }
             OutboundSendClass::Data => {
                 entry.best_effort_data_in_flight >= OUTBOUND_BEST_EFFORT_DATA_PERMITS_PER_PEER
             }
@@ -1634,11 +1713,17 @@ impl PeerOutboundBudgets {
             // in `critical`) is its sole limiter, so `release` is a no-op for it.
             OutboundSendClass::Data if priority == TopicPriority::Critical => 0,
             OutboundSendClass::Data => {
-                entry.best_effort_data_in_flight += 1;
+                if local_origin {
+                    entry.local_data_in_flight += 1;
+                } else {
+                    entry.best_effort_data_in_flight += 1;
+                }
                 let slot_id = NEXT_BUDGET_SLOT_ID.fetch_add(1, Ordering::Relaxed);
-                entry
-                    .data_slots
-                    .push(InFlightDataSlot { slot_id, priority });
+                entry.data_slots.push(InFlightDataSlot {
+                    slot_id,
+                    priority,
+                    local_origin,
+                });
                 slot_id
             }
             OutboundSendClass::Control => {
@@ -1683,6 +1768,12 @@ impl PeerOutboundBudgets {
                             warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound Critical data permit released with zero in-flight count");
                         } else {
                             entry.critical_data_in_flight -= 1;
+                        }
+                    } else if slot.local_origin {
+                        if entry.local_data_in_flight == 0 {
+                            warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound local-origin data permit released with zero in-flight count");
+                        } else {
+                            entry.local_data_in_flight -= 1;
                         }
                     } else if entry.best_effort_data_in_flight == 0 {
                         warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound best-effort data permit released with zero in-flight count");
@@ -1819,6 +1910,10 @@ struct SendClaimContext<'a> {
     /// Topic priority for the claim, used to choose the Critical or
     /// best-effort per-peer Data lane.
     priority: TopicPriority,
+    /// Issue #104: the frame is this node's own (local publish, its retry,
+    /// or a serve of a local-origin message), so Normal/Bulk Data takes the
+    /// dedicated local-origin permit rather than the shared relay lane.
+    local_origin: bool,
 }
 
 /// Per-reason tally of peers that were skipped (no attempt claimed) inside
@@ -1837,6 +1932,25 @@ struct SendClaimSkips {
     /// Peers skipped because `try_acquire` had no permit (Critical FIFO gate
     /// full, or best-effort/control lane exhausted).
     budget_exhausted: usize,
+}
+
+impl SendClaimSkips {
+    /// Dominant reason for a single-peer claim that produced no attempt.
+    /// Budget wins over cooling over disconnected, matching the
+    /// Critical-control classification precedence.
+    fn primary_reason(&self) -> ClaimSkipReason {
+        if self.budget_exhausted > 0 {
+            ClaimSkipReason::Budget
+        } else if self.cooling > 0 {
+            ClaimSkipReason::Cooling
+        } else if self.transport_disconnected > 0 {
+            ClaimSkipReason::TransportDisconnected
+        } else {
+            // Defensive: no recorded reason. Book it as local pressure, the
+            // same default the Critical-control path uses (hard error).
+            ClaimSkipReason::Budget
+        }
+    }
 }
 
 struct SendAttemptClaims {
@@ -2565,6 +2679,16 @@ impl PubSubStageStats {
                 .load(Ordering::Relaxed),
             stranded_publish_cache_miss: self.stranded_publish_cache_miss.load(Ordering::Relaxed),
             lazy_ihave_withheld_peers: self.lazy_ihave_withheld_peers.load(Ordering::Relaxed),
+            publish_claim_skipped_disconnected: self
+                .publish_claim_skipped_disconnected
+                .load(Ordering::Relaxed),
+            publish_claim_skipped_cooling: self
+                .publish_claim_skipped_cooling
+                .load(Ordering::Relaxed),
+            publish_claim_skipped_budget: self.publish_claim_skipped_budget.load(Ordering::Relaxed),
+            claim_skip_ihave_queued_peers: self
+                .claim_skip_ihave_queued_peers
+                .load(Ordering::Relaxed),
             suppressed_peers: self.suppressed_peer_snapshots(),
             suppressed_peers_by_topic: BTreeMap::new(),
             suppression_cleanup_interval_ms: self
@@ -2689,6 +2813,20 @@ impl PubSubStageStats {
     /// queued as direct IHAVE announce targets).
     fn record_lazy_ihave_withheld_peers(&self, peers: usize) {
         self.lazy_ihave_withheld_peers
+            .fetch_add(peers as u64, Ordering::Relaxed);
+    }
+
+    fn record_publish_claim_skips(&self, counts: &FanoutCounts) {
+        self.publish_claim_skipped_disconnected
+            .fetch_add(counts.claim_skipped_disconnected as u64, Ordering::Relaxed);
+        self.publish_claim_skipped_cooling
+            .fetch_add(counts.claim_skipped_cooling as u64, Ordering::Relaxed);
+        self.publish_claim_skipped_budget
+            .fetch_add(counts.claim_skipped_budget as u64, Ordering::Relaxed);
+    }
+
+    fn record_claim_skip_ihave_queued(&self, peers: usize) {
+        self.claim_skip_ihave_queued_peers
             .fetch_add(peers as u64, Ordering::Relaxed);
     }
 
@@ -5008,6 +5146,26 @@ impl TopicState {
     fn confirm_cooldown_bypass_claim(&mut self, peer: PeerId, now: Instant) {
         if let Some(cooling) = self.peer_cooling.get_mut(&peer) {
             cooling.note_cooldown_bypass_claimed_at(now);
+        }
+    }
+
+    /// Issue #105: roll back a recovery-probe claim whose outbound permit
+    /// was refused. `claim_send_attempt_at` marks the probe in flight before
+    /// the claim layer tries for a permit; when none is available no probe
+    /// is sent, so no send outcome would ever clear the flag and the peer
+    /// would stay suppressed (never graftable, every claim skipped) until it
+    /// disconnected or sent verified traffic on the topic. Only the probe
+    /// this claim created is undone.
+    fn abandon_unsent_recovery_probe(
+        &mut self,
+        peer: PeerId,
+        recovery_probe_id: Option<RecoveryProbeId>,
+    ) {
+        if let Some(cooling) = self.peer_cooling.get_mut(&peer) {
+            if cooling.matches_recovery_probe(recovery_probe_id) {
+                cooling.recovery_probe_in_flight = false;
+                cooling.recovery_probe_id = None;
+            }
         }
     }
 
@@ -7827,8 +7985,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let bulk_admitted = priority == TopicPriority::Bulk;
         let release_guard = scopeguard_release(bulk_admitted, &peer, &self.admission);
 
-        let (mut claims, _lock_wait) = self.claim_topic_send_attempts(topic, vec![peer], op).await;
+        let (mut claims, _lock_wait) = self
+            .claim_topic_send_attempts(topic, vec![peer], op, local_origin)
+            .await;
         let Some(attempt) = claims.attempts().first().copied() else {
+            let skip_reason = claims.skips().primary_reason();
             // X0X-0074d: Critical *Data* skips (cooling vs gate overflow) are
             // counted inside claim_topic_send_attempts where the reason is
             // known, so we must not re-count them here. Only the Critical
@@ -7886,7 +8047,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
             drop(release_guard);
-            return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ClaimSkipped);
+            return (
+                Ok(PeerSendOutcome::Deferred),
+                FanoutPeerStage::ClaimSkipped(skip_reason),
+            );
         };
         let Some(permit) = claims.take_permits().into_iter().next() else {
             // Defensive: claim pushes attempt+permit together, so this is
@@ -7907,7 +8071,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 );
             }
             drop(release_guard);
-            return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ClaimSkipped);
+            return (
+                Ok(PeerSendOutcome::Deferred),
+                FanoutPeerStage::ClaimSkipped(ClaimSkipReason::Budget),
+            );
         };
 
         // x0x #380: outbound demand metering — this bounded path carries
@@ -8059,6 +8226,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         peers: Vec<PeerId>,
         op: &'static str,
+        local_origin: bool,
     ) -> (SendAttemptClaims, Duration) {
         let send_path = self.send_path_context();
         if peers.is_empty() {
@@ -8094,6 +8262,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 op,
                 send_class,
                 priority,
+                local_origin,
             };
             Self::claim_topic_send_attempts_for_state(&claim_context, state, peers, now)
         } else {
@@ -8115,10 +8284,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     );
                     continue;
                 }
-                if let Some(permit) = self
-                    .outbound_budgets
-                    .try_acquire(peer, send_class, priority, now)
-                {
+                if let Some(permit) = self.outbound_budgets.try_acquire_for_origin(
+                    peer,
+                    send_class,
+                    priority,
+                    local_origin,
+                    now,
+                ) {
                     attempts.push(PeerSendAttempt {
                         peer,
                         kind: SendAttemptKind::Normal,
@@ -8189,35 +8361,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
             match state.claim_send_attempt_at(peer, now) {
                 Some((attempt, recovery_event)) => {
-                    if attempt.kind == SendAttemptKind::RecoveryProbe {
-                        state
-                            .peer_scores
-                            .entry(peer)
-                            .or_insert_with(|| PeerScore::new_at(now))
-                            .record_recovery_probe_at(now);
-                    }
-                    if let Some(event) = recovery_event {
-                        claim_context.stage_stats.record_peer_recovery_probe(
-                            claim_context.topic,
-                            peer,
-                            event.suppressed_until,
-                            event.recent_timeout_count,
-                            event.cooldown,
-                        );
-                        debug!(
-                            peer_id = %peer,
-                            topic = ?claim_context.topic,
-                            op = claim_context.op,
-                            "{} send admitted as peer recovery probe",
-                            claim_context.op
-                        );
-                    }
-                    let Some(permit) = claim_context.outbound_budgets.try_acquire(
+                    let Some(permit) = claim_context.outbound_budgets.try_acquire_for_origin(
                         peer,
                         claim_context.send_class,
                         claim_context.priority,
+                        claim_context.local_origin,
                         now,
                     ) else {
+                        // Issue #105: the claim above already marked a
+                        // recovery probe in flight. No probe will be sent,
+                        // so nothing would ever resolve that flag — undo it
+                        // or the peer stays suppressed and every later claim
+                        // is skipped as cooling.
+                        if attempt.kind == SendAttemptKind::RecoveryProbe {
+                            state.abandon_unsent_recovery_probe(peer, attempt.recovery_probe_id);
+                        }
                         skips.budget_exhausted += 1;
                         if claim_context.priority == TopicPriority::Critical
                             && matches!(claim_context.send_class, OutboundSendClass::Data)
@@ -8251,6 +8409,32 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         );
                         continue;
                     };
+                    // Issue #105: a recovery probe is booked (score + stage
+                    // stats) only once its permit is held, like the bypass
+                    // slot below.
+                    if attempt.kind == SendAttemptKind::RecoveryProbe {
+                        state
+                            .peer_scores
+                            .entry(peer)
+                            .or_insert_with(|| PeerScore::new_at(now))
+                            .record_recovery_probe_at(now);
+                    }
+                    if let Some(event) = recovery_event {
+                        claim_context.stage_stats.record_peer_recovery_probe(
+                            claim_context.topic,
+                            peer,
+                            event.suppressed_until,
+                            event.recent_timeout_count,
+                            event.cooldown,
+                        );
+                        debug!(
+                            peer_id = %peer,
+                            topic = ?claim_context.topic,
+                            op = claim_context.op,
+                            "{} send admitted as peer recovery probe",
+                            claim_context.op
+                        );
+                    }
                     // #71 r2: the bypass slot is consumed (and counted)
                     // only now that a permit is actually held — a refused
                     // budget above leaves the trickle due for the next
@@ -8584,6 +8768,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let mut byte_rejected = 0;
             let mut admission_dropped = 0;
             let mut claim_skipped = 0;
+            let mut claim_skipped_disconnected = 0;
+            let mut claim_skipped_cooling = 0;
+            let mut claim_skipped_budget = 0;
             while !tasks.is_empty() {
                 let completed = std::future::poll_fn(|context| {
                     tasks
@@ -8620,8 +8807,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         admission_dropped += 1;
                         deferred.push(peer);
                     }
-                    (peer, (_, FanoutPeerStage::ClaimSkipped)) => {
+                    (peer, (_, FanoutPeerStage::ClaimSkipped(reason))) => {
                         claim_skipped += 1;
+                        match reason {
+                            ClaimSkipReason::TransportDisconnected => {
+                                claim_skipped_disconnected += 1;
+                            }
+                            ClaimSkipReason::Cooling => claim_skipped_cooling += 1,
+                            ClaimSkipReason::Budget => claim_skipped_budget += 1,
+                        }
                         deferred.push(peer);
                     }
                     (peer, (_, FanoutPeerStage::Attempted)) => {
@@ -8647,6 +8841,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     byte_rejected,
                     admission_dropped,
                     claim_skipped,
+                    claim_skipped_disconnected,
+                    claim_skipped_cooling,
+                    claim_skipped_budget,
                     attempted: attempted_count,
                     succeeded,
                 },
@@ -8764,9 +8961,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     candidates,
                     byte_rejected,
                     admission_dropped: candidates - byte_rejected,
-                    claim_skipped: 0,
                     attempted: 0,
                     succeeded: 0,
+                    ..FanoutCounts::default()
                 },
                 Vec::new(),
             );
@@ -8783,7 +8980,44 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             admission: Arc::clone(&self.admission),
         };
 
-        let (mut claims, lock_wait) = self.claim_topic_send_attempts(topic, admitted, op).await;
+        // Issue #104: `detach_accounting` is the local-vs-relayed marker (see
+        // the #504 note above) — a local publish claims the dedicated
+        // local-origin Data permit so relay sends cannot starve it.
+        let local_origin = !detach_accounting;
+        // Issue #104 fix 3: keep the admitted set of a local EAGER so every
+        // peer the claim skips can be announced lazily below.
+        let announce_candidates = (op == "EAGER" && local_origin).then(|| admitted.clone());
+        let (mut claims, lock_wait) = self
+            .claim_topic_send_attempts(topic, admitted, op, local_origin)
+            .await;
+        let skips = claims.skips();
+
+        // Issue #104 fix 3: a claim-skipped eager peer of a LOCAL publish
+        // (budget or cooling; disconnected targets are dropped again by the
+        // flush's own claim) is queued as a direct IHAVE announce target for
+        // the next 100 ms flush, exactly as byte deferral does above. Without
+        // this, a publish whose every eager peer was skipped had no pull path
+        // on an all-eager topic (the pending-IHAVE batch reaches lazy members
+        // only, and the #613 self-IHAVE needs an attempted send) and waited
+        // for the 30 s anti-entropy round. Relayed traffic is not queued: this
+        // node is not its only source, and announcing under relay saturation
+        // would add control load exactly when the lanes are busiest.
+        if let Some(candidates_for_announce) = announce_candidates {
+            let skipped: Vec<PeerId> = candidates_for_announce
+                .into_iter()
+                .filter(|peer| !claims.attempts().iter().any(|a| a.peer == *peer))
+                .collect();
+            if !skipped.is_empty() {
+                if let Ok((message, _)) = postcard::take_from_bytes::<GossipMessage>(&bytes) {
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        state.queue_lazy_withheld(message.header.msg_id, &skipped, false);
+                        self.stage_stats
+                            .record_claim_skip_ihave_queued(skipped.len());
+                    }
+                }
+            }
+        }
 
         // X0X-0074d: per-peer Critical accounting now happens inside
         // `claim_topic_send_attempts`, where the skip reason is known —
@@ -8802,6 +9036,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     byte_rejected,
                     admission_dropped: candidates - byte_rejected - admitted_count,
                     claim_skipped: admitted_count,
+                    claim_skipped_disconnected: skips.transport_disconnected,
+                    claim_skipped_cooling: skips.cooling,
+                    claim_skipped_budget: skips.budget_exhausted,
                     attempted: 0,
                     succeeded: 0,
                 },
@@ -8865,6 +9102,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     byte_rejected,
                     admission_dropped: candidates - byte_rejected - admitted_count,
                     claim_skipped: admitted_count - attempted,
+                    claim_skipped_disconnected: skips.transport_disconnected,
+                    claim_skipped_cooling: skips.cooling,
+                    claim_skipped_budget: skips.budget_exhausted,
                     attempted,
                     succeeded: 0,
                 },
@@ -8886,6 +9126,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     byte_rejected,
                     admission_dropped: candidates - byte_rejected - admitted_count,
                     claim_skipped: admitted_count - attempted,
+                    claim_skipped_disconnected: skips.transport_disconnected,
+                    claim_skipped_cooling: skips.cooling,
+                    claim_skipped_budget: skips.budget_exhausted,
                     attempted,
                     succeeded,
                 },
@@ -9296,6 +9539,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         //                                    every send failed at dispatch.
         // The WARN fires on either condition (succeeded == 0) so operators
         // see it whether the problem is missing peers or unreachable ones.
+        self.stage_stats.record_publish_claim_skips(&counts);
         if counts.attempted == 0 {
             self.stage_stats.record_zero_fanout_publish();
         } else if counts.succeeded == 0 {
@@ -9321,6 +9565,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     byte_rejected = counts.byte_rejected,
                     admission_dropped = counts.admission_dropped,
                     claim_skipped = counts.claim_skipped,
+                    claim_skipped_disconnected = counts.claim_skipped_disconnected,
+                    claim_skipped_cooling = counts.claim_skipped_cooling,
+                    claim_skipped_budget = counts.claim_skipped_budget,
                     attempted = counts.attempted,
                     succeeded = counts.succeeded,
                     target_outcome = ?target_outcome,
@@ -11068,6 +11315,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     op,
                     send_class: OutboundSendClass::for_op(op),
                     priority: env.send_path.admission.registry().priority_for(&topic_id),
+                    // IHAVE/IWANT are Control-class; origin selects no lane.
+                    local_origin: false,
                 };
                 // Skip reasons are only consulted by the single-peer
                 // Critical-control path; this fanout path ignores them.
@@ -11391,6 +11640,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     op: "EAGER",
                     send_class: OutboundSendClass::for_op("EAGER"),
                     priority: send_path.admission.registry().priority_for(&topic),
+                    local_origin: cached.local_origin,
                 };
                 let (attempts, permits, _) =
                     Self::claim_topic_send_attempts_for_state(&context, state, admitted, now);
@@ -11682,6 +11932,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     op: "EAGER",
                     send_class: OutboundSendClass::for_op("EAGER"),
                     priority: ctx.send_path.admission.registry().priority_for(&topic),
+                    // The stranded retry re-sends this node's own publish.
+                    local_origin: true,
                 };
                 let (attempts, permits, _skips) =
                     Self::claim_topic_send_attempts_for_state(&claim_context, state, admitted, now);
@@ -12129,6 +12381,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 op: "ANTI_ENTROPY",
                                 send_class: OutboundSendClass::for_op("ANTI_ENTROPY"),
                                 priority: send_path.admission.registry().priority_for(&topic_id),
+                                // Control-class; origin selects no lane.
+                                local_origin: false,
                             };
                             // Skip reasons are only consulted by the
                             // single-peer Critical-control path.
@@ -15781,18 +16035,20 @@ mod tests {
             Some(HashSet::from([target])),
         );
 
-        // Exhaust the peer's single best-effort Data permit and hold it
-        // across the publish: claim's `try_acquire` fails after admission,
-        // so the candidate is shed at claim time.
+        // Exhaust the peer's single local-origin Data permit and hold it
+        // across the publish (issue #104: a local publish no longer shares
+        // the relay lane): claim's `try_acquire` fails after admission, so
+        // the candidate is shed at claim time.
         let held = pubsub
             .outbound_budgets
-            .try_acquire(
+            .try_acquire_for_origin(
                 target,
                 OutboundSendClass::Data,
                 TopicPriority::Normal,
+                true,
                 Instant::now(),
             )
-            .expect("first data permit is available");
+            .expect("first local-origin data permit is available");
 
         let counts = pubsub
             .publish_local_with_fanout(topic, Bytes::from_static(b"claim-skip"))
@@ -15803,10 +16059,181 @@ mod tests {
         assert_eq!(counts.byte_rejected, 0);
         assert_eq!(counts.admission_dropped, 0);
         assert_eq!(counts.claim_skipped, 1);
+        assert_eq!(counts.claim_skipped_budget, 1);
+        assert_eq!(counts.claim_skipped_cooling, 0);
+        assert_eq!(counts.claim_skipped_disconnected, 0);
         assert_eq!(counts.attempted, 0);
         assert_eq!(transport.send_count_to(target), 0);
 
         drop(held);
+    }
+
+    /// Issue #104 fixes 1 and 3 (x0x#857 `claim_skipped=6 attempted=0`): an
+    /// all-eager topic (6 eager, 0 lazy) whose every eager peer's
+    /// local-origin permit is busy. The per-reason counts must say "budget"
+    /// and the fully claim-skipped publish must still be announced by the
+    /// next 100 ms IHAVE flush — not left for the 30 s anti-entropy round —
+    /// so the receivers can pull it.
+    #[tokio::test(start_paused = true)]
+    async fn fanout_stage_counts_all_eager_budget_claim_skip_announces_within_flush() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x65; 32]);
+        let targets: Vec<PeerId> = (2..=7).map(test_peer_id).collect();
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            for target in &targets {
+                state.eager_peers.insert(*target);
+            }
+            assert!(state.lazy_peers.is_empty(), "all-eager topic");
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(targets.iter().copied().collect()),
+        );
+        let held: Vec<OutboundSendPermit> = targets
+            .iter()
+            .map(|target| {
+                pubsub
+                    .outbound_budgets
+                    .try_acquire_for_origin(
+                        *target,
+                        OutboundSendClass::Data,
+                        TopicPriority::Normal,
+                        true,
+                        Instant::now(),
+                    )
+                    .expect("local-origin data permit is available")
+            })
+            .collect();
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"all-skipped"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 6);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 0);
+        assert_eq!(counts.claim_skipped, 6);
+        assert_eq!(counts.claim_skipped_budget, 6);
+        assert_eq!(counts.claim_skipped_cooling, 0);
+        assert_eq!(counts.claim_skipped_disconnected, 0);
+        assert_eq!(counts.attempted, 0);
+        let stats = pubsub.stage_stats();
+        assert_eq!(stats.publish_claim_skipped_budget, 6);
+        assert_eq!(stats.publish_claim_skipped_cooling, 0);
+        assert_eq!(stats.publish_claim_skipped_disconnected, 0);
+        assert_eq!(stats.claim_skip_ihave_queued_peers, 6);
+        assert!(transport.sent_frames().is_empty(), "nothing sent yet");
+
+        // Every skipped eager peer is a direct announce target of the msg_id.
+        let msg_id = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state exists");
+            let msg_id = *state.pending_ihave.back().expect("msg_id queued");
+            let queued = &state
+                .lazy_withheld
+                .iter()
+                .find(|entry| entry.msg_id == msg_id)
+                .expect("claim-skipped peers queued for the IHAVE flush")
+                .targets;
+            assert_eq!(queued.len(), targets.len());
+            assert_eq!(
+                queued.iter().copied().collect::<HashSet<_>>(),
+                targets.iter().copied().collect::<HashSet<_>>()
+            );
+            msg_id
+        };
+
+        // The real 100 ms flusher announces it well inside 30 s: advance
+        // paused time by a few flush intervals only.
+        pubsub.spawn_ihave_flusher();
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS)).await;
+        for target in &targets {
+            let ihaves = transport.sent_messages_of_kind_to(*target, MessageKind::IHave);
+            assert_eq!(ihaves.len(), 1, "one IHAVE to eager peer {target:?}");
+            let ids: Vec<MessageIdType> =
+                postcard::from_bytes(ihaves[0].payload.as_deref().expect("IHAVE carries ids"))
+                    .expect("IHAVE payload decodes");
+            assert!(ids.contains(&msg_id), "IHAVE advertises the publish");
+        }
+        let _ = pubsub.shutdown_tx.send(true);
+
+        // Once the local lane frees, the receiver's IWANT pulls the message.
+        drop(held);
+        pubsub
+            .handle_iwant(targets[0], topic, vec![msg_id])
+            .await
+            .expect("iwant serve");
+        let served = transport.sent_messages_of_kind_to(targets[0], MessageKind::Eager);
+        assert_eq!(served.len(), 1, "IWANT pulls the claim-skipped publish");
+        assert_eq!(served[0].payload.as_deref(), Some(&b"all-skipped"[..]));
+    }
+
+    /// Issue #104 fix 2: relayed sends holding every eager peer's shared
+    /// best-effort Data permit must not claim-skip this node's own Normal
+    /// publish — local-origin frames have their own per-peer permit.
+    #[tokio::test]
+    async fn local_publish_not_starved_by_relay_held_permits() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x66; 32]);
+        let targets: Vec<PeerId> = (2..=7).map(test_peer_id).collect();
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            for target in &targets {
+                state.eager_peers.insert(*target);
+            }
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(targets.iter().copied().collect()),
+        );
+        // Relay forwards in flight to every eager peer (relay-origin lane).
+        let relay_held: Vec<OutboundSendPermit> = targets
+            .iter()
+            .map(|target| {
+                pubsub
+                    .outbound_budgets
+                    .try_acquire(
+                        *target,
+                        OutboundSendClass::Data,
+                        TopicPriority::Normal,
+                        Instant::now(),
+                    )
+                    .expect("relay data permit is available")
+            })
+            .collect();
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"own-speech"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(
+            counts.claim_skipped, 0,
+            "relays must not starve a local publish"
+        );
+        assert_eq!(counts.attempted, 6);
+        for target in &targets {
+            assert_eq!(transport.send_count_to(*target), 1);
+        }
+        drop(relay_held);
     }
 
     #[tokio::test]
@@ -19695,7 +20122,7 @@ mod tests {
         // (a, cont.) eager-eligible in practice: the very next claim for the
         // peer succeeds (permit now free, no cooldown in the way).
         let (claims, _) = pubsub
-            .claim_topic_send_attempts(topic, vec![slow_peer], "EAGER")
+            .claim_topic_send_attempts(topic, vec![slow_peer], "EAGER", false)
             .await;
         assert_eq!(
             claims.attempts().len(),
@@ -26170,7 +26597,7 @@ mod tests {
         );
 
         let (claims, _) = pubsub
-            .claim_topic_send_attempts(topic, vec![ghost_peer], "EAGER")
+            .claim_topic_send_attempts(topic, vec![ghost_peer], "EAGER", false)
             .await;
 
         assert!(claims.is_empty());
@@ -27579,12 +28006,13 @@ mod tests {
                 topic,
                 vec![target; OUTBOUND_CRITICAL_QUEUE_PER_PEER],
                 "EAGER",
+                false,
             )
             .await;
         assert_eq!(held.attempts().len(), OUTBOUND_CRITICAL_QUEUE_PER_PEER);
 
         let (overflow, _) = pubsub
-            .claim_topic_send_attempts(topic, vec![target], "EAGER")
+            .claim_topic_send_attempts(topic, vec![target], "EAGER", false)
             .await;
         assert!(overflow.is_empty());
         {
@@ -27608,7 +28036,7 @@ mod tests {
         // hard error + saturation count, still zero cooling skips (the old
         // behaviour skipped this claim via the cooling it had just created).
         let (still_not_cooled, _) = pubsub
-            .claim_topic_send_attempts(topic, vec![target], "EAGER")
+            .claim_topic_send_attempts(topic, vec![target], "EAGER", false)
             .await;
         assert!(still_not_cooled.is_empty());
 
@@ -27638,7 +28066,7 @@ mod tests {
         // no 30-60 s cooldown stands between a full FIFO and recovery.
         drop(held);
         let (recovered, _) = pubsub
-            .claim_topic_send_attempts(topic, vec![target], "EAGER")
+            .claim_topic_send_attempts(topic, vec![target], "EAGER", false)
             .await;
         assert_eq!(
             recovered.attempts().len(),
@@ -29462,6 +29890,124 @@ mod tests {
             admission_stats.dropped_bulk_peer_cooled, 1,
             "the skipped send books PeerCooled on the Bulk lane"
         );
+    }
+
+    /// Issue #105 (found via x0x#857): a claim that converts into a
+    /// recovery probe marks the probe in flight BEFORE the outbound permit
+    /// is taken. When the permit was refused the probe was dropped with the
+    /// flag still set, so the peer stayed suppressed and every later claim
+    /// was skipped as cooling. The refused claim must leave no in-flight
+    /// flag, and once the permit frees the next claim must send the probe.
+    #[tokio::test]
+    async fn recovery_probe_flag_not_leaked_when_budget_refuses_permit() {
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        transport.set_connected_peer_ids(vec![target]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0xB5; 32]); // default Normal priority
+        let now = Instant::now();
+        let expired = now
+            .checked_sub(Duration::from_secs(1))
+            .expect("monotonic clock is past one second");
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(target);
+            state.peer_cooling.insert(
+                target,
+                PeerCoolingState {
+                    timeout_window_started: now,
+                    timeout_count: 0,
+                    // Suppression already expired: the next claim is the
+                    // recovery probe.
+                    suppressed_until: Some(expired),
+                    cooldown: PEER_SUPPRESSION_COOLDOWN,
+                    last_suppressed_at: Some(expired),
+                    last_suppression_timeout_count: PEER_TIMEOUT_THRESHOLD,
+                    recovery_probe_in_flight: false,
+                    recovery_probe_id: None,
+                    last_bypass_probe_at: None,
+                },
+            );
+        }
+        async fn probe_in_flight(
+            pubsub: &PlumtreePubSub<RecordingTransport>,
+            topic: TopicId,
+            peer: PeerId,
+        ) -> bool {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            topics
+                .get(&topic)
+                .and_then(|state| state.peer_cooling.get(&peer))
+                .is_some_and(|cooling| cooling.recovery_probe_in_flight)
+        }
+
+        // Hold the peer's Data permit (a relay send in flight) and claim
+        // twice: both claims are refused by the budget.
+        let held = pubsub
+            .outbound_budgets
+            .try_acquire(
+                target,
+                OutboundSendClass::Data,
+                TopicPriority::Normal,
+                Instant::now(),
+            )
+            .expect("first data permit is available");
+        for attempt in 0..2 {
+            pubsub
+                .send_to_peer_bounded(
+                    topic,
+                    target,
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"budget-starved-probe"),
+                    "EAGER",
+                )
+                .await
+                .expect("budget-refused send completes");
+            assert_eq!(
+                transport.send_count_to(target),
+                0,
+                "claim {attempt} sent nothing"
+            );
+            assert!(
+                !probe_in_flight(&pubsub, topic, target).await,
+                "claim {attempt}: a budget-refused probe must not leave the in-flight flag set"
+            );
+        }
+        drop(held);
+
+        // The permit is free: the next claim IS the recovery probe, and its
+        // success lifts the suppression.
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"probe-after-budget-frees"),
+                "EAGER",
+            )
+            .await
+            .expect("probe send completes");
+        assert_eq!(
+            transport.send_count_to(target),
+            1,
+            "the recovery probe must fire once a permit is available"
+        );
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state exists");
+        let cooling = state.peer_cooling.get(&target).expect("cooling state kept");
+        assert!(!cooling.recovery_probe_in_flight);
+        assert_eq!(
+            cooling.suppressed_until, None,
+            "probe success lifts suppression"
+        );
+        assert!(state.can_graft_peer_at(target, Instant::now()));
     }
 
     #[tokio::test]

@@ -17792,15 +17792,21 @@ mod tests {
 
         /// Consume one hang slot, if any remain.
         fn take_hang_slot(&self) -> bool {
-            self.hang_budget
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    if n > 0 {
-                        Some(n - 1)
-                    } else {
-                        None
-                    }
-                })
-                .is_ok()
+            let mut current = self.hang_budget.load(Ordering::SeqCst);
+            loop {
+                if current == 0 {
+                    return false;
+                }
+                match self.hang_budget.compare_exchange(
+                    current,
+                    current - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => return true,
+                    Err(actual) => current = actual,
+                }
+            }
         }
     }
 

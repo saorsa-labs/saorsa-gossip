@@ -171,6 +171,11 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Pin uuid to MSRV-compatible version
+        # uuid 1.27.0 bumped its rust-version to 1.89.0; pin to 1.26.1
+        # (rust-version 1.85.0) for the MSRV build only.
+        run: cargo update -p uuid --precise 1.26.1
+
       - name: Check MSRV
         run: cargo check --all-features --all-targets
 

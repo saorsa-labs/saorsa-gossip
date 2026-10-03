@@ -3920,11 +3920,104 @@ struct DeferredIwant {
 /// busy, or the peer is cooling or admission-dropped), with the limiter
 /// enabled or not. The retry re-reads `local_origin` from the cache, so a
 /// local-origin entry claims the local-origin lane again.
+///
+/// # Lifecycle of an IWANT reply
+///
+/// Issue #104, PR #106 review r3. Within a topic, the key is
+/// `k = (requester, msg_id)`, and two records track a reply:
+/// - **custody:** one `DeferredEagerReply` in `deferred_eager_replies` (at
+///   most one per `k`). It holds a request that is waiting for a retry
+///   tick.
+/// - **claim:** `eager_reply_claims[k]`, an [`EagerReplyClaim`]. It means
+///   that one EAGER reply for `k` is between its claim and its completion.
+///   Only the holder of the claim's token may send that reply, and only it
+///   may release the claim.
+///
+/// States: `Idle` (no record), `Pending` (custody only) and `InFlight(t)`
+/// (a claim with token `t`; custody may also exist). Every transition
+/// happens under the topic's write lock.
+///
+/// | Event | Performed by | From | To |
+/// |---|---|---|---|
+/// | IWANT for a cached id | IWANT serve | Idle, Pending | InFlight(t): claims `t`, then sends inline |
+/// | IWANT for a cached id | IWANT serve | InFlight | unchanged: coalesced, no second send; sets `rerequested` |
+/// | retry tick | flusher | Pending | InFlight(t): claims `t` with the outbound permit, sends detached |
+/// | retry tick | flusher | InFlight | unchanged: skipped |
+/// | completion(t), sent | IWANT serve, detached retry | InFlight(t) | Idle: drops custody for `k`, marks the pull served |
+/// | completion(t), deferred | IWANT serve (permit refused) | InFlight(t) | Pending |
+/// | completion(t), failed | IWANT serve, detached retry | InFlight(t) | Pending if custody for `k` remains, else Idle; see note 1 |
+/// | disconnect cleanup | eviction, connected-set refresh | any | Idle for that peer: drops custody and claims |
+/// | cache expiry, validator drop | custody prune | Pending | Idle |
+/// | claim older than [`EAGER_REPLY_CLAIM_TTL`] | claim prune | InFlight | claim dropped: its send was aborted |
+/// | topic removed (unsubscribe, idle) | topic map | any | all records dropped |
+///
+/// Note 1: a detached retry first drops its own custody entry. If the
+/// requester asked again while the reply was in flight (`rerequested`),
+/// the request is queued in custody again. Custody that was already there
+/// before an IWANT serve claimed `k` stays.
+///
+/// A completion releases a claim only if the claim still carries the
+/// completion's own token, and tokens are never reused. So a completion
+/// that arrives after disconnect cleanup, a TTL prune or the topic's
+/// re-creation cannot release a newer claim for the same `k`.
+///
+/// Fault matrix:
+/// - **Abort** (the send task is dropped, for example at shutdown): the
+///   claim blocks any resend of `k` until the TTL prune. Custody expires
+///   with the cached message.
+/// - **Timeout:** completion `failed`. The request is retried only if
+///   custody remains (note 1).
+/// - **Disconnect mid-send:** cleanup drops custody and the claim. The old
+///   completion finds no claim of its own. It changes nothing except
+///   dropping its own custody entry, if that still exists.
+/// - **Reconnect:** a new IWANT starts from `Idle` with a new token. The
+///   peer can receive two copies only if the old send still succeeds after
+///   the transport reported the peer disconnected.
+/// - **Repeated IWANT:** coalesced into the in-flight reply. It is queued
+///   again only if that reply fails.
+/// - **Unsubscribe:** the topic's records are dropped with its state. A
+///   late completion finds no topic, or a re-created topic whose tokens
+///   differ.
+///
+/// Adjacent sender, unchanged by this design: the x0x #613 stranded-publish
+/// retry re-sends a local publish to eager peers that have not completed a
+/// pull. It does not consult reply claims.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DeferredEagerReply {
     peer: PeerId,
     msg_id: MessageIdType,
     requested_at: Instant,
+}
+
+/// Ownership token of one [`EagerReplyClaim`]. Tokens are process-unique
+/// and never reused.
+type EagerReplyToken = u64;
+
+static NEXT_EAGER_REPLY_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// PR #106 review r3: the one in-flight EAGER reply for a
+/// `(requester, msg_id)`. See the lifecycle on [`DeferredEagerReply`].
+#[derive(Clone, Copy, Debug)]
+struct EagerReplyClaim {
+    token: EagerReplyToken,
+    claimed_at: Instant,
+    /// The requester asked again while this reply was in flight. If the
+    /// reply fails, the request returns to custody instead of being lost.
+    rerequested: bool,
+}
+
+/// How a claimed EAGER reply ended. This drives
+/// [`TopicState::settle_eager_reply`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EagerReplyOutcome {
+    /// The reply was handed to the transport.
+    Sent,
+    /// The reply was refused before sending (permit busy, cooling,
+    /// admission, byte budget). The request waits in custody.
+    Deferred,
+    /// The reply was attempted and failed (timeout, not connected, error),
+    /// or was abandoned before sending.
+    Failed,
 }
 
 const MAX_DEFERRED_IWANT_IDS: usize = MAX_IHAVE_BATCH_SIZE;
@@ -3945,6 +4038,14 @@ const MAX_LATE_LOCAL_OFFERS_PER_FLUSH: usize = 4;
 /// the flusher, bounds how many are in flight. A larger custody drains over
 /// later ticks in rotation (see `LateOfferRotation::deferred_reply_cursor`).
 const MAX_DEFERRED_REPLY_RETRIES_PER_FLUSH: usize = 8;
+
+/// PR #106 review r3: age at which an [`EagerReplyClaim`] is presumed
+/// abandoned (its send task was aborted, for example at shutdown) and is
+/// dropped. A claim's legitimate lifetime is at most one Critical gate wait
+/// plus one send, each bounded by `PER_PEER_TIMEOUT_CEILING`. Six ceilings
+/// therefore leave a threefold margin and still bound a leaked claim.
+const EAGER_REPLY_CLAIM_TTL: Duration =
+    Duration::from_secs(crate::timing::PER_PEER_TIMEOUT_CEILING.as_secs() * 6);
 
 /// Ring rank for the bounded under-lock late-offer selection (review r3,
 /// item 2): the 100 ms flush must not materialize every eligible
@@ -4081,14 +4182,13 @@ struct TopicState {
     /// the limiter state. Payload and proof remain in the bounded cache and
     /// are re-derived at each attempt.
     deferred_eager_replies: Vec<DeferredEagerReply>,
-    /// PR #106 review r2: `(peer, msg_id)` of custody entries whose retry has
-    /// been claimed and handed to a detached send. They stay in
-    /// `deferred_eager_replies`, so a repeat IWANT is still deduplicated,
-    /// but later flush ticks skip them. A Critical retry waiting on its FIFO
-    /// gate would otherwise be dispatched again on every tick. The detached
-    /// completion clears the mark. Pruned with custody, so it never holds a
-    /// key that custody no longer holds.
-    deferred_eager_replies_in_flight: HashSet<(PeerId, MessageIdType)>,
+    /// PR #106 review r3: the one in-flight EAGER reply per
+    /// `(requester, msg_id)`, whether an IWANT serve or a deferred-reply
+    /// retry is sending it. Both paths claim here before sending, so a
+    /// repeated IWANT coalesces with a reply already in flight. A
+    /// completion releases only the claim that carries its own token. See
+    /// the lifecycle on [`DeferredEagerReply`].
+    eager_reply_claims: HashMap<(PeerId, MessageIdType), EagerReplyClaim>,
     /// Per-peer quality scores for tree optimization
     peer_scores: HashMap<PeerId, PeerScore>,
     /// Local subscribers
@@ -4135,31 +4235,117 @@ impl TopicState {
                     .peek(&entry.msg_id)
                     .is_some_and(|cached| !cached.message.dropped)
         });
-        self.prune_deferred_eager_replies_in_flight();
+        self.prune_eager_reply_claims(now);
     }
 
-    /// PR #106 review r2: drop in-flight marks whose custody entry is gone
-    /// (age, cache drop, eviction, or a direct serve). This bounds the set by
-    /// custody even if a detached retry never completes, for example when
-    /// it is aborted at shutdown.
-    fn prune_deferred_eager_replies_in_flight(&mut self) {
-        if self.deferred_eager_replies_in_flight.is_empty() {
+    /// PR #106 review r3: drop claims older than [`EAGER_REPLY_CLAIM_TTL`].
+    /// Their send task was aborted and will never complete.
+    fn prune_eager_reply_claims(&mut self, now: Instant) {
+        if self.eager_reply_claims.is_empty() {
             return;
         }
-        let custody: HashSet<(PeerId, MessageIdType)> = self
-            .deferred_eager_replies
-            .iter()
-            .map(|entry| (entry.peer, entry.msg_id))
-            .collect();
-        self.deferred_eager_replies_in_flight
-            .retain(|key| custody.contains(key));
+        self.eager_reply_claims.retain(|_, claim| {
+            now.saturating_duration_since(claim.claimed_at) < EAGER_REPLY_CLAIM_TTL
+        });
     }
 
-    /// PR #106 review r2: whether this custody entry's retry is already
-    /// handed to a detached send.
-    fn deferred_eager_reply_in_flight(&self, entry: &DeferredEagerReply) -> bool {
-        self.deferred_eager_replies_in_flight
-            .contains(&(entry.peer, entry.msg_id))
+    /// PR #106 review r3: whether an EAGER reply of `msg_id` to `peer` is in
+    /// flight.
+    fn eager_reply_claimed(&self, peer: PeerId, msg_id: MessageIdType) -> bool {
+        self.eager_reply_claims.contains_key(&(peer, msg_id))
+    }
+
+    /// PR #106 review r3: claim the reply for `(peer, msg_id)`. The caller
+    /// has checked that no claim exists, under the same lock.
+    fn insert_eager_reply_claim(
+        &mut self,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        now: Instant,
+    ) -> EagerReplyToken {
+        let token = NEXT_EAGER_REPLY_TOKEN.fetch_add(1, Ordering::Relaxed);
+        self.eager_reply_claims.insert(
+            (peer, msg_id),
+            EagerReplyClaim {
+                token,
+                claimed_at: now,
+                rerequested: false,
+            },
+        );
+        token
+    }
+
+    /// PR #106 review r3: the IWANT-serve transition. It returns the token
+    /// when this serve now owns the reply. It returns `None` when a reply is
+    /// already in flight: the request is then coalesced into that reply and
+    /// marked `rerequested`, so a failure of that reply queues it again.
+    fn claim_eager_reply_for_iwant(
+        &mut self,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        now: Instant,
+    ) -> Option<EagerReplyToken> {
+        self.prune_eager_reply_claims(now);
+        if let Some(claim) = self.eager_reply_claims.get_mut(&(peer, msg_id)) {
+            claim.rerequested = true;
+            return None;
+        }
+        Some(self.insert_eager_reply_claim(peer, msg_id, now))
+    }
+
+    /// PR #106 review r3: the completion transition, shared by the IWANT
+    /// serve and the detached retry. It releases the claim only if the claim
+    /// still carries `token`. `own_custody` is the custody entry the
+    /// completing retry was dispatched for; an IWANT serve passes `None`.
+    fn settle_eager_reply(
+        &mut self,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        token: EagerReplyToken,
+        outcome: EagerReplyOutcome,
+        own_custody: Option<DeferredEagerReply>,
+        now: Instant,
+    ) {
+        let key = (peer, msg_id);
+        let rerequested = match self.eager_reply_claims.get(&key) {
+            Some(claim) if claim.token == token => self
+                .eager_reply_claims
+                .remove(&key)
+                .is_some_and(|claim| claim.rerequested),
+            // The claim was dropped (disconnect cleanup, TTL prune) or a
+            // newer claim replaced it. It is not ours to release.
+            _ => false,
+        };
+        match outcome {
+            EagerReplyOutcome::Sent => {
+                self.deferred_eager_replies
+                    .retain(|entry| entry.peer != peer || entry.msg_id != msg_id);
+                self.record_stranded_ihave_served(&msg_id, peer);
+                self.record_lazy_withheld_served(&msg_id, peer);
+            }
+            EagerReplyOutcome::Deferred => {
+                let _ = self.retain_deferred_eager_reply(peer, msg_id, now);
+            }
+            EagerReplyOutcome::Failed => {
+                if let Some(entry) = own_custody {
+                    self.deferred_eager_replies
+                        .retain(|candidate| *candidate != entry);
+                }
+                if rerequested {
+                    let _ = self.retain_deferred_eager_reply(peer, msg_id, now);
+                }
+            }
+        }
+    }
+
+    /// PR #106 review r3: the disconnect-cleanup transition for one peer.
+    /// Its custody and claims go. A send still in flight completes later
+    /// with a token that no longer matches, so it releases nothing.
+    fn drop_eager_reply_records_for_peer(&mut self, peer: PeerId) {
+        self.deferred_eager_replies
+            .retain(|entry| entry.peer != peer);
+        self.eager_reply_claims
+            .retain(|(claimed, _), _| *claimed != peer);
     }
 
     fn retain_deferred_eager_reply(
@@ -4269,7 +4455,7 @@ impl TopicState {
             outstanding_iwants: HashMap::new(),
             deferred_iwants: Vec::new(),
             deferred_eager_replies: Vec::new(),
-            deferred_eager_replies_in_flight: HashSet::new(),
+            eager_reply_claims: HashMap::new(),
             peer_scores: HashMap::new(),
             subscribers: Vec::new(),
             replay_cache: LruCache::new(replay_cache_capacity()),
@@ -5671,8 +5857,9 @@ impl TopicState {
         let eager = self.eager_peers.remove(&peer);
         let lazy = self.lazy_peers.remove(&peer);
         self.late_local_offers.remove(&peer);
-        self.deferred_eager_replies
-            .retain(|entry| entry.peer != peer);
+        // PR #106 review r3: custody and in-flight reply claims do not
+        // outlive the connection (the disconnect transition).
+        self.drop_eager_reply_records_for_peer(peer);
         let cooling = self.peer_cooling.remove(&peer).is_some();
         NotConnectedEviction {
             eager,
@@ -10573,18 +10760,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         let mut to_send = Vec::new();
         let mut requester_has_cached_message = false;
-        // x0x #613 (PR #54 r3 item 2): pull-path completion is tracked for
-        // stranded ids, but `served` is marked only AFTER the reply send
-        // succeeds — a timed-out IWANT reply must not exclude the peer
-        // from the bounded retry. The emptiness probe keeps the common
-        // (non-stranded) IWANT path lock-only.
-        let track_served = !state.stranded_ihave.is_empty() || !state.lazy_withheld.is_empty();
-        // Issue #104 (PR #106 review r1): a claim skip defers replies with
-        // the byte limiter disabled too. A served reply must clear its
-        // custody entry whenever one can exist, or the flush retry would
-        // send a duplicate EAGER (and draw the receiver's duplicate PRUNE).
-        let clear_custody_on_serve =
-            self.egress_limiter.enabled() || !state.deferred_eager_replies.is_empty();
+        // x0x #613 (PR #54 r3 item 2): a pull is marked served only AFTER its
+        // reply send succeeds (in `settle_eager_reply`), so a timed-out IWANT
+        // reply never excludes the peer from the bounded retry.
 
         for msg_id in msg_ids {
             let cached = if local_origin_only {
@@ -10637,100 +10815,46 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         drop(topics); // Release lock
 
         let republish_started = Instant::now();
-        // Ids whose IWANT reply send succeeded — marked served after the
-        // loop (or before an error return) so a stranded retry never
-        // treats a failed reply as a completed pull.
-        let mut served_ids: Vec<MessageIdType> = Vec::new();
-        let mut deferred_ids: Vec<MessageIdType> = Vec::new();
         let mut sent_any = false;
         let mut send_err: Option<anyhow::Error> = None;
-        // Send EAGER with payloads
+        // Send EAGER with payloads. PR #106 review r3: each reply follows the
+        // lifecycle on `DeferredEagerReply`. It is claimed just before it is
+        // sent and settled right after. If a reply for the same
+        // (requester, msg_id) is already in flight, from an earlier IWANT or
+        // from a deferred-reply retry, this request is coalesced into it
+        // instead of sending a second copy.
         for (msg_id, cached) in to_send {
-            self.transport.migration.admit_cache_serve(
-                topic,
-                cached.payload.len()
-                    + MESSAGE_CRYPTO_OVERHEAD_BYTES
-                    + MESSAGE_HEADER_OVERHEAD_BYTES,
-            )?;
-            if !forwardable_payload("iwant_serve", &msg_id, &cached.payload) {
-                continue;
-            }
-            debug!(peer_id = %from, msg_id = ?msg_id, "Sending EAGER in response to IWANT");
-            debug!(
-                target: "sg.payload.trace",
-                stage = "iwant_serve",
-                msg_id = %msg_id_hex8(&msg_id),
-                len = cached.payload.len(),
-                zero_tail = payload_zero_tail(&cached.payload),
-            );
-
-            let _message = GossipMessage {
-                header: cached.header.clone(),
-                payload: Some(cached.payload.clone()),
-                signature: self.sign_message(&cached.header),
-                public_key: self.signing_key.public_key().to_vec(),
-            };
-
-            let bytes = match postcard::to_stdvec(&_message) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    self.mark_stranded_ihave_served(topic, from, &served_ids)
-                        .await;
-                    self.record_stage(PubSubStage::Republish, republish_started);
-                    return Err(anyhow!("Serialization failed: {}", e));
-                }
-            };
-            let send_result = self
-                .send_to_peer_bounded_outcome_tracked(
-                    topic,
-                    from,
-                    GossipStreamType::PubSub,
-                    bytes.into(),
-                    "EAGER",
-                    // An IWANT serve is demand traffic, not a new relay
-                    // publish; outbound wire bytes are still counted.
-                    BoundedSendOrigin {
-                        local: local_origin_only || cached.local_origin,
-                        meter_publish: false,
-                    },
-                )
-                .await
-                .0;
-            match send_result {
-                Ok(PeerSendOutcome::Sent { .. }) => {
-                    sent_any = true;
-                    // With an empty custody and a disabled limiter, taking
-                    // the topic write lock per served message to retain an
-                    // empty list is pure dispatch-path overhead.
-                    if clear_custody_on_serve {
-                        let mut topics = self.topics.write_topic(&topic).await;
-                        if let Some(state) = topics.get_mut(&topic) {
-                            state
-                                .deferred_eager_replies
-                                .retain(|entry| entry.peer != from || entry.msg_id != msg_id);
-                        }
-                    }
-                    if track_served {
-                        served_ids.push(msg_id);
-                    }
-                }
-                Ok(PeerSendOutcome::Deferred) => deferred_ids.push(msg_id),
-                Ok(PeerSendOutcome::TimedOut | PeerSendOutcome::NotConnected) => {}
-                Err(e) => {
-                    send_err = Some(e);
+            let token = {
+                let mut topics = self.topics.write_topic(&topic).await;
+                let Some(state) = topics.get_mut(&topic) else {
+                    // The topic was removed (unsubscribe) while serving.
                     break;
+                };
+                state.claim_eager_reply_for_iwant(from, msg_id, Instant::now())
+            };
+            let Some(token) = token else {
+                debug!(peer_id = %from, msg_id = ?msg_id, "IWANT reply coalesced with the reply already in flight");
+                continue;
+            };
+            let result = self
+                .send_claimed_iwant_reply(topic, from, msg_id, &cached, local_origin_only)
+                .await;
+            let outcome = match &result {
+                Ok(outcome) => *outcome,
+                Err(_) => EagerReplyOutcome::Failed,
+            };
+            {
+                let mut topics = self.topics.write_topic(&topic).await;
+                if let Some(state) = topics.get_mut(&topic) {
+                    state.settle_eager_reply(from, msg_id, token, outcome, None, Instant::now());
                 }
             }
-        }
-        self.mark_stranded_ihave_served(topic, from, &served_ids)
-            .await;
-        if !deferred_ids.is_empty() {
-            let mut topics = self.topics.write_topic(&topic).await;
-            if let Some(state) = topics.get_mut(&topic) {
-                let now = Instant::now();
-                for msg_id in deferred_ids {
-                    let _ = state.retain_deferred_eager_reply(from, msg_id, now);
-                }
+            if outcome == EagerReplyOutcome::Sent {
+                sent_any = true;
+            }
+            if let Err(error) = result {
+                send_err = Some(error);
+                break;
             }
         }
         self.record_stage(PubSubStage::Republish, republish_started);
@@ -10741,27 +10865,62 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         Ok(sent_any)
     }
 
-    /// x0x #613 (PR #54 r3 item 2): mark stranded ids as pull-served for
-    /// `from` — called by the IWANT serve path with the ids whose reply
-    /// sends actually succeeded. No-op for empty inputs or ids no longer
-    /// stranded. Also marks #59 LazyForward withheld-announce entries
-    /// served, so a pre-flush pull is not re-advertised.
-    async fn mark_stranded_ihave_served(
+    /// Admit, sign and send one claimed IWANT reply. An error is returned as
+    /// `Err` so that the caller settles the claim before it reports the
+    /// error.
+    async fn send_claimed_iwant_reply(
         &self,
         topic: TopicId,
         from: PeerId,
-        msg_ids: &[MessageIdType],
-    ) {
-        if msg_ids.is_empty() {
-            return;
+        msg_id: MessageIdType,
+        cached: &CachedMessage,
+        local_origin_only: bool,
+    ) -> Result<EagerReplyOutcome> {
+        self.transport.migration.admit_cache_serve(
+            topic,
+            cached.payload.len() + MESSAGE_CRYPTO_OVERHEAD_BYTES + MESSAGE_HEADER_OVERHEAD_BYTES,
+        )?;
+        if !forwardable_payload("iwant_serve", &msg_id, &cached.payload) {
+            return Ok(EagerReplyOutcome::Failed);
         }
-        let mut topics = self.topics.write_topic(&topic).await;
-        if let Some(state) = topics.get_mut(&topic) {
-            for msg_id in msg_ids {
-                state.record_stranded_ihave_served(msg_id, from);
-                state.record_lazy_withheld_served(msg_id, from);
-            }
-        }
+        debug!(peer_id = %from, msg_id = ?msg_id, "Sending EAGER in response to IWANT");
+        debug!(
+            target: "sg.payload.trace",
+            stage = "iwant_serve",
+            msg_id = %msg_id_hex8(&msg_id),
+            len = cached.payload.len(),
+            zero_tail = payload_zero_tail(&cached.payload),
+        );
+
+        let message = GossipMessage {
+            header: cached.header.clone(),
+            payload: Some(cached.payload.clone()),
+            signature: self.sign_message(&cached.header),
+            public_key: self.signing_key.public_key().to_vec(),
+        };
+        let bytes =
+            postcard::to_stdvec(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
+        let send_result = self
+            .send_to_peer_bounded_outcome_tracked(
+                topic,
+                from,
+                GossipStreamType::PubSub,
+                bytes.into(),
+                "EAGER",
+                // An IWANT serve is demand traffic, not a new relay
+                // publish; outbound wire bytes are still counted.
+                BoundedSendOrigin {
+                    local: local_origin_only || cached.local_origin,
+                    meter_publish: false,
+                },
+            )
+            .await
+            .0;
+        Ok(match send_result? {
+            PeerSendOutcome::Sent { .. } => EagerReplyOutcome::Sent,
+            PeerSendOutcome::Deferred => EagerReplyOutcome::Deferred,
+            PeerSendOutcome::TimedOut | PeerSendOutcome::NotConnected => EagerReplyOutcome::Failed,
+        })
     }
     /// Handle incoming anti-entropy message
     ///
@@ -11410,15 +11569,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         });
                     }
 
+                    // PR #106 review r3: claims of aborted sends expire here
+                    // even when custody is empty (an IWANT-serve claim has no
+                    // custody entry). This is a no-op without claims.
+                    state.prune_eager_reply_claims(now);
                     if !state.deferred_eager_replies.is_empty() {
                         state.prune_deferred_eager_replies(now);
-                        // PR #106 review r2: a reply already handed to a
-                        // detached send is not retried again.
+                        // A reply already in flight (claimed by an IWANT
+                        // serve or an earlier retry) is not retried.
                         deferred_replies.extend(
                             state
                                 .deferred_eager_replies
                                 .iter()
-                                .filter(|entry| !state.deferred_eager_reply_in_flight(entry))
+                                .filter(|entry| {
+                                    !state.eager_reply_claimed(entry.peer, entry.msg_id)
+                                })
                                 .map(|entry| (*topic_id, *entry)),
                         );
                     }
@@ -11830,7 +11995,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 };
                 state.prune_deferred_eager_replies(Instant::now());
                 if !state.deferred_eager_replies.contains(&entry)
-                    || state.deferred_eager_reply_in_flight(&entry)
+                    || state.eager_reply_claimed(entry.peer, entry.msg_id)
                 {
                     continue;
                 }
@@ -11940,12 +12105,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let Some((peer, reservation)) = reserved.into_iter().next() else {
                 continue;
             };
-            let (attempts, permits, bulk_admitted) = {
+            // PR #106 review r3, retry-tick transition: the reply claim and the
+            // outbound permit are taken under ONE topic lock. If an IWANT
+            // serve or another retry already holds the reply claim, this
+            // entry is skipped, and nothing is reserved.
+            let (attempts, permits, bulk_admitted, token) = {
                 let now = Instant::now();
                 let mut guard = topics.write_topic(&topic).await;
                 let Some(state) = guard.get_mut(&topic) else {
                     continue;
                 };
+                state.prune_eager_reply_claims(now);
+                if state.eager_reply_claimed(entry.peer, entry.msg_id) {
+                    continue;
+                }
                 let (admitted, bulk) = filter_peers_through_admission_in_state(
                     send_path,
                     state,
@@ -11966,14 +12139,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 };
                 let (attempts, permits, _) =
                     Self::claim_topic_send_attempts_for_state(&context, state, admitted, now);
-                if !attempts.is_empty() {
-                    // Marked under the same lock as the claim: no later
-                    // snapshot can see this entry as retryable.
-                    state
-                        .deferred_eager_replies_in_flight
-                        .insert((entry.peer, entry.msg_id));
-                }
-                (attempts, permits, bulk)
+                let token = (!attempts.is_empty())
+                    .then(|| state.insert_eager_reply_claim(entry.peer, entry.msg_id, now));
+                (attempts, permits, bulk, token)
             };
             let mut claims = SendAttemptClaims::new(
                 topic,
@@ -11983,12 +12151,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 Arc::clone(stage_stats),
                 send_path.clone(),
             );
-            if claims.is_empty() {
+            let Some(token) = token else {
                 // Refused at claim time (cooling, admission, a full Critical
                 // queue): the entry stays in custody for a later tick.
                 release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
                 continue;
-            }
+            };
             stage_stats.record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
             for _ in claims.attempts() {
                 stage_stats.record_publish_origin_bytes(cached.local_origin, bytes.len());
@@ -12016,28 +12184,28 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let admission = Arc::clone(&send_path.admission);
             tokio::spawn(async move {
                 let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
-                let served_peers: Vec<_> = sent
-                    .iter()
-                    .map(|completion| completion.attempt.peer)
-                    .collect();
-                let terminal =
-                    !sent.is_empty() || !timed_out.is_empty() || !not_connected.is_empty();
+                // Completion transition. A dispatched retry has one attempt,
+                // so it ends `sent` or `failed`. A result set with no outcome
+                // at all keeps the request in custody (`Deferred`).
+                let outcome = if !sent.is_empty() {
+                    EagerReplyOutcome::Sent
+                } else if !timed_out.is_empty() || !not_connected.is_empty() {
+                    EagerReplyOutcome::Failed
+                } else {
+                    EagerReplyOutcome::Deferred
+                };
                 claims.record_results(sent, timed_out, not_connected).await;
                 release_bulk_admissions_free(&admission, &bulk_admitted);
                 let mut guard = topics.write_topic(&topic).await;
                 if let Some(state) = guard.get_mut(&topic) {
-                    for peer in served_peers {
-                        state.record_stranded_ihave_served(&entry.msg_id, peer);
-                        state.record_lazy_withheld_served(&entry.msg_id, peer);
-                    }
-                    if terminal {
-                        state
-                            .deferred_eager_replies
-                            .retain(|candidate| *candidate != entry);
-                    }
-                    state
-                        .deferred_eager_replies_in_flight
-                        .remove(&(entry.peer, entry.msg_id));
+                    state.settle_eager_reply(
+                        entry.peer,
+                        entry.msg_id,
+                        token,
+                        outcome,
+                        Some(entry),
+                        Instant::now(),
+                    );
                 }
             });
         }
@@ -12970,6 +13138,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         state
             .deferred_eager_replies
             .retain(|entry| connected_set.contains(&entry.peer));
+        // PR #106 review r3: the disconnect transition drops in-flight reply
+        // claims with custody. A stale completion's token then matches
+        // nothing.
+        state
+            .eager_reply_claims
+            .retain(|(peer, _), _| connected_set.contains(peer));
         let removed_cooling = state.clear_disconnected_peer_cooling(&connected_set);
         for peer in removed_cooling {
             self.stage_stats.clear_peer_suppression(topic, peer);
@@ -17084,6 +17258,397 @@ mod tests {
         .await
         .expect("the rotated next tick reaches the healthy reply");
         assert_eq!(transport.send_count_to(cooling), 0);
+    }
+
+    /// A default (limiter-disabled) node with `peer` connected on a Critical
+    /// topic that caches one local-origin message, and another Critical
+    /// send to `peer` holding the peer's in-flight gate slot (`active`).
+    struct CriticalReplyFixture {
+        transport: Arc<RecordingTransport>,
+        pubsub: PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        active: OutboundSendPermit,
+    }
+
+    async fn critical_reply_fixture(topic_byte: u8) -> CriticalReplyFixture {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        assert!(
+            !pubsub.egress_limiter.enabled(),
+            "default node: byte limiter disabled"
+        );
+        let topic = TopicId::new([topic_byte; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([peer])),
+        );
+        let payload = Bytes::from_static(b"critical-reply");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            state.cache_message(msg_id, payload, test_header(topic, msg_id), true);
+        }
+        let mut active = pubsub
+            .outbound_budgets
+            .try_acquire(
+                peer,
+                OutboundSendClass::Data,
+                TopicPriority::Critical,
+                Instant::now(),
+            )
+            .expect("Critical gate slot");
+        assert!(active.engage_critical_gate(Duration::from_secs(1)).await);
+        CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        }
+    }
+
+    /// Put `(peer, msg_id)` into deferred-reply custody, as a deferred IWANT
+    /// serve does.
+    async fn defer_eager_reply(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        requested_at: Instant,
+    ) {
+        let mut topics = pubsub.topics.write_topic(&topic).await;
+        let state = topics.get_mut(&topic).expect("topic state");
+        assert!(state.retain_deferred_eager_reply(peer, msg_id, requested_at));
+    }
+
+    /// Wait (polling on the tokio clock, so paused tests advance) until the
+    /// topic's deferred-reply custody is empty.
+    async fn wait_for_deferred_custody_drained(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while deferred_reply_custody_len(pubsub, topic).await > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("deferred reply custody drains");
+    }
+
+    /// PR #106 review r3, finding 1: a repeated IWANT must not start a
+    /// second EAGER reply while one for the same (peer, msg_id) is in
+    /// flight. Here the deferred-reply retry waits at the peer's Critical
+    /// gate when the requester asks again. Before r3 the repeat queued its
+    /// own reply behind the retry, so the peer received the message twice,
+    /// and a duplicate EAGER draws the receiver's PRUNE.
+    #[tokio::test]
+    async fn repeated_iwant_coalesces_with_in_flight_retry() {
+        let CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        } = critical_reply_fixture(0x6e).await;
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        defer_eager_reply(&pubsub, topic, peer, msg_id, Instant::now()).await;
+        let mut late_rotation = LateOfferRotation::default();
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(eager_sent(), 0, "the retry waits at the peer's gate");
+
+        // The requester asks again while the retry waits; the gate then
+        // frees.
+        let repeat = async {
+            pubsub
+                .handle_iwant(peer, topic, vec![msg_id])
+                .await
+                .expect("repeat IWANT handled");
+        };
+        let release_gate = async move {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            drop(active);
+        };
+        tokio::join!(repeat, release_gate);
+        wait_for_deferred_custody_drained(&pubsub, topic).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            eager_sent(),
+            1,
+            "a repeated IWANT coalesces with the in-flight reply"
+        );
+    }
+
+    /// PR #106 review r3, finding 1 (the other order): a retry tick must not
+    /// dispatch a deferred reply while an IWANT serve is sending the same
+    /// `(peer, msg_id)`. Here the custody entry exists when the requester
+    /// asks again, and the serve waits at the peer's Critical gate. Before
+    /// r3 the tick dispatched the custody entry anyway, and the peer
+    /// received two copies.
+    #[tokio::test]
+    async fn retry_tick_skips_a_reply_an_iwant_serve_is_sending() {
+        let CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        } = critical_reply_fixture(0x73).await;
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        defer_eager_reply(&pubsub, topic, peer, msg_id, Instant::now()).await;
+
+        // The requester asks again: the serve waits at the gate while a
+        // retry tick runs, and the gate then frees.
+        let serve = async {
+            pubsub
+                .handle_iwant(peer, topic, vec![msg_id])
+                .await
+                .expect("IWANT handled");
+        };
+        let tick_then_release = async {
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            let mut late_rotation = LateOfferRotation::default();
+            drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            drop(active);
+        };
+        tokio::join!(serve, tick_then_release);
+        wait_for_deferred_custody_drained(&pubsub, topic).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            eager_sent(),
+            1,
+            "the retry tick must not send a reply the IWANT serve is sending"
+        );
+    }
+
+    /// PR #106 review r3, finding 2: a reply's completion may release only
+    /// the claim it took. Disconnect cleanup removes the peer's custody
+    /// while the old retry still waits at the gate. The reconnected peer
+    /// asks again, and a new retry is dispatched. When the old retry then
+    /// fails, its completion must not free the new retry's claim. If it
+    /// did, the next tick would dispatch the same reply a second time.
+    #[tokio::test(start_paused = true)]
+    async fn stale_retry_completion_does_not_release_a_newer_claim() {
+        let CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        } = critical_reply_fixture(0x6f).await;
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        let mut late_rotation = LateOfferRotation::default();
+        // Old retry: dispatched at t = 0, waits at the gate until its
+        // adaptive gate wait (the 4 s floor, no RTT samples) runs out.
+        defer_eager_reply(&pubsub, topic, peer, msg_id, Instant::now()).await;
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Disconnect cleanup, then the reconnected peer asks again.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            let _ = state.evict_not_connected_peer(peer);
+            assert!(
+                state.deferred_eager_replies.is_empty(),
+                "disconnect cleanup drops the custody"
+            );
+        }
+        defer_eager_reply(
+            &pubsub,
+            topic,
+            peer,
+            msg_id,
+            Instant::now() + Duration::from_millis(1),
+        )
+        .await;
+        // New retry: dispatched at t = 1 s, gate wait until t = 5 s.
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+
+        // t = 4.5 s: the old retry has timed out at the gate and completed.
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+
+        drop(active);
+        wait_for_deferred_custody_drained(&pubsub, topic).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            eager_sent(),
+            1,
+            "the stale completion must not let the newer reply be dispatched twice"
+        );
+    }
+
+    /// PR #106 review r3 (state machine, repeated IWANT x timeout): a
+    /// repeated IWANT that was coalesced into an in-flight reply must not be
+    /// lost when that reply fails. The request returns to custody and a
+    /// later tick serves it.
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_iwant_is_served_after_the_in_flight_reply_fails() {
+        let CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        } = critical_reply_fixture(0x70).await;
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        let mut late_rotation = LateOfferRotation::default();
+        defer_eager_reply(&pubsub, topic, peer, msg_id, Instant::now()).await;
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+
+        // The requester asks again while the retry waits at the gate; by
+        // t = 5 s the retry's gate wait (4 s) has run out.
+        let repeat = async {
+            pubsub
+                .handle_iwant(peer, topic, vec![msg_id])
+                .await
+                .expect("repeat IWANT handled");
+        };
+        tokio::join!(repeat, tokio::time::sleep(Duration::from_secs(5)));
+        assert_eq!(eager_sent(), 0, "nothing is sent while the gate is held");
+
+        drop(active);
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+        wait_for_deferred_custody_drained(&pubsub, topic).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            eager_sent(),
+            1,
+            "the coalesced request is served after the in-flight reply failed"
+        );
+    }
+
+    /// PR #106 review r3 (state machine): the reply-claim transitions on one
+    /// topic's state, with injected time. A repeat coalesces. A foreign
+    /// token releases nothing. A failure with a coalesced repeat queues the
+    /// request again. Sent clears custody. Disconnect cleanup and the TTL
+    /// drop claims.
+    #[test]
+    fn eager_reply_claim_transitions_follow_the_lifecycle() {
+        let topic = TopicId::new([0x71; 32]);
+        let mut state = TopicState::new();
+        let msg_id = [0x72; 32];
+        state.cache_message(
+            msg_id,
+            Bytes::from_static(b"claimed"),
+            test_header(topic, msg_id),
+            true,
+        );
+        let (peer, other) = (test_peer_id(2), test_peer_id(3));
+        let now = Instant::now();
+        let in_custody = |state: &TopicState| {
+            state
+                .deferred_eager_replies
+                .iter()
+                .any(|entry| entry.peer == peer && entry.msg_id == msg_id)
+        };
+
+        // IWANT serve: the first request claims the reply, a repeat coalesces.
+        let token = state
+            .claim_eager_reply_for_iwant(peer, msg_id, now)
+            .expect("the first serve claims the reply");
+        assert_eq!(
+            state.claim_eager_reply_for_iwant(peer, msg_id, now),
+            None,
+            "a repeat IWANT coalesces"
+        );
+
+        // A completion that carries another claim's token releases nothing.
+        let foreign = state
+            .claim_eager_reply_for_iwant(other, msg_id, now)
+            .expect("another peer's reply has its own claim");
+        state.settle_eager_reply(peer, msg_id, foreign, EagerReplyOutcome::Failed, None, now);
+        assert!(
+            state.eager_reply_claimed(peer, msg_id),
+            "a foreign token must not release the claim"
+        );
+
+        // The owner fails, so the coalesced repeat goes back into custody.
+        state.settle_eager_reply(peer, msg_id, token, EagerReplyOutcome::Failed, None, now);
+        assert!(!state.eager_reply_claimed(peer, msg_id));
+        assert!(
+            in_custody(&state),
+            "a failed reply with a coalesced repeat queues the request again"
+        );
+
+        // A sent reply clears custody for the key.
+        let token = state
+            .claim_eager_reply_for_iwant(peer, msg_id, now)
+            .expect("claimed again");
+        state.settle_eager_reply(peer, msg_id, token, EagerReplyOutcome::Sent, None, now);
+        assert!(!in_custody(&state), "a sent reply leaves custody");
+
+        // Disconnect cleanup drops the peer's claims, not other peers' claims.
+        let _ = state
+            .claim_eager_reply_for_iwant(peer, msg_id, now)
+            .expect("claimed again");
+        let _ = state.evict_not_connected_peer(peer);
+        assert!(
+            !state.eager_reply_claimed(peer, msg_id),
+            "claims do not outlive the connection"
+        );
+        assert!(state.eager_reply_claimed(other, msg_id));
+
+        // An aborted send's claim expires at the TTL.
+        state.prune_eager_reply_claims(now + EAGER_REPLY_CLAIM_TTL - Duration::from_millis(1));
+        assert!(
+            state.eager_reply_claimed(other, msg_id),
+            "kept inside the TTL"
+        );
+        state.prune_eager_reply_claims(now + EAGER_REPLY_CLAIM_TTL);
+        assert!(
+            !state.eager_reply_claimed(other, msg_id),
+            "an abandoned claim expires"
+        );
     }
 
     /// Issue #104 fix 2: relayed sends holding every eager peer's shared

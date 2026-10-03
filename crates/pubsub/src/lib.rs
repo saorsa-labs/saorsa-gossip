@@ -1999,6 +1999,10 @@ struct SendAttemptClaims {
     /// Why peers were skipped during the claim, per reason. Only consulted
     /// by the single-peer Critical-control path today.
     skips: SendClaimSkips,
+    /// PR #106 review r5: the claimed EAGER reply these attempts carry, if
+    /// any. A cancelled booking (drop while armed) then also goes through
+    /// the reply lifecycle gate, so a stale cancellation books nothing.
+    reply: Option<EagerReplyCompletion>,
     armed: bool,
 }
 
@@ -2019,6 +2023,7 @@ impl SendAttemptClaims {
             stage_stats,
             send_path,
             skips: SendClaimSkips::default(),
+            reply: None,
             armed: true,
         }
     }
@@ -2070,7 +2075,13 @@ impl SendAttemptClaims {
         outcome: EagerReplyOutcome,
         results: SendAttemptResults,
     ) {
-        let Some(completion) = reply else {
+        // PR #106 review r5: recorded BEFORE awaiting the topic lock, so a
+        // cancellation while waiting routes its drop booking through the
+        // same gate.
+        if reply.is_some() {
+            self.reply = reply;
+        }
+        let Some(completion) = self.reply else {
             let SendAttemptResults {
                 sent,
                 timed_out,
@@ -2113,9 +2124,30 @@ impl Drop for SendAttemptClaims {
         let topics = Arc::clone(&self.topics);
         let stage_stats = Arc::clone(&self.stage_stats);
         let send_path = self.send_path.clone();
+        let reply = self.reply;
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
+                    // PR #106 review r5: a cancelled reply books its probe
+                    // timeouts through the lifecycle gate: as a current
+                    // `failed` completion, or not at all if it is stale.
+                    if let Some(completion) = reply {
+                        complete_eager_reply(
+                            &topics,
+                            &stage_stats,
+                            &send_path,
+                            topic,
+                            completion,
+                            EagerReplyOutcome::Failed,
+                            SendAttemptResults {
+                                sent: Vec::new(),
+                                timed_out,
+                                not_connected: Vec::new(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
                     record_topic_send_attempt_results_for_state(
                         &topics,
                         &stage_stats,
@@ -3988,7 +4020,7 @@ struct DeferredIwant {
 /// | stale completion(t) | IWANT serve, detached retry | any | unchanged, except that its own exact custody entry is removed; see note 2 |
 /// | disconnect cleanup | eviction, connected-set refresh | any | Idle for that peer: drops custody and claims |
 /// | cache expiry, validator drop | custody prune | Pending | Idle |
-/// | claim older than [`EAGER_REPLY_CLAIM_TTL`] | claim prune | InFlight | claim dropped: its send was aborted |
+/// | claim older than [`EAGER_REPLY_CLAIM_TTL`] | claim prune | InFlight | claim dropped, and its recovery probe (if any) cleared; see note 2 |
 /// | topic removed (unsubscribe, idle) | topic map | any | all records dropped |
 ///
 /// A completion is **current** when `eager_reply_claims[k]` still carries
@@ -4011,20 +4043,34 @@ struct DeferredIwant {
 /// remove other custody for `k`, or book transport results. Booking covers
 /// RTT samples, cooling and the x0x #380 not-connected eviction. The
 /// resources the send held (outbound permit, Critical gate slot, admission
-/// depth) are still released. A claim is lost only to disconnect cleanup
-/// (which also clears the peer's cooling state, including any recovery
-/// probe), to topic removal, or to the TTL prune. A completing send cannot
-/// outlive the TTL, because its gate wait and its send are each bounded by
-/// `PER_PEER_TIMEOUT_CEILING`. Skipping the booking of a stale completion
-/// therefore never leaves a probe in flight. A completion can also be
-/// presented twice: an IWANT serve whose send was attempted is completed
-/// inside the send, then again by the serve. The second presentation is
-/// stale and so has no effect.
+/// depth) are still released. A claim is lost only to one of these:
+/// - disconnect cleanup, which also clears the peer's cooling state,
+///   including any recovery probe;
+/// - topic removal, which drops the cooling state;
+/// - the TTL prune.
+///
+/// Transport deadlines bound the send, but not scheduling or the
+/// completion's wait for the topic lock. A completion can therefore arrive
+/// after its claim expired (PR #106 review r5). The claim records the
+/// recovery probe its send carries (`EagerReplyClaim::probe`), under the
+/// lock that armed the probe, and the TTL prune clears exactly that probe.
+/// Skipping a stale completion's booking therefore never leaves a probe in
+/// flight.
+///
+/// A completion can also be presented twice. An IWANT serve whose send was
+/// attempted is completed inside the send, then again by the serve. The
+/// second presentation is stale and so has no effect.
 ///
 /// Fault matrix:
 /// - **Abort** (the send task is dropped, for example at shutdown): the
-///   claim blocks any resend of `k` until the TTL prune. Custody expires
-///   with the cached message.
+///   claim blocks any resend of `k` until the TTL prune, which also clears
+///   its recovery probe. Custody expires with the cached message.
+/// - **Cancelled completion** (its future is dropped while it waits for
+///   the topic lock): the claims guard carries the reply and books its
+///   recovery-probe timeout through the same gate (PR #106 review r5). A
+///   current reply books as a `failed` completion. A stale reply books
+///   nothing. A guard with no probe books nothing, and the claim waits for
+///   the TTL prune, as on abort.
 /// - **Timeout:** current completion, `failed`. The request is retried only
 ///   if custody remains (note 1).
 /// - **Disconnect mid-send:** cleanup drops custody and the claim. The old
@@ -4081,6 +4127,11 @@ struct EagerReplyClaim {
     /// The requester asked again while this reply was in flight. If the
     /// reply fails, the request returns to custody instead of being lost.
     rerequested: bool,
+    /// PR #106 review r5: the recovery probe this reply's send carries, if
+    /// it is one. It is recorded under the lock that armed the probe. The
+    /// TTL prune clears exactly this probe, because a completion that
+    /// arrives after the prune is stale and books nothing.
+    probe: Option<RecoveryProbeId>,
 }
 
 /// PR #106 review r4: what a completion presents to the lifecycle gate,
@@ -4139,9 +4190,12 @@ const MAX_DEFERRED_REPLY_RETRIES_PER_FLUSH: usize = 8;
 
 /// PR #106 review r3: age at which an [`EagerReplyClaim`] is presumed
 /// abandoned (its send task was aborted, for example at shutdown) and is
-/// dropped. A claim's legitimate lifetime is at most one Critical gate wait
-/// plus one send, each bounded by `PER_PEER_TIMEOUT_CEILING`. Six ceilings
-/// therefore leave a threefold margin and still bound a leaked claim.
+/// dropped. The send itself is at most one Critical gate wait plus one
+/// send, each bounded by `PER_PEER_TIMEOUT_CEILING`, so six ceilings leave
+/// a threefold margin for it. Scheduling and the completion's wait for the
+/// topic lock are not bounded, so a completion can still arrive after the
+/// TTL. It is then stale, and the prune has already cleared its recovery
+/// probe (PR #106 review r5).
 const EAGER_REPLY_CLAIM_TTL: Duration =
     Duration::from_secs(crate::timing::PER_PEER_TIMEOUT_CEILING.as_secs() * 6);
 
@@ -4342,9 +4396,44 @@ impl TopicState {
         if self.eager_reply_claims.is_empty() {
             return;
         }
-        self.eager_reply_claims.retain(|_, claim| {
-            now.saturating_duration_since(claim.claimed_at) < EAGER_REPLY_CLAIM_TTL
+        let mut expired_probes = Vec::new();
+        self.eager_reply_claims.retain(|(peer, _), claim| {
+            let live = now.saturating_duration_since(claim.claimed_at) < EAGER_REPLY_CLAIM_TTL;
+            if !live {
+                if let Some(probe) = claim.probe {
+                    expired_probes.push((*peer, probe));
+                }
+            }
+            live
         });
+        // PR #106 review r5: the expired claim's completion (if it ever
+        // arrives) is stale and books nothing, so its recovery probe is
+        // cleared here. The peer's next send becomes a fresh probe instead
+        // of staying suppressed. Only that exact probe is cleared.
+        for (peer, probe) in expired_probes {
+            self.abandon_unsent_recovery_probe(peer, Some(probe));
+        }
+    }
+
+    /// PR #106 review r5: record on the reply claim `token` that its send is
+    /// the recovery probe `attempt`. The caller holds the lock under which
+    /// the probe was armed. This is a no-op for other attempt kinds, and for
+    /// a claim the token no longer owns.
+    fn attach_probe_to_eager_reply_claim(
+        &mut self,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        token: EagerReplyToken,
+        attempt: &PeerSendAttempt,
+    ) {
+        if attempt.kind != SendAttemptKind::RecoveryProbe {
+            return;
+        }
+        if let Some(claim) = self.eager_reply_claims.get_mut(&(peer, msg_id)) {
+            if claim.token == token {
+                claim.probe = attempt.recovery_probe_id;
+            }
+        }
     }
 
     /// PR #106 review r3: whether an EAGER reply of `msg_id` to `peer` is in
@@ -4368,6 +4457,7 @@ impl TopicState {
                 token,
                 claimed_at: now,
                 rerequested: false,
+                probe: None,
             },
         );
         token
@@ -8607,7 +8697,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let release_guard = scopeguard_release(bulk_admitted, &peer, &self.admission);
 
         let (mut claims, _lock_wait) = self
-            .claim_topic_send_attempts(topic, vec![peer], op, local_origin)
+            .claim_topic_send_attempts_for_reply(topic, vec![peer], op, local_origin, origin.reply)
             .await;
         let Some(attempt) = claims.attempts().first().copied() else {
             let skip_reason = claims.skips().primary_reason();
@@ -8744,8 +8834,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         // PR #106 review r4: a send that carries a claimed EAGER reply books
         // its results only through the reply lifecycle gate
-        // (`record_results_for`), so a stale reply books nothing.
-        let reply = origin.reply;
+        // (`record_results_for`), so a stale reply books nothing. Since r5 the
+        // claims guard carries that reply from the claim on (set by
+        // `claim_topic_send_attempts_for_reply`), so a cancelled booking uses
+        // the same gate.
         let booked = |sent, timed_out, not_connected| SendAttemptResults {
             sent,
             timed_out,
@@ -8755,7 +8847,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Ok(Ok(PeerSendOutcome::Sent { observed })) => {
                 claims
                     .record_results_for(
-                        reply,
+                        None,
                         EagerReplyOutcome::Sent,
                         booked(
                             vec![PeerSendCompletion { attempt, observed }],
@@ -8769,7 +8861,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Ok(Ok(PeerSendOutcome::TimedOut)) => {
                 claims
                     .record_results_for(
-                        reply,
+                        None,
                         EagerReplyOutcome::Failed,
                         booked(Vec::new(), vec![attempt], Vec::new()),
                     )
@@ -8781,7 +8873,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // nor an Err for the caller to count as a send failure.
                 claims
                     .record_results_for(
-                        reply,
+                        None,
                         EagerReplyOutcome::Failed,
                         booked(Vec::new(), Vec::new(), vec![attempt]),
                     )
@@ -8792,7 +8884,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let timed_out = recovery_probe_timeout(attempt);
                 claims
                     .record_results_for(
-                        reply,
+                        None,
                         EagerReplyOutcome::Deferred,
                         booked(Vec::new(), timed_out, Vec::new()),
                     )
@@ -8803,7 +8895,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let timed_out = recovery_probe_timeout(attempt);
                 claims
                     .record_results_for(
-                        reply,
+                        None,
                         EagerReplyOutcome::Failed,
                         booked(Vec::new(), timed_out, Vec::new()),
                     )
@@ -8814,7 +8906,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let timed_out = recovery_probe_timeout(attempt);
                 claims
                     .record_results_for(
-                        reply,
+                        None,
                         EagerReplyOutcome::Failed,
                         booked(Vec::new(), timed_out, Vec::new()),
                     )
@@ -8882,6 +8974,22 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         op: &'static str,
         local_origin: bool,
     ) -> (SendAttemptClaims, Duration) {
+        self.claim_topic_send_attempts_for_reply(topic, peers, op, local_origin, None)
+            .await
+    }
+
+    /// [`Self::claim_topic_send_attempts`] for a send that carries the
+    /// claimed EAGER reply `reply` (an IWANT serve). PR #106 review r5: a
+    /// recovery probe armed by this claim is recorded on the reply claim
+    /// under the same lock, and the returned guard carries the reply.
+    async fn claim_topic_send_attempts_for_reply(
+        &self,
+        topic: TopicId,
+        peers: Vec<PeerId>,
+        op: &'static str,
+        local_origin: bool,
+        reply: Option<EagerReplyCompletion>,
+    ) -> (SendAttemptClaims, Duration) {
         let send_path = self.send_path_context();
         if peers.is_empty() {
             return (
@@ -8918,7 +9026,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 priority,
                 local_origin,
             };
-            Self::claim_topic_send_attempts_for_state(&claim_context, state, peers, now)
+            let claimed =
+                Self::claim_topic_send_attempts_for_state(&claim_context, state, peers, now);
+            if let Some(reply) = reply {
+                for attempt in &claimed.0 {
+                    state.attach_probe_to_eager_reply_claim(
+                        reply.peer,
+                        reply.msg_id,
+                        reply.token,
+                        attempt,
+                    );
+                }
+            }
+            claimed
         } else {
             let mut attempts = Vec::with_capacity(peers.len());
             let mut permits = Vec::with_capacity(peers.len());
@@ -8982,6 +9102,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             send_path,
         );
         claims.skips = skips;
+        claims.reply = reply;
         (claims, lock_wait)
     }
 
@@ -12390,8 +12511,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 };
                 let (attempts, permits, _) =
                     Self::claim_topic_send_attempts_for_state(&context, state, admitted, now);
-                let token = (!attempts.is_empty())
-                    .then(|| state.insert_eager_reply_claim(entry.peer, entry.msg_id, now));
+                let token = (!attempts.is_empty()).then(|| {
+                    let token = state.insert_eager_reply_claim(entry.peer, entry.msg_id, now);
+                    for attempt in &attempts {
+                        state.attach_probe_to_eager_reply_claim(
+                            entry.peer,
+                            entry.msg_id,
+                            token,
+                            attempt,
+                        );
+                    }
+                    token
+                });
                 (attempts, permits, bulk, token)
             };
             let mut claims = SendAttemptClaims::new(
@@ -12408,6 +12539,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
                 continue;
             };
+            // PR #106 review r5: from here on, even a cancelled booking goes
+            // through the reply lifecycle gate.
+            claims.reply = Some(EagerReplyCompletion {
+                peer: entry.peer,
+                msg_id: entry.msg_id,
+                token,
+                own_custody: Some(entry),
+            });
             stage_stats.record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
             for _ in claims.attempts() {
                 stage_stats.record_publish_origin_bytes(cached.local_origin, bytes.len());
@@ -12446,15 +12585,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 };
                 // PR #106 review r4: the gate, the outcome and the transport
                 // results under one lock. A stale retry books nothing and only
-                // removes its own custody entry.
+                // removes its own custody entry. The reply comes from the
+                // claims guard (set at the claim, PR #106 review r5).
                 claims
                     .record_results_for(
-                        Some(EagerReplyCompletion {
-                            peer: entry.peer,
-                            msg_id: entry.msg_id,
-                            token,
-                            own_custody: Some(entry),
-                        }),
+                        None,
                         outcome,
                         SendAttemptResults {
                             sent,
@@ -18316,6 +18451,256 @@ mod tests {
             .deferred_eager_replies
             .iter()
             .any(|entry| entry.peer == peer && entry.msg_id == msg_id));
+    }
+
+    /// Expired-suppression cooling for `peer`: its next claim is a recovery
+    /// probe.
+    fn probe_due_cooling(now: Instant) -> PeerCoolingState {
+        let expired = now
+            .checked_sub(Duration::from_secs(1))
+            .expect("monotonic clock is past one second");
+        PeerCoolingState {
+            timeout_window_started: now,
+            timeout_count: 0,
+            suppressed_until: Some(expired),
+            cooldown: PEER_SUPPRESSION_COOLDOWN,
+            last_suppressed_at: Some(expired),
+            last_suppression_timeout_count: PEER_TIMEOUT_THRESHOLD,
+            recovery_probe_in_flight: false,
+            recovery_probe_id: None,
+            last_bypass_probe_at: None,
+        }
+    }
+
+    async fn recovery_probe_in_flight(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        peer: PeerId,
+    ) -> bool {
+        pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .and_then(|state| state.peer_cooling.get(&peer))
+            .is_some_and(|cooling| cooling.recovery_probe_in_flight)
+    }
+
+    /// PR #106 review r5, residual 1 scenario: a reply that is a recovery
+    /// probe is sent. Its completion is then blocked on the topic lock
+    /// before booking, and meanwhile the reply's claim passes
+    /// `EAGER_REPLY_CLAIM_TTL` and is pruned. The completion is therefore
+    /// stale and discards the probe's outcome. The TTL prune must clear that
+    /// exact probe, or sends to the peer stay suppressed until inbound
+    /// activity or a disconnect.
+    async fn assert_ttl_prune_clears_the_expired_claims_probe(
+        via_iwant_serve: bool,
+        topic_byte: u8,
+    ) {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([peer])),
+        );
+        let topic = TopicId::new([topic_byte; 32]);
+        let payload = Bytes::from_static(b"probe-reply");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        {
+            let now = Instant::now();
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            state.cache_message(msg_id, payload, test_header(topic, msg_id), true);
+            state.peer_cooling.insert(peer, probe_due_cooling(now));
+            if !via_iwant_serve {
+                assert!(state.retain_deferred_eager_reply(peer, msg_id, now));
+            }
+        }
+        // Block the completion before it books, and expire the claim.
+        let block_and_expire = async {
+            let mut guard = pubsub.topics.write_topic(&topic).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                transport
+                    .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                    .len(),
+                1,
+                "the probe reply was sent"
+            );
+            let state = guard.get_mut(&topic).expect("topic state");
+            assert!(
+                state
+                    .peer_cooling
+                    .get(&peer)
+                    .is_some_and(|cooling| cooling.recovery_probe_in_flight),
+                "the reply is the peer's recovery probe"
+            );
+            state.prune_eager_reply_claims(Instant::now() + EAGER_REPLY_CLAIM_TTL);
+        };
+        if via_iwant_serve {
+            let serve = async {
+                pubsub
+                    .handle_iwant(peer, topic, vec![msg_id])
+                    .await
+                    .expect("IWANT handled");
+            };
+            tokio::join!(serve, block_and_expire);
+        } else {
+            let mut late_rotation = LateOfferRotation::default();
+            drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+            block_and_expire.await;
+        }
+        // The stale completion runs now and discards the probe's outcome.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !recovery_probe_in_flight(&pubsub, topic, peer).await,
+            "the TTL prune clears the expired claim's recovery probe"
+        );
+        let (claims, _) = pubsub
+            .claim_topic_send_attempts(topic, vec![peer], "EAGER", true)
+            .await;
+        assert_eq!(
+            claims.attempts().len(),
+            1,
+            "a later send to the peer is not suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_prune_clears_the_probe_of_an_expired_retry_claim() {
+        assert_ttl_prune_clears_the_expired_claims_probe(false, 0x7b).await;
+    }
+
+    #[tokio::test]
+    async fn ttl_prune_clears_the_probe_of_an_expired_iwant_serve_claim() {
+        assert_ttl_prune_clears_the_expired_claims_probe(true, 0x7c).await;
+    }
+
+    /// PR #106 review r5, residual 2: a completion cancelled while it waits
+    /// for the topic lock must not bypass the lifecycle gate. Its claims
+    /// guard used to book the recovery-probe timeout directly on drop. Here
+    /// the completion is stale (a newer claim holds the key), so the
+    /// cancellation must book nothing: the newer claim and the peer's
+    /// cooling state stay exactly as they were.
+    #[tokio::test]
+    async fn cancelled_stale_completion_books_nothing() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x7d; 32]);
+        let msg_id = [0x7e; 32];
+        let now = Instant::now();
+        let (probe_attempt, old_token, new_token) = {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            state.cache_message(
+                msg_id,
+                Bytes::from_static(b"cancelled-reply"),
+                test_header(topic, msg_id),
+                true,
+            );
+            state.peer_cooling.insert(peer, probe_due_cooling(now));
+            let (probe_attempt, _) = state
+                .claim_send_attempt_at(peer, now)
+                .expect("the reply is a recovery probe");
+            assert_eq!(probe_attempt.kind, SendAttemptKind::RecoveryProbe);
+            let old_token = state.insert_eager_reply_claim(peer, msg_id, now);
+            // A newer reply holds the key now.
+            state.eager_reply_claims.remove(&(peer, msg_id));
+            let new_token = state.insert_eager_reply_claim(peer, msg_id, now);
+            (probe_attempt, old_token, new_token)
+        };
+        let cooling_fields = |state: &TopicState| {
+            state.peer_cooling.get(&peer).map(|cooling| {
+                (
+                    cooling.suppressed_until,
+                    cooling.recovery_probe_in_flight,
+                    cooling.recovery_probe_id,
+                    cooling.timeout_count,
+                )
+            })
+        };
+        let cooling_before = cooling_fields(
+            pubsub
+                .topics
+                .read_topic(&topic)
+                .await
+                .get(&topic)
+                .expect("topic state"),
+        );
+
+        let claims = SendAttemptClaims::new(
+            topic,
+            vec![probe_attempt],
+            Vec::new(),
+            Arc::clone(&pubsub.topics),
+            Arc::clone(&pubsub.stage_stats),
+            pubsub.send_path_context(),
+        );
+        // The old completion waits for the topic lock and is cancelled there.
+        let guard = pubsub.topics.write_topic(&topic).await;
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            claims.record_results_for(
+                Some(EagerReplyCompletion {
+                    peer,
+                    msg_id,
+                    token: old_token,
+                    own_custody: None,
+                }),
+                EagerReplyOutcome::Failed,
+                SendAttemptResults {
+                    sent: Vec::new(),
+                    timed_out: vec![probe_attempt],
+                    not_connected: Vec::new(),
+                },
+            ),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the completion is cancelled while it waits for the lock"
+        );
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        assert_eq!(
+            state
+                .eager_reply_claims
+                .get(&(peer, msg_id))
+                .map(|claim| claim.token),
+            Some(new_token),
+            "the newer claim is untouched"
+        );
+        assert_eq!(
+            cooling_fields(state),
+            cooling_before,
+            "a stale cancellation books nothing"
+        );
     }
 
     /// Issue #104 fix 2: relayed sends holding every eager peer's shared

@@ -472,9 +472,11 @@ impl LeafEgressLimiter {
     }
 
     /// Whether an enabled→disabled reconfigure may have stranded
-    /// `deferred_eager_replies` in topic state. The next flush tick with a
-    /// disabled limiter drains them (see `flush_deferred_eager_replies`)
-    /// and clears the bit, restoring the zero-overhead steady state.
+    /// `deferred_eager_replies` in topic state. The next flush tick retries
+    /// or prunes them and clears the bit. Issue #104 (PR #106 review r1):
+    /// the flush now snapshots that custody on every tick, whatever the
+    /// limiter state (a claim skip defers replies on a disabled limiter
+    /// too), so the bit no longer gates the retry and is only acknowledged.
     pub(crate) fn deferred_residue(&self) -> bool {
         self.flags.load(Ordering::Acquire) & FLAG_DEFERRED_RESIDUE != 0
     }

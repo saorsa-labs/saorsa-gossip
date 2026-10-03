@@ -153,6 +153,14 @@ const BACKGROUND_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// Anti-entropy reconciliation interval (30 seconds)
 const ANTI_ENTROPY_INTERVAL_SECS: u64 = 30;
 
+/// Issue #104 (PR #106 review r1): how long a local publish's claim-skipped
+/// eager peers stay direct IHAVE announce targets while no flush manages to
+/// hand them the announcement (Control permit busy, cooling, admission). It
+/// spans several worst-case adaptive sends (≤ 10 s each, which is how long a
+/// busy Control permit can stay held), and it ends where the 30 s
+/// anti-entropy round, the designed fallback, takes over.
+const RETAINED_ANNOUNCE_TTL: Duration = Duration::from_secs(ANTI_ENTROPY_INTERVAL_SECS);
+
 /// Target eager peer degree (6-8)
 const MIN_EAGER_DEGREE: usize = 6;
 const MAX_EAGER_DEGREE: usize = 12;
@@ -281,6 +289,15 @@ const OUTBOUND_CRITICAL_DATA_PERMITS_PER_PEER: usize = 1;
 
 /// Per-peer concurrent Normal/Bulk EAGER/data sends allowed beside Critical.
 const OUTBOUND_BEST_EFFORT_DATA_PERMITS_PER_PEER: usize = 1;
+
+/// Issue #104: per-peer concurrent Normal/Bulk EAGER/data sends reserved for
+/// this node's OWN frames (local publishes, their stranded retry, targeted
+/// legs and IWANT serves of local-origin messages). Relayed traffic uses the
+/// best-effort lane above and can never occupy this one, so a relay burst —
+/// each send holding its permit for the whole 1.5-10 s adaptive timeout —
+/// cannot claim-skip every eager peer of a local publish. Same #504 rule as
+/// the byte budget: forwarding must not be what silences our own speech.
+const OUTBOUND_LOCAL_DATA_PERMITS_PER_PEER: usize = 1;
 
 /// Per-peer concurrent control sends allowed beside one data send.
 const OUTBOUND_CONTROL_PERMITS_PER_PEER: usize = 2;
@@ -812,7 +829,18 @@ pub struct FanoutCounts {
     pub admission_dropped: usize,
     /// Admitted candidates that acquired no send claim (transport-
     /// disconnected, cooling at claim time, exhausted outbound budget).
+    /// Issue #104: `claim_skipped == claim_skipped_disconnected +
+    /// claim_skipped_cooling + claim_skipped_budget`.
     pub claim_skipped: usize,
+    /// Claim-skipped because the transport reported the peer disconnected.
+    pub claim_skipped_disconnected: usize,
+    /// Claim-skipped because the peer was cooling at claim time (suppressed
+    /// with no bypass slot due, or a recovery probe already in flight).
+    pub claim_skipped_cooling: usize,
+    /// Claim-skipped because the peer's outbound permit was busy (local
+    /// saturation: best-effort/local-origin lane in use, or the Critical
+    /// FIFO gate full).
+    pub claim_skipped_budget: usize,
     /// Number of peers the message was dispatched toward.
     pub attempted: usize,
     /// Number of those peers that confirmed receipt before this call returned.
@@ -939,6 +967,14 @@ pub struct PubSubStageStats {
     /// `ValidationAction::LazyForward` verdict withheld — the IHAVE
     /// announce fan-out that replaces those eager sends.
     lazy_ihave_withheld_peers: AtomicU64,
+    /// Issue #104: cumulative per-reason claim skips on local publishes
+    /// (the [`FanoutCounts`] `claim_skipped_*` fields, summed).
+    publish_claim_skipped_disconnected: AtomicU64,
+    publish_claim_skipped_cooling: AtomicU64,
+    publish_claim_skipped_budget: AtomicU64,
+    /// Issue #104: cumulative claim-skipped eager peers of local publishes
+    /// queued as direct IHAVE announce targets for the next flush.
+    claim_skip_ihave_queued_peers: AtomicU64,
     /// Topic-set evictions after a definitive transport "peer not connected"
     /// failure (x0x #380). Unlike timeouts these feed no cooling — the peer
     /// simply leaves the topic's eager/lazy sets until the transport reports
@@ -1223,6 +1259,20 @@ pub struct PubSubStageStatsSnapshot {
     /// `ValidationAction::LazyForward` verdict withheld, advertised to
     /// via IHAVE instead (the announce fan-out).
     pub lazy_ihave_withheld_peers: u64,
+    /// Issue #104: cumulative local-publish eager peers claim-skipped
+    /// because the transport reported them disconnected.
+    pub publish_claim_skipped_disconnected: u64,
+    /// Issue #104: cumulative local-publish eager peers claim-skipped
+    /// because they were cooling at claim time.
+    pub publish_claim_skipped_cooling: u64,
+    /// Issue #104: cumulative local-publish eager peers claim-skipped
+    /// because their outbound permit was busy (local saturation).
+    pub publish_claim_skipped_budget: u64,
+    /// Issue #104: cumulative claim-skipped local-publish eager peers
+    /// queued as direct IHAVE announce targets, so a fully skipped publish
+    /// is still announced within one flush instead of waiting for
+    /// anti-entropy.
+    pub claim_skip_ihave_queued_peers: u64,
     /// Topic-set evictions after a definitive transport "peer not connected"
     /// failure (x0x #380) — eviction, not cooling; see
     /// [`PubSubStageStats`] for the interpretation.
@@ -1309,14 +1359,26 @@ enum PeerSendOutcome {
 struct BoundedSendOrigin {
     local: bool,
     meter_publish: bool,
+    /// PR #106 review r4: the claimed EAGER reply this send carries (an
+    /// IWANT serve). The send's results are then booked only through the
+    /// reply lifecycle gate.
+    reply: Option<EagerReplyCompletion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FanoutPeerStage {
     ByteRejected,
     AdmissionDropped,
-    ClaimSkipped,
+    ClaimSkipped(ClaimSkipReason),
     Attempted,
+}
+
+/// Issue #104: why an admitted peer acquired no send claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimSkipReason {
+    TransportDisconnected,
+    Cooling,
+    Budget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1379,11 +1441,16 @@ static NEXT_BUDGET_SLOT_ID: AtomicU64 = AtomicU64::new(1);
 struct InFlightDataSlot {
     slot_id: BudgetSlotId,
     priority: TopicPriority,
+    /// Issue #104: the slot occupies the local-origin lane rather than the
+    /// shared best-effort (relay) lane.
+    local_origin: bool,
 }
 
 struct PeerOutboundBudgetEntry {
     critical_data_in_flight: usize,
     best_effort_data_in_flight: usize,
+    /// Issue #104: in-flight Normal/Bulk data sends of local-origin frames.
+    local_data_in_flight: usize,
     control_in_flight: usize,
     /// One entry per in-flight Data permit. Critical and Normal/Bulk use
     /// separate lanes (X0X-0074c); each slot records which lane it occupies so
@@ -1397,6 +1464,7 @@ impl PeerOutboundBudgetEntry {
         Self {
             critical_data_in_flight: 0,
             best_effort_data_in_flight: 0,
+            local_data_in_flight: 0,
             control_in_flight: 0,
             data_slots: Vec::new(),
             last_used: now,
@@ -1406,6 +1474,7 @@ impl PeerOutboundBudgetEntry {
     fn is_idle_at(&self, now: Instant) -> bool {
         self.critical_data_in_flight == 0
             && self.best_effort_data_in_flight == 0
+            && self.local_data_in_flight == 0
             && self.control_in_flight == 0
             && self.data_slots.is_empty()
             && now.saturating_duration_since(self.last_used) > OUTBOUND_BUDGET_REAP_AFTER
@@ -1581,19 +1650,62 @@ impl PeerOutboundBudgets {
         }
     }
 
-    /// Try to reserve an outbound permit for `peer`.
-    ///
-    /// Critical Data sends are serialized per-peer by the FIFO Critical gate
-    /// (X0X-0074d): `try_reserve` is non-blocking and bounds the queue, and the
-    /// send task later [`CriticalReservation::engage`]s to wait for the single
-    /// in-flight permit. Normal and Bulk Data share a separate best-effort lane;
-    /// Control has its own. `None` means: Critical queue overflow (caller records
-    /// a hard error) or best-effort/control lane exhausted.
+    /// Test shorthand: [`Self::try_acquire_for_origin`] on the relay-origin
+    /// (shared best-effort) lane.
+    #[cfg(test)]
     fn try_acquire(
         self: &Arc<Self>,
         peer: PeerId,
         class: OutboundSendClass,
         priority: TopicPriority,
+        now: Instant,
+    ) -> Option<OutboundSendPermit> {
+        self.try_acquire_for_origin(peer, class, priority, false, now)
+    }
+
+    /// Read-only: could [`Self::try_acquire_for_origin`] grant `peer` a
+    /// Data permit on the lane selected by `priority` and `local_origin`
+    /// right now? Critical Data is bounded by the FIFO gate, not by a lane,
+    /// so it always reports `true`. This is advisory only, and a concurrent
+    /// release or acquire can change the answer. The deferred-reply retry
+    /// uses it to skip signing a frame that it could not claim this tick.
+    fn data_lane_available(
+        &self,
+        peer: PeerId,
+        priority: TopicPriority,
+        local_origin: bool,
+    ) -> bool {
+        if priority == TopicPriority::Critical {
+            return true;
+        }
+        self.peers_guard().get(&peer).is_none_or(|entry| {
+            if local_origin {
+                entry.local_data_in_flight < OUTBOUND_LOCAL_DATA_PERMITS_PER_PEER
+            } else {
+                entry.best_effort_data_in_flight < OUTBOUND_BEST_EFFORT_DATA_PERMITS_PER_PEER
+            }
+        })
+    }
+
+    /// Try to reserve an outbound permit for `peer`.
+    ///
+    /// Critical Data sends are serialized per-peer by the FIFO Critical gate
+    /// (X0X-0074d): `try_reserve` is non-blocking and bounds the queue, and the
+    /// send task later [`CriticalReservation::engage`]s to wait for the single
+    /// in-flight permit. Normal and Bulk Data use a separate best-effort lane;
+    /// Control has its own. `None` means: Critical queue overflow (caller records
+    /// a hard error) or best-effort/local-origin/control lane exhausted.
+    ///
+    /// Issue #104: a `local_origin` Normal/Bulk Data send takes the peer's
+    /// dedicated local-origin permit instead of the shared best-effort
+    /// (relay) one, so relayed traffic cannot starve this node's own
+    /// publishes. Critical Data (FIFO gate) and Control ignore `local_origin`.
+    fn try_acquire_for_origin(
+        self: &Arc<Self>,
+        peer: PeerId,
+        class: OutboundSendClass,
+        priority: TopicPriority,
+        local_origin: bool,
         now: Instant,
     ) -> Option<OutboundSendPermit> {
         // Critical Data: reserve a FIFO queue slot before touching the budget
@@ -1617,6 +1729,9 @@ impl PeerOutboundBudgets {
         let exhausted = match class {
             // Critical is bounded by the gate above, not the in-flight lane.
             OutboundSendClass::Data if priority == TopicPriority::Critical => false,
+            OutboundSendClass::Data if local_origin => {
+                entry.local_data_in_flight >= OUTBOUND_LOCAL_DATA_PERMITS_PER_PEER
+            }
             OutboundSendClass::Data => {
                 entry.best_effort_data_in_flight >= OUTBOUND_BEST_EFFORT_DATA_PERMITS_PER_PEER
             }
@@ -1634,11 +1749,17 @@ impl PeerOutboundBudgets {
             // in `critical`) is its sole limiter, so `release` is a no-op for it.
             OutboundSendClass::Data if priority == TopicPriority::Critical => 0,
             OutboundSendClass::Data => {
-                entry.best_effort_data_in_flight += 1;
+                if local_origin {
+                    entry.local_data_in_flight += 1;
+                } else {
+                    entry.best_effort_data_in_flight += 1;
+                }
                 let slot_id = NEXT_BUDGET_SLOT_ID.fetch_add(1, Ordering::Relaxed);
-                entry
-                    .data_slots
-                    .push(InFlightDataSlot { slot_id, priority });
+                entry.data_slots.push(InFlightDataSlot {
+                    slot_id,
+                    priority,
+                    local_origin,
+                });
                 slot_id
             }
             OutboundSendClass::Control => {
@@ -1683,6 +1804,12 @@ impl PeerOutboundBudgets {
                             warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound Critical data permit released with zero in-flight count");
                         } else {
                             entry.critical_data_in_flight -= 1;
+                        }
+                    } else if slot.local_origin {
+                        if entry.local_data_in_flight == 0 {
+                            warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound local-origin data permit released with zero in-flight count");
+                        } else {
+                            entry.local_data_in_flight -= 1;
                         }
                     } else if entry.best_effort_data_in_flight == 0 {
                         warn!(peer_id = %LogPeerId::from(peer), class = class.label(), "PubSub outbound best-effort data permit released with zero in-flight count");
@@ -1819,6 +1946,10 @@ struct SendClaimContext<'a> {
     /// Topic priority for the claim, used to choose the Critical or
     /// best-effort per-peer Data lane.
     priority: TopicPriority,
+    /// Issue #104: the frame is this node's own (local publish, its retry,
+    /// or a serve of a local-origin message), so Normal/Bulk Data takes the
+    /// dedicated local-origin permit rather than the shared relay lane.
+    local_origin: bool,
 }
 
 /// Per-reason tally of peers that were skipped (no attempt claimed) inside
@@ -1839,6 +1970,25 @@ struct SendClaimSkips {
     budget_exhausted: usize,
 }
 
+impl SendClaimSkips {
+    /// Dominant reason for a single-peer claim that produced no attempt.
+    /// Budget wins over cooling over disconnected, matching the
+    /// Critical-control classification precedence.
+    fn primary_reason(&self) -> ClaimSkipReason {
+        if self.budget_exhausted > 0 {
+            ClaimSkipReason::Budget
+        } else if self.cooling > 0 {
+            ClaimSkipReason::Cooling
+        } else if self.transport_disconnected > 0 {
+            ClaimSkipReason::TransportDisconnected
+        } else {
+            // Defensive: no recorded reason. Book it as local pressure, the
+            // same default the Critical-control path uses (hard error).
+            ClaimSkipReason::Budget
+        }
+    }
+}
+
 struct SendAttemptClaims {
     topic: TopicId,
     attempts: Vec<PeerSendAttempt>,
@@ -1849,6 +1999,10 @@ struct SendAttemptClaims {
     /// Why peers were skipped during the claim, per reason. Only consulted
     /// by the single-peer Critical-control path today.
     skips: SendClaimSkips,
+    /// PR #106 review r5: the claimed EAGER reply these attempts carry, if
+    /// any. A cancelled booking (drop while armed) then also goes through
+    /// the reply lifecycle gate, so a stale cancellation books nothing.
+    reply: Option<EagerReplyCompletion>,
     armed: bool,
 }
 
@@ -1869,6 +2023,7 @@ impl SendAttemptClaims {
             stage_stats,
             send_path,
             skips: SendClaimSkips::default(),
+            reply: None,
             armed: true,
         }
     }
@@ -1907,6 +2062,46 @@ impl SendAttemptClaims {
         .await;
         self.armed = false;
     }
+
+    /// PR #106 review r4: book the results of a send. If the send carried a
+    /// claimed EAGER reply (`reply`), the booking goes through the lifecycle
+    /// gate ([`complete_eager_reply`]), so a stale reply books nothing.
+    /// Other sends book as [`Self::record_results`] does. Either way the
+    /// claim is disarmed, so a stale reply's attempts are not re-booked as
+    /// timeouts on drop either.
+    async fn record_results_for(
+        mut self,
+        reply: Option<EagerReplyCompletion>,
+        outcome: EagerReplyOutcome,
+        results: SendAttemptResults,
+    ) {
+        // PR #106 review r5: recorded BEFORE awaiting the topic lock, so a
+        // cancellation while waiting routes its drop booking through the
+        // same gate.
+        if reply.is_some() {
+            self.reply = reply;
+        }
+        let Some(completion) = self.reply else {
+            let SendAttemptResults {
+                sent,
+                timed_out,
+                not_connected,
+            } = results;
+            self.record_results(sent, timed_out, not_connected).await;
+            return;
+        };
+        complete_eager_reply(
+            &self.topics,
+            &self.stage_stats,
+            &self.send_path,
+            self.topic,
+            completion,
+            outcome,
+            results,
+        )
+        .await;
+        self.armed = false;
+    }
 }
 
 impl Drop for SendAttemptClaims {
@@ -1929,9 +2124,30 @@ impl Drop for SendAttemptClaims {
         let topics = Arc::clone(&self.topics);
         let stage_stats = Arc::clone(&self.stage_stats);
         let send_path = self.send_path.clone();
+        let reply = self.reply;
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
+                    // PR #106 review r5: a cancelled reply books its probe
+                    // timeouts through the lifecycle gate: as a current
+                    // `failed` completion, or not at all if it is stale.
+                    if let Some(completion) = reply {
+                        complete_eager_reply(
+                            &topics,
+                            &stage_stats,
+                            &send_path,
+                            topic,
+                            completion,
+                            EagerReplyOutcome::Failed,
+                            SendAttemptResults {
+                                sent: Vec::new(),
+                                timed_out,
+                                not_connected: Vec::new(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
                     record_topic_send_attempt_results_for_state(
                         &topics,
                         &stage_stats,
@@ -2565,6 +2781,16 @@ impl PubSubStageStats {
                 .load(Ordering::Relaxed),
             stranded_publish_cache_miss: self.stranded_publish_cache_miss.load(Ordering::Relaxed),
             lazy_ihave_withheld_peers: self.lazy_ihave_withheld_peers.load(Ordering::Relaxed),
+            publish_claim_skipped_disconnected: self
+                .publish_claim_skipped_disconnected
+                .load(Ordering::Relaxed),
+            publish_claim_skipped_cooling: self
+                .publish_claim_skipped_cooling
+                .load(Ordering::Relaxed),
+            publish_claim_skipped_budget: self.publish_claim_skipped_budget.load(Ordering::Relaxed),
+            claim_skip_ihave_queued_peers: self
+                .claim_skip_ihave_queued_peers
+                .load(Ordering::Relaxed),
             suppressed_peers: self.suppressed_peer_snapshots(),
             suppressed_peers_by_topic: BTreeMap::new(),
             suppression_cleanup_interval_ms: self
@@ -2689,6 +2915,20 @@ impl PubSubStageStats {
     /// queued as direct IHAVE announce targets).
     fn record_lazy_ihave_withheld_peers(&self, peers: usize) {
         self.lazy_ihave_withheld_peers
+            .fetch_add(peers as u64, Ordering::Relaxed);
+    }
+
+    fn record_publish_claim_skips(&self, counts: &FanoutCounts) {
+        self.publish_claim_skipped_disconnected
+            .fetch_add(counts.claim_skipped_disconnected as u64, Ordering::Relaxed);
+        self.publish_claim_skipped_cooling
+            .fetch_add(counts.claim_skipped_cooling as u64, Ordering::Relaxed);
+        self.publish_claim_skipped_budget
+            .fetch_add(counts.claim_skipped_budget as u64, Ordering::Relaxed);
+    }
+
+    fn record_claim_skip_ihave_queued(&self, peers: usize) {
+        self.claim_skip_ihave_queued_peers
             .fetch_add(peers as u64, Ordering::Relaxed);
     }
 
@@ -3671,6 +3911,23 @@ struct LazyWithheldEntry {
     /// Targets that already pulled this id via IWANT before the flush
     /// consumed the entry — excluded from re-advertising.
     served: Vec<PeerId>,
+    /// Issue #104 (PR #106 review r1): `Some(deadline)` for a local
+    /// publish's claim-skipped eager peers. This node is the only source of
+    /// that message, so the entry is not lossy. A target leaves `targets`
+    /// only once an IHAVE is handed off to it (or it pulls the id, or it
+    /// disconnects), and the entry outlives the consumption of its
+    /// `pending_ihave` batch. After that, later flushes advertise it as a
+    /// separate batch until `deadline`. `None` keeps the #59 one-shot
+    /// semantics, which relayed traffic uses.
+    retain_until: Option<Instant>,
+}
+
+impl LazyWithheldEntry {
+    /// A retained entry still has a target that has neither been handed an
+    /// IHAVE nor pulled the id.
+    fn has_unresolved_retained_target(&self) -> bool {
+        self.retain_until.is_some() && self.targets.iter().any(|peer| !self.served.contains(peer))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3724,18 +3981,192 @@ struct DeferredIwant {
     requested_at: Instant,
 }
 
-/// A pull reply that the byte budget deferred, retained so the requester's
-/// pull is not lost.
+/// A pull reply that came back `Deferred`, retained so the requester's pull
+/// is not lost.
 ///
-/// #504: entries are only ever *relay* payloads. A local-origin reply is
-/// protected from shedding, so it is sent rather than deferred and can never
-/// reach custody — the `local_origin_only` flag this used to carry became
-/// unreachable and was removed with its merge and serve-side filter.
+/// #504: the byte budget only ever defers *relay* payloads. A local-origin
+/// reply is protected from shedding. Issue #104 (PR #106 review r1): a reply
+/// of either origin can still be deferred by the claim (its Data permit is
+/// busy, or the peer is cooling or admission-dropped), with the limiter
+/// enabled or not. The retry re-reads `local_origin` from the cache, so a
+/// local-origin entry claims the local-origin lane again.
+///
+/// # Lifecycle of an IWANT reply
+///
+/// Issue #104, PR #106 reviews r3 and r4. Within a topic, the key is
+/// `k = (requester, msg_id)`, and two records track a reply:
+/// - **custody:** one `DeferredEagerReply` in `deferred_eager_replies` (at
+///   most one per `k`). It holds a request that is waiting for a retry
+///   tick. Each entry carries a process-unique `id`, so an entry is always
+///   identified exactly, never by `k` alone.
+/// - **claim:** `eager_reply_claims[k]`, an [`EagerReplyClaim`]. It means
+///   that one EAGER reply for `k` is between its claim and its completion.
+///   Only the holder of the claim's token may send that reply, and only it
+///   may complete it.
+///
+/// States: `Idle` (no record), `Pending` (custody only) and `InFlight(t)`
+/// (a claim with token `t`; custody may also exist). Every transition
+/// happens under the topic's write lock.
+///
+/// | Event | Performed by | From | To |
+/// |---|---|---|---|
+/// | IWANT for a cached id | IWANT serve | Idle, Pending | InFlight(t): claims `t`, then sends inline |
+/// | IWANT for a cached id | IWANT serve | InFlight | unchanged: coalesced, no second send; sets `rerequested` |
+/// | retry tick | flusher | Pending | InFlight(t): claims `t` with the outbound permit, sends detached |
+/// | retry tick | flusher | InFlight | unchanged: skipped |
+/// | current completion(t), sent | IWANT serve, detached retry | InFlight(t) | Idle: drops custody for `k`, marks the pull served |
+/// | current completion(t), deferred | IWANT serve (refused before sending) | InFlight(t) | Pending |
+/// | current completion(t), failed | IWANT serve, detached retry | InFlight(t) | Pending if custody for `k` remains, else Idle; see note 1 |
+/// | stale completion(t) | IWANT serve, detached retry | any | unchanged, except that its own exact custody entry is removed; see note 2 |
+/// | disconnect cleanup | eviction, connected-set refresh | any | Idle for that peer: drops custody and claims |
+/// | cache expiry, validator drop | custody prune | Pending | Idle |
+/// | claim older than [`EAGER_REPLY_CLAIM_TTL`] | claim prune | InFlight | claim dropped, and its recovery probe (if any) cleared; see note 2 |
+/// | topic removed (unsubscribe, idle) | topic map | any | all records dropped |
+///
+/// A completion is **current** when `eager_reply_claims[k]` still carries
+/// its token `t`, and **stale** otherwise. Tokens are never reused. Every
+/// completion first calls [`TopicState::admit_eager_reply_completion`].
+/// That gate decides current or stale and releases a current claim, under
+/// the same lock that applies the outcome and books the send's transport
+/// results ([`complete_eager_reply`]). Only a current completion receives
+/// the [`AdmittedEagerReply`] proof, and an outcome cannot be applied
+/// without that proof.
+///
+/// Note 1: a current failed retry drops its own custody entry. If the
+/// requester asked again while the reply was in flight (`rerequested`),
+/// the request is queued in custody again. Custody that was already there
+/// before an IWANT serve claimed `k` stays.
+///
+/// Note 2: a stale completion has exactly one side effect. It removes its
+/// own original custody entry (matched by custody `id`) if that is still
+/// present. It does not mark the pull served, re-queue, create custody,
+/// remove other custody for `k`, or book transport results. Booking covers
+/// RTT samples, cooling and the x0x #380 not-connected eviction. The
+/// resources the send held (outbound permit, Critical gate slot, admission
+/// depth) are still released. A claim is lost only to one of these:
+/// - disconnect cleanup, which also clears the peer's cooling state,
+///   including any recovery probe;
+/// - topic removal, which drops the cooling state;
+/// - the TTL prune.
+///
+/// Transport deadlines bound the send, but not scheduling or the
+/// completion's wait for the topic lock. A completion can therefore arrive
+/// after its claim expired (PR #106 review r5). The claim records the
+/// recovery probe its send carries (`EagerReplyClaim::probe`), under the
+/// lock that armed the probe, and the TTL prune clears exactly that probe.
+/// Skipping a stale completion's booking therefore never leaves a probe in
+/// flight.
+///
+/// A completion can also be presented twice. An IWANT serve whose send was
+/// attempted is completed inside the send, then again by the serve. The
+/// second presentation is stale and so has no effect.
+///
+/// Fault matrix:
+/// - **Abort** (the send task is dropped, for example at shutdown): the
+///   claim blocks any resend of `k` until the TTL prune, which also clears
+///   its recovery probe. Custody expires with the cached message.
+/// - **Cancelled completion** (its future is dropped while it waits for
+///   the topic lock): the claims guard carries the reply and books its
+///   recovery-probe timeout through the same gate (PR #106 review r5). A
+///   current reply books as a `failed` completion. A stale reply books
+///   nothing. A guard with no probe books nothing, and the claim waits for
+///   the TTL prune, as on abort.
+/// - **Timeout:** current completion, `failed`. The request is retried only
+///   if custody remains (note 1).
+/// - **Disconnect mid-send:** cleanup drops custody and the claim. The old
+///   completion is stale (note 2). Its not-connected result books no
+///   eviction, so it cannot drop the records of a reconnected peer.
+/// - **Reconnect:** a new IWANT starts from `Idle` with a new token. The
+///   peer can receive two copies only if the old send still succeeds after
+///   the transport reported the peer disconnected. Even then, the old
+///   completion is stale and leaves the newer request alone.
+/// - **Repeated IWANT:** coalesced into the in-flight reply. It is queued
+///   again only if that reply fails.
+/// - **Unsubscribe:** the topic's records are dropped with its state. A
+///   late completion finds no topic (and does nothing), or a re-created
+///   topic whose tokens differ (stale).
+///
+/// Adjacent sender, unchanged by this design: the x0x #613 stranded-publish
+/// retry re-sends a local publish to eager peers that have not completed a
+/// pull. It does not consult reply claims.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DeferredEagerReply {
+    /// Process-unique custody id (PR #106 review r4): a stale completion
+    /// removes exactly its own entry, never a newer one for the same `k`.
+    id: u64,
     peer: PeerId,
     msg_id: MessageIdType,
     requested_at: Instant,
+}
+
+static NEXT_DEFERRED_EAGER_REPLY_ID: AtomicU64 = AtomicU64::new(1);
+
+impl DeferredEagerReply {
+    fn new(peer: PeerId, msg_id: MessageIdType, requested_at: Instant) -> Self {
+        Self {
+            id: NEXT_DEFERRED_EAGER_REPLY_ID.fetch_add(1, Ordering::Relaxed),
+            peer,
+            msg_id,
+            requested_at,
+        }
+    }
+}
+
+/// Ownership token of one [`EagerReplyClaim`]. Tokens are process-unique
+/// and never reused.
+type EagerReplyToken = u64;
+
+static NEXT_EAGER_REPLY_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// PR #106 review r3: the one in-flight EAGER reply for a
+/// `(requester, msg_id)`. See the lifecycle on [`DeferredEagerReply`].
+#[derive(Clone, Copy, Debug)]
+struct EagerReplyClaim {
+    token: EagerReplyToken,
+    claimed_at: Instant,
+    /// The requester asked again while this reply was in flight. If the
+    /// reply fails, the request returns to custody instead of being lost.
+    rerequested: bool,
+    /// PR #106 review r5: the recovery probe this reply's send carries, if
+    /// it is one. It is recorded under the lock that armed the probe. The
+    /// TTL prune clears exactly this probe, because a completion that
+    /// arrives after the prune is stale and books nothing.
+    probe: Option<RecoveryProbeId>,
+}
+
+/// PR #106 review r4: what a completion presents to the lifecycle gate,
+/// [`TopicState::admit_eager_reply_completion`].
+#[derive(Clone, Copy)]
+struct EagerReplyCompletion {
+    peer: PeerId,
+    msg_id: MessageIdType,
+    token: EagerReplyToken,
+    /// The custody entry a detached retry was dispatched for. An IWANT
+    /// serve has none.
+    own_custody: Option<DeferredEagerReply>,
+}
+
+/// PR #106 review r4: proof that a completion passed the lifecycle gate as
+/// current. Only [`TopicState::admit_eager_reply_completion`] creates one,
+/// and [`TopicState::apply_eager_reply_outcome`] requires one, so no
+/// completion path can apply an outcome without passing the gate first.
+struct AdmittedEagerReply {
+    completion: EagerReplyCompletion,
+    rerequested: bool,
+}
+
+/// How a claimed EAGER reply ended. This drives
+/// [`TopicState::apply_eager_reply_outcome`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EagerReplyOutcome {
+    /// The reply was handed to the transport.
+    Sent,
+    /// The reply was refused before sending (permit busy, cooling,
+    /// admission, byte budget). The request waits in custody.
+    Deferred,
+    /// The reply was attempted and failed (timeout, not connected, error),
+    /// or was abandoned before sending.
+    Failed,
 }
 
 const MAX_DEFERRED_IWANT_IDS: usize = MAX_IHAVE_BATCH_SIZE;
@@ -3749,6 +4180,24 @@ const MAX_LATE_LOCAL_OFFERS: usize = MAX_IHAVE_BATCH_SIZE;
 /// keeps a large catch-up backlog from monopolising a single 100 ms tick.
 /// The backlog drains over subsequent ticks instead.
 const MAX_LATE_LOCAL_OFFERS_PER_FLUSH: usize = 4;
+
+/// PR #106 review r2: per-flush-tick bound on deferred IWANT replies whose
+/// retry reaches signing. Each one costs an ML-DSA signature on the
+/// flusher. Its send is then detached, and the peer's outbound permit, not
+/// the flusher, bounds how many are in flight. A larger custody drains over
+/// later ticks in rotation (see `LateOfferRotation::deferred_reply_cursor`).
+const MAX_DEFERRED_REPLY_RETRIES_PER_FLUSH: usize = 8;
+
+/// PR #106 review r3: age at which an [`EagerReplyClaim`] is presumed
+/// abandoned (its send task was aborted, for example at shutdown) and is
+/// dropped. The send itself is at most one Critical gate wait plus one
+/// send, each bounded by `PER_PEER_TIMEOUT_CEILING`, so six ceilings leave
+/// a threefold margin for it. Scheduling and the completion's wait for the
+/// topic lock are not bounded, so a completion can still arrive after the
+/// TTL. It is then stale, and the prune has already cleared its recovery
+/// probe (PR #106 review r5).
+const EAGER_REPLY_CLAIM_TTL: Duration =
+    Duration::from_secs(crate::timing::PER_PEER_TIMEOUT_CEILING.as_secs() * 6);
 
 /// Ring rank for the bounded under-lock late-offer selection (review r3,
 /// item 2): the 100 ms flush must not materialize every eligible
@@ -3783,14 +4232,21 @@ impl LateOfferRank {
     }
 }
 
-/// Per-flusher rotation state for the bounded late-offer selection: the
-/// key of the last candidate the previous tick served. Owned by the flush
-/// task (flusher-local, not process-global); read and advanced only while
-/// the all-shard `write_all()` is held, so it needs no synchronization of
-/// its own.
+/// Per-flusher rotation state for the bounded per-tick selections. It is
+/// owned by the flush task (flusher-local, not process-global) and reached
+/// only through the flusher's `&mut`, so it needs no synchronization of its
+/// own.
 #[derive(Default)]
 struct LateOfferRotation {
+    /// Late-local offers: the key of the last candidate the previous tick
+    /// served. It is read and advanced while the all-shard `write_all()` is
+    /// held.
     last_served: Option<(TopicId, PeerId)>,
+    /// PR #106 review r2: where the next tick starts in the deferred-reply
+    /// snapshot. The per-tick retry bound
+    /// ([`MAX_DEFERRED_REPLY_RETRIES_PER_FLUSH`]) can then not keep spending
+    /// on the same unclaimable entries while later ones wait.
+    deferred_reply_cursor: usize,
 }
 
 /// Send-side wiring the 100 ms IHAVE flush needs beyond the topic map,
@@ -3815,6 +4271,10 @@ struct IhaveFlushWork {
     /// #504: a local-origin advertisement is this node's own speech, so the
     /// byte budget may not shed it even under `BytePolicy::ShedNormal`.
     local_origin: bool,
+    /// Issue #104 (PR #106 review r1): this batch carries retained announce
+    /// entries whose `pending_ihave` batch was already consumed. A handoff
+    /// resolves those targets only, not `pending_ihave`.
+    retained_announce: bool,
 }
 
 struct TopicState {
@@ -3845,7 +4305,11 @@ struct TopicState {
     /// finally by anti-entropy). Deliberately separate from
     /// `stranded_ihave`: that path's bounded retry re-sends cached EAGER
     /// wire bytes, which is exactly what a LazyForward verdict withholds.
-    /// Capped at `MAX_IHAVE_BATCH_SIZE` entries.
+    /// Capped at `MAX_IHAVE_BATCH_SIZE` entries. Exception (issue #104, PR
+    /// #106 review r1): entries with `retain_until` set carry a local
+    /// publish's claim-skipped eager peers. They are not lossy. Each target
+    /// is kept until its IHAVE handoff succeeds, bounded by
+    /// [`RETAINED_ANNOUNCE_TTL`].
     lazy_withheld: Vec<LazyWithheldEntry>,
     /// Non-tree peers (send IHAVE only)
     lazy_peers: HashSet<PeerId>,
@@ -3863,10 +4327,20 @@ struct TopicState {
     /// them through the same limiter/admission path.
     outstanding_iwants: HashMap<MessageIdType, OutstandingIwant>,
     deferred_iwants: Vec<DeferredIwant>,
-    /// Publisher-side custody for IWANT replies whose EAGER bytes were
-    /// deferred by the hard egress limiter. Payload and proof remain in the
-    /// bounded cache and are re-derived at each attempt.
+    /// Publisher-side custody for IWANT replies that came back `Deferred`:
+    /// the hard egress limiter deferred their EAGER bytes, or the claim
+    /// skipped them (permit busy, cooling, admission). A claim skip happens
+    /// with the limiter disabled too, so the flush retries custody whatever
+    /// the limiter state. Payload and proof remain in the bounded cache and
+    /// are re-derived at each attempt.
     deferred_eager_replies: Vec<DeferredEagerReply>,
+    /// PR #106 review r3: the one in-flight EAGER reply per
+    /// `(requester, msg_id)`, whether an IWANT serve or a deferred-reply
+    /// retry is sending it. Both paths claim here before sending, so a
+    /// repeated IWANT coalesces with a reply already in flight. A
+    /// completion releases only the claim that carries its own token. See
+    /// the lifecycle on [`DeferredEagerReply`].
+    eager_reply_claims: HashMap<(PeerId, MessageIdType), EagerReplyClaim>,
     /// Per-peer quality scores for tree optimization
     peer_scores: HashMap<PeerId, PeerScore>,
     /// Local subscribers
@@ -3913,6 +4387,199 @@ impl TopicState {
                     .peek(&entry.msg_id)
                     .is_some_and(|cached| !cached.message.dropped)
         });
+        self.prune_eager_reply_claims(now);
+    }
+
+    /// PR #106 review r3: drop claims older than [`EAGER_REPLY_CLAIM_TTL`].
+    /// Their send task was aborted and will never complete.
+    fn prune_eager_reply_claims(&mut self, now: Instant) {
+        if self.eager_reply_claims.is_empty() {
+            return;
+        }
+        let mut expired_probes = Vec::new();
+        self.eager_reply_claims.retain(|(peer, _), claim| {
+            let live = now.saturating_duration_since(claim.claimed_at) < EAGER_REPLY_CLAIM_TTL;
+            if !live {
+                if let Some(probe) = claim.probe {
+                    expired_probes.push((*peer, probe));
+                }
+            }
+            live
+        });
+        // PR #106 review r5: the expired claim's completion (if it ever
+        // arrives) is stale and books nothing, so its recovery probe is
+        // cleared here. The peer's next send becomes a fresh probe instead
+        // of staying suppressed. Only that exact probe is cleared.
+        for (peer, probe) in expired_probes {
+            self.abandon_unsent_recovery_probe(peer, Some(probe));
+        }
+    }
+
+    /// PR #106 review r5: record on the reply claim `token` that its send is
+    /// the recovery probe `attempt`. The caller holds the lock under which
+    /// the probe was armed. This is a no-op for other attempt kinds, and for
+    /// a claim the token no longer owns.
+    fn attach_probe_to_eager_reply_claim(
+        &mut self,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        token: EagerReplyToken,
+        attempt: &PeerSendAttempt,
+    ) {
+        if attempt.kind != SendAttemptKind::RecoveryProbe {
+            return;
+        }
+        if let Some(claim) = self.eager_reply_claims.get_mut(&(peer, msg_id)) {
+            if claim.token == token {
+                claim.probe = attempt.recovery_probe_id;
+            }
+        }
+    }
+
+    /// PR #106 review r3: whether an EAGER reply of `msg_id` to `peer` is in
+    /// flight.
+    fn eager_reply_claimed(&self, peer: PeerId, msg_id: MessageIdType) -> bool {
+        self.eager_reply_claims.contains_key(&(peer, msg_id))
+    }
+
+    /// PR #106 review r3: claim the reply for `(peer, msg_id)`. The caller
+    /// has checked that no claim exists, under the same lock.
+    fn insert_eager_reply_claim(
+        &mut self,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        now: Instant,
+    ) -> EagerReplyToken {
+        let token = NEXT_EAGER_REPLY_TOKEN.fetch_add(1, Ordering::Relaxed);
+        self.eager_reply_claims.insert(
+            (peer, msg_id),
+            EagerReplyClaim {
+                token,
+                claimed_at: now,
+                rerequested: false,
+                probe: None,
+            },
+        );
+        token
+    }
+
+    /// PR #106 review r3: the IWANT-serve transition. It returns the token
+    /// when this serve now owns the reply. It returns `None` when a reply is
+    /// already in flight: the request is then coalesced into that reply and
+    /// marked `rerequested`, so a failure of that reply queues it again.
+    fn claim_eager_reply_for_iwant(
+        &mut self,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        now: Instant,
+    ) -> Option<EagerReplyToken> {
+        self.prune_eager_reply_claims(now);
+        if let Some(claim) = self.eager_reply_claims.get_mut(&(peer, msg_id)) {
+            claim.rerequested = true;
+            return None;
+        }
+        Some(self.insert_eager_reply_claim(peer, msg_id, now))
+    }
+
+    /// PR #106 review r4: the lifecycle gate that every reply completion
+    /// passes FIRST (see the lifecycle on [`DeferredEagerReply`]).
+    /// - Current (`eager_reply_claims[k]` still carries `completion.token`):
+    ///   the claim is released, and the [`AdmittedEagerReply`] proof is
+    ///   returned.
+    /// - Stale: the completion's own original custody entry (matched by
+    ///   custody id) is removed if it is still present, and `None` is
+    ///   returned. The caller must then return without any other side
+    ///   effect.
+    fn admit_eager_reply_completion(
+        &mut self,
+        completion: &EagerReplyCompletion,
+    ) -> Option<AdmittedEagerReply> {
+        let key = (completion.peer, completion.msg_id);
+        match self.eager_reply_claims.get(&key) {
+            Some(claim) if claim.token == completion.token => self
+                .eager_reply_claims
+                .remove(&key)
+                .map(|claim| AdmittedEagerReply {
+                    completion: *completion,
+                    rerequested: claim.rerequested,
+                }),
+            _ => {
+                if let Some(own) = completion.own_custody {
+                    self.deferred_eager_replies
+                        .retain(|entry| entry.id != own.id);
+                }
+                None
+            }
+        }
+    }
+
+    /// PR #106 review r4: the outcome of a CURRENT completion. Only the
+    /// gate's [`AdmittedEagerReply`] proof can reach it.
+    fn apply_eager_reply_outcome(
+        &mut self,
+        admitted: AdmittedEagerReply,
+        outcome: EagerReplyOutcome,
+        now: Instant,
+    ) {
+        let AdmittedEagerReply {
+            completion,
+            rerequested,
+        } = admitted;
+        let (peer, msg_id) = (completion.peer, completion.msg_id);
+        match outcome {
+            EagerReplyOutcome::Sent => {
+                self.deferred_eager_replies
+                    .retain(|entry| entry.peer != peer || entry.msg_id != msg_id);
+                self.record_stranded_ihave_served(&msg_id, peer);
+                self.record_lazy_withheld_served(&msg_id, peer);
+            }
+            EagerReplyOutcome::Deferred => {
+                let _ = self.retain_deferred_eager_reply(peer, msg_id, now);
+            }
+            EagerReplyOutcome::Failed => {
+                if let Some(own) = completion.own_custody {
+                    self.deferred_eager_replies
+                        .retain(|entry| entry.id != own.id);
+                }
+                if rerequested {
+                    let _ = self.retain_deferred_eager_reply(peer, msg_id, now);
+                }
+            }
+        }
+    }
+
+    /// A completion that books no transport results: the gate first, then
+    /// the outcome only if the completion is current. For example, an IWANT
+    /// serve refused before sending, or the serve's second presentation
+    /// after its send already completed.
+    fn settle_eager_reply(
+        &mut self,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        token: EagerReplyToken,
+        outcome: EagerReplyOutcome,
+        own_custody: Option<DeferredEagerReply>,
+        now: Instant,
+    ) {
+        let completion = EagerReplyCompletion {
+            peer,
+            msg_id,
+            token,
+            own_custody,
+        };
+        if let Some(admitted) = self.admit_eager_reply_completion(&completion) {
+            self.apply_eager_reply_outcome(admitted, outcome, now);
+        }
+    }
+
+    /// PR #106 review r3: the disconnect-cleanup transition for one peer.
+    /// Its custody and claims go. A send still in flight completes later
+    /// with a token that no longer matches, so it releases nothing.
+    fn drop_eager_reply_records_for_peer(&mut self, peer: PeerId) {
+        self.deferred_eager_replies
+            .retain(|entry| entry.peer != peer);
+        self.eager_reply_claims
+            .retain(|(claimed, _), _| *claimed != peer);
     }
 
     fn retain_deferred_eager_reply(
@@ -3932,11 +4599,8 @@ impl TopicState {
         if self.deferred_eager_replies.len() >= MAX_DEFERRED_EAGER_REPLIES {
             return false;
         }
-        self.deferred_eager_replies.push(DeferredEagerReply {
-            peer,
-            msg_id,
-            requested_at: now,
-        });
+        self.deferred_eager_replies
+            .push(DeferredEagerReply::new(peer, msg_id, now));
         true
     }
 
@@ -4022,6 +4686,7 @@ impl TopicState {
             outstanding_iwants: HashMap::new(),
             deferred_iwants: Vec::new(),
             deferred_eager_replies: Vec::new(),
+            eager_reply_claims: HashMap::new(),
             peer_scores: HashMap::new(),
             subscribers: Vec::new(),
             replay_cache: LruCache::new(replay_cache_capacity()),
@@ -4269,7 +4934,118 @@ impl TopicState {
             targets: peers.to_vec(),
             cold_relay,
             served: Vec::new(),
+            retain_until: None,
         });
+    }
+
+    /// Issue #104 (PR #106 review r1): queue a local publish's claim-skipped
+    /// eager peers as RETAINED direct IHAVE announce targets. The
+    /// `queue_lazy_withheld` entry is lossy: the first flush that hands the
+    /// batch to any recipient consumes it, including targets whose Control
+    /// permit was busy at that moment. This node is the only source of its
+    /// own publish, so each target is kept until its IHAVE handoff succeeds
+    /// or `now + RETAINED_ANNOUNCE_TTL` passes. It uses the same list and cap
+    /// as `queue_lazy_withheld`.
+    fn queue_retained_announce(&mut self, msg_id: MessageIdType, peers: &[PeerId], now: Instant) {
+        if peers.is_empty() {
+            return;
+        }
+        let deadline = now + RETAINED_ANNOUNCE_TTL;
+        self.queue_lazy_withheld(msg_id, peers, false);
+        if let Some(entry) = self.lazy_withheld.iter_mut().find(|e| e.msg_id == msg_id) {
+            entry.retain_until = Some(entry.retain_until.map_or(deadline, |t| t.max(deadline)));
+        }
+    }
+
+    /// Issue #104 (PR #106 review r1): `peers` accepted an IHAVE handoff for
+    /// `batch`, so they are no longer pending targets of any retained entry
+    /// in that batch. Lossy (`retain_until == None`) entries are untouched,
+    /// because consuming the batch drops them anyway. One pass, and the
+    /// batch is indexed only when a retained entry exists.
+    fn record_lazy_withheld_advertised(&mut self, batch: &[MessageIdType], peers: &[PeerId]) {
+        if peers.is_empty()
+            || !self
+                .lazy_withheld
+                .iter()
+                .any(|entry| entry.retain_until.is_some())
+        {
+            return;
+        }
+        let batch_index: HashSet<MessageIdType> = batch.iter().copied().collect();
+        for entry in &mut self.lazy_withheld {
+            if entry.retain_until.is_some() && batch_index.contains(&entry.msg_id) {
+                entry.targets.retain(|target| !peers.contains(target));
+            }
+        }
+    }
+
+    /// Issue #104 (PR #106 review r1): bound the retained announce entries
+    /// at the start of a flush. This drops entries past their deadline. It
+    /// also drops targets that pulled the id, and targets the transport
+    /// reports disconnected: a reconnecting peer is caught up by its
+    /// late-local offer, and a disconnected target would only keep a signed
+    /// IHAVE being rebuilt every tick. Finally it drops entries left with no
+    /// target. Lossy entries are untouched.
+    fn prune_retained_announces(
+        &mut self,
+        now: Instant,
+        connected_peers: &StdRwLock<Option<HashSet<PeerId>>>,
+    ) {
+        if self.lazy_withheld.is_empty() {
+            return;
+        }
+        self.lazy_withheld.retain_mut(|entry| {
+            let Some(deadline) = entry.retain_until else {
+                return true;
+            };
+            if deadline <= now {
+                return false;
+            }
+            entry.targets.retain(|peer| {
+                !entry.served.contains(peer)
+                    && transport_connected_for_peer(connected_peers, peer) != Some(false)
+            });
+            !entry.targets.is_empty()
+        });
+    }
+
+    /// Issue #104 (PR #106 review r1): the retained announce entries whose
+    /// `pending_ihave` batch has already been consumed (their id is no
+    /// longer pending), as one IHAVE batch plus its unresolved targets.
+    /// Entries whose id is still pending ride the ordinary batch instead.
+    /// `None` when there is nothing to retry. The entry list is capped at
+    /// `MAX_IHAVE_BATCH_SIZE`, so the ids fit one IHAVE frame.
+    fn retained_announce_work(&self) -> Option<(Vec<MessageIdType>, Vec<PeerId>)> {
+        if !self
+            .lazy_withheld
+            .iter()
+            .any(LazyWithheldEntry::has_unresolved_retained_target)
+        {
+            return None;
+        }
+        let pending: HashSet<MessageIdType> = self.pending_ihave.iter().copied().collect();
+        let mut batch = Vec::new();
+        let mut targets: Vec<PeerId> = Vec::new();
+        for entry in &self.lazy_withheld {
+            if !entry.has_unresolved_retained_target() || pending.contains(&entry.msg_id) {
+                continue;
+            }
+            batch.push(entry.msg_id);
+            for peer in &entry.targets {
+                if !entry.served.contains(peer) && !targets.contains(peer) {
+                    targets.push(*peer);
+                }
+            }
+        }
+        (!batch.is_empty()).then_some((batch, targets))
+    }
+
+    /// Issue #104 (PR #106 review r1): remove every retained announce entry
+    /// whose targets have all been handed an IHAVE or have pulled the id.
+    /// Lossy entries are untouched.
+    fn drop_resolved_retained_announces(&mut self) {
+        self.lazy_withheld
+            .retain(|entry| entry.retain_until.is_none() || entry.has_unresolved_retained_target());
     }
 
     /// Give only still-pending LazyForward IDs to peers first seen after the
@@ -4356,6 +5132,11 @@ impl TopicState {
     /// fan-out withholds the eager send on ~27-30% of relayed traffic and
     /// depends on exactly these IHAVEs, a lost batch was lost delivery
     /// until anti-entropy.
+    ///
+    /// Issue #104 (PR #106 review r1): a retained announce entry that still
+    /// has unresolved targets survives consumption. Its id leaves
+    /// `pending_ihave`, and `retained_announce_work` advertises it to the
+    /// remaining targets on later flushes.
     fn consume_flushed_ihave_batch(&mut self, batch: &[MessageIdType]) {
         if batch.is_empty() {
             return;
@@ -4364,7 +5145,7 @@ impl TopicState {
         self.pending_ihave.retain(|id| !ids.contains(id));
         self.ihave_advertised.retain(|id, _| !ids.contains(id));
         self.lazy_withheld
-            .retain(|entry| !ids.contains(&entry.msg_id));
+            .retain(|entry| !ids.contains(&entry.msg_id) || entry.has_unresolved_retained_target());
     }
 
     /// Add message to cache
@@ -5011,6 +5792,26 @@ impl TopicState {
         }
     }
 
+    /// Issue #105: roll back a recovery-probe claim whose outbound permit
+    /// was refused. `claim_send_attempt_at` marks the probe in flight before
+    /// the claim layer tries for a permit; when none is available no probe
+    /// is sent, so no send outcome would ever clear the flag and the peer
+    /// would stay suppressed (never graftable, every claim skipped) until it
+    /// disconnected or sent verified traffic on the topic. Only the probe
+    /// this claim created is undone.
+    fn abandon_unsent_recovery_probe(
+        &mut self,
+        peer: PeerId,
+        recovery_probe_id: Option<RecoveryProbeId>,
+    ) {
+        if let Some(cooling) = self.peer_cooling.get_mut(&peer) {
+            if cooling.matches_recovery_probe(recovery_probe_id) {
+                cooling.recovery_probe_in_flight = false;
+                cooling.recovery_probe_id = None;
+            }
+        }
+    }
+
     #[cfg(test)]
     fn record_send_success_at(&mut self, attempt: PeerSendAttempt, now: Instant) -> bool {
         self.record_send_success_with_context_at(attempt, now, AdaptiveCoolingConfig::default())
@@ -5287,8 +6088,9 @@ impl TopicState {
         let eager = self.eager_peers.remove(&peer);
         let lazy = self.lazy_peers.remove(&peer);
         self.late_local_offers.remove(&peer);
-        self.deferred_eager_replies
-            .retain(|entry| entry.peer != peer);
+        // PR #106 review r3: custody and in-flight reply claims do not
+        // outlive the connection (the disconnect transition).
+        self.drop_eager_reply_records_for_peer(peer);
         let cooling = self.peer_cooling.remove(&peer).is_some();
         NotConnectedEviction {
             eager,
@@ -5542,6 +6344,13 @@ impl TopicState {
     }
 }
 
+/// Transport results of one batch of claimed send attempts.
+struct SendAttemptResults {
+    sent: Vec<PeerSendCompletion>,
+    timed_out: Vec<PeerSendAttempt>,
+    not_connected: Vec<PeerSendAttempt>,
+}
+
 async fn record_topic_send_attempt_results_for_state(
     topics: &ShardedTopicMap,
     stage_stats: &Arc<PubSubStageStats>,
@@ -5551,6 +6360,66 @@ async fn record_topic_send_attempt_results_for_state(
     timed_out: Vec<PeerSendAttempt>,
     not_connected: Vec<PeerSendAttempt>,
 ) {
+    let mut topics_guard = topics.write_topic(&topic).await;
+    book_topic_send_attempt_results(
+        topics_guard.get_mut(&topic),
+        stage_stats,
+        send_path,
+        topic,
+        SendAttemptResults {
+            sent,
+            timed_out,
+            not_connected,
+        },
+    );
+}
+
+/// PR #106 review r4: the one completion path of a claimed EAGER reply
+/// whose send was attempted, for both an IWANT serve and a detached retry.
+/// Under ONE topic lock it does three things in order:
+/// 1. the lifecycle gate ([`TopicState::admit_eager_reply_completion`]);
+/// 2. for a current completion only, the outcome;
+/// 3. for a current completion only, the transport results (RTT, cooling,
+///    x0x #380 not-connected eviction).
+///
+/// A stale completion therefore cannot evict or change a reconnected
+/// peer's newer records. A removed topic leaves nothing of the reply to
+/// complete.
+async fn complete_eager_reply(
+    topics: &ShardedTopicMap,
+    stage_stats: &Arc<PubSubStageStats>,
+    send_path: &SendPathContext,
+    topic: TopicId,
+    completion: EagerReplyCompletion,
+    outcome: EagerReplyOutcome,
+    results: SendAttemptResults,
+) {
+    let mut topics_guard = topics.write_topic(&topic).await;
+    let Some(state) = topics_guard.get_mut(&topic) else {
+        return;
+    };
+    let Some(admitted) = state.admit_eager_reply_completion(&completion) else {
+        return;
+    };
+    state.apply_eager_reply_outcome(admitted, outcome, Instant::now());
+    book_topic_send_attempt_results(Some(state), stage_stats, send_path, topic, results);
+}
+
+/// Book the transport results of claimed send attempts: RTT samples,
+/// cooling outcomes and the x0x #380 not-connected eviction. It runs under
+/// the caller's topic lock. `state` is `None` when the topic has gone.
+fn book_topic_send_attempt_results(
+    state: Option<&mut TopicState>,
+    stage_stats: &Arc<PubSubStageStats>,
+    send_path: &SendPathContext,
+    topic: TopicId,
+    results: SendAttemptResults,
+) {
+    let SendAttemptResults {
+        sent,
+        timed_out,
+        not_connected,
+    } = results;
     let now = Instant::now();
 
     // x0x #380: transport-not-connected attempts are evictions, not
@@ -5567,8 +6436,7 @@ async fn record_topic_send_attempt_results_for_state(
             .record(completion.attempt.peer, completion.observed);
     }
 
-    let mut topics_guard = topics.write_topic(&topic).await;
-    let Some(state) = topics_guard.get_mut(&topic) else {
+    let Some(state) = state else {
         for attempt in sent
             .iter()
             .map(|completion| &completion.attempt)
@@ -7687,6 +8555,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             BoundedSendOrigin {
                 local: local_origin,
                 meter_publish: true,
+                reply: None,
             },
         )
         .await
@@ -7827,8 +8696,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let bulk_admitted = priority == TopicPriority::Bulk;
         let release_guard = scopeguard_release(bulk_admitted, &peer, &self.admission);
 
-        let (mut claims, _lock_wait) = self.claim_topic_send_attempts(topic, vec![peer], op).await;
+        let (mut claims, _lock_wait) = self
+            .claim_topic_send_attempts_for_reply(topic, vec![peer], op, local_origin, origin.reply)
+            .await;
         let Some(attempt) = claims.attempts().first().copied() else {
+            let skip_reason = claims.skips().primary_reason();
             // X0X-0074d: Critical *Data* skips (cooling vs gate overflow) are
             // counted inside claim_topic_send_attempts where the reason is
             // known, so we must not re-count them here. Only the Critical
@@ -7886,7 +8758,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
             drop(release_guard);
-            return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ClaimSkipped);
+            return (
+                Ok(PeerSendOutcome::Deferred),
+                FanoutPeerStage::ClaimSkipped(skip_reason),
+            );
         };
         let Some(permit) = claims.take_permits().into_iter().next() else {
             // Defensive: claim pushes attempt+permit together, so this is
@@ -7907,7 +8782,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 );
             }
             drop(release_guard);
-            return (Ok(PeerSendOutcome::Deferred), FanoutPeerStage::ClaimSkipped);
+            return (
+                Ok(PeerSendOutcome::Deferred),
+                FanoutPeerStage::ClaimSkipped(ClaimSkipReason::Budget),
+            );
         };
 
         // x0x #380: outbound demand metering — this bounded path carries
@@ -7954,20 +8832,39 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .await
         }));
 
+        // PR #106 review r4: a send that carries a claimed EAGER reply books
+        // its results only through the reply lifecycle gate
+        // (`record_results_for`), so a stale reply books nothing. Since r5 the
+        // claims guard carries that reply from the claim on (set by
+        // `claim_topic_send_attempts_for_reply`), so a cancelled booking uses
+        // the same gate.
+        let booked = |sent, timed_out, not_connected| SendAttemptResults {
+            sent,
+            timed_out,
+            not_connected,
+        };
         let result = match handle.join().await {
             Ok(Ok(PeerSendOutcome::Sent { observed })) => {
                 claims
-                    .record_results(
-                        vec![PeerSendCompletion { attempt, observed }],
-                        Vec::new(),
-                        Vec::new(),
+                    .record_results_for(
+                        None,
+                        EagerReplyOutcome::Sent,
+                        booked(
+                            vec![PeerSendCompletion { attempt, observed }],
+                            Vec::new(),
+                            Vec::new(),
+                        ),
                     )
                     .await;
                 Ok(PeerSendOutcome::Sent { observed })
             }
             Ok(Ok(PeerSendOutcome::TimedOut)) => {
                 claims
-                    .record_results(Vec::new(), vec![attempt], Vec::new())
+                    .record_results_for(
+                        None,
+                        EagerReplyOutcome::Failed,
+                        booked(Vec::new(), vec![attempt], Vec::new()),
+                    )
                     .await;
                 Ok(PeerSendOutcome::TimedOut)
             }
@@ -7975,28 +8872,44 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // x0x #380: eviction, booked below — never a timeout sample
                 // nor an Err for the caller to count as a send failure.
                 claims
-                    .record_results(Vec::new(), Vec::new(), vec![attempt])
+                    .record_results_for(
+                        None,
+                        EagerReplyOutcome::Failed,
+                        booked(Vec::new(), Vec::new(), vec![attempt]),
+                    )
                     .await;
                 Ok(PeerSendOutcome::NotConnected)
             }
             Ok(Ok(PeerSendOutcome::Deferred)) => {
                 let timed_out = recovery_probe_timeout(attempt);
                 claims
-                    .record_results(Vec::new(), timed_out, Vec::new())
+                    .record_results_for(
+                        None,
+                        EagerReplyOutcome::Deferred,
+                        booked(Vec::new(), timed_out, Vec::new()),
+                    )
                     .await;
                 Ok(PeerSendOutcome::Deferred)
             }
             Ok(Err(e)) => {
                 let timed_out = recovery_probe_timeout(attempt);
                 claims
-                    .record_results(Vec::new(), timed_out, Vec::new())
+                    .record_results_for(
+                        None,
+                        EagerReplyOutcome::Failed,
+                        booked(Vec::new(), timed_out, Vec::new()),
+                    )
                     .await;
                 Err(e)
             }
             Err(e) => {
                 let timed_out = recovery_probe_timeout(attempt);
                 claims
-                    .record_results(Vec::new(), timed_out, Vec::new())
+                    .record_results_for(
+                        None,
+                        EagerReplyOutcome::Failed,
+                        booked(Vec::new(), timed_out, Vec::new()),
+                    )
                     .await;
                 warn!(
                     peer_id = %LogPeerId::from(attempt.peer),
@@ -8059,6 +8972,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         peers: Vec<PeerId>,
         op: &'static str,
+        local_origin: bool,
+    ) -> (SendAttemptClaims, Duration) {
+        self.claim_topic_send_attempts_for_reply(topic, peers, op, local_origin, None)
+            .await
+    }
+
+    /// [`Self::claim_topic_send_attempts`] for a send that carries the
+    /// claimed EAGER reply `reply` (an IWANT serve). PR #106 review r5: a
+    /// recovery probe armed by this claim is recorded on the reply claim
+    /// under the same lock, and the returned guard carries the reply.
+    async fn claim_topic_send_attempts_for_reply(
+        &self,
+        topic: TopicId,
+        peers: Vec<PeerId>,
+        op: &'static str,
+        local_origin: bool,
+        reply: Option<EagerReplyCompletion>,
     ) -> (SendAttemptClaims, Duration) {
         let send_path = self.send_path_context();
         if peers.is_empty() {
@@ -8094,8 +9024,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 op,
                 send_class,
                 priority,
+                local_origin,
             };
-            Self::claim_topic_send_attempts_for_state(&claim_context, state, peers, now)
+            let claimed =
+                Self::claim_topic_send_attempts_for_state(&claim_context, state, peers, now);
+            if let Some(reply) = reply {
+                for attempt in &claimed.0 {
+                    state.attach_probe_to_eager_reply_claim(
+                        reply.peer,
+                        reply.msg_id,
+                        reply.token,
+                        attempt,
+                    );
+                }
+            }
+            claimed
         } else {
             let mut attempts = Vec::with_capacity(peers.len());
             let mut permits = Vec::with_capacity(peers.len());
@@ -8115,10 +9058,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     );
                     continue;
                 }
-                if let Some(permit) = self
-                    .outbound_budgets
-                    .try_acquire(peer, send_class, priority, now)
-                {
+                if let Some(permit) = self.outbound_budgets.try_acquire_for_origin(
+                    peer,
+                    send_class,
+                    priority,
+                    local_origin,
+                    now,
+                ) {
                     attempts.push(PeerSendAttempt {
                         peer,
                         kind: SendAttemptKind::Normal,
@@ -8156,6 +9102,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             send_path,
         );
         claims.skips = skips;
+        claims.reply = reply;
         (claims, lock_wait)
     }
 
@@ -8189,35 +9136,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
             match state.claim_send_attempt_at(peer, now) {
                 Some((attempt, recovery_event)) => {
-                    if attempt.kind == SendAttemptKind::RecoveryProbe {
-                        state
-                            .peer_scores
-                            .entry(peer)
-                            .or_insert_with(|| PeerScore::new_at(now))
-                            .record_recovery_probe_at(now);
-                    }
-                    if let Some(event) = recovery_event {
-                        claim_context.stage_stats.record_peer_recovery_probe(
-                            claim_context.topic,
-                            peer,
-                            event.suppressed_until,
-                            event.recent_timeout_count,
-                            event.cooldown,
-                        );
-                        debug!(
-                            peer_id = %peer,
-                            topic = ?claim_context.topic,
-                            op = claim_context.op,
-                            "{} send admitted as peer recovery probe",
-                            claim_context.op
-                        );
-                    }
-                    let Some(permit) = claim_context.outbound_budgets.try_acquire(
+                    let Some(permit) = claim_context.outbound_budgets.try_acquire_for_origin(
                         peer,
                         claim_context.send_class,
                         claim_context.priority,
+                        claim_context.local_origin,
                         now,
                     ) else {
+                        // Issue #105: the claim above already marked a
+                        // recovery probe in flight. No probe will be sent,
+                        // so nothing would ever resolve that flag — undo it
+                        // or the peer stays suppressed and every later claim
+                        // is skipped as cooling.
+                        if attempt.kind == SendAttemptKind::RecoveryProbe {
+                            state.abandon_unsent_recovery_probe(peer, attempt.recovery_probe_id);
+                        }
                         skips.budget_exhausted += 1;
                         if claim_context.priority == TopicPriority::Critical
                             && matches!(claim_context.send_class, OutboundSendClass::Data)
@@ -8251,6 +9184,32 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         );
                         continue;
                     };
+                    // Issue #105: a recovery probe is booked (score + stage
+                    // stats) only once its permit is held, like the bypass
+                    // slot below.
+                    if attempt.kind == SendAttemptKind::RecoveryProbe {
+                        state
+                            .peer_scores
+                            .entry(peer)
+                            .or_insert_with(|| PeerScore::new_at(now))
+                            .record_recovery_probe_at(now);
+                    }
+                    if let Some(event) = recovery_event {
+                        claim_context.stage_stats.record_peer_recovery_probe(
+                            claim_context.topic,
+                            peer,
+                            event.suppressed_until,
+                            event.recent_timeout_count,
+                            event.cooldown,
+                        );
+                        debug!(
+                            peer_id = %peer,
+                            topic = ?claim_context.topic,
+                            op = claim_context.op,
+                            "{} send admitted as peer recovery probe",
+                            claim_context.op
+                        );
+                    }
                     // #71 r2: the bypass slot is consumed (and counted)
                     // only now that a permit is actually held — a refused
                     // budget above leaves the trickle due for the next
@@ -8572,6 +9531,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             BoundedSendOrigin {
                                 local: !detach_accounting,
                                 meter_publish: true,
+                                reply: None,
                             },
                         )
                         .await;
@@ -8584,6 +9544,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let mut byte_rejected = 0;
             let mut admission_dropped = 0;
             let mut claim_skipped = 0;
+            let mut claim_skipped_disconnected = 0;
+            let mut claim_skipped_cooling = 0;
+            let mut claim_skipped_budget = 0;
             while !tasks.is_empty() {
                 let completed = std::future::poll_fn(|context| {
                     tasks
@@ -8620,8 +9583,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         admission_dropped += 1;
                         deferred.push(peer);
                     }
-                    (peer, (_, FanoutPeerStage::ClaimSkipped)) => {
+                    (peer, (_, FanoutPeerStage::ClaimSkipped(reason))) => {
                         claim_skipped += 1;
+                        match reason {
+                            ClaimSkipReason::TransportDisconnected => {
+                                claim_skipped_disconnected += 1;
+                            }
+                            ClaimSkipReason::Cooling => claim_skipped_cooling += 1,
+                            ClaimSkipReason::Budget => claim_skipped_budget += 1,
+                        }
                         deferred.push(peer);
                     }
                     (peer, (_, FanoutPeerStage::Attempted)) => {
@@ -8647,6 +9617,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     byte_rejected,
                     admission_dropped,
                     claim_skipped,
+                    claim_skipped_disconnected,
+                    claim_skipped_cooling,
+                    claim_skipped_budget,
                     attempted: attempted_count,
                     succeeded,
                 },
@@ -8764,9 +9737,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     candidates,
                     byte_rejected,
                     admission_dropped: candidates - byte_rejected,
-                    claim_skipped: 0,
                     attempted: 0,
                     succeeded: 0,
+                    ..FanoutCounts::default()
                 },
                 Vec::new(),
             );
@@ -8783,7 +9756,54 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             admission: Arc::clone(&self.admission),
         };
 
-        let (mut claims, lock_wait) = self.claim_topic_send_attempts(topic, admitted, op).await;
+        // Issue #104: `detach_accounting` is the local-vs-relayed marker (see
+        // the #504 note above) — a local publish claims the dedicated
+        // local-origin Data permit so relay sends cannot starve it.
+        let local_origin = !detach_accounting;
+        // Issue #104 fix 3: keep the admitted set of a local EAGER so every
+        // peer the claim skips can be announced lazily below.
+        let announce_candidates = (op == "EAGER" && local_origin).then(|| admitted.clone());
+        let (mut claims, lock_wait) = self
+            .claim_topic_send_attempts(topic, admitted, op, local_origin)
+            .await;
+        let skips = claims.skips();
+
+        // Issue #104 fix 3: a claim-skipped eager peer of a LOCAL publish
+        // (budget or cooling; disconnected targets are dropped again by the
+        // flush's own claim) is queued as a direct IHAVE announce target for
+        // the next 100 ms flush, exactly as byte deferral does above. Without
+        // this, a publish whose every eager peer was skipped had no pull path
+        // on an all-eager topic (the pending-IHAVE batch reaches lazy members
+        // only, and the #613 self-IHAVE needs an attempted send) and waited
+        // for the 30 s anti-entropy round. Relayed traffic is not queued: this
+        // node is not its only source, and announcing under relay saturation
+        // would add control load exactly when the lanes are busiest.
+        //
+        // PR #106 review r1: the targets are RETAINED, not lossy. The
+        // pending-IHAVE batch is consumed by the first flush that hands it
+        // to any recipient. A target whose Control permit was busy at that
+        // flush therefore stays queued until its own handoff succeeds,
+        // bounded by RETAINED_ANNOUNCE_TTL.
+        if let Some(candidates_for_announce) = announce_candidates {
+            let skipped: Vec<PeerId> = candidates_for_announce
+                .into_iter()
+                .filter(|peer| !claims.attempts().iter().any(|a| a.peer == *peer))
+                .collect();
+            if !skipped.is_empty() {
+                if let Ok((message, _)) = postcard::take_from_bytes::<GossipMessage>(&bytes) {
+                    let mut topics = self.topics.write_topic(&topic).await;
+                    if let Some(state) = topics.get_mut(&topic) {
+                        state.queue_retained_announce(
+                            message.header.msg_id,
+                            &skipped,
+                            Instant::now(),
+                        );
+                        self.stage_stats
+                            .record_claim_skip_ihave_queued(skipped.len());
+                    }
+                }
+            }
+        }
 
         // X0X-0074d: per-peer Critical accounting now happens inside
         // `claim_topic_send_attempts`, where the skip reason is known —
@@ -8802,6 +9822,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     byte_rejected,
                     admission_dropped: candidates - byte_rejected - admitted_count,
                     claim_skipped: admitted_count,
+                    claim_skipped_disconnected: skips.transport_disconnected,
+                    claim_skipped_cooling: skips.cooling,
+                    claim_skipped_budget: skips.budget_exhausted,
                     attempted: 0,
                     succeeded: 0,
                 },
@@ -8865,6 +9888,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     byte_rejected,
                     admission_dropped: candidates - byte_rejected - admitted_count,
                     claim_skipped: admitted_count - attempted,
+                    claim_skipped_disconnected: skips.transport_disconnected,
+                    claim_skipped_cooling: skips.cooling,
+                    claim_skipped_budget: skips.budget_exhausted,
                     attempted,
                     succeeded: 0,
                 },
@@ -8886,6 +9912,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     byte_rejected,
                     admission_dropped: candidates - byte_rejected - admitted_count,
                     claim_skipped: admitted_count - attempted,
+                    claim_skipped_disconnected: skips.transport_disconnected,
+                    claim_skipped_cooling: skips.cooling,
+                    claim_skipped_budget: skips.budget_exhausted,
                     attempted,
                     succeeded,
                 },
@@ -9296,6 +10325,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         //                                    every send failed at dispatch.
         // The WARN fires on either condition (succeeded == 0) so operators
         // see it whether the problem is missing peers or unreachable ones.
+        self.stage_stats.record_publish_claim_skips(&counts);
         if counts.attempted == 0 {
             self.stage_stats.record_zero_fanout_publish();
         } else if counts.succeeded == 0 {
@@ -9321,6 +10351,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     byte_rejected = counts.byte_rejected,
                     admission_dropped = counts.admission_dropped,
                     claim_skipped = counts.claim_skipped,
+                    claim_skipped_disconnected = counts.claim_skipped_disconnected,
+                    claim_skipped_cooling = counts.claim_skipped_cooling,
+                    claim_skipped_budget = counts.claim_skipped_budget,
                     attempted = counts.attempted,
                     succeeded = counts.succeeded,
                     target_outcome = ?target_outcome,
@@ -10090,12 +11123,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         let mut to_send = Vec::new();
         let mut requester_has_cached_message = false;
-        // x0x #613 (PR #54 r3 item 2): pull-path completion is tracked for
-        // stranded ids, but `served` is marked only AFTER the reply send
-        // succeeds — a timed-out IWANT reply must not exclude the peer
-        // from the bounded retry. The emptiness probe keeps the common
-        // (non-stranded) IWANT path lock-only.
-        let track_served = !state.stranded_ihave.is_empty() || !state.lazy_withheld.is_empty();
+        // x0x #613 (PR #54 r3 item 2): a pull is marked served only AFTER its
+        // reply send succeeds (in `settle_eager_reply`), so a timed-out IWANT
+        // reply never excludes the peer from the bounded retry.
 
         for msg_id in msg_ids {
             let cached = if local_origin_only {
@@ -10148,102 +11178,52 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         drop(topics); // Release lock
 
         let republish_started = Instant::now();
-        // Ids whose IWANT reply send succeeded — marked served after the
-        // loop (or before an error return) so a stranded retry never
-        // treats a failed reply as a completed pull.
-        let mut served_ids: Vec<MessageIdType> = Vec::new();
-        let mut deferred_ids: Vec<MessageIdType> = Vec::new();
         let mut sent_any = false;
         let mut send_err: Option<anyhow::Error> = None;
-        // Send EAGER with payloads
+        // Send EAGER with payloads. PR #106 review r3: each reply follows the
+        // lifecycle on `DeferredEagerReply`. It is claimed just before it is
+        // sent and settled right after. If a reply for the same
+        // (requester, msg_id) is already in flight, from an earlier IWANT or
+        // from a deferred-reply retry, this request is coalesced into it
+        // instead of sending a second copy.
         for (msg_id, cached) in to_send {
-            self.transport.migration.admit_cache_serve(
-                topic,
-                cached.payload.len()
-                    + MESSAGE_CRYPTO_OVERHEAD_BYTES
-                    + MESSAGE_HEADER_OVERHEAD_BYTES,
-            )?;
-            if !forwardable_payload("iwant_serve", &msg_id, &cached.payload) {
-                continue;
-            }
-            debug!(peer_id = %from, msg_id = ?msg_id, "Sending EAGER in response to IWANT");
-            debug!(
-                target: "sg.payload.trace",
-                stage = "iwant_serve",
-                msg_id = %msg_id_hex8(&msg_id),
-                len = cached.payload.len(),
-                zero_tail = payload_zero_tail(&cached.payload),
-            );
-
-            let _message = GossipMessage {
-                header: cached.header.clone(),
-                payload: Some(cached.payload.clone()),
-                signature: self.sign_message(&cached.header),
-                public_key: self.signing_key.public_key().to_vec(),
-            };
-
-            let bytes = match postcard::to_stdvec(&_message) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    self.mark_stranded_ihave_served(topic, from, &served_ids)
-                        .await;
-                    self.record_stage(PubSubStage::Republish, republish_started);
-                    return Err(anyhow!("Serialization failed: {}", e));
-                }
-            };
-            let send_result = self
-                .send_to_peer_bounded_outcome_tracked(
-                    topic,
-                    from,
-                    GossipStreamType::PubSub,
-                    bytes.into(),
-                    "EAGER",
-                    // An IWANT serve is demand traffic, not a new relay
-                    // publish; outbound wire bytes are still counted.
-                    BoundedSendOrigin {
-                        local: local_origin_only || cached.local_origin,
-                        meter_publish: false,
-                    },
-                )
-                .await
-                .0;
-            match send_result {
-                Ok(PeerSendOutcome::Sent { .. }) => {
-                    sent_any = true;
-                    // `deferred_eager_replies` can only be populated while
-                    // the egress limiter is enabled (populating it requires
-                    // a `Deferred` outcome). When disabled, taking the
-                    // topic write lock per served message to retain an
-                    // empty list is pure dispatch-path overhead.
-                    if self.egress_limiter.enabled() {
-                        let mut topics = self.topics.write_topic(&topic).await;
-                        if let Some(state) = topics.get_mut(&topic) {
-                            state
-                                .deferred_eager_replies
-                                .retain(|entry| entry.peer != from || entry.msg_id != msg_id);
-                        }
-                    }
-                    if track_served {
-                        served_ids.push(msg_id);
-                    }
-                }
-                Ok(PeerSendOutcome::Deferred) => deferred_ids.push(msg_id),
-                Ok(PeerSendOutcome::TimedOut | PeerSendOutcome::NotConnected) => {}
-                Err(e) => {
-                    send_err = Some(e);
+            let token = {
+                let mut topics = self.topics.write_topic(&topic).await;
+                let Some(state) = topics.get_mut(&topic) else {
+                    // The topic was removed (unsubscribe) while serving.
                     break;
+                };
+                state.claim_eager_reply_for_iwant(from, msg_id, Instant::now())
+            };
+            let Some(token) = token else {
+                debug!(peer_id = %from, msg_id = ?msg_id, "IWANT reply coalesced with the reply already in flight");
+                continue;
+            };
+            let completion = EagerReplyCompletion {
+                peer: from,
+                msg_id,
+                token,
+                own_custody: None,
+            };
+            let result = self
+                .send_claimed_iwant_reply(topic, completion, &cached, local_origin_only)
+                .await;
+            let outcome = match &result {
+                Ok(outcome) => *outcome,
+                Err(_) => EagerReplyOutcome::Failed,
+            };
+            {
+                let mut topics = self.topics.write_topic(&topic).await;
+                if let Some(state) = topics.get_mut(&topic) {
+                    state.settle_eager_reply(from, msg_id, token, outcome, None, Instant::now());
                 }
             }
-        }
-        self.mark_stranded_ihave_served(topic, from, &served_ids)
-            .await;
-        if !deferred_ids.is_empty() {
-            let mut topics = self.topics.write_topic(&topic).await;
-            if let Some(state) = topics.get_mut(&topic) {
-                let now = Instant::now();
-                for msg_id in deferred_ids {
-                    let _ = state.retain_deferred_eager_reply(from, msg_id, now);
-                }
+            if outcome == EagerReplyOutcome::Sent {
+                sent_any = true;
+            }
+            if let Err(error) = result {
+                send_err = Some(error);
+                break;
             }
         }
         self.record_stage(PubSubStage::Republish, republish_started);
@@ -10254,27 +11234,65 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         Ok(sent_any)
     }
 
-    /// x0x #613 (PR #54 r3 item 2): mark stranded ids as pull-served for
-    /// `from` — called by the IWANT serve path with the ids whose reply
-    /// sends actually succeeded. No-op for empty inputs or ids no longer
-    /// stranded. Also marks #59 LazyForward withheld-announce entries
-    /// served, so a pre-flush pull is not re-advertised.
-    async fn mark_stranded_ihave_served(
+    /// Admit, sign and send one claimed IWANT reply. An error is returned as
+    /// `Err` so that the caller settles the claim before it reports the
+    /// error.
+    async fn send_claimed_iwant_reply(
         &self,
         topic: TopicId,
-        from: PeerId,
-        msg_ids: &[MessageIdType],
-    ) {
-        if msg_ids.is_empty() {
-            return;
+        completion: EagerReplyCompletion,
+        cached: &CachedMessage,
+        local_origin_only: bool,
+    ) -> Result<EagerReplyOutcome> {
+        let (from, msg_id) = (completion.peer, completion.msg_id);
+        self.transport.migration.admit_cache_serve(
+            topic,
+            cached.payload.len() + MESSAGE_CRYPTO_OVERHEAD_BYTES + MESSAGE_HEADER_OVERHEAD_BYTES,
+        )?;
+        if !forwardable_payload("iwant_serve", &msg_id, &cached.payload) {
+            return Ok(EagerReplyOutcome::Failed);
         }
-        let mut topics = self.topics.write_topic(&topic).await;
-        if let Some(state) = topics.get_mut(&topic) {
-            for msg_id in msg_ids {
-                state.record_stranded_ihave_served(msg_id, from);
-                state.record_lazy_withheld_served(msg_id, from);
-            }
-        }
+        debug!(peer_id = %from, msg_id = ?msg_id, "Sending EAGER in response to IWANT");
+        debug!(
+            target: "sg.payload.trace",
+            stage = "iwant_serve",
+            msg_id = %msg_id_hex8(&msg_id),
+            len = cached.payload.len(),
+            zero_tail = payload_zero_tail(&cached.payload),
+        );
+
+        let message = GossipMessage {
+            header: cached.header.clone(),
+            payload: Some(cached.payload.clone()),
+            signature: self.sign_message(&cached.header),
+            public_key: self.signing_key.public_key().to_vec(),
+        };
+        let bytes =
+            postcard::to_stdvec(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
+        let send_result = self
+            .send_to_peer_bounded_outcome_tracked(
+                topic,
+                from,
+                GossipStreamType::PubSub,
+                bytes.into(),
+                "EAGER",
+                // An IWANT serve is demand traffic, not a new relay
+                // publish; outbound wire bytes are still counted.
+                // PR #106 review r4: an attempted send completes the reply
+                // inside the send, through the lifecycle gate.
+                BoundedSendOrigin {
+                    local: local_origin_only || cached.local_origin,
+                    meter_publish: false,
+                    reply: Some(completion),
+                },
+            )
+            .await
+            .0;
+        Ok(match send_result? {
+            PeerSendOutcome::Sent { .. } => EagerReplyOutcome::Sent,
+            PeerSendOutcome::Deferred => EagerReplyOutcome::Deferred,
+            PeerSendOutcome::TimedOut | PeerSendOutcome::NotConnected => EagerReplyOutcome::Failed,
+        })
     }
     /// Handle incoming anti-entropy message
     ///
@@ -10765,9 +11783,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
         stage_stats: &Arc<PubSubStageStats>,
         outbound_budgets: &Arc<PeerOutboundBudgets>,
-        env: IhaveFlushEnv<'_>,
+        mut env: IhaveFlushEnv<'_>,
     ) {
-        let work: Vec<IhaveFlushWork> = {
+        let (work, deferred_replies) = {
             #[cfg(test)]
             topics
                 .contention
@@ -10775,6 +11793,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 .store(true, Ordering::Relaxed);
             let mut topics_guard = topics.write_all().await;
             let mut work = Vec::new();
+            // Issue #104 (PR #106 review r1): deferred IWANT replies are
+            // snapshotted in this same all-shard pass. A claim skip defers a
+            // reply whatever the byte-limiter state, so the retry cannot be
+            // gated on the limiter, and collecting here keeps the steady
+            // state at one `write_all()` per tick.
+            let mut deferred_replies: Vec<(TopicId, DeferredEagerReply)> = Vec::new();
             // Late-local-offer candidates snapshotted here are only cheap
             // map reads; the LRU scan for their ids happens later under the
             // narrow per-topic lock (see `late_local_offer_keys`), never
@@ -10788,6 +11812,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
             for shard in topics_guard.iter_mut() {
                 for (topic_id, state) in shard.iter_mut() {
+                    let now = Instant::now();
+                    state.prune_retained_announces(
+                        now,
+                        env.send_path.connected_peers_snapshot.as_ref(),
+                    );
                     if !state.pending_ihave.is_empty() {
                         // Issue #42 round 2: SNAPSHOT the batch instead of
                         // draining it — the ids (and the #59 withheld-eager
@@ -10843,10 +11872,32 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             late_offer: None,
                             kind: MessageKind::IHave,
                             local_origin,
+                            retained_announce: false,
                         });
                     }
 
-                    let now = Instant::now();
+                    // Issue #104 (PR #106 review r1): retained announce
+                    // targets whose batch was already consumed get their own
+                    // IHAVE until each handoff succeeds or the entry expires.
+                    if let Some((batch, targets)) = state.retained_announce_work() {
+                        let local_origin = batch.iter().any(|id| {
+                            state
+                                .message_cache
+                                .lru
+                                .peek(id)
+                                .is_some_and(|cached| cached.message.local_origin)
+                        });
+                        work.push(IhaveFlushWork {
+                            topic: *topic_id,
+                            batch,
+                            targets,
+                            late_offer: None,
+                            kind: MessageKind::IHave,
+                            local_origin,
+                            retained_announce: true,
+                        });
+                    }
+
                     // S3 bounds: offers under a failure backoff are
                     // skipped. Each remaining candidate is ranked on the
                     // rotation ring and enters a bounded buffer of at most
@@ -10886,7 +11937,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             kind: MessageKind::IWant,
                             // We are asking for a message we do not hold.
                             local_origin: false,
+                            retained_announce: false,
                         });
+                    }
+
+                    // PR #106 review r3: claims of aborted sends expire here
+                    // even when custody is empty (an IWANT-serve claim has no
+                    // custody entry). This is a no-op without claims.
+                    state.prune_eager_reply_claims(now);
+                    if !state.deferred_eager_replies.is_empty() {
+                        state.prune_deferred_eager_replies(now);
+                        // A reply already in flight (claimed by an IWANT
+                        // serve or an earlier retry) is not retried.
+                        deferred_replies.extend(
+                            state
+                                .deferred_eager_replies
+                                .iter()
+                                .filter(|entry| {
+                                    !state.eager_reply_claimed(entry.peer, entry.msg_id)
+                                })
+                                .map(|entry| (*topic_id, *entry)),
+                        );
                     }
                 }
             }
@@ -10945,10 +12016,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     // `late_local_offer_keys` selects only `local_origin`
                     // cache entries.
                     local_origin: true,
+                    retained_announce: false,
                 });
             }
             work.append(&mut late_work);
-            work
+            (work, deferred_replies)
         };
 
         for IhaveFlushWork {
@@ -10958,6 +12030,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             late_offer,
             kind,
             local_origin,
+            retained_announce,
         } in work
         {
             if ihave_targets.is_empty() {
@@ -11068,6 +12141,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     op,
                     send_class: OutboundSendClass::for_op(op),
                     priority: env.send_path.admission.registry().priority_for(&topic_id),
+                    // IHAVE/IWANT are Control-class; origin selects no lane.
+                    local_origin: false,
                 };
                 // Skip reasons are only consulted by the single-peer
                 // Critical-control path; this fanout path ignores them.
@@ -11179,7 +12254,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             // never retried at the flush-tick rate.
                             state.backoff_late_local_offer(peer, cursor);
                         }
+                    } else if retained_announce {
+                        // Issue #104 (PR #106 review r1): these ids are no
+                        // longer in `pending_ihave`, so only the retained
+                        // entries are resolved.
+                        state.record_lazy_withheld_advertised(&batch, &advertised_peers);
+                        state.drop_resolved_retained_announces();
                     } else {
+                        state.record_lazy_withheld_advertised(&batch, &advertised_peers);
                         for peer in advertised_peers {
                             state.record_ihave_handoff(&batch, peer);
                             state.record_stranded_ihave_advertised(&batch, peer);
@@ -11207,63 +12289,74 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             signing_key,
             stage_stats,
             outbound_budgets,
-            env.send_path,
-            env.egress_limiter,
+            &mut env,
+            deferred_replies,
         )
         .await;
     }
 
+    /// Retry the IWANT replies in `work`, the `deferred_eager_replies`
+    /// snapshot that [`Self::flush_ihave_batches`] took in its own all-shard
+    /// pass (pruned there to the cache's lifetime and the
+    /// `MAX_DEFERRED_EAGER_REPLIES` cap, without replies already in flight).
+    ///
+    /// Issue #104 (PR #106 review r1): this runs whatever the byte-limiter
+    /// state. It used to return early on a disabled limiter, on the
+    /// assumption that only the limiter can defer a reply. A claim skip
+    /// (Data permit busy, peer cooling, admission drop) also defers it, with
+    /// the limiter on or off. A default node therefore never retried such a
+    /// reply after the permit freed, and the requester's pull waited for
+    /// anti-entropy. Relay overhead invariant I1 still holds, because the
+    /// snapshot shares the flush's single `write_all()`. An empty custody
+    /// costs nothing here.
+    ///
+    /// PR #106 review r2: the retry is bounded and detached, because it runs
+    /// inside the single IHAVE flusher, and it uses the ordinary send path.
+    /// - At most [`MAX_DEFERRED_REPLY_RETRIES_PER_FLUSH`] replies reach
+    ///   signing per tick, starting from a rotating cursor.
+    /// - A claimed reply is sent through
+    ///   [`Self::spawn_bounded_send_tasks`]. That path engages the peer's
+    ///   Critical FIFO gate before transmitting, so a Critical reply is
+    ///   serialized behind any Critical send already in flight.
+    /// - The send and its bookkeeping run detached. The flusher no longer
+    ///   awaits each reply in turn, and announcements on other topics keep
+    ///   their cadence. The entry is marked in flight until that completion,
+    ///   so no later tick dispatches it again. The peer's outbound permit,
+    ///   which the detached send holds, bounds how many replies are in
+    ///   flight per peer.
     async fn flush_deferred_eager_replies(
         topics: &Arc<ShardedTopicMap>,
         transport: &Arc<PolicyTransport<T>>,
         signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
         stage_stats: &Arc<PubSubStageStats>,
         outbound_budgets: &Arc<PeerOutboundBudgets>,
-        send_path: &SendPathContext,
-        egress_limiter: &Arc<egress::LeafEgressLimiter>,
+        env: &mut IhaveFlushEnv<'_>,
+        mut work: Vec<(TopicId, DeferredEagerReply)>,
     ) {
-        // Relay overhead invariant: a disabled limiter can never have
-        // deferred an EAGER reply (a `PeerSendOutcome::Deferred` requires
-        // it), so this pass must not take its all-shard `write_all()` at
-        // all — otherwise every 100 ms flush doubles the all-shard write
-        // lock stalls even though there is nothing to do. The ONE
-        // exception is the transition itself: an enabled→disabled
-        // `configure()` may have stranded custody entries (bounded
-        // ≤1024/topic). The limiter's residue flag marks that state; the
-        // first disabled flush drains them and clears the flag, restoring
-        // the zero-overhead steady state (a plain disabled startup never
-        // sets the flag, so relays pay nothing).
-        if !egress_limiter.enabled() {
-            if !egress_limiter.deferred_residue() {
-                return;
-            }
-            {
-                let mut topics_guard = topics.write_all().await;
-                for shard in topics_guard.iter_mut() {
-                    for state in shard.values_mut() {
-                        state.deferred_eager_replies.clear();
-                    }
-                }
-            }
+        let send_path = env.send_path;
+        let egress_limiter = env.egress_limiter;
+        // An enabled→disabled `configure()` marks custody it may have
+        // stranded. The snapshot above already covers that custody (it is
+        // retried or pruned like any other entry), so the mark only needs
+        // acknowledging. The atomic read takes no limiter mutex.
+        if egress_limiter.deferred_residue() {
             egress_limiter.clear_deferred_residue();
+        }
+        if work.is_empty() {
             return;
         }
-        let work: Vec<_> = {
-            let now = Instant::now();
-            let mut topics_guard = topics.write_all().await;
-            let mut work = Vec::new();
-            for shard in topics_guard.iter_mut() {
-                for (topic, state) in shard.iter_mut() {
-                    state.prune_deferred_eager_replies(now);
-                    for entry in state.deferred_eager_replies.iter().copied() {
-                        work.push((*topic, entry));
-                    }
-                }
-            }
-            work
-        };
+        // Rotate so the per-tick bound cannot keep spending on the same
+        // unclaimable entries (a cooling peer, say) while later ones wait.
+        let start = env.late_rotation.deferred_reply_cursor % work.len();
+        work.rotate_left(start);
+        let mut examined = 0usize;
+        let mut signed = 0usize;
 
         for (topic, entry) in work {
+            if signed >= MAX_DEFERRED_REPLY_RETRIES_PER_FLUSH {
+                break;
+            }
+            examined += 1;
             // Snapshot only bounded identity metadata above. Re-read the cache
             // immediately before this attempt so an expiry, validator drop,
             // or loss of local-origin authority cannot race a stale clone.
@@ -11273,7 +12366,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     continue;
                 };
                 state.prune_deferred_eager_replies(Instant::now());
-                if !state.deferred_eager_replies.contains(&entry) {
+                if !state.deferred_eager_replies.contains(&entry)
+                    || state.eager_reply_claimed(entry.peer, entry.msg_id)
+                {
                     continue;
                 }
                 state
@@ -11288,6 +12383,22 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let Some(cached) = cached else {
                 continue;
             };
+            let priority = send_path.admission.registry().priority_for(&topic);
+            // Issue #104 (PR #106 review r1): default nodes now run this
+            // retry too. If the transport reports the requester
+            // disconnected, or its Data lane for this origin is visibly
+            // busy, the claim below would refuse it anyway. So skip it for
+            // this tick only and keep the entry, rather than sign an EAGER
+            // frame every 100 ms just to learn that. The claim stays
+            // authoritative.
+            if transport_connected_for_peer(
+                send_path.connected_peers_snapshot.as_ref(),
+                &entry.peer,
+            ) == Some(false)
+                || !outbound_budgets.data_lane_available(entry.peer, priority, cached.local_origin)
+            {
+                continue;
+            }
             if transport
                 .migration
                 .admit_cache_serve(
@@ -11307,6 +12418,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 continue;
             }
+            signed += 1;
             let header_bytes = match postcard::to_stdvec(&cached.header) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -11352,11 +12464,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     continue;
                 }
             };
-            let bytes = transport.wire_bytes_for_peer(
-                entry.peer,
-                &bytes,
-                send_path.admission.registry().priority_for(&topic),
-            );
+            let bytes = transport.wire_bytes_for_peer(entry.peer, &bytes, priority);
             let (reserved, _) = Self::reserve_recovery_targets(
                 egress_limiter,
                 topic,
@@ -11364,17 +12472,25 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 "EAGER",
                 &bytes,
                 cached.local_origin,
-                send_path.admission.registry().priority_for(&topic),
+                priority,
             );
             let Some((peer, reservation)) = reserved.into_iter().next() else {
                 continue;
             };
-            let (attempts, permits, bulk_admitted) = {
+            // PR #106 review r3, retry-tick transition: the reply claim and the
+            // outbound permit are taken under ONE topic lock. If an IWANT
+            // serve or another retry already holds the reply claim, this
+            // entry is skipped, and nothing is reserved.
+            let (attempts, permits, bulk_admitted, token) = {
                 let now = Instant::now();
                 let mut guard = topics.write_topic(&topic).await;
                 let Some(state) = guard.get_mut(&topic) else {
                     continue;
                 };
+                state.prune_eager_reply_claims(now);
+                if state.eager_reply_claimed(entry.peer, entry.msg_id) {
+                    continue;
+                }
                 let (admitted, bulk) = filter_peers_through_admission_in_state(
                     send_path,
                     state,
@@ -11390,11 +12506,24 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     topic,
                     op: "EAGER",
                     send_class: OutboundSendClass::for_op("EAGER"),
-                    priority: send_path.admission.registry().priority_for(&topic),
+                    priority,
+                    local_origin: cached.local_origin,
                 };
                 let (attempts, permits, _) =
                     Self::claim_topic_send_attempts_for_state(&context, state, admitted, now);
-                (attempts, permits, bulk)
+                let token = (!attempts.is_empty()).then(|| {
+                    let token = state.insert_eager_reply_claim(entry.peer, entry.msg_id, now);
+                    for attempt in &attempts {
+                        state.attach_probe_to_eager_reply_claim(
+                            entry.peer,
+                            entry.msg_id,
+                            token,
+                            attempt,
+                        );
+                    }
+                    token
+                });
+                (attempts, permits, bulk, token)
             };
             let mut claims = SendAttemptClaims::new(
                 topic,
@@ -11404,65 +12533,75 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 Arc::clone(stage_stats),
                 send_path.clone(),
             );
-            if !claims.is_empty() {
-                stage_stats.record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
-                for _ in claims.attempts() {
-                    stage_stats.record_publish_origin_bytes(cached.local_origin, bytes.len());
-                }
+            let Some(token) = token else {
+                // Refused at claim time (cooling, admission, a full Critical
+                // queue): the entry stays in custody for a later tick.
+                release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+                continue;
+            };
+            // PR #106 review r5: from here on, even a cancelled booking goes
+            // through the reply lifecycle gate.
+            claims.reply = Some(EagerReplyCompletion {
+                peer: entry.peer,
+                msg_id: entry.msg_id,
+                token,
+                own_custody: Some(entry),
+            });
+            stage_stats.record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
+            for _ in claims.attempts() {
+                stage_stats.record_publish_origin_bytes(cached.local_origin, bytes.len());
             }
-            let attempts = claims.attempts().to_vec();
-            let permits = claims.take_permits();
-            let mut tasks = SendTaskSet::with_capacity("EAGER", attempts.len());
-            let mut reservation = reservation;
-            for (attempt, permit) in attempts.into_iter().zip(permits) {
-                let transport = Arc::clone(transport);
-                let stage_stats = Arc::clone(stage_stats);
-                let limiter = Arc::clone(egress_limiter);
-                let rtt_tracker = Arc::clone(&send_path.rtt_tracker);
-                let bytes = bytes.clone();
-                let reservation = reservation.take();
-                let handle = tokio::spawn(async move {
-                    let _permit = permit;
-                    Self::send_to_peer_with_timeout(
-                        transport,
-                        limiter,
-                        stage_stats,
-                        rtt_tracker,
-                        PeerSendRequest {
-                            reservation,
-                            topic,
-                            peer: attempt.peer,
-                            stream_type: GossipStreamType::PubSub,
-                            bytes,
-                            op: "EAGER",
-                            send_timeout: None,
+            let reservations: HashMap<PeerId, egress::ByteReservation> = reservation
+                .map(|reservation| (peer, reservation))
+                .into_iter()
+                .collect();
+            let send_tasks = Self::spawn_bounded_send_tasks(
+                FanoutSendContext {
+                    transport,
+                    egress_limiter,
+                    stage_stats,
+                    rtt_tracker: &send_path.rtt_tracker,
+                    topic,
+                    stream_type: GossipStreamType::PubSub,
+                    op: "EAGER",
+                },
+                &mut claims,
+                reservations,
+                &HashMap::new(),
+                &bytes,
+            );
+            let admission = Arc::clone(&send_path.admission);
+            tokio::spawn(async move {
+                let (sent, timed_out, not_connected) = send_tasks.collect_results().await;
+                // Completion transition. A dispatched retry has one attempt,
+                // so it ends `sent` or `failed`. A result set with no outcome
+                // at all keeps the request in custody (`Deferred`).
+                let outcome = if !sent.is_empty() {
+                    EagerReplyOutcome::Sent
+                } else if !timed_out.is_empty() || !not_connected.is_empty() {
+                    EagerReplyOutcome::Failed
+                } else {
+                    EagerReplyOutcome::Deferred
+                };
+                // PR #106 review r4: the gate, the outcome and the transport
+                // results under one lock. A stale retry books nothing and only
+                // removes its own custody entry. The reply comes from the
+                // claims guard (set at the claim, PR #106 review r5).
+                claims
+                    .record_results_for(
+                        None,
+                        outcome,
+                        SendAttemptResults {
+                            sent,
+                            timed_out,
+                            not_connected,
                         },
                     )
-                    .await
-                });
-                tasks.push(attempt, handle);
-            }
-            let (sent, timed_out, not_connected) = tasks.collect_results().await;
-            let served_peers: Vec<_> = sent
-                .iter()
-                .map(|completion| completion.attempt.peer)
-                .collect();
-            let terminal = !sent.is_empty() || !timed_out.is_empty() || !not_connected.is_empty();
-            claims.record_results(sent, timed_out, not_connected).await;
-            release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
-            if terminal {
-                let mut guard = topics.write_topic(&topic).await;
-                if let Some(state) = guard.get_mut(&topic) {
-                    for peer in served_peers {
-                        state.record_stranded_ihave_served(&entry.msg_id, peer);
-                        state.record_lazy_withheld_served(&entry.msg_id, peer);
-                    }
-                    state
-                        .deferred_eager_replies
-                        .retain(|candidate| *candidate != entry);
-                }
-            }
+                    .await;
+                release_bulk_admissions_free(&admission, &bulk_admitted);
+            });
         }
+        env.late_rotation.deferred_reply_cursor = start.wrapping_add(examined);
     }
 
     /// x0x #613 mitigation 2: bounded single-shot retry for a stranded
@@ -11682,6 +12821,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     op: "EAGER",
                     send_class: OutboundSendClass::for_op("EAGER"),
                     priority: ctx.send_path.admission.registry().priority_for(&topic),
+                    // The stranded retry re-sends this node's own publish.
+                    local_origin: true,
                 };
                 let (attempts, permits, _skips) =
                     Self::claim_topic_send_attempts_for_state(&claim_context, state, admitted, now);
@@ -12129,6 +13270,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 op: "ANTI_ENTROPY",
                                 send_class: OutboundSendClass::for_op("ANTI_ENTROPY"),
                                 priority: send_path.admission.registry().priority_for(&topic_id),
+                                // Control-class; origin selects no lane.
+                                local_origin: false,
                             };
                             // Skip reasons are only consulted by the
                             // single-peer Critical-control path.
@@ -12387,6 +13530,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         state
             .deferred_eager_replies
             .retain(|entry| connected_set.contains(&entry.peer));
+        // PR #106 review r3: the disconnect transition drops in-flight reply
+        // claims with custody. A stale completion's token then matches
+        // nothing.
+        state
+            .eager_reply_claims
+            .retain(|(peer, _), _| connected_set.contains(peer));
         let removed_cooling = state.clear_disconnected_peer_cooling(&connected_set);
         for peer in removed_cooling {
             self.stage_stats.clear_peer_suppression(topic, peer);
@@ -13579,6 +14728,13 @@ mod tests {
         /// #59: every outbound frame in send order — (peer, stream, wire
         /// bytes) — so tests can assert which wire kind reached whom.
         frames: Mutex<Vec<(PeerId, GossipStreamType, Bytes)>>,
+        /// PR #106 review r2: peers whose sends never complete (only the
+        /// caller's per-peer timeout ends them), with the number of send
+        /// attempts each received. Empty by default.
+        stalled: Mutex<HashMap<PeerId, usize>>,
+        /// PR #106 review r4: the next N sends to a peer fail as "peer not
+        /// connected" (a connection that dropped under an in-flight send).
+        not_connected: Mutex<HashMap<PeerId, usize>>,
     }
 
     /// Issue #42: transport that starts failing every send once closed —
@@ -13669,7 +14825,36 @@ mod tests {
                 send_counts: Mutex::new(HashMap::new()),
                 connected_peer_ids: Mutex::new(Vec::new()),
                 frames: Mutex::new(Vec::new()),
+                stalled: Mutex::new(HashMap::new()),
+                not_connected: Mutex::new(HashMap::new()),
             })
+        }
+
+        /// Every later send to `peer` hangs until the caller's timeout.
+        fn stall_sends_to(&self, peer: PeerId) {
+            self.stalled
+                .lock()
+                .expect("stalled lock")
+                .entry(peer)
+                .or_insert(0);
+        }
+
+        /// Send attempts that reached a stalled `peer`.
+        fn stalled_attempts_to(&self, peer: PeerId) -> usize {
+            self.stalled
+                .lock()
+                .expect("stalled lock")
+                .get(&peer)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        /// The next `count` sends to `peer` fail with a not-connected error.
+        fn fail_next_sends_to(&self, peer: PeerId, count: usize) {
+            self.not_connected
+                .lock()
+                .expect("not-connected lock")
+                .insert(peer, count);
         }
 
         fn set_connected_peer_ids(&self, peers: Vec<PeerId>) {
@@ -13749,6 +14934,29 @@ mod tests {
             _stream_type: GossipStreamType,
             _data: Bytes,
         ) -> Result<()> {
+            let stalled = {
+                let mut stalled = self.stalled.lock().expect("stalled lock");
+                stalled
+                    .get_mut(&peer)
+                    .map(|attempts| *attempts += 1)
+                    .is_some()
+            };
+            if stalled {
+                std::future::pending::<()>().await;
+            }
+            let fail_not_connected = {
+                let mut failing = self.not_connected.lock().expect("not-connected lock");
+                match failing.get_mut(&peer) {
+                    Some(remaining) if *remaining > 0 => {
+                        *remaining -= 1;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if fail_not_connected {
+                return Err(anyhow!("peer not connected"));
+            }
             let mut counts = self.send_counts.lock().expect("send counts lock");
             *counts.entry(peer).or_default() += 1;
             self.frames
@@ -15781,18 +16989,20 @@ mod tests {
             Some(HashSet::from([target])),
         );
 
-        // Exhaust the peer's single best-effort Data permit and hold it
-        // across the publish: claim's `try_acquire` fails after admission,
-        // so the candidate is shed at claim time.
+        // Exhaust the peer's single local-origin Data permit and hold it
+        // across the publish (issue #104: a local publish no longer shares
+        // the relay lane): claim's `try_acquire` fails after admission, so
+        // the candidate is shed at claim time.
         let held = pubsub
             .outbound_budgets
-            .try_acquire(
+            .try_acquire_for_origin(
                 target,
                 OutboundSendClass::Data,
                 TopicPriority::Normal,
+                true,
                 Instant::now(),
             )
-            .expect("first data permit is available");
+            .expect("first local-origin data permit is available");
 
         let counts = pubsub
             .publish_local_with_fanout(topic, Bytes::from_static(b"claim-skip"))
@@ -15803,10 +17013,1752 @@ mod tests {
         assert_eq!(counts.byte_rejected, 0);
         assert_eq!(counts.admission_dropped, 0);
         assert_eq!(counts.claim_skipped, 1);
+        assert_eq!(counts.claim_skipped_budget, 1);
+        assert_eq!(counts.claim_skipped_cooling, 0);
+        assert_eq!(counts.claim_skipped_disconnected, 0);
         assert_eq!(counts.attempted, 0);
         assert_eq!(transport.send_count_to(target), 0);
 
         drop(held);
+    }
+
+    /// Issue #104 fixes 1 and 3 (x0x#857 `claim_skipped=6 attempted=0`): an
+    /// all-eager topic (6 eager, 0 lazy) whose every eager peer's
+    /// local-origin permit is busy. The per-reason counts must say "budget"
+    /// and the fully claim-skipped publish must still be announced by the
+    /// next 100 ms IHAVE flush — not left for the 30 s anti-entropy round —
+    /// so the receivers can pull it.
+    #[tokio::test(start_paused = true)]
+    async fn fanout_stage_counts_all_eager_budget_claim_skip_announces_within_flush() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x65; 32]);
+        let targets: Vec<PeerId> = (2..=7).map(test_peer_id).collect();
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            for target in &targets {
+                state.eager_peers.insert(*target);
+            }
+            assert!(state.lazy_peers.is_empty(), "all-eager topic");
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(targets.iter().copied().collect()),
+        );
+        let held: Vec<OutboundSendPermit> = targets
+            .iter()
+            .map(|target| {
+                pubsub
+                    .outbound_budgets
+                    .try_acquire_for_origin(
+                        *target,
+                        OutboundSendClass::Data,
+                        TopicPriority::Normal,
+                        true,
+                        Instant::now(),
+                    )
+                    .expect("local-origin data permit is available")
+            })
+            .collect();
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"all-skipped"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(counts.candidates, 6);
+        assert_eq!(counts.byte_rejected, 0);
+        assert_eq!(counts.admission_dropped, 0);
+        assert_eq!(counts.claim_skipped, 6);
+        assert_eq!(counts.claim_skipped_budget, 6);
+        assert_eq!(counts.claim_skipped_cooling, 0);
+        assert_eq!(counts.claim_skipped_disconnected, 0);
+        assert_eq!(counts.attempted, 0);
+        let stats = pubsub.stage_stats();
+        assert_eq!(stats.publish_claim_skipped_budget, 6);
+        assert_eq!(stats.publish_claim_skipped_cooling, 0);
+        assert_eq!(stats.publish_claim_skipped_disconnected, 0);
+        assert_eq!(stats.claim_skip_ihave_queued_peers, 6);
+        assert!(transport.sent_frames().is_empty(), "nothing sent yet");
+
+        // Every skipped eager peer is a direct announce target of the msg_id.
+        let msg_id = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state exists");
+            let msg_id = *state.pending_ihave.back().expect("msg_id queued");
+            let queued = &state
+                .lazy_withheld
+                .iter()
+                .find(|entry| entry.msg_id == msg_id)
+                .expect("claim-skipped peers queued for the IHAVE flush")
+                .targets;
+            assert_eq!(queued.len(), targets.len());
+            assert_eq!(
+                queued.iter().copied().collect::<HashSet<_>>(),
+                targets.iter().copied().collect::<HashSet<_>>()
+            );
+            msg_id
+        };
+
+        // The real 100 ms flusher announces it well inside 30 s: advance
+        // paused time by a few flush intervals only.
+        pubsub.spawn_ihave_flusher();
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS)).await;
+        for target in &targets {
+            let ihaves = transport.sent_messages_of_kind_to(*target, MessageKind::IHave);
+            assert_eq!(ihaves.len(), 1, "one IHAVE to eager peer {target:?}");
+            let ids: Vec<MessageIdType> =
+                postcard::from_bytes(ihaves[0].payload.as_deref().expect("IHAVE carries ids"))
+                    .expect("IHAVE payload decodes");
+            assert!(ids.contains(&msg_id), "IHAVE advertises the publish");
+        }
+
+        // PR #106 review r1, finding 1: the receiver's IWANT answers that
+        // IHAVE while the local lane is STILL busy, so the reply is
+        // claim-skipped into `deferred_eager_replies`. With the default
+        // (disabled) byte limiter the flusher must still retry it once the
+        // permit frees; otherwise the pull is lost until anti-entropy.
+        assert!(
+            !pubsub.egress_limiter.enabled(),
+            "default node: byte limiter disabled"
+        );
+        pubsub
+            .handle_iwant(targets[0], topic, vec![msg_id])
+            .await
+            .expect("iwant handled");
+        assert!(
+            transport
+                .sent_messages_of_kind_to(targets[0], MessageKind::Eager)
+                .is_empty(),
+            "the local lane is busy: the IWANT reply is deferred, not sent"
+        );
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS)).await;
+        let served = transport.sent_messages_of_kind_to(targets[0], MessageKind::Eager);
+        assert_eq!(
+            served.len(),
+            1,
+            "the deferred IWANT reply is retried once the local lane frees"
+        );
+        assert_eq!(served[0].payload.as_deref(), Some(&b"all-skipped"[..]));
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state exists");
+            assert!(
+                state.deferred_eager_replies.is_empty(),
+                "a served deferred reply leaves custody"
+            );
+        }
+        let _ = pubsub.shutdown_tx.send(true);
+    }
+
+    /// PR #106 review r1, finding 2: a local publish's claim-skipped eager
+    /// peers are announce targets, but the IHAVE batch that carries them is
+    /// lossy. With byte enforcement disabled (the default), ONE successful
+    /// IHAVE recipient consumed the whole batch, including the targets whose
+    /// Control permits were busy, and those peers then had no pull path
+    /// until anti-entropy. The refused targets must be retained, and
+    /// announced by a later flush once their Control lane frees.
+    #[tokio::test]
+    async fn claim_skip_announce_survives_partial_control_refusal() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        assert!(
+            !pubsub.egress_limiter.enforcing(),
+            "default node: byte enforcement disabled"
+        );
+        let topic = TopicId::new([0x67; 32]);
+        let targets: Vec<PeerId> = (2..=7).map(test_peer_id).collect();
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            for target in &targets {
+                state.eager_peers.insert(*target);
+            }
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(targets.iter().copied().collect()),
+        );
+        // Every eager peer's local Data lane is busy: the publish
+        // claim-skips all six and queues them as announce targets.
+        let data_held: Vec<OutboundSendPermit> = targets
+            .iter()
+            .map(|target| {
+                pubsub
+                    .outbound_budgets
+                    .try_acquire_for_origin(
+                        *target,
+                        OutboundSendClass::Data,
+                        TopicPriority::Normal,
+                        true,
+                        Instant::now(),
+                    )
+                    .expect("local-origin data permit is available")
+            })
+            .collect();
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"partial-control"))
+            .await
+            .expect("publish returns Ok");
+        assert_eq!(counts.claim_skipped, 6);
+        assert_eq!(counts.attempted, 0);
+        let msg_id = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            *topics
+                .get(&topic)
+                .expect("topic state exists")
+                .pending_ihave
+                .back()
+                .expect("msg_id queued")
+        };
+
+        // Partial Control refusal: half the targets have every Control
+        // permit in flight, so the flush can claim only the other half.
+        let (refused, accepted) = targets.split_at(3);
+        let control_held: Vec<OutboundSendPermit> = refused
+            .iter()
+            .flat_map(|target| {
+                (0..OUTBOUND_CONTROL_PERMITS_PER_PEER).map(|_| {
+                    pubsub
+                        .outbound_budgets
+                        .try_acquire(
+                            *target,
+                            OutboundSendClass::Control,
+                            TopicPriority::Normal,
+                            Instant::now(),
+                        )
+                        .expect("control permit is available")
+                })
+            })
+            .collect();
+        async fn flush_once(
+            pubsub: &PlumtreePubSub<RecordingTransport>,
+            late_rotation: &mut LateOfferRotation,
+        ) {
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &pubsub.topics,
+                &pubsub.transport,
+                &pubsub.signing_key,
+                &pubsub.stage_stats,
+                &pubsub.outbound_budgets,
+                IhaveFlushEnv {
+                    send_path: &pubsub.send_path_context(),
+                    egress_limiter: &pubsub.egress_limiter,
+                    late_rotation,
+                },
+            )
+            .await;
+        }
+        let mut late_rotation = LateOfferRotation::default();
+        let ihave_ids_to = |peer: PeerId| -> Vec<Vec<MessageIdType>> {
+            transport
+                .sent_messages_of_kind_to(peer, MessageKind::IHave)
+                .iter()
+                .map(|message| {
+                    postcard::from_bytes(message.payload.as_deref().expect("IHAVE carries ids"))
+                        .expect("IHAVE payload decodes")
+                })
+                .collect()
+        };
+
+        flush_once(&pubsub, &mut late_rotation).await;
+        for peer in accepted {
+            let ihaves = ihave_ids_to(*peer);
+            assert_eq!(ihaves.len(), 1, "free Control lane: one IHAVE to {peer:?}");
+            assert!(ihaves[0].contains(&msg_id));
+        }
+        for peer in refused {
+            assert!(
+                ihave_ids_to(*peer).is_empty(),
+                "busy Control lane: no IHAVE to {peer:?} yet"
+            );
+        }
+
+        // Pressure clears. The next flushes must reach the refused targets,
+        // and must not re-announce to the peers that already got it.
+        drop(control_held);
+        flush_once(&pubsub, &mut late_rotation).await;
+        flush_once(&pubsub, &mut late_rotation).await;
+        for peer in &targets {
+            let ihaves = ihave_ids_to(*peer);
+            assert_eq!(
+                ihaves.len(),
+                1,
+                "exactly one IHAVE to {peer:?} once its Control lane frees"
+            );
+            assert!(ihaves[0].contains(&msg_id), "IHAVE advertises the publish");
+        }
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state exists");
+            assert!(
+                state
+                    .lazy_withheld
+                    .iter()
+                    .all(|entry| entry.msg_id != msg_id),
+                "fully handed-off announce targets leave the retained set"
+            );
+        }
+        drop(data_held);
+    }
+
+    /// PR #106 review r1, finding 2 (the bound): retained announce targets
+    /// leave the entry when they disconnect or pull the id, and the whole
+    /// entry expires at `RETAINED_ANNOUNCE_TTL`. A target that never frees
+    /// therefore cannot pin the entry, or a per-tick IHAVE rebuild, forever.
+    #[test]
+    fn retained_announce_targets_bounded_by_ttl_connectivity_and_pull() {
+        let mut state = TopicState::new();
+        let msg_id = [0x68; 32];
+        let (a, b, c) = (test_peer_id(2), test_peer_id(3), test_peer_id(4));
+        let now = Instant::now();
+        state.queue_retained_announce(msg_id, &[a, b, c], now);
+        state.push_pending_ihave(msg_id);
+        assert_eq!(
+            state.retained_announce_work(),
+            None,
+            "a still-pending id rides the ordinary batch"
+        );
+        // The batch was handed to some other recipient and consumed: the
+        // unresolved entry survives on its own.
+        state.consume_flushed_ihave_batch(&[msg_id]);
+        assert_eq!(
+            state.retained_announce_work(),
+            Some((vec![msg_id], vec![a, b, c]))
+        );
+
+        let connected = StdRwLock::new(Some(HashSet::from([a, b])));
+        state.prune_retained_announces(now, &connected);
+        assert_eq!(
+            state.retained_announce_work(),
+            Some((vec![msg_id], vec![a, b])),
+            "a disconnected target is dropped"
+        );
+        state.record_lazy_withheld_served(&msg_id, b);
+        assert_eq!(
+            state.retained_announce_work(),
+            Some((vec![msg_id], vec![a])),
+            "a target that pulled the id is resolved"
+        );
+
+        state.prune_retained_announces(
+            now + RETAINED_ANNOUNCE_TTL - Duration::from_millis(1),
+            &connected,
+        );
+        assert!(
+            state.retained_announce_work().is_some(),
+            "retained inside the TTL"
+        );
+        state.prune_retained_announces(now + RETAINED_ANNOUNCE_TTL, &connected);
+        assert_eq!(state.retained_announce_work(), None);
+        assert!(
+            state.lazy_withheld.is_empty(),
+            "an expired retained entry is dropped"
+        );
+    }
+
+    /// One IHAVE flush tick, driven directly (no background flusher).
+    async fn drive_ihave_flush_tick(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        late_rotation: &mut LateOfferRotation,
+    ) {
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation,
+            },
+        )
+        .await;
+    }
+
+    async fn deferred_reply_custody_len(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+    ) -> usize {
+        pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .map_or(0, |state| state.deferred_eager_replies.len())
+    }
+
+    /// PR #106 review r2, finding 1: the deferred-reply retry, now live on
+    /// default (limiter-disabled) nodes, must send a Critical EAGER reply
+    /// through the peer's Critical FIFO gate like every other Critical send.
+    /// The reply is deferred because the gate queue is full. One queued
+    /// reservation then frees while another Critical send still holds the
+    /// in-flight slot. The retry must wait for that slot instead of
+    /// transmitting concurrently, and later ticks must not dispatch it again.
+    #[tokio::test]
+    async fn deferred_critical_reply_retry_waits_for_the_critical_gate() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        assert!(
+            !pubsub.egress_limiter.enabled(),
+            "default node: byte limiter disabled"
+        );
+        let topic = TopicId::new([0x69; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([peer])),
+        );
+        let payload = Bytes::from_static(b"critical-reply");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            state.cache_message(msg_id, payload.clone(), test_header(topic, msg_id), true);
+        }
+        let critical_permit = || {
+            pubsub.outbound_budgets.try_acquire(
+                peer,
+                OutboundSendClass::Data,
+                TopicPriority::Critical,
+                Instant::now(),
+            )
+        };
+        // Another Critical send to the peer holds the in-flight slot, and
+        // the rest of the FIFO queue is reserved.
+        let mut active = critical_permit().expect("Critical gate slot");
+        assert!(active.engage_critical_gate(Duration::from_secs(1)).await);
+        let mut queued: Vec<OutboundSendPermit> = (1..OUTBOUND_CRITICAL_QUEUE_PER_PEER)
+            .map(|_| critical_permit().expect("Critical queue slot"))
+            .collect();
+        assert!(critical_permit().is_none(), "the Critical queue is full");
+
+        // The IWANT reply overflows the queue and is deferred into custody.
+        pubsub
+            .handle_iwant(peer, topic, vec![msg_id])
+            .await
+            .expect("iwant handled");
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        assert_eq!(eager_sent(), 0, "queue overflow defers the reply");
+        assert_eq!(deferred_reply_custody_len(&pubsub, topic).await, 1);
+
+        // Queued reservations free while the active send still holds the
+        // gate. Two are freed, so a retry dispatched again on the second
+        // tick would also find room in the queue. Retry ticks must neither
+        // transmit around the gate nor queue the reply twice.
+        drop(queued.pop());
+        drop(queued.pop());
+        let mut late_rotation = LateOfferRotation::default();
+        for _ in 0..2 {
+            drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(
+            eager_sent(),
+            0,
+            "the retry must wait for the peer's in-flight Critical send"
+        );
+
+        drop(active);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while deferred_reply_custody_len(&pubsub, topic).await > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the retry completes once the gate frees");
+        // Give any second, duplicate dispatch time to reach the wire.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            eager_sent(),
+            1,
+            "the deferred Critical reply is sent exactly once"
+        );
+        drop(queued);
+    }
+
+    /// PR #106 review r2, finding 2: the deferred-reply retry runs inside
+    /// the single IHAVE flusher. It used to await each reply in turn, so
+    /// replies to a peer whose sends stall held the flusher for one send
+    /// timeout each, and no other topic was announced meanwhile. A retained
+    /// announce has a 30 s TTL, so it could expire unannounced. The retry
+    /// must be bounded and detached: another topic's IHAVE flush keeps its
+    /// 100 ms cadence, and the stalled peer's local-origin Data lane keeps
+    /// at most one reply in flight.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_deferred_replies_do_not_block_other_topics_ihave_flush() {
+        let local = test_peer_id(1);
+        let slow = test_peer_id(2);
+        let lazy = test_peer_id(3);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![slow, lazy]);
+        transport.stall_sends_to(slow);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        assert!(
+            !pubsub.egress_limiter.enabled(),
+            "default node: byte limiter disabled"
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([slow, lazy])),
+        );
+        let replies_topic = TopicId::new([0x6a; 32]);
+        let announce_topic = TopicId::new([0x6b; 32]);
+        {
+            let mut topics = pubsub.topics.write_topic(&replies_topic).await;
+            let state = topics
+                .entry(replies_topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            for index in 0..16u8 {
+                let msg_id = [0x70 + index; 32];
+                state.cache_message(
+                    msg_id,
+                    Bytes::from(vec![index; 8]),
+                    test_header(replies_topic, msg_id),
+                    true,
+                );
+                assert!(state.retain_deferred_eager_reply(slow, msg_id, Instant::now()));
+            }
+        }
+
+        pubsub.spawn_ihave_flusher();
+        tokio::time::sleep(Duration::from_millis(2 * IHAVE_FLUSH_INTERVAL_MS)).await;
+        assert!(
+            transport.stalled_attempts_to(slow) >= 1,
+            "the retry reached the stalled peer"
+        );
+
+        // Another topic now has an announcement due.
+        {
+            let mut topics = pubsub.topics.write_topic(&announce_topic).await;
+            let state = topics.entry(announce_topic).or_insert_with(TopicState::new);
+            state.lazy_peers.insert(lazy);
+            state.push_pending_ihave([0x6c; 32]);
+        }
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS)).await;
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(lazy, MessageKind::IHave)
+                .len(),
+            1,
+            "another topic's IHAVE flush keeps running while replies stall"
+        );
+        assert_eq!(
+            transport.stalled_attempts_to(slow),
+            1,
+            "the stalled peer's local lane bounds the retry to one reply in flight"
+        );
+        let _ = pubsub.shutdown_tx.send(true);
+    }
+
+    /// PR #106 review r2, finding 2 (the bound): at most
+    /// `MAX_DEFERRED_REPLY_RETRIES_PER_FLUSH` replies reach signing per tick,
+    /// and the start rotates. Custody that begins with more unclaimable
+    /// replies than the bound (here, a cooling peer's) must not starve a
+    /// serviceable reply behind them.
+    #[tokio::test]
+    async fn deferred_reply_retry_bound_rotates_past_unclaimable_entries() {
+        let local = test_peer_id(1);
+        let cooling = test_peer_id(2);
+        let healthy = test_peer_id(3);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![cooling, healthy]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([cooling, healthy])),
+        );
+        let topic = TopicId::new([0x6d; 32]);
+        let served_id = [0x7f; 32];
+        {
+            let now = Instant::now();
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            // Suppressed, and its rate-limited bypass is not due: every
+            // claim for this peer is refused after the reply is signed.
+            state.peer_cooling.insert(
+                cooling,
+                PeerCoolingState {
+                    timeout_window_started: now,
+                    timeout_count: 0,
+                    suppressed_until: Some(now + Duration::from_secs(60)),
+                    cooldown: PEER_SUPPRESSION_COOLDOWN,
+                    last_suppressed_at: Some(now),
+                    last_suppression_timeout_count: PEER_TIMEOUT_THRESHOLD,
+                    recovery_probe_in_flight: false,
+                    recovery_probe_id: None,
+                    last_bypass_probe_at: Some(now),
+                },
+            );
+            for index in 0..=MAX_DEFERRED_REPLY_RETRIES_PER_FLUSH {
+                let msg_id = [0x40 + u8::try_from(index).expect("small index"); 32];
+                state.cache_message(
+                    msg_id,
+                    Bytes::from(vec![0xc0; 8]),
+                    test_header(topic, msg_id),
+                    true,
+                );
+                assert!(state.retain_deferred_eager_reply(cooling, msg_id, now));
+            }
+            state.cache_message(
+                served_id,
+                Bytes::from_static(b"behind-the-bound"),
+                test_header(topic, served_id),
+                true,
+            );
+            assert!(state.retain_deferred_eager_reply(healthy, served_id, now));
+        }
+
+        let mut late_rotation = LateOfferRotation::default();
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            transport.send_count_to(healthy),
+            0,
+            "the first tick stops at the per-tick bound, before the healthy reply"
+        );
+
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transport.send_count_to(healthy) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the rotated next tick reaches the healthy reply");
+        assert_eq!(transport.send_count_to(cooling), 0);
+    }
+
+    /// A default (limiter-disabled) node with `peer` connected on a Critical
+    /// topic that caches one local-origin message, and another Critical
+    /// send to `peer` holding the peer's in-flight gate slot (`active`).
+    struct CriticalReplyFixture {
+        transport: Arc<RecordingTransport>,
+        pubsub: PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        active: OutboundSendPermit,
+    }
+
+    async fn critical_reply_fixture(topic_byte: u8) -> CriticalReplyFixture {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        assert!(
+            !pubsub.egress_limiter.enabled(),
+            "default node: byte limiter disabled"
+        );
+        let topic = TopicId::new([topic_byte; 32]);
+        pubsub
+            .admission
+            .registry()
+            .register(topic, TopicPriority::Critical);
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([peer])),
+        );
+        let payload = Bytes::from_static(b"critical-reply");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            state.cache_message(msg_id, payload, test_header(topic, msg_id), true);
+        }
+        let mut active = pubsub
+            .outbound_budgets
+            .try_acquire(
+                peer,
+                OutboundSendClass::Data,
+                TopicPriority::Critical,
+                Instant::now(),
+            )
+            .expect("Critical gate slot");
+        assert!(active.engage_critical_gate(Duration::from_secs(1)).await);
+        CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        }
+    }
+
+    /// Put `(peer, msg_id)` into deferred-reply custody, as a deferred IWANT
+    /// serve does.
+    async fn defer_eager_reply(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        requested_at: Instant,
+    ) {
+        let mut topics = pubsub.topics.write_topic(&topic).await;
+        let state = topics.get_mut(&topic).expect("topic state");
+        assert!(state.retain_deferred_eager_reply(peer, msg_id, requested_at));
+    }
+
+    /// Wait (polling on the tokio clock, so paused tests advance) until the
+    /// topic's deferred-reply custody is empty.
+    async fn wait_for_deferred_custody_drained(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while deferred_reply_custody_len(pubsub, topic).await > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("deferred reply custody drains");
+    }
+
+    /// PR #106 review r3, finding 1: a repeated IWANT must not start a
+    /// second EAGER reply while one for the same (peer, msg_id) is in
+    /// flight. Here the deferred-reply retry waits at the peer's Critical
+    /// gate when the requester asks again. Before r3 the repeat queued its
+    /// own reply behind the retry, so the peer received the message twice,
+    /// and a duplicate EAGER draws the receiver's PRUNE.
+    #[tokio::test]
+    async fn repeated_iwant_coalesces_with_in_flight_retry() {
+        let CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        } = critical_reply_fixture(0x6e).await;
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        defer_eager_reply(&pubsub, topic, peer, msg_id, Instant::now()).await;
+        let mut late_rotation = LateOfferRotation::default();
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(eager_sent(), 0, "the retry waits at the peer's gate");
+
+        // The requester asks again while the retry waits; the gate then
+        // frees.
+        let repeat = async {
+            pubsub
+                .handle_iwant(peer, topic, vec![msg_id])
+                .await
+                .expect("repeat IWANT handled");
+        };
+        let release_gate = async move {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            drop(active);
+        };
+        tokio::join!(repeat, release_gate);
+        wait_for_deferred_custody_drained(&pubsub, topic).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            eager_sent(),
+            1,
+            "a repeated IWANT coalesces with the in-flight reply"
+        );
+    }
+
+    /// PR #106 review r3, finding 1 (the other order): a retry tick must not
+    /// dispatch a deferred reply while an IWANT serve is sending the same
+    /// `(peer, msg_id)`. Here the custody entry exists when the requester
+    /// asks again, and the serve waits at the peer's Critical gate. Before
+    /// r3 the tick dispatched the custody entry anyway, and the peer
+    /// received two copies.
+    #[tokio::test]
+    async fn retry_tick_skips_a_reply_an_iwant_serve_is_sending() {
+        let CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        } = critical_reply_fixture(0x73).await;
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        defer_eager_reply(&pubsub, topic, peer, msg_id, Instant::now()).await;
+
+        // The requester asks again: the serve waits at the gate while a
+        // retry tick runs, and the gate then frees.
+        let serve = async {
+            pubsub
+                .handle_iwant(peer, topic, vec![msg_id])
+                .await
+                .expect("IWANT handled");
+        };
+        let tick_then_release = async {
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            let mut late_rotation = LateOfferRotation::default();
+            drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            drop(active);
+        };
+        tokio::join!(serve, tick_then_release);
+        wait_for_deferred_custody_drained(&pubsub, topic).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            eager_sent(),
+            1,
+            "the retry tick must not send a reply the IWANT serve is sending"
+        );
+    }
+
+    /// PR #106 review r3, finding 2: a reply's completion may release only
+    /// the claim it took. Disconnect cleanup removes the peer's custody
+    /// while the old retry still waits at the gate. The reconnected peer
+    /// asks again, and a new retry is dispatched. When the old retry then
+    /// fails, its completion must not free the new retry's claim. If it
+    /// did, the next tick would dispatch the same reply a second time.
+    #[tokio::test(start_paused = true)]
+    async fn stale_retry_completion_does_not_release_a_newer_claim() {
+        let CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        } = critical_reply_fixture(0x6f).await;
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        let mut late_rotation = LateOfferRotation::default();
+        // Old retry: dispatched at t = 0, waits at the gate until its
+        // adaptive gate wait (the 4 s floor, no RTT samples) runs out.
+        defer_eager_reply(&pubsub, topic, peer, msg_id, Instant::now()).await;
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Disconnect cleanup, then the reconnected peer asks again.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            let _ = state.evict_not_connected_peer(peer);
+            assert!(
+                state.deferred_eager_replies.is_empty(),
+                "disconnect cleanup drops the custody"
+            );
+        }
+        defer_eager_reply(
+            &pubsub,
+            topic,
+            peer,
+            msg_id,
+            Instant::now() + Duration::from_millis(1),
+        )
+        .await;
+        // New retry: dispatched at t = 1 s, gate wait until t = 5 s.
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+
+        // t = 4.5 s: the old retry has timed out at the gate and completed.
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+
+        drop(active);
+        wait_for_deferred_custody_drained(&pubsub, topic).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            eager_sent(),
+            1,
+            "the stale completion must not let the newer reply be dispatched twice"
+        );
+    }
+
+    /// PR #106 review r3 (state machine, repeated IWANT x timeout): a
+    /// repeated IWANT that was coalesced into an in-flight reply must not be
+    /// lost when that reply fails. The request returns to custody and a
+    /// later tick serves it.
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_iwant_is_served_after_the_in_flight_reply_fails() {
+        let CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        } = critical_reply_fixture(0x70).await;
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        let mut late_rotation = LateOfferRotation::default();
+        defer_eager_reply(&pubsub, topic, peer, msg_id, Instant::now()).await;
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+
+        // The requester asks again while the retry waits at the gate; by
+        // t = 5 s the retry's gate wait (4 s) has run out.
+        let repeat = async {
+            pubsub
+                .handle_iwant(peer, topic, vec![msg_id])
+                .await
+                .expect("repeat IWANT handled");
+        };
+        tokio::join!(repeat, tokio::time::sleep(Duration::from_secs(5)));
+        assert_eq!(eager_sent(), 0, "nothing is sent while the gate is held");
+
+        drop(active);
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+        wait_for_deferred_custody_drained(&pubsub, topic).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            eager_sent(),
+            1,
+            "the coalesced request is served after the in-flight reply failed"
+        );
+    }
+
+    /// PR #106 review r3 (state machine): the reply-claim transitions on one
+    /// topic's state, with injected time. A repeat coalesces. A foreign
+    /// token releases nothing. A failure with a coalesced repeat queues the
+    /// request again. Sent clears custody. Disconnect cleanup and the TTL
+    /// drop claims.
+    #[test]
+    fn eager_reply_claim_transitions_follow_the_lifecycle() {
+        let topic = TopicId::new([0x71; 32]);
+        let mut state = TopicState::new();
+        let msg_id = [0x72; 32];
+        state.cache_message(
+            msg_id,
+            Bytes::from_static(b"claimed"),
+            test_header(topic, msg_id),
+            true,
+        );
+        let (peer, other) = (test_peer_id(2), test_peer_id(3));
+        let now = Instant::now();
+        let in_custody = |state: &TopicState| {
+            state
+                .deferred_eager_replies
+                .iter()
+                .any(|entry| entry.peer == peer && entry.msg_id == msg_id)
+        };
+
+        // IWANT serve: the first request claims the reply, a repeat coalesces.
+        let token = state
+            .claim_eager_reply_for_iwant(peer, msg_id, now)
+            .expect("the first serve claims the reply");
+        assert_eq!(
+            state.claim_eager_reply_for_iwant(peer, msg_id, now),
+            None,
+            "a repeat IWANT coalesces"
+        );
+
+        // A completion that carries another claim's token releases nothing.
+        let foreign = state
+            .claim_eager_reply_for_iwant(other, msg_id, now)
+            .expect("another peer's reply has its own claim");
+        state.settle_eager_reply(peer, msg_id, foreign, EagerReplyOutcome::Failed, None, now);
+        assert!(
+            state.eager_reply_claimed(peer, msg_id),
+            "a foreign token must not release the claim"
+        );
+
+        // The owner fails, so the coalesced repeat goes back into custody.
+        state.settle_eager_reply(peer, msg_id, token, EagerReplyOutcome::Failed, None, now);
+        assert!(!state.eager_reply_claimed(peer, msg_id));
+        assert!(
+            in_custody(&state),
+            "a failed reply with a coalesced repeat queues the request again"
+        );
+
+        // A sent reply clears custody for the key.
+        let token = state
+            .claim_eager_reply_for_iwant(peer, msg_id, now)
+            .expect("claimed again");
+        state.settle_eager_reply(peer, msg_id, token, EagerReplyOutcome::Sent, None, now);
+        assert!(!in_custody(&state), "a sent reply leaves custody");
+
+        // Disconnect cleanup drops the peer's claims, not other peers' claims.
+        let _ = state
+            .claim_eager_reply_for_iwant(peer, msg_id, now)
+            .expect("claimed again");
+        let _ = state.evict_not_connected_peer(peer);
+        assert!(
+            !state.eager_reply_claimed(peer, msg_id),
+            "claims do not outlive the connection"
+        );
+        assert!(state.eager_reply_claimed(other, msg_id));
+
+        // An aborted send's claim expires at the TTL.
+        state.prune_eager_reply_claims(now + EAGER_REPLY_CLAIM_TTL - Duration::from_millis(1));
+        assert!(
+            state.eager_reply_claimed(other, msg_id),
+            "kept inside the TTL"
+        );
+        state.prune_eager_reply_claims(now + EAGER_REPLY_CLAIM_TTL);
+        assert!(
+            !state.eager_reply_claimed(other, msg_id),
+            "an abandoned claim expires"
+        );
+    }
+
+    /// Disconnect cleanup for `peer` on `topic`, as transport eviction runs it.
+    async fn disconnect_cleanup(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        peer: PeerId,
+    ) {
+        let mut topics = pubsub.topics.write_topic(&topic).await;
+        let state = topics.get_mut(&topic).expect("topic state");
+        let _ = state.evict_not_connected_peer(peer);
+    }
+
+    /// PR #106 review r4, finding 1 scenario:
+    /// - An old reply to `peer` (an IWANT serve or a deferred-reply retry)
+    ///   waits at the peer's Critical gate when disconnect cleanup runs.
+    /// - The reconnected peer's request is claimed by a NEW retry, queued
+    ///   behind a gate slot the test holds.
+    /// - The old reply's send then fails "not connected" because its
+    ///   connection is gone. That completion is stale. It must not evict,
+    ///   and the newer claim must survive.
+    ///
+    /// So a repeated IWANT coalesces into the newer reply, and the peer
+    /// receives exactly one EAGER. Before r4 the stale completion ran the
+    /// x0x #380 eviction and freed the newer claim, so the repeat started a
+    /// second reply.
+    async fn assert_stale_not_connected_completion_keeps_newer_claim(
+        old_reply_is_iwant_serve: bool,
+        topic_byte: u8,
+    ) {
+        let CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        } = critical_reply_fixture(topic_byte).await;
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        let old_reply = async {
+            if old_reply_is_iwant_serve {
+                pubsub
+                    .handle_iwant(peer, topic, vec![msg_id])
+                    .await
+                    .expect("old IWANT handled");
+            }
+        };
+        let scenario = async {
+            let mut late_rotation = LateOfferRotation::default();
+            if !old_reply_is_iwant_serve {
+                defer_eager_reply(&pubsub, topic, peer, msg_id, Instant::now()).await;
+                drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+            }
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            // Disconnect cleanup. The reconnected peer's request is then
+            // claimed by a new retry that queues behind a held gate slot.
+            disconnect_cleanup(&pubsub, topic, peer).await;
+            defer_eager_reply(
+                &pubsub,
+                topic,
+                peer,
+                msg_id,
+                Instant::now() + Duration::from_millis(1),
+            )
+            .await;
+            let mut held = pubsub
+                .outbound_budgets
+                .try_acquire(
+                    peer,
+                    OutboundSendClass::Data,
+                    TopicPriority::Critical,
+                    Instant::now(),
+                )
+                .expect("Critical queue slot");
+            let (engaged_tx, engaged_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let blocker = tokio::spawn(async move {
+                assert!(held.engage_critical_gate(Duration::from_secs(5)).await);
+                let _ = engaged_tx.send(());
+                let _ = release_rx.await;
+                drop(held);
+            });
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            // The old connection is gone: the old reply's send fails.
+            transport.fail_next_sends_to(peer, 1);
+            drop(active);
+            tokio::time::timeout(Duration::from_secs(2), engaged_rx)
+                .await
+                .expect("the held slot engages after the old reply")
+                .expect("engaged signal");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // The requester asks again while the newer reply still waits.
+            let repeat = async {
+                pubsub
+                    .handle_iwant(peer, topic, vec![msg_id])
+                    .await
+                    .expect("repeat IWANT handled");
+            };
+            let release = async {
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+                let _ = release_tx.send(());
+            };
+            tokio::join!(repeat, release);
+            blocker.await.expect("blocker task");
+        };
+        tokio::join!(old_reply, scenario);
+        wait_for_deferred_custody_drained(&pubsub, topic).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            eager_sent(),
+            1,
+            "a stale not-connected completion must not free the newer reply's claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_not_connected_retry_completion_keeps_the_newer_claim() {
+        assert_stale_not_connected_completion_keeps_newer_claim(false, 0x74).await;
+    }
+
+    #[tokio::test]
+    async fn stale_not_connected_iwant_serve_completion_keeps_the_newer_claim() {
+        assert_stale_not_connected_completion_keeps_newer_claim(true, 0x78).await;
+    }
+
+    /// PR #106 review r4, finding 2: a stale SUCCESSFUL completion may remove
+    /// only its own original custody entry. The old retry waits at the gate
+    /// when disconnect cleanup runs, and the reconnected peer asks again
+    /// (new custody, not yet dispatched). The old send then succeeds. Its
+    /// completion must leave the newer custody alone, and that request is
+    /// still served exactly once.
+    #[tokio::test]
+    async fn stale_successful_completion_keeps_the_newer_custody() {
+        let CriticalReplyFixture {
+            transport,
+            pubsub,
+            topic,
+            peer,
+            msg_id,
+            active,
+        } = critical_reply_fixture(0x75).await;
+        let eager_sent = || {
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len()
+        };
+        let mut late_rotation = LateOfferRotation::default();
+        defer_eager_reply(&pubsub, topic, peer, msg_id, Instant::now()).await;
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        disconnect_cleanup(&pubsub, topic, peer).await;
+        defer_eager_reply(
+            &pubsub,
+            topic,
+            peer,
+            msg_id,
+            Instant::now() + Duration::from_millis(1),
+        )
+        .await;
+
+        // The old send succeeds after the reconnect.
+        drop(active);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while eager_sent() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the old reply is sent");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            deferred_reply_custody_len(&pubsub, topic).await,
+            1,
+            "a stale completion must leave the newer request in custody"
+        );
+
+        drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+        wait_for_deferred_custody_drained(&pubsub, topic).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(eager_sent(), 2, "the newer request is served exactly once");
+    }
+
+    /// PR #106 review r4, finding 2: a stale DEFERRED completion must not
+    /// resurrect custody after disconnect cleanup. A relay IWANT reply waits
+    /// for byte budget it cannot get (ShedNormal, bucket drained), and
+    /// disconnect cleanup runs while it waits. When the reply comes back
+    /// `Deferred`, its completion is stale and must not queue custody for
+    /// the cleaned-up peer.
+    #[tokio::test(start_paused = true)]
+    async fn stale_deferred_completion_does_not_resurrect_custody() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([peer])),
+        );
+        let topic = TopicId::new([0x76; 32]);
+        let msg_id = [0x77; 32];
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            state.cache_message(
+                msg_id,
+                Bytes::from_static(b"relayed-reply"),
+                test_header(topic, msg_id),
+                false,
+            );
+        }
+        const BUDGET: usize = 64 * 1024;
+        assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: u64::try_from(BUDGET).expect("budget size"),
+            max_serialized_frame_bytes: BUDGET,
+            policy: BytePolicy::ShedNormal,
+        })));
+        let drain = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
+            topic,
+            peer,
+            "EAGER",
+            b"drain-reply-budget",
+        );
+        let _charged = pubsub
+            .egress_limiter
+            .reserve_critical_eager(drain, BUDGET, Duration::from_secs(1))
+            .await
+            .expect("drain the byte bucket");
+
+        let serve = async {
+            pubsub
+                .handle_iwant(peer, topic, vec![msg_id])
+                .await
+                .expect("IWANT handled");
+        };
+        let cleanup = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            disconnect_cleanup(&pubsub, topic, peer).await;
+        };
+        tokio::join!(serve, cleanup);
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                .len(),
+            0,
+            "the relay reply was byte-deferred, not sent"
+        );
+        assert_eq!(
+            deferred_reply_custody_len(&pubsub, topic).await,
+            0,
+            "a stale Deferred completion must not resurrect custody after cleanup"
+        );
+    }
+
+    /// PR #106 review r4 (the gate, note 2 of the lifecycle): a stale
+    /// completion's only effect is to remove its own original custody
+    /// entry, matched by custody id, if present. It never touches a newer
+    /// claim or newer custody for the same key, whatever its outcome. A
+    /// current completion gets the proof and applies its outcome.
+    #[test]
+    fn stale_completion_only_removes_its_own_custody() {
+        let topic = TopicId::new([0x79; 32]);
+        let mut state = TopicState::new();
+        let msg_id = [0x7a; 32];
+        state.cache_message(
+            msg_id,
+            Bytes::from_static(b"gate"),
+            test_header(topic, msg_id),
+            true,
+        );
+        let peer = test_peer_id(2);
+        let now = Instant::now();
+
+        // An old retry claims its custody entry; disconnect cleanup then
+        // drops both, and the reconnected peer's request is claimed anew.
+        assert!(state.retain_deferred_eager_reply(peer, msg_id, now));
+        let old_custody = state.deferred_eager_replies[0];
+        let old_token = state.insert_eager_reply_claim(peer, msg_id, now);
+        let _ = state.evict_not_connected_peer(peer);
+        assert!(state.retain_deferred_eager_reply(peer, msg_id, now));
+        let new_custody = state.deferred_eager_replies[0];
+        assert_ne!(new_custody.id, old_custody.id, "custody ids are unique");
+        let new_token = state.insert_eager_reply_claim(peer, msg_id, now);
+        let stale = EagerReplyCompletion {
+            peer,
+            msg_id,
+            token: old_token,
+            own_custody: Some(old_custody),
+        };
+
+        for outcome in [
+            EagerReplyOutcome::Sent,
+            EagerReplyOutcome::Deferred,
+            EagerReplyOutcome::Failed,
+        ] {
+            state.settle_eager_reply(peer, msg_id, old_token, outcome, Some(old_custody), now);
+            assert!(
+                state.admit_eager_reply_completion(&stale).is_none(),
+                "{outcome:?}: the old token stays stale"
+            );
+            assert_eq!(
+                state
+                    .deferred_eager_replies
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
+                vec![new_custody.id],
+                "{outcome:?}: newer custody untouched, none created"
+            );
+            assert_eq!(
+                state
+                    .eager_reply_claims
+                    .get(&(peer, msg_id))
+                    .map(|claim| claim.token),
+                Some(new_token),
+                "{outcome:?}: the newer claim survives"
+            );
+        }
+
+        // A stale completion whose own entry is still present removes it
+        // exactly, and nothing else.
+        let _ = state.evict_not_connected_peer(peer);
+        assert!(state.retain_deferred_eager_reply(peer, msg_id, now));
+        let own = state.deferred_eager_replies[0];
+        let other_peer = test_peer_id(3);
+        assert!(state.retain_deferred_eager_reply(other_peer, msg_id, now));
+        state.settle_eager_reply(
+            peer,
+            msg_id,
+            old_token,
+            EagerReplyOutcome::Sent,
+            Some(own),
+            now,
+        );
+        assert!(state
+            .deferred_eager_replies
+            .iter()
+            .all(|entry| entry.id != own.id));
+        assert!(state
+            .deferred_eager_replies
+            .iter()
+            .any(|entry| entry.peer == other_peer));
+
+        // A current completion is admitted and applies its outcome.
+        let token = state.insert_eager_reply_claim(peer, msg_id, now);
+        let current = EagerReplyCompletion {
+            peer,
+            msg_id,
+            token,
+            own_custody: None,
+        };
+        let admitted = state
+            .admit_eager_reply_completion(&current)
+            .expect("the current completion is admitted");
+        state.apply_eager_reply_outcome(admitted, EagerReplyOutcome::Deferred, now);
+        assert!(!state.eager_reply_claimed(peer, msg_id));
+        assert!(state
+            .deferred_eager_replies
+            .iter()
+            .any(|entry| entry.peer == peer && entry.msg_id == msg_id));
+    }
+
+    /// Expired-suppression cooling for `peer`: its next claim is a recovery
+    /// probe.
+    fn probe_due_cooling(now: Instant) -> PeerCoolingState {
+        let expired = now
+            .checked_sub(Duration::from_secs(1))
+            .expect("monotonic clock is past one second");
+        PeerCoolingState {
+            timeout_window_started: now,
+            timeout_count: 0,
+            suppressed_until: Some(expired),
+            cooldown: PEER_SUPPRESSION_COOLDOWN,
+            last_suppressed_at: Some(expired),
+            last_suppression_timeout_count: PEER_TIMEOUT_THRESHOLD,
+            recovery_probe_in_flight: false,
+            recovery_probe_id: None,
+            last_bypass_probe_at: None,
+        }
+    }
+
+    async fn recovery_probe_in_flight(
+        pubsub: &PlumtreePubSub<RecordingTransport>,
+        topic: TopicId,
+        peer: PeerId,
+    ) -> bool {
+        pubsub
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .and_then(|state| state.peer_cooling.get(&peer))
+            .is_some_and(|cooling| cooling.recovery_probe_in_flight)
+    }
+
+    /// PR #106 review r5, residual 1 scenario: a reply that is a recovery
+    /// probe is sent. Its completion is then blocked on the topic lock
+    /// before booking, and meanwhile the reply's claim passes
+    /// `EAGER_REPLY_CLAIM_TTL` and is pruned. The completion is therefore
+    /// stale and discards the probe's outcome. The TTL prune must clear that
+    /// exact probe, or sends to the peer stay suppressed until inbound
+    /// activity or a disconnect.
+    async fn assert_ttl_prune_clears_the_expired_claims_probe(
+        via_iwant_serve: bool,
+        topic_byte: u8,
+    ) {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([peer])),
+        );
+        let topic = TopicId::new([topic_byte; 32]);
+        let payload = Bytes::from_static(b"probe-reply");
+        let msg_id = pubsub.calculate_msg_id(&topic, &payload);
+        {
+            let now = Instant::now();
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            state.cache_message(msg_id, payload, test_header(topic, msg_id), true);
+            state.peer_cooling.insert(peer, probe_due_cooling(now));
+            if !via_iwant_serve {
+                assert!(state.retain_deferred_eager_reply(peer, msg_id, now));
+            }
+        }
+        // Block the completion before it books, and expire the claim.
+        let block_and_expire = async {
+            let mut guard = pubsub.topics.write_topic(&topic).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                transport
+                    .sent_frames_of_kind_to(peer, MessageKind::Eager)
+                    .len(),
+                1,
+                "the probe reply was sent"
+            );
+            let state = guard.get_mut(&topic).expect("topic state");
+            assert!(
+                state
+                    .peer_cooling
+                    .get(&peer)
+                    .is_some_and(|cooling| cooling.recovery_probe_in_flight),
+                "the reply is the peer's recovery probe"
+            );
+            state.prune_eager_reply_claims(Instant::now() + EAGER_REPLY_CLAIM_TTL);
+        };
+        if via_iwant_serve {
+            let serve = async {
+                pubsub
+                    .handle_iwant(peer, topic, vec![msg_id])
+                    .await
+                    .expect("IWANT handled");
+            };
+            tokio::join!(serve, block_and_expire);
+        } else {
+            let mut late_rotation = LateOfferRotation::default();
+            drive_ihave_flush_tick(&pubsub, &mut late_rotation).await;
+            block_and_expire.await;
+        }
+        // The stale completion runs now and discards the probe's outcome.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !recovery_probe_in_flight(&pubsub, topic, peer).await,
+            "the TTL prune clears the expired claim's recovery probe"
+        );
+        let (claims, _) = pubsub
+            .claim_topic_send_attempts(topic, vec![peer], "EAGER", true)
+            .await;
+        assert_eq!(
+            claims.attempts().len(),
+            1,
+            "a later send to the peer is not suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_prune_clears_the_probe_of_an_expired_retry_claim() {
+        assert_ttl_prune_clears_the_expired_claims_probe(false, 0x7b).await;
+    }
+
+    #[tokio::test]
+    async fn ttl_prune_clears_the_probe_of_an_expired_iwant_serve_claim() {
+        assert_ttl_prune_clears_the_expired_claims_probe(true, 0x7c).await;
+    }
+
+    /// PR #106 review r5, residual 2: a completion cancelled while it waits
+    /// for the topic lock must not bypass the lifecycle gate. Its claims
+    /// guard used to book the recovery-probe timeout directly on drop. Here
+    /// the completion is stale (a newer claim holds the key), so the
+    /// cancellation must book nothing: the newer claim and the peer's
+    /// cooling state stay exactly as they were.
+    #[tokio::test]
+    async fn cancelled_stale_completion_books_nothing() {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x7d; 32]);
+        let msg_id = [0x7e; 32];
+        let now = Instant::now();
+        let (probe_attempt, old_token, new_token) = {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics
+                .entry(topic)
+                .or_insert_with(|| pubsub.new_topic_state());
+            state.cache_message(
+                msg_id,
+                Bytes::from_static(b"cancelled-reply"),
+                test_header(topic, msg_id),
+                true,
+            );
+            state.peer_cooling.insert(peer, probe_due_cooling(now));
+            let (probe_attempt, _) = state
+                .claim_send_attempt_at(peer, now)
+                .expect("the reply is a recovery probe");
+            assert_eq!(probe_attempt.kind, SendAttemptKind::RecoveryProbe);
+            let old_token = state.insert_eager_reply_claim(peer, msg_id, now);
+            // A newer reply holds the key now.
+            state.eager_reply_claims.remove(&(peer, msg_id));
+            let new_token = state.insert_eager_reply_claim(peer, msg_id, now);
+            (probe_attempt, old_token, new_token)
+        };
+        let cooling_fields = |state: &TopicState| {
+            state.peer_cooling.get(&peer).map(|cooling| {
+                (
+                    cooling.suppressed_until,
+                    cooling.recovery_probe_in_flight,
+                    cooling.recovery_probe_id,
+                    cooling.timeout_count,
+                )
+            })
+        };
+        let cooling_before = cooling_fields(
+            pubsub
+                .topics
+                .read_topic(&topic)
+                .await
+                .get(&topic)
+                .expect("topic state"),
+        );
+
+        let claims = SendAttemptClaims::new(
+            topic,
+            vec![probe_attempt],
+            Vec::new(),
+            Arc::clone(&pubsub.topics),
+            Arc::clone(&pubsub.stage_stats),
+            pubsub.send_path_context(),
+        );
+        // The old completion waits for the topic lock and is cancelled there.
+        let guard = pubsub.topics.write_topic(&topic).await;
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            claims.record_results_for(
+                Some(EagerReplyCompletion {
+                    peer,
+                    msg_id,
+                    token: old_token,
+                    own_custody: None,
+                }),
+                EagerReplyOutcome::Failed,
+                SendAttemptResults {
+                    sent: Vec::new(),
+                    timed_out: vec![probe_attempt],
+                    not_connected: Vec::new(),
+                },
+            ),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the completion is cancelled while it waits for the lock"
+        );
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        assert_eq!(
+            state
+                .eager_reply_claims
+                .get(&(peer, msg_id))
+                .map(|claim| claim.token),
+            Some(new_token),
+            "the newer claim is untouched"
+        );
+        assert_eq!(
+            cooling_fields(state),
+            cooling_before,
+            "a stale cancellation books nothing"
+        );
+    }
+
+    /// Issue #104 fix 2: relayed sends holding every eager peer's shared
+    /// best-effort Data permit must not claim-skip this node's own Normal
+    /// publish — local-origin frames have their own per-peer permit.
+    #[tokio::test]
+    async fn local_publish_not_starved_by_relay_held_permits() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x66; 32]);
+        let targets: Vec<PeerId> = (2..=7).map(test_peer_id).collect();
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            for target in &targets {
+                state.eager_peers.insert(*target);
+            }
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(targets.iter().copied().collect()),
+        );
+        // Relay forwards in flight to every eager peer (relay-origin lane).
+        let relay_held: Vec<OutboundSendPermit> = targets
+            .iter()
+            .map(|target| {
+                pubsub
+                    .outbound_budgets
+                    .try_acquire(
+                        *target,
+                        OutboundSendClass::Data,
+                        TopicPriority::Normal,
+                        Instant::now(),
+                    )
+                    .expect("relay data permit is available")
+            })
+            .collect();
+
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"own-speech"))
+            .await
+            .expect("publish returns Ok");
+
+        assert_eq!(
+            counts.claim_skipped, 0,
+            "relays must not starve a local publish"
+        );
+        assert_eq!(counts.attempted, 6);
+        for target in &targets {
+            assert_eq!(transport.send_count_to(*target), 1);
+        }
+        drop(relay_held);
     }
 
     #[tokio::test]
@@ -19701,7 +22653,7 @@ mod tests {
         // (a, cont.) eager-eligible in practice: the very next claim for the
         // peer succeeds (permit now free, no cooldown in the way).
         let (claims, _) = pubsub
-            .claim_topic_send_attempts(topic, vec![slow_peer], "EAGER")
+            .claim_topic_send_attempts(topic, vec![slow_peer], "EAGER", false)
             .await;
         assert_eq!(
             claims.attempts().len(),
@@ -23287,11 +26239,11 @@ mod tests {
         {
             let mut topics = pubsub.topics.write_topic(&topic).await;
             let state = topics.entry(topic).or_insert_with(TopicState::new);
-            state.deferred_eager_replies.push(DeferredEagerReply {
+            state.deferred_eager_replies.push(DeferredEagerReply::new(
                 peer,
-                msg_id: [0xdb; 32],
-                requested_at: Instant::now(),
-            });
+                [0xdb; 32],
+                Instant::now(),
+            ));
         }
 
         // The disabling transition arms the residue flag.
@@ -23987,16 +26939,8 @@ mod tests {
                 now - Duration::from_secs(2),
             );
             state.deferred_eager_replies.extend([
-                DeferredEagerReply {
-                    peer,
-                    msg_id: dropped,
-                    requested_at: now,
-                },
-                DeferredEagerReply {
-                    peer,
-                    msg_id: expired,
-                    requested_at: now,
-                },
+                DeferredEagerReply::new(peer, dropped, now),
+                DeferredEagerReply::new(peer, expired, now),
             ]);
         }
         PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
@@ -24059,8 +27003,8 @@ mod tests {
             test_signing_key(),
             false,
         );
-        // Deferred custody requires an enabled limiter (see the sibling
-        // test above); the disabled flush skips the deferred pass.
+        // Byte-deferred custody, the limiter's producer of this state. Since
+        // PR #106 r1 a claim skip produces it with the limiter disabled too.
         assert!(pubsub.configure_leaf_egress(Some(LeafEgressConfig {
             soft_bytes_per_second: 0,
             hard_bytes_per_second: 1024 * 1024,
@@ -24093,6 +27037,15 @@ mod tests {
             },
         )
         .await;
+        // PR #106 review r2: the retry's send and bookkeeping are detached
+        // from the flush, so wait for them to complete.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while deferred_reply_custody_len(&pubsub, topic).await > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached retry completes");
         assert_eq!(
             transport
                 .sent_frames_of_kind_to(peer, MessageKind::Eager)
@@ -26176,7 +29129,7 @@ mod tests {
         );
 
         let (claims, _) = pubsub
-            .claim_topic_send_attempts(topic, vec![ghost_peer], "EAGER")
+            .claim_topic_send_attempts(topic, vec![ghost_peer], "EAGER", false)
             .await;
 
         assert!(claims.is_empty());
@@ -27585,12 +30538,13 @@ mod tests {
                 topic,
                 vec![target; OUTBOUND_CRITICAL_QUEUE_PER_PEER],
                 "EAGER",
+                false,
             )
             .await;
         assert_eq!(held.attempts().len(), OUTBOUND_CRITICAL_QUEUE_PER_PEER);
 
         let (overflow, _) = pubsub
-            .claim_topic_send_attempts(topic, vec![target], "EAGER")
+            .claim_topic_send_attempts(topic, vec![target], "EAGER", false)
             .await;
         assert!(overflow.is_empty());
         {
@@ -27614,7 +30568,7 @@ mod tests {
         // hard error + saturation count, still zero cooling skips (the old
         // behaviour skipped this claim via the cooling it had just created).
         let (still_not_cooled, _) = pubsub
-            .claim_topic_send_attempts(topic, vec![target], "EAGER")
+            .claim_topic_send_attempts(topic, vec![target], "EAGER", false)
             .await;
         assert!(still_not_cooled.is_empty());
 
@@ -27644,7 +30598,7 @@ mod tests {
         // no 30-60 s cooldown stands between a full FIFO and recovery.
         drop(held);
         let (recovered, _) = pubsub
-            .claim_topic_send_attempts(topic, vec![target], "EAGER")
+            .claim_topic_send_attempts(topic, vec![target], "EAGER", false)
             .await;
         assert_eq!(
             recovered.attempts().len(),
@@ -29468,6 +32422,124 @@ mod tests {
             admission_stats.dropped_bulk_peer_cooled, 1,
             "the skipped send books PeerCooled on the Bulk lane"
         );
+    }
+
+    /// Issue #105 (found via x0x#857): a claim that converts into a
+    /// recovery probe marks the probe in flight BEFORE the outbound permit
+    /// is taken. When the permit was refused the probe was dropped with the
+    /// flag still set, so the peer stayed suppressed and every later claim
+    /// was skipped as cooling. The refused claim must leave no in-flight
+    /// flag, and once the permit frees the next claim must send the probe.
+    #[tokio::test]
+    async fn recovery_probe_flag_not_leaked_when_budget_refuses_permit() {
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        transport.set_connected_peer_ids(vec![target]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0xB5; 32]); // default Normal priority
+        let now = Instant::now();
+        let expired = now
+            .checked_sub(Duration::from_secs(1))
+            .expect("monotonic clock is past one second");
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            state.eager_peers.insert(target);
+            state.peer_cooling.insert(
+                target,
+                PeerCoolingState {
+                    timeout_window_started: now,
+                    timeout_count: 0,
+                    // Suppression already expired: the next claim is the
+                    // recovery probe.
+                    suppressed_until: Some(expired),
+                    cooldown: PEER_SUPPRESSION_COOLDOWN,
+                    last_suppressed_at: Some(expired),
+                    last_suppression_timeout_count: PEER_TIMEOUT_THRESHOLD,
+                    recovery_probe_in_flight: false,
+                    recovery_probe_id: None,
+                    last_bypass_probe_at: None,
+                },
+            );
+        }
+        async fn probe_in_flight(
+            pubsub: &PlumtreePubSub<RecordingTransport>,
+            topic: TopicId,
+            peer: PeerId,
+        ) -> bool {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            topics
+                .get(&topic)
+                .and_then(|state| state.peer_cooling.get(&peer))
+                .is_some_and(|cooling| cooling.recovery_probe_in_flight)
+        }
+
+        // Hold the peer's Data permit (a relay send in flight) and claim
+        // twice: both claims are refused by the budget.
+        let held = pubsub
+            .outbound_budgets
+            .try_acquire(
+                target,
+                OutboundSendClass::Data,
+                TopicPriority::Normal,
+                Instant::now(),
+            )
+            .expect("first data permit is available");
+        for attempt in 0..2 {
+            pubsub
+                .send_to_peer_bounded(
+                    topic,
+                    target,
+                    GossipStreamType::PubSub,
+                    Bytes::from_static(b"budget-starved-probe"),
+                    "EAGER",
+                )
+                .await
+                .expect("budget-refused send completes");
+            assert_eq!(
+                transport.send_count_to(target),
+                0,
+                "claim {attempt} sent nothing"
+            );
+            assert!(
+                !probe_in_flight(&pubsub, topic, target).await,
+                "claim {attempt}: a budget-refused probe must not leave the in-flight flag set"
+            );
+        }
+        drop(held);
+
+        // The permit is free: the next claim IS the recovery probe, and its
+        // success lifts the suppression.
+        pubsub
+            .send_to_peer_bounded(
+                topic,
+                target,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"probe-after-budget-frees"),
+                "EAGER",
+            )
+            .await
+            .expect("probe send completes");
+        assert_eq!(
+            transport.send_count_to(target),
+            1,
+            "the recovery probe must fire once a permit is available"
+        );
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state exists");
+        let cooling = state.peer_cooling.get(&target).expect("cooling state kept");
+        assert!(!cooling.recovery_probe_in_flight);
+        assert_eq!(
+            cooling.suppressed_until, None,
+            "probe success lifts suppression"
+        );
+        assert!(state.can_graft_peer_at(target, Instant::now()));
     }
 
     #[tokio::test]

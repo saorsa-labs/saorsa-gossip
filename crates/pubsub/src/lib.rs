@@ -153,6 +153,14 @@ const BACKGROUND_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// Anti-entropy reconciliation interval (30 seconds)
 const ANTI_ENTROPY_INTERVAL_SECS: u64 = 30;
 
+/// Issue #104 (PR #106 review r1): how long a local publish's claim-skipped
+/// eager peers stay direct IHAVE announce targets while no flush manages to
+/// hand them the announcement (Control permit busy, cooling, admission). It
+/// spans several worst-case adaptive sends (≤ 10 s each, which is how long a
+/// busy Control permit can stay held), and it ends where the 30 s
+/// anti-entropy round, the designed fallback, takes over.
+const RETAINED_ANNOUNCE_TTL: Duration = Duration::from_secs(ANTI_ENTROPY_INTERVAL_SECS);
+
 /// Target eager peer degree (6-8)
 const MIN_EAGER_DEGREE: usize = 6;
 const MAX_EAGER_DEGREE: usize = 12;
@@ -1649,6 +1657,30 @@ impl PeerOutboundBudgets {
         now: Instant,
     ) -> Option<OutboundSendPermit> {
         self.try_acquire_for_origin(peer, class, priority, false, now)
+    }
+
+    /// Read-only: could [`Self::try_acquire_for_origin`] grant `peer` a
+    /// Data permit on the lane selected by `priority` and `local_origin`
+    /// right now? Critical Data is bounded by the FIFO gate, not by a lane,
+    /// so it always reports `true`. This is advisory only, and a concurrent
+    /// release or acquire can change the answer. The deferred-reply retry
+    /// uses it to skip signing a frame that it could not claim this tick.
+    fn data_lane_available(
+        &self,
+        peer: PeerId,
+        priority: TopicPriority,
+        local_origin: bool,
+    ) -> bool {
+        if priority == TopicPriority::Critical {
+            return true;
+        }
+        self.peers_guard().get(&peer).is_none_or(|entry| {
+            if local_origin {
+                entry.local_data_in_flight < OUTBOUND_LOCAL_DATA_PERMITS_PER_PEER
+            } else {
+                entry.best_effort_data_in_flight < OUTBOUND_BEST_EFFORT_DATA_PERMITS_PER_PEER
+            }
+        })
     }
 
     /// Try to reserve an outbound permit for `peer`.
@@ -3809,6 +3841,23 @@ struct LazyWithheldEntry {
     /// Targets that already pulled this id via IWANT before the flush
     /// consumed the entry — excluded from re-advertising.
     served: Vec<PeerId>,
+    /// Issue #104 (PR #106 review r1): `Some(deadline)` for a local
+    /// publish's claim-skipped eager peers. This node is the only source of
+    /// that message, so the entry is not lossy. A target leaves `targets`
+    /// only once an IHAVE is handed off to it (or it pulls the id, or it
+    /// disconnects), and the entry outlives the consumption of its
+    /// `pending_ihave` batch. After that, later flushes advertise it as a
+    /// separate batch until `deadline`. `None` keeps the #59 one-shot
+    /// semantics, which relayed traffic uses.
+    retain_until: Option<Instant>,
+}
+
+impl LazyWithheldEntry {
+    /// A retained entry still has a target that has neither been handed an
+    /// IHAVE nor pulled the id.
+    fn has_unresolved_retained_target(&self) -> bool {
+        self.retain_until.is_some() && self.targets.iter().any(|peer| !self.served.contains(peer))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3862,13 +3911,15 @@ struct DeferredIwant {
     requested_at: Instant,
 }
 
-/// A pull reply that the byte budget deferred, retained so the requester's
-/// pull is not lost.
+/// A pull reply that came back `Deferred`, retained so the requester's pull
+/// is not lost.
 ///
-/// #504: entries are only ever *relay* payloads. A local-origin reply is
-/// protected from shedding, so it is sent rather than deferred and can never
-/// reach custody — the `local_origin_only` flag this used to carry became
-/// unreachable and was removed with its merge and serve-side filter.
+/// #504: the byte budget only ever defers *relay* payloads. A local-origin
+/// reply is protected from shedding. Issue #104 (PR #106 review r1): a reply
+/// of either origin can still be deferred by the claim (its Data permit is
+/// busy, or the peer is cooling or admission-dropped), with the limiter
+/// enabled or not. The retry re-reads `local_origin` from the cache, so a
+/// local-origin entry claims the local-origin lane again.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DeferredEagerReply {
     peer: PeerId,
@@ -3953,6 +4004,10 @@ struct IhaveFlushWork {
     /// #504: a local-origin advertisement is this node's own speech, so the
     /// byte budget may not shed it even under `BytePolicy::ShedNormal`.
     local_origin: bool,
+    /// Issue #104 (PR #106 review r1): this batch carries retained announce
+    /// entries whose `pending_ihave` batch was already consumed. A handoff
+    /// resolves those targets only, not `pending_ihave`.
+    retained_announce: bool,
 }
 
 struct TopicState {
@@ -3983,7 +4038,11 @@ struct TopicState {
     /// finally by anti-entropy). Deliberately separate from
     /// `stranded_ihave`: that path's bounded retry re-sends cached EAGER
     /// wire bytes, which is exactly what a LazyForward verdict withholds.
-    /// Capped at `MAX_IHAVE_BATCH_SIZE` entries.
+    /// Capped at `MAX_IHAVE_BATCH_SIZE` entries. Exception (issue #104, PR
+    /// #106 review r1): entries with `retain_until` set carry a local
+    /// publish's claim-skipped eager peers. They are not lossy. Each target
+    /// is kept until its IHAVE handoff succeeds, bounded by
+    /// [`RETAINED_ANNOUNCE_TTL`].
     lazy_withheld: Vec<LazyWithheldEntry>,
     /// Non-tree peers (send IHAVE only)
     lazy_peers: HashSet<PeerId>,
@@ -4001,9 +4060,12 @@ struct TopicState {
     /// them through the same limiter/admission path.
     outstanding_iwants: HashMap<MessageIdType, OutstandingIwant>,
     deferred_iwants: Vec<DeferredIwant>,
-    /// Publisher-side custody for IWANT replies whose EAGER bytes were
-    /// deferred by the hard egress limiter. Payload and proof remain in the
-    /// bounded cache and are re-derived at each attempt.
+    /// Publisher-side custody for IWANT replies that came back `Deferred`:
+    /// the hard egress limiter deferred their EAGER bytes, or the claim
+    /// skipped them (permit busy, cooling, admission). A claim skip happens
+    /// with the limiter disabled too, so the flush retries custody whatever
+    /// the limiter state. Payload and proof remain in the bounded cache and
+    /// are re-derived at each attempt.
     deferred_eager_replies: Vec<DeferredEagerReply>,
     /// Per-peer quality scores for tree optimization
     peer_scores: HashMap<PeerId, PeerScore>,
@@ -4407,7 +4469,118 @@ impl TopicState {
             targets: peers.to_vec(),
             cold_relay,
             served: Vec::new(),
+            retain_until: None,
         });
+    }
+
+    /// Issue #104 (PR #106 review r1): queue a local publish's claim-skipped
+    /// eager peers as RETAINED direct IHAVE announce targets. The
+    /// `queue_lazy_withheld` entry is lossy: the first flush that hands the
+    /// batch to any recipient consumes it, including targets whose Control
+    /// permit was busy at that moment. This node is the only source of its
+    /// own publish, so each target is kept until its IHAVE handoff succeeds
+    /// or `now + RETAINED_ANNOUNCE_TTL` passes. It uses the same list and cap
+    /// as `queue_lazy_withheld`.
+    fn queue_retained_announce(&mut self, msg_id: MessageIdType, peers: &[PeerId], now: Instant) {
+        if peers.is_empty() {
+            return;
+        }
+        let deadline = now + RETAINED_ANNOUNCE_TTL;
+        self.queue_lazy_withheld(msg_id, peers, false);
+        if let Some(entry) = self.lazy_withheld.iter_mut().find(|e| e.msg_id == msg_id) {
+            entry.retain_until = Some(entry.retain_until.map_or(deadline, |t| t.max(deadline)));
+        }
+    }
+
+    /// Issue #104 (PR #106 review r1): `peers` accepted an IHAVE handoff for
+    /// `batch`, so they are no longer pending targets of any retained entry
+    /// in that batch. Lossy (`retain_until == None`) entries are untouched,
+    /// because consuming the batch drops them anyway. One pass, and the
+    /// batch is indexed only when a retained entry exists.
+    fn record_lazy_withheld_advertised(&mut self, batch: &[MessageIdType], peers: &[PeerId]) {
+        if peers.is_empty()
+            || !self
+                .lazy_withheld
+                .iter()
+                .any(|entry| entry.retain_until.is_some())
+        {
+            return;
+        }
+        let batch_index: HashSet<MessageIdType> = batch.iter().copied().collect();
+        for entry in &mut self.lazy_withheld {
+            if entry.retain_until.is_some() && batch_index.contains(&entry.msg_id) {
+                entry.targets.retain(|target| !peers.contains(target));
+            }
+        }
+    }
+
+    /// Issue #104 (PR #106 review r1): bound the retained announce entries
+    /// at the start of a flush. This drops entries past their deadline. It
+    /// also drops targets that pulled the id, and targets the transport
+    /// reports disconnected: a reconnecting peer is caught up by its
+    /// late-local offer, and a disconnected target would only keep a signed
+    /// IHAVE being rebuilt every tick. Finally it drops entries left with no
+    /// target. Lossy entries are untouched.
+    fn prune_retained_announces(
+        &mut self,
+        now: Instant,
+        connected_peers: &StdRwLock<Option<HashSet<PeerId>>>,
+    ) {
+        if self.lazy_withheld.is_empty() {
+            return;
+        }
+        self.lazy_withheld.retain_mut(|entry| {
+            let Some(deadline) = entry.retain_until else {
+                return true;
+            };
+            if deadline <= now {
+                return false;
+            }
+            entry.targets.retain(|peer| {
+                !entry.served.contains(peer)
+                    && transport_connected_for_peer(connected_peers, peer) != Some(false)
+            });
+            !entry.targets.is_empty()
+        });
+    }
+
+    /// Issue #104 (PR #106 review r1): the retained announce entries whose
+    /// `pending_ihave` batch has already been consumed (their id is no
+    /// longer pending), as one IHAVE batch plus its unresolved targets.
+    /// Entries whose id is still pending ride the ordinary batch instead.
+    /// `None` when there is nothing to retry. The entry list is capped at
+    /// `MAX_IHAVE_BATCH_SIZE`, so the ids fit one IHAVE frame.
+    fn retained_announce_work(&self) -> Option<(Vec<MessageIdType>, Vec<PeerId>)> {
+        if !self
+            .lazy_withheld
+            .iter()
+            .any(LazyWithheldEntry::has_unresolved_retained_target)
+        {
+            return None;
+        }
+        let pending: HashSet<MessageIdType> = self.pending_ihave.iter().copied().collect();
+        let mut batch = Vec::new();
+        let mut targets: Vec<PeerId> = Vec::new();
+        for entry in &self.lazy_withheld {
+            if !entry.has_unresolved_retained_target() || pending.contains(&entry.msg_id) {
+                continue;
+            }
+            batch.push(entry.msg_id);
+            for peer in &entry.targets {
+                if !entry.served.contains(peer) && !targets.contains(peer) {
+                    targets.push(*peer);
+                }
+            }
+        }
+        (!batch.is_empty()).then_some((batch, targets))
+    }
+
+    /// Issue #104 (PR #106 review r1): remove every retained announce entry
+    /// whose targets have all been handed an IHAVE or have pulled the id.
+    /// Lossy entries are untouched.
+    fn drop_resolved_retained_announces(&mut self) {
+        self.lazy_withheld
+            .retain(|entry| entry.retain_until.is_none() || entry.has_unresolved_retained_target());
     }
 
     /// Give only still-pending LazyForward IDs to peers first seen after the
@@ -4494,6 +4667,11 @@ impl TopicState {
     /// fan-out withholds the eager send on ~27-30% of relayed traffic and
     /// depends on exactly these IHAVEs, a lost batch was lost delivery
     /// until anti-entropy.
+    ///
+    /// Issue #104 (PR #106 review r1): a retained announce entry that still
+    /// has unresolved targets survives consumption. Its id leaves
+    /// `pending_ihave`, and `retained_announce_work` advertises it to the
+    /// remaining targets on later flushes.
     fn consume_flushed_ihave_batch(&mut self, batch: &[MessageIdType]) {
         if batch.is_empty() {
             return;
@@ -4502,7 +4680,7 @@ impl TopicState {
         self.pending_ihave.retain(|id| !ids.contains(id));
         self.ihave_advertised.retain(|id, _| !ids.contains(id));
         self.lazy_withheld
-            .retain(|entry| !ids.contains(&entry.msg_id));
+            .retain(|entry| !ids.contains(&entry.msg_id) || entry.has_unresolved_retained_target());
     }
 
     /// Add message to cache
@@ -9002,6 +9180,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // for the 30 s anti-entropy round. Relayed traffic is not queued: this
         // node is not its only source, and announcing under relay saturation
         // would add control load exactly when the lanes are busiest.
+        //
+        // PR #106 review r1: the targets are RETAINED, not lossy. The
+        // pending-IHAVE batch is consumed by the first flush that hands it
+        // to any recipient. A target whose Control permit was busy at that
+        // flush therefore stays queued until its own handoff succeeds,
+        // bounded by RETAINED_ANNOUNCE_TTL.
         if let Some(candidates_for_announce) = announce_candidates {
             let skipped: Vec<PeerId> = candidates_for_announce
                 .into_iter()
@@ -9011,7 +9195,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 if let Ok((message, _)) = postcard::take_from_bytes::<GossipMessage>(&bytes) {
                     let mut topics = self.topics.write_topic(&topic).await;
                     if let Some(state) = topics.get_mut(&topic) {
-                        state.queue_lazy_withheld(message.header.msg_id, &skipped, false);
+                        state.queue_retained_announce(
+                            message.header.msg_id,
+                            &skipped,
+                            Instant::now(),
+                        );
                         self.stage_stats
                             .record_claim_skip_ihave_queued(skipped.len());
                     }
@@ -10343,6 +10531,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // from the bounded retry. The emptiness probe keeps the common
         // (non-stranded) IWANT path lock-only.
         let track_served = !state.stranded_ihave.is_empty() || !state.lazy_withheld.is_empty();
+        // Issue #104 (PR #106 review r1): a claim skip defers replies with
+        // the byte limiter disabled too. A served reply must clear its
+        // custody entry whenever one can exist, or the flush retry would
+        // send a duplicate EAGER (and draw the receiver's duplicate PRUNE).
+        let clear_custody_on_serve =
+            self.egress_limiter.enabled() || !state.deferred_eager_replies.is_empty();
 
         for msg_id in msg_ids {
             let cached = if local_origin_only {
@@ -10457,12 +10651,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             match send_result {
                 Ok(PeerSendOutcome::Sent { .. }) => {
                     sent_any = true;
-                    // `deferred_eager_replies` can only be populated while
-                    // the egress limiter is enabled (populating it requires
-                    // a `Deferred` outcome). When disabled, taking the
-                    // topic write lock per served message to retain an
+                    // With an empty custody and a disabled limiter, taking
+                    // the topic write lock per served message to retain an
                     // empty list is pure dispatch-path overhead.
-                    if self.egress_limiter.enabled() {
+                    if clear_custody_on_serve {
                         let mut topics = self.topics.write_topic(&topic).await;
                         if let Some(state) = topics.get_mut(&topic) {
                             state
@@ -11014,7 +11206,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         outbound_budgets: &Arc<PeerOutboundBudgets>,
         env: IhaveFlushEnv<'_>,
     ) {
-        let work: Vec<IhaveFlushWork> = {
+        let (work, deferred_replies) = {
             #[cfg(test)]
             topics
                 .contention
@@ -11022,6 +11214,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 .store(true, Ordering::Relaxed);
             let mut topics_guard = topics.write_all().await;
             let mut work = Vec::new();
+            // Issue #104 (PR #106 review r1): deferred IWANT replies are
+            // snapshotted in this same all-shard pass. A claim skip defers a
+            // reply whatever the byte-limiter state, so the retry cannot be
+            // gated on the limiter, and collecting here keeps the steady
+            // state at one `write_all()` per tick.
+            let mut deferred_replies: Vec<(TopicId, DeferredEagerReply)> = Vec::new();
             // Late-local-offer candidates snapshotted here are only cheap
             // map reads; the LRU scan for their ids happens later under the
             // narrow per-topic lock (see `late_local_offer_keys`), never
@@ -11035,6 +11233,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
             for shard in topics_guard.iter_mut() {
                 for (topic_id, state) in shard.iter_mut() {
+                    let now = Instant::now();
+                    state.prune_retained_announces(
+                        now,
+                        env.send_path.connected_peers_snapshot.as_ref(),
+                    );
                     if !state.pending_ihave.is_empty() {
                         // Issue #42 round 2: SNAPSHOT the batch instead of
                         // draining it — the ids (and the #59 withheld-eager
@@ -11090,10 +11293,32 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             late_offer: None,
                             kind: MessageKind::IHave,
                             local_origin,
+                            retained_announce: false,
                         });
                     }
 
-                    let now = Instant::now();
+                    // Issue #104 (PR #106 review r1): retained announce
+                    // targets whose batch was already consumed get their own
+                    // IHAVE until each handoff succeeds or the entry expires.
+                    if let Some((batch, targets)) = state.retained_announce_work() {
+                        let local_origin = batch.iter().any(|id| {
+                            state
+                                .message_cache
+                                .lru
+                                .peek(id)
+                                .is_some_and(|cached| cached.message.local_origin)
+                        });
+                        work.push(IhaveFlushWork {
+                            topic: *topic_id,
+                            batch,
+                            targets,
+                            late_offer: None,
+                            kind: MessageKind::IHave,
+                            local_origin,
+                            retained_announce: true,
+                        });
+                    }
+
                     // S3 bounds: offers under a failure backoff are
                     // skipped. Each remaining candidate is ranked on the
                     // rotation ring and enters a bounded buffer of at most
@@ -11133,7 +11358,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             kind: MessageKind::IWant,
                             // We are asking for a message we do not hold.
                             local_origin: false,
+                            retained_announce: false,
                         });
+                    }
+
+                    if !state.deferred_eager_replies.is_empty() {
+                        state.prune_deferred_eager_replies(now);
+                        deferred_replies.extend(
+                            state
+                                .deferred_eager_replies
+                                .iter()
+                                .map(|entry| (*topic_id, *entry)),
+                        );
                     }
                 }
             }
@@ -11192,10 +11428,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     // `late_local_offer_keys` selects only `local_origin`
                     // cache entries.
                     local_origin: true,
+                    retained_announce: false,
                 });
             }
             work.append(&mut late_work);
-            work
+            (work, deferred_replies)
         };
 
         for IhaveFlushWork {
@@ -11205,6 +11442,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             late_offer,
             kind,
             local_origin,
+            retained_announce,
         } in work
         {
             if ihave_targets.is_empty() {
@@ -11428,7 +11666,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             // never retried at the flush-tick rate.
                             state.backoff_late_local_offer(peer, cursor);
                         }
+                    } else if retained_announce {
+                        // Issue #104 (PR #106 review r1): these ids are no
+                        // longer in `pending_ihave`, so only the retained
+                        // entries are resolved.
+                        state.record_lazy_withheld_advertised(&batch, &advertised_peers);
+                        state.drop_resolved_retained_announces();
                     } else {
+                        state.record_lazy_withheld_advertised(&batch, &advertised_peers);
                         for peer in advertised_peers {
                             state.record_ihave_handoff(&batch, peer);
                             state.record_stranded_ihave_advertised(&batch, peer);
@@ -11456,61 +11701,44 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             signing_key,
             stage_stats,
             outbound_budgets,
-            env.send_path,
-            env.egress_limiter,
+            &env,
+            deferred_replies,
         )
         .await;
     }
 
+    /// Retry the IWANT replies in `work`, the `deferred_eager_replies`
+    /// snapshot that [`Self::flush_ihave_batches`] took in its own all-shard
+    /// pass (pruned there to the cache's lifetime and the
+    /// `MAX_DEFERRED_EAGER_REPLIES` cap).
+    ///
+    /// Issue #104 (PR #106 review r1): this runs whatever the byte-limiter
+    /// state. It used to return early on a disabled limiter, on the
+    /// assumption that only the limiter can defer a reply. A claim skip
+    /// (Data permit busy, peer cooling, admission drop) also defers it, with
+    /// the limiter on or off. A default node therefore never retried such a
+    /// reply after the permit freed, and the requester's pull waited for
+    /// anti-entropy. Relay overhead invariant I1 still holds, because the
+    /// snapshot shares the flush's single `write_all()`. An empty custody
+    /// costs nothing here.
     async fn flush_deferred_eager_replies(
         topics: &Arc<ShardedTopicMap>,
         transport: &Arc<PolicyTransport<T>>,
         signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
         stage_stats: &Arc<PubSubStageStats>,
         outbound_budgets: &Arc<PeerOutboundBudgets>,
-        send_path: &SendPathContext,
-        egress_limiter: &Arc<egress::LeafEgressLimiter>,
+        env: &IhaveFlushEnv<'_>,
+        work: Vec<(TopicId, DeferredEagerReply)>,
     ) {
-        // Relay overhead invariant: a disabled limiter can never have
-        // deferred an EAGER reply (a `PeerSendOutcome::Deferred` requires
-        // it), so this pass must not take its all-shard `write_all()` at
-        // all — otherwise every 100 ms flush doubles the all-shard write
-        // lock stalls even though there is nothing to do. The ONE
-        // exception is the transition itself: an enabled→disabled
-        // `configure()` may have stranded custody entries (bounded
-        // ≤1024/topic). The limiter's residue flag marks that state; the
-        // first disabled flush drains them and clears the flag, restoring
-        // the zero-overhead steady state (a plain disabled startup never
-        // sets the flag, so relays pay nothing).
-        if !egress_limiter.enabled() {
-            if !egress_limiter.deferred_residue() {
-                return;
-            }
-            {
-                let mut topics_guard = topics.write_all().await;
-                for shard in topics_guard.iter_mut() {
-                    for state in shard.values_mut() {
-                        state.deferred_eager_replies.clear();
-                    }
-                }
-            }
+        let send_path = env.send_path;
+        let egress_limiter = env.egress_limiter;
+        // An enabled→disabled `configure()` marks custody it may have
+        // stranded. The snapshot above already covers that custody (it is
+        // retried or pruned like any other entry), so the mark only needs
+        // acknowledging. The atomic read takes no limiter mutex.
+        if egress_limiter.deferred_residue() {
             egress_limiter.clear_deferred_residue();
-            return;
         }
-        let work: Vec<_> = {
-            let now = Instant::now();
-            let mut topics_guard = topics.write_all().await;
-            let mut work = Vec::new();
-            for shard in topics_guard.iter_mut() {
-                for (topic, state) in shard.iter_mut() {
-                    state.prune_deferred_eager_replies(now);
-                    for entry in state.deferred_eager_replies.iter().copied() {
-                        work.push((*topic, entry));
-                    }
-                }
-            }
-            work
-        };
 
         for (topic, entry) in work {
             // Snapshot only bounded identity metadata above. Re-read the cache
@@ -11537,6 +11765,25 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let Some(cached) = cached else {
                 continue;
             };
+            // Issue #104 (PR #106 review r1): default nodes now run this
+            // retry too. If the transport reports the requester
+            // disconnected, or its Data lane for this origin is visibly
+            // busy, the claim below would refuse it anyway. So skip it for
+            // this tick only and keep the entry, rather than sign an EAGER
+            // frame every 100 ms just to learn that. The claim stays
+            // authoritative.
+            if transport_connected_for_peer(
+                send_path.connected_peers_snapshot.as_ref(),
+                &entry.peer,
+            ) == Some(false)
+                || !outbound_budgets.data_lane_available(
+                    entry.peer,
+                    send_path.admission.registry().priority_for(&topic),
+                    cached.local_origin,
+                )
+            {
+                continue;
+            }
             if transport
                 .migration
                 .admit_cache_serve(
@@ -16165,17 +16412,256 @@ mod tests {
                     .expect("IHAVE payload decodes");
             assert!(ids.contains(&msg_id), "IHAVE advertises the publish");
         }
-        let _ = pubsub.shutdown_tx.send(true);
 
-        // Once the local lane frees, the receiver's IWANT pulls the message.
-        drop(held);
+        // PR #106 review r1, finding 1: the receiver's IWANT answers that
+        // IHAVE while the local lane is STILL busy, so the reply is
+        // claim-skipped into `deferred_eager_replies`. With the default
+        // (disabled) byte limiter the flusher must still retry it once the
+        // permit frees; otherwise the pull is lost until anti-entropy.
+        assert!(
+            !pubsub.egress_limiter.enabled(),
+            "default node: byte limiter disabled"
+        );
         pubsub
             .handle_iwant(targets[0], topic, vec![msg_id])
             .await
-            .expect("iwant serve");
+            .expect("iwant handled");
+        assert!(
+            transport
+                .sent_messages_of_kind_to(targets[0], MessageKind::Eager)
+                .is_empty(),
+            "the local lane is busy: the IWANT reply is deferred, not sent"
+        );
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(3 * IHAVE_FLUSH_INTERVAL_MS)).await;
         let served = transport.sent_messages_of_kind_to(targets[0], MessageKind::Eager);
-        assert_eq!(served.len(), 1, "IWANT pulls the claim-skipped publish");
+        assert_eq!(
+            served.len(),
+            1,
+            "the deferred IWANT reply is retried once the local lane frees"
+        );
         assert_eq!(served[0].payload.as_deref(), Some(&b"all-skipped"[..]));
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state exists");
+            assert!(
+                state.deferred_eager_replies.is_empty(),
+                "a served deferred reply leaves custody"
+            );
+        }
+        let _ = pubsub.shutdown_tx.send(true);
+    }
+
+    /// PR #106 review r1, finding 2: a local publish's claim-skipped eager
+    /// peers are announce targets, but the IHAVE batch that carries them is
+    /// lossy. With byte enforcement disabled (the default), ONE successful
+    /// IHAVE recipient consumed the whole batch, including the targets whose
+    /// Control permits were busy, and those peers then had no pull path
+    /// until anti-entropy. The refused targets must be retained, and
+    /// announced by a later flush once their Control lane frees.
+    #[tokio::test]
+    async fn claim_skip_announce_survives_partial_control_refusal() {
+        let peer_id = test_peer_id(1);
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        assert!(
+            !pubsub.egress_limiter.enforcing(),
+            "default node: byte enforcement disabled"
+        );
+        let topic = TopicId::new([0x67; 32]);
+        let targets: Vec<PeerId> = (2..=7).map(test_peer_id).collect();
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.entry(topic).or_insert_with(TopicState::new);
+            for target in &targets {
+                state.eager_peers.insert(*target);
+            }
+        }
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(targets.iter().copied().collect()),
+        );
+        // Every eager peer's local Data lane is busy: the publish
+        // claim-skips all six and queues them as announce targets.
+        let data_held: Vec<OutboundSendPermit> = targets
+            .iter()
+            .map(|target| {
+                pubsub
+                    .outbound_budgets
+                    .try_acquire_for_origin(
+                        *target,
+                        OutboundSendClass::Data,
+                        TopicPriority::Normal,
+                        true,
+                        Instant::now(),
+                    )
+                    .expect("local-origin data permit is available")
+            })
+            .collect();
+        let counts = pubsub
+            .publish_local_with_fanout(topic, Bytes::from_static(b"partial-control"))
+            .await
+            .expect("publish returns Ok");
+        assert_eq!(counts.claim_skipped, 6);
+        assert_eq!(counts.attempted, 0);
+        let msg_id = {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            *topics
+                .get(&topic)
+                .expect("topic state exists")
+                .pending_ihave
+                .back()
+                .expect("msg_id queued")
+        };
+
+        // Partial Control refusal: half the targets have every Control
+        // permit in flight, so the flush can claim only the other half.
+        let (refused, accepted) = targets.split_at(3);
+        let control_held: Vec<OutboundSendPermit> = refused
+            .iter()
+            .flat_map(|target| {
+                (0..OUTBOUND_CONTROL_PERMITS_PER_PEER).map(|_| {
+                    pubsub
+                        .outbound_budgets
+                        .try_acquire(
+                            *target,
+                            OutboundSendClass::Control,
+                            TopicPriority::Normal,
+                            Instant::now(),
+                        )
+                        .expect("control permit is available")
+                })
+            })
+            .collect();
+        async fn flush_once(
+            pubsub: &PlumtreePubSub<RecordingTransport>,
+            late_rotation: &mut LateOfferRotation,
+        ) {
+            PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+                &pubsub.topics,
+                &pubsub.transport,
+                &pubsub.signing_key,
+                &pubsub.stage_stats,
+                &pubsub.outbound_budgets,
+                IhaveFlushEnv {
+                    send_path: &pubsub.send_path_context(),
+                    egress_limiter: &pubsub.egress_limiter,
+                    late_rotation,
+                },
+            )
+            .await;
+        }
+        let mut late_rotation = LateOfferRotation::default();
+        let ihave_ids_to = |peer: PeerId| -> Vec<Vec<MessageIdType>> {
+            transport
+                .sent_messages_of_kind_to(peer, MessageKind::IHave)
+                .iter()
+                .map(|message| {
+                    postcard::from_bytes(message.payload.as_deref().expect("IHAVE carries ids"))
+                        .expect("IHAVE payload decodes")
+                })
+                .collect()
+        };
+
+        flush_once(&pubsub, &mut late_rotation).await;
+        for peer in accepted {
+            let ihaves = ihave_ids_to(*peer);
+            assert_eq!(ihaves.len(), 1, "free Control lane: one IHAVE to {peer:?}");
+            assert!(ihaves[0].contains(&msg_id));
+        }
+        for peer in refused {
+            assert!(
+                ihave_ids_to(*peer).is_empty(),
+                "busy Control lane: no IHAVE to {peer:?} yet"
+            );
+        }
+
+        // Pressure clears. The next flushes must reach the refused targets,
+        // and must not re-announce to the peers that already got it.
+        drop(control_held);
+        flush_once(&pubsub, &mut late_rotation).await;
+        flush_once(&pubsub, &mut late_rotation).await;
+        for peer in &targets {
+            let ihaves = ihave_ids_to(*peer);
+            assert_eq!(
+                ihaves.len(),
+                1,
+                "exactly one IHAVE to {peer:?} once its Control lane frees"
+            );
+            assert!(ihaves[0].contains(&msg_id), "IHAVE advertises the publish");
+        }
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state exists");
+            assert!(
+                state
+                    .lazy_withheld
+                    .iter()
+                    .all(|entry| entry.msg_id != msg_id),
+                "fully handed-off announce targets leave the retained set"
+            );
+        }
+        drop(data_held);
+    }
+
+    /// PR #106 review r1, finding 2 (the bound): retained announce targets
+    /// leave the entry when they disconnect or pull the id, and the whole
+    /// entry expires at `RETAINED_ANNOUNCE_TTL`. A target that never frees
+    /// therefore cannot pin the entry, or a per-tick IHAVE rebuild, forever.
+    #[test]
+    fn retained_announce_targets_bounded_by_ttl_connectivity_and_pull() {
+        let mut state = TopicState::new();
+        let msg_id = [0x68; 32];
+        let (a, b, c) = (test_peer_id(2), test_peer_id(3), test_peer_id(4));
+        let now = Instant::now();
+        state.queue_retained_announce(msg_id, &[a, b, c], now);
+        state.push_pending_ihave(msg_id);
+        assert_eq!(
+            state.retained_announce_work(),
+            None,
+            "a still-pending id rides the ordinary batch"
+        );
+        // The batch was handed to some other recipient and consumed: the
+        // unresolved entry survives on its own.
+        state.consume_flushed_ihave_batch(&[msg_id]);
+        assert_eq!(
+            state.retained_announce_work(),
+            Some((vec![msg_id], vec![a, b, c]))
+        );
+
+        let connected = StdRwLock::new(Some(HashSet::from([a, b])));
+        state.prune_retained_announces(now, &connected);
+        assert_eq!(
+            state.retained_announce_work(),
+            Some((vec![msg_id], vec![a, b])),
+            "a disconnected target is dropped"
+        );
+        state.record_lazy_withheld_served(&msg_id, b);
+        assert_eq!(
+            state.retained_announce_work(),
+            Some((vec![msg_id], vec![a])),
+            "a target that pulled the id is resolved"
+        );
+
+        state.prune_retained_announces(
+            now + RETAINED_ANNOUNCE_TTL - Duration::from_millis(1),
+            &connected,
+        );
+        assert!(
+            state.retained_announce_work().is_some(),
+            "retained inside the TTL"
+        );
+        state.prune_retained_announces(now + RETAINED_ANNOUNCE_TTL, &connected);
+        assert_eq!(state.retained_announce_work(), None);
+        assert!(
+            state.lazy_withheld.is_empty(),
+            "an expired retained entry is dropped"
+        );
     }
 
     /// Issue #104 fix 2: relayed sends holding every eager peer's shared

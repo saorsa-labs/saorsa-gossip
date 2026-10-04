@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.87] - 2026-10-04
+
+### Fixed
+
+- **pubsub: claim-skipped local publishes are announced within one flush (#104, #105; for x0x#857).**
+  A local publish whose eager candidates were all claim-skipped is now
+  advertised to them by IHAVE within one flush, so it no longer waits for anti-
+  entropy. That wait caused 22–60 s pub/sub stalls after a whole-network restart.
+  Deferred IWANT replies are retried independently of the byte limiter, through
+  the bounded-send path, with the Critical gate engaged. Retry work is detached and
+  bounded (8 per tick, rotating cursor). Each reply is owned by a token-owned
+  claim shared by IWANT serves and retries, so a stale completion has no side
+  effects beyond its own custody entry. Unadvertised announce targets are kept,
+  with a 30 s TTL, until handoff. The probe-flag leak is fixed. Follow-up: #109.
+- **ci: rustc 1.99 `fetch_update` deprecation in a test helper; MSRV job pins uuid 1.26.1 (#108).**
+
 ## [0.5.86] - 2026-09-25
 
 ### Added

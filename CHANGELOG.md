@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a read), lock-free on the receive hot path, and safe across concurrent
   receive workers. The API does not go through `stage_stats()` and takes no
   topic/peer locks. Additive public API only; no wire-format change.
+- **pubsub: expose validated `MessageHeader.msg_id` on subscription delivery
+  (#100).** Additive `SubscriptionMessage` plus `PubSub::subscribe_with_msg_id`
+  / `subscribe_ready_with_msg_id` carry the wire header id beside peer and
+  payload. Legacy `(PeerId, Bytes)` subscribe channels are unchanged.
+  `msg_id` is `Some` only after the header signature verifies against the
+  public key carried in the message (locally signed publish or
+  signature-verified inbound); it is a signer-chosen correlation id, not a
+  publisher identity, and never a synthesized payload hash. No wire format
+  change.
 
 ## [0.5.90] - 2026-10-17
 

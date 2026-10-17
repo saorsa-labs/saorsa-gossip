@@ -480,6 +480,55 @@ impl OutboundTopicMeters {
     }
 }
 
+/// Local subscriber delivery with optional authenticated transport identity.
+///
+/// Issue #100: the wire header carries a validated `MessageHeader.msg_id`, but
+/// the legacy `(PeerId, Bytes)` subscription channel drops it. This type is the
+/// additive surface that preserves that id for correlation without changing the
+/// wire format.
+///
+/// `msg_id` is `Some` only when the delivery path authenticated the header
+/// (signature-verified inbound, or locally originated and signed). It is never
+/// a synthesized payload hash. `None` means no trusted header id is available
+/// for this delivery — callers must not invent one from `payload`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionMessage {
+    /// Peer associated with this delivery (local publisher or inbound sender).
+    pub from: PeerId,
+    /// Application payload bytes.
+    pub payload: Bytes,
+    /// Validated `MessageHeader.msg_id`, when trusted.
+    pub msg_id: Option<[u8; 32]>,
+}
+
+/// Internal fan-out sink for local subscribers (legacy bytes-only or meta).
+enum LocalSubscriber {
+    BytesOnly(mpsc::UnboundedSender<(PeerId, Bytes)>),
+    WithMeta(mpsc::UnboundedSender<SubscriptionMessage>),
+}
+
+impl LocalSubscriber {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::BytesOnly(tx) => tx.is_closed(),
+            Self::WithMeta(tx) => tx.is_closed(),
+        }
+    }
+
+    fn send(&self, from: PeerId, payload: Bytes, msg_id: Option<[u8; 32]>) -> bool {
+        match self {
+            Self::BytesOnly(tx) => tx.send((from, payload)).is_ok(),
+            Self::WithMeta(tx) => tx
+                .send(SubscriptionMessage {
+                    from,
+                    payload,
+                    msg_id,
+                })
+                .is_ok(),
+        }
+    }
+}
+
 /// Per-topic validation verdict for inbound gossip payloads (x0x storm
 /// control): the application decides, per topic, whether a
 /// signature-valid, non-replay message should propagate.
@@ -4419,8 +4468,8 @@ struct TopicState {
     eager_reply_claims: HashMap<(PeerId, MessageIdType), EagerReplyClaim>,
     /// Per-peer quality scores for tree optimization
     peer_scores: HashMap<PeerId, PeerScore>,
-    /// Local subscribers
-    subscribers: Vec<mpsc::UnboundedSender<(PeerId, Bytes)>>,
+    /// Local subscribers (legacy bytes-only and additive meta channels).
+    subscribers: Vec<LocalSubscriber>,
     /// Payload-level replay cache: BLAKE3(payload) -> time and refusal.
     ///
     /// Catches replays where the same application payload is wrapped in a
@@ -4802,6 +4851,20 @@ impl TopicState {
 
     fn has_live_subscribers(&self) -> bool {
         self.subscribers.iter().any(|tx| !tx.is_closed())
+    }
+
+    /// Fan out an accepted message to every live local subscriber.
+    ///
+    /// `msg_id` must be the authenticated header id, or `None` when no trusted
+    /// id exists. Never pass a synthesized payload hash.
+    fn deliver_to_local_subscribers(
+        &mut self,
+        from: PeerId,
+        payload: Bytes,
+        msg_id: Option<[u8; 32]>,
+    ) {
+        self.subscribers
+            .retain(|tx| tx.send(from, payload.clone(), msg_id));
     }
 
     /// Check if a payload has been seen before (replay detection).
@@ -6797,6 +6860,46 @@ pub trait PubSub: Send + Sync {
     /// barrier.
     async fn subscribe_ready(&self, topic: TopicId) -> mpsc::UnboundedReceiver<(PeerId, Bytes)> {
         self.subscribe(topic)
+    }
+
+    /// Subscribe with validated transport `msg_id` metadata (issue #100).
+    ///
+    /// Additive companion to [`Self::subscribe`]. The default maps the legacy
+    /// channel and sets `msg_id` to `None` (untrusted / unavailable) — it never
+    /// synthesizes an id from payload bytes. Implementations that authenticate
+    /// headers should override and supply `Some(validated_header_msg_id)`.
+    fn subscribe_with_msg_id(
+        &self,
+        topic: TopicId,
+    ) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
+        let mut rx = self.subscribe(topic);
+        let (tx, meta_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some((from, payload)) = rx.recv().await {
+                if tx
+                    .send(SubscriptionMessage {
+                        from,
+                        payload,
+                        msg_id: None,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        meta_rx
+    }
+
+    /// Readiness barrier for [`Self::subscribe_with_msg_id`].
+    ///
+    /// Default delegates to [`Self::subscribe_with_msg_id`]. Override alongside
+    /// a true [`Self::subscribe_ready`] barrier when registration is async.
+    async fn subscribe_ready_with_msg_id(
+        &self,
+        topic: TopicId,
+    ) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
+        self.subscribe_with_msg_id(topic)
     }
 
     /// Unsubscribe from a topic
@@ -10405,8 +10508,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             len = payload.len(),
             zero_tail = payload_zero_tail(&payload),
         );
-        let data = (self.peer_id, payload);
-        state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
+        // Local origin: header was just signed, so msg_id is trusted.
+        state.deliver_to_local_subscribers(self.peer_id, payload, Some(msg_id));
 
         drop(topics); // Release lock before network I/O
         trace!(msg_id = ?msg_id, peer_count = eager_peers.len(), "Sending EAGER fan-out");
@@ -10913,10 +11016,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
         self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
 
-        // Deliver to local subscribers
+        // Deliver to local subscribers. Signature verification already passed,
+        // so the header msg_id is trusted metadata (issue #100).
         let fanout_started = Instant::now();
         let sub_count = state.subscribers.len();
-        let data = (from, payload.clone());
         debug!(
             target: "sg.payload.trace",
             stage = "subscriber_deliver",
@@ -10925,7 +11028,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             len = payload.len(),
             zero_tail = payload_zero_tail(&payload),
         );
-        state.subscribers.retain(|tx| tx.send(data.clone()).is_ok());
+        state.deliver_to_local_subscribers(from, payload.clone(), Some(msg_id));
         let delivered = state.subscribers.len();
         self.record_stage(PubSubStage::EagerFanout, fanout_started);
         debug!(
@@ -13759,7 +13862,7 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
                 .entry(topic)
                 .or_insert_with(|| topics.new_topic_state(cache_config));
             state.touch();
-            state.subscribers.push(tx);
+            state.subscribers.push(LocalSubscriber::BytesOnly(tx));
         });
 
         rx
@@ -13772,7 +13875,41 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
         state.touch();
-        state.subscribers.push(tx);
+        state.subscribers.push(LocalSubscriber::BytesOnly(tx));
+        rx
+    }
+
+    fn subscribe_with_msg_id(
+        &self,
+        topic: TopicId,
+    ) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let topics = self.topics.clone();
+        let cache_config = self.cache_config;
+
+        tokio::spawn(async move {
+            let mut topics_guard = topics.write_topic(&topic).await;
+            let state = topics_guard
+                .entry(topic)
+                .or_insert_with(|| topics.new_topic_state(cache_config));
+            state.touch();
+            state.subscribers.push(LocalSubscriber::WithMeta(tx));
+        });
+
+        rx
+    }
+
+    async fn subscribe_ready_with_msg_id(
+        &self,
+        topic: TopicId,
+    ) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut topics_guard = self.topics.write_topic(&topic).await;
+        let state = topics_guard
+            .entry(topic)
+            .or_insert_with(|| self.new_topic_state());
+        state.touch();
+        state.subscribers.push(LocalSubscriber::WithMeta(tx));
         rx
     }
 
@@ -19690,7 +19827,7 @@ mod tests {
         );
 
         let (tx, rx) = mpsc::unbounded_channel();
-        state.subscribers.push(tx);
+        state.subscribers.push(LocalSubscriber::BytesOnly(tx));
         assert!(
             state.cooling_floor_blocks_at(last_eager, now),
             "a locally subscribed topic must keep its last eligible eager peer"
@@ -20419,7 +20556,7 @@ mod tests {
         state.eager_peers.insert(peer_a);
         state.eager_peers.insert(peer_b);
         let (tx, _rx) = mpsc::unbounded_channel();
-        state.subscribers.push(tx);
+        state.subscribers.push(LocalSubscriber::BytesOnly(tx));
 
         // Leg 1 — no replacement available: five Normal-kind timeouts at
         // A inside one window must reach the suppression threshold but
@@ -20488,7 +20625,7 @@ mod tests {
         state.eager_peers.insert(peer_a);
         state.eager_peers.insert(peer_b);
         let (tx, _rx) = mpsc::unbounded_channel();
-        state.subscribers.push(tx);
+        state.subscribers.push(LocalSubscriber::BytesOnly(tx));
         let now = Instant::now();
 
         // Insert the graft-eligible replacement first so B can be cooled
@@ -20899,7 +21036,7 @@ mod tests {
         state.eager_peers.insert(peer_a);
         state.eager_peers.insert(peer_b);
         let (tx, _rx) = mpsc::unbounded_channel();
-        state.subscribers.push(tx);
+        state.subscribers.push(LocalSubscriber::BytesOnly(tx));
         let now = Instant::now();
 
         // Dead + at-target (2) + no replacement: the #62 widening must NOT
@@ -21746,6 +21883,176 @@ mod tests {
         assert!(received.is_ok());
         let (_, payload) = received.unwrap().unwrap();
         assert_eq!(payload, data);
+    }
+
+    /// Issue #100: one transport message keeps the same validated header
+    /// `msg_id` across every local meta-subscriber delivery.
+    #[tokio::test]
+    async fn subscription_meta_retains_validated_msg_id_across_subscribers() {
+        let peer_id = test_peer_id(1);
+        let pubsub = PlumtreePubSub::new(peer_id, test_transport().await, test_signing_key());
+        let topic = TopicId::new([0x10; 32]);
+        let mut rx_a = pubsub.subscribe_ready_with_msg_id(topic).await;
+        let mut rx_b = pubsub.subscribe_ready_with_msg_id(topic).await;
+        let payload = Bytes::from_static(b"issue-100-shared");
+
+        pubsub
+            .publish(topic, payload.clone())
+            .await
+            .expect("local publish");
+
+        let a = tokio::time::timeout(Duration::from_millis(200), rx_a.recv())
+            .await
+            .expect("subscriber A receives")
+            .expect("channel open");
+        let b = tokio::time::timeout(Duration::from_millis(200), rx_b.recv())
+            .await
+            .expect("subscriber B receives")
+            .expect("channel open");
+
+        assert_eq!(a.payload, payload);
+        assert_eq!(b.payload, payload);
+        assert_eq!(a.from, peer_id);
+        assert_eq!(b.from, peer_id);
+        assert_eq!(
+            a.msg_id, b.msg_id,
+            "repeated local delivery of one transport message must retain the same id"
+        );
+        let msg_id = a
+            .msg_id
+            .expect("locally signed publish exposes a trusted msg_id");
+        let payload_digest = *blake3::hash(payload.as_ref()).as_bytes();
+        assert_ne!(
+            msg_id, payload_digest,
+            "trusted msg_id must not be a synthesized payload hash"
+        );
+    }
+
+    fn signed_eager_v2(
+        signing_key: &saorsa_gossip_identity::MlDsaKeyPair,
+        topic: TopicId,
+        msg_id: MessageIdType,
+        payload: Bytes,
+    ) -> GossipMessage {
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(&payload));
+        let header_bytes = postcard::to_stdvec(&header).expect("header serializes");
+        let signature = signing_key.sign(&header_bytes).expect("header signs");
+        GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        }
+    }
+
+    /// Issue #100: identical application bytes with distinct validated header
+    /// ids remain distinct on the meta subscription channel.
+    #[tokio::test]
+    async fn subscription_meta_distinguishes_identical_payloads_with_distinct_header_ids() {
+        let local = test_peer_id(1);
+        let remote = test_peer_id(2);
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(local, test_transport().await, signing_key.clone());
+        let topic = TopicId::new([0x11; 32]);
+        let mut rx = pubsub.subscribe_ready_with_msg_id(topic).await;
+        let payload = Bytes::from_static(b"same-application-bytes");
+        let id_a = [0xAAu8; 32];
+        let id_b = [0xBBu8; 32];
+
+        pubsub
+            .handle_eager(
+                remote,
+                topic,
+                signed_eager_v2(&signing_key, topic, id_a, payload.clone()),
+            )
+            .await
+            .expect("first validated eager");
+        let first = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("first delivery")
+            .expect("channel open");
+        assert_eq!(first.msg_id, Some(id_a));
+        assert_eq!(first.payload, payload);
+
+        // Payload-replay suppresses a second delivery of the same bytes under
+        // a fresh envelope. Clear only that cache so the identity test can
+        // observe two intentional, signature-valid header ids.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            topics
+                .get_mut(&topic)
+                .expect("topic exists after first delivery")
+                .replay_cache
+                .clear();
+        }
+
+        pubsub
+            .handle_eager(
+                remote,
+                topic,
+                signed_eager_v2(&signing_key, topic, id_b, payload.clone()),
+            )
+            .await
+            .expect("second validated eager");
+        let second = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("second delivery")
+            .expect("channel open");
+        assert_eq!(second.msg_id, Some(id_b));
+        assert_eq!(second.payload, payload);
+        assert_ne!(
+            first.msg_id, second.msg_id,
+            "distinct validated header ids must not collapse to a payload hash"
+        );
+    }
+
+    /// Issue #100: unvalidated headers must not surface trusted msg_id metadata.
+    #[tokio::test]
+    async fn subscription_meta_does_not_expose_unvalidated_msg_id() {
+        let local = test_peer_id(1);
+        let remote = test_peer_id(2);
+        let signing_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new(local, test_transport().await, signing_key.clone());
+        let topic = TopicId::new([0x12; 32]);
+        let mut rx = pubsub.subscribe_ready_with_msg_id(topic).await;
+        let payload = Bytes::from_static(b"forged");
+        let claimed_id = [0xCCu8; 32];
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id: claimed_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(&payload));
+        let forged = GossipMessage {
+            header,
+            payload: Some(payload),
+            signature: signing_key.sign(b"not-the-header").expect("sign"),
+            public_key: signing_key.public_key().to_vec(),
+        };
+
+        assert!(
+            pubsub.handle_eager(remote, topic, forged).await.is_err(),
+            "invalid signature must be rejected before subscriber delivery"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "unvalidated header must not deliver trusted msg_id metadata"
+        );
     }
 
     #[tokio::test]
@@ -28216,7 +28523,7 @@ mod tests {
         let mut state = TopicState::new();
         state.last_activity = old_activity;
         let (tx, rx) = mpsc::unbounded_channel();
-        state.subscribers.push(tx);
+        state.subscribers.push(LocalSubscriber::BytesOnly(tx));
 
         let mut topics = HashMap::new();
         topics.insert(topic, state);

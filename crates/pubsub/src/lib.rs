@@ -4277,6 +4277,13 @@ struct IhaveFlushWork {
     retained_announce: bool,
 }
 
+/// One bounded payload replay entry. Keep refusal with the payload digest so
+/// a fresh outer ID cannot turn rejected bytes into a serveable cache entry.
+struct PayloadReplayEntry {
+    inserted_at: Instant,
+    refused: bool,
+}
+
 struct TopicState {
     /// Spanning tree peers (forward EAGER)
     eager_peers: HashSet<PeerId>,
@@ -4345,11 +4352,11 @@ struct TopicState {
     peer_scores: HashMap<PeerId, PeerScore>,
     /// Local subscribers
     subscribers: Vec<mpsc::UnboundedSender<(PeerId, Bytes)>>,
-    /// Payload-level replay cache: BLAKE3(payload) -> insertion time.
+    /// Payload-level replay cache: BLAKE3(payload) -> time and refusal.
     ///
     /// Catches replays where the same application payload is wrapped in a
     /// different gossip envelope (different epoch, sender, msg_id).
-    replay_cache: LruCache<[u8; 32], Instant>,
+    replay_cache: LruCache<[u8; 32], PayloadReplayEntry>,
     /// TTL for replay cache entries.
     replay_ttl: Duration,
     /// Last time this topic saw any activity (publish, incoming, IHAVE, etc).
@@ -4736,13 +4743,36 @@ impl TopicState {
     fn is_payload_replay(&mut self, payload: &[u8]) -> bool {
         self.touch();
         let key: [u8; 32] = *blake3::hash(payload).as_bytes();
-        if let Some(ts) = self.replay_cache.get(&key) {
-            if ts.elapsed() < self.replay_ttl {
+        if let Some(entry) = self.replay_cache.get(&key) {
+            if entry.inserted_at.elapsed() < self.replay_ttl {
                 return true;
             }
         }
-        self.replay_cache.put(key, Instant::now());
+        self.replay_cache.put(
+            key,
+            PayloadReplayEntry {
+                inserted_at: Instant::now(),
+                refused: false,
+            },
+        );
         false
+    }
+
+    /// Remember the validator's Drop for this payload, without adding a new
+    /// cache or changing replay TTL/count bounds. Called under the topic lock.
+    fn refuse_payload_replays(&mut self, payload: &[u8]) {
+        let key = *blake3::hash(payload).as_bytes();
+        if let Some(entry) = self.replay_cache.get_mut(&key) {
+            entry.refused = true;
+        }
+    }
+
+    /// Called only after `is_payload_replay` confirms the entry is live.
+    fn payload_replay_was_refused(&mut self, payload: &[u8]) -> bool {
+        let key = *blake3::hash(payload).as_bytes();
+        self.replay_cache
+            .get(&key)
+            .is_some_and(|entry| entry.refused)
     }
 
     /// Get all cached message IDs for anti-entropy digest
@@ -5414,8 +5444,8 @@ impl TopicState {
         let replay_ttl = self.replay_ttl;
         let now = Instant::now();
         let mut expired_replay = Vec::new();
-        for (hash, ts) in self.replay_cache.iter() {
-            if now.saturating_duration_since(*ts) > replay_ttl {
+        for (hash, entry) in self.replay_cache.iter() {
+            if now.saturating_duration_since(entry.inserted_at) > replay_ttl {
                 expired_replay.push(*hash);
             }
         }
@@ -10680,6 +10710,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // We keep the msg_id cache entry (already done above) so PlumTree's
         // PRUNE/GRAFT still works, but skip subscriber delivery and forwarding.
         if state.is_payload_replay(&payload) {
+            // #116: cache_message inserted this fresh ID with dropped=false.
+            // Carry forward a prior refusal before any repair path can serve it.
+            if state.payload_replay_was_refused(&payload) {
+                state.mark_message_dropped(&msg_id);
+            }
             debug!(
                 topic = ?topic,
                 msg_id = ?msg_id,
@@ -10704,6 +10739,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 "Topic validator dropped the message — retained in dedupe cache, never served"
             );
             state.mark_message_dropped(&msg_id);
+            state.refuse_payload_replays(&payload);
             self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
             return Ok(());
         }
@@ -30065,6 +30101,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_payload_replay_refusal_expires_with_its_entry() {
+        let mut state = TopicState::new();
+        let payload = b"refused payload";
+        assert!(!state.is_payload_replay(payload));
+        state.refuse_payload_replays(payload);
+        assert!(state.is_payload_replay(payload));
+        assert!(state.payload_replay_was_refused(payload));
+        // A policy is checked again when the bounded replay entry expires.
+        state.replay_ttl = Duration::ZERO;
+        assert!(!state.is_payload_replay(payload));
+        assert!(!state.payload_replay_was_refused(payload));
+    }
+
     #[tokio::test]
     async fn test_handle_eager_drops_replayed_payload() {
         let peer_id = test_peer_id(1);
@@ -31943,6 +31993,109 @@ mod tests {
                 snapshot.validator.dropped, 1,
                 "retransmit must hit dedupe, not the validator"
             );
+        }
+
+        /// #116: a new outer ID must not let identical bytes bypass a Drop
+        /// verdict and become serveable by IWANT or anti-entropy. Accepted
+        /// payloads retain the existing cache recovery path for both IDs.
+        #[tokio::test]
+        async fn rewrapped_payload_preserves_validator_refusal_and_recovery() {
+            for refuse in [true, false] {
+                let topic = TopicId::new([0xB6; 32]);
+                let sender = test_peer_id(2);
+                let requester = test_peer_id(3);
+                let transport = RecordingTransport::new(test_peer_id(1));
+                transport.set_connected_peer_ids(vec![requester]);
+                let pubsub = PlumtreePubSub::new_with_task_control(
+                    test_peer_id(1),
+                    Arc::clone(&transport),
+                    test_signing_key(),
+                    false,
+                );
+                pubsub.set_signature_policy(SignaturePolicy::RejectV1);
+                pubsub.set_topic_validator(
+                    topic,
+                    Arc::new(move |_, _| {
+                        if refuse {
+                            ValidationAction::Drop
+                        } else {
+                            ValidationAction::ForwardAndDeliver
+                        }
+                    }),
+                );
+                let key = test_signing_key();
+                let payload = Bytes::from_static(b"same application payload, fresh outer IDs");
+                let ids = [[0x61; 32], [0x62; 32]];
+                for id in ids {
+                    let mut message = signed_eager_message(&key, topic, id, payload.clone());
+                    message.header.seal_payload_hash(Some(&payload));
+                    message.signature = key
+                        .sign(&postcard::to_stdvec(&message.header).unwrap())
+                        .unwrap();
+                    pubsub
+                        .handle_eager(sender, topic, message)
+                        .await
+                        .expect("outer admission");
+                }
+                {
+                    let mut topics = pubsub.topics.write_topic(&topic).await;
+                    let state = topics.get_mut(&topic).expect("topic cached");
+                    for id in ids {
+                        assert_eq!(
+                            state.get_message(&id).expect("dedupe retained").dropped,
+                            refuse,
+                            "each ID must preserve the validator refusal for IWANT/anti-entropy"
+                        );
+                    }
+                }
+                assert_eq!(
+                    pubsub.stage_stats().validator.dropped,
+                    if refuse { 1 } else { 0 }
+                );
+                assert!(
+                    transport.sent_frames().is_empty(),
+                    "no unsolicited send targets"
+                );
+                pubsub
+                    .handle_iwant(requester, topic, ids.to_vec())
+                    .await
+                    .expect("IWANT");
+                let attempts = pubsub
+                    .stage_stats()
+                    .outbound_by_kind
+                    .get("eager")
+                    .map_or(0, |m| m.msgs);
+                assert_eq!(
+                    attempts,
+                    if refuse { 0 } else { 2 },
+                    "refused bytes must never be served"
+                );
+                if !refuse {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if transport
+                                .sent_messages_of_kind_to(requester, MessageKind::Eager)
+                                .len()
+                                == 2
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("accepted IDs remain recoverable");
+                    let frames = transport.sent_messages_of_kind_to(requester, MessageKind::Eager);
+                    for id in ids {
+                        assert!(
+                            frames
+                                .iter()
+                                .any(|m| m.header.msg_id == id
+                                    && m.payload.as_ref() == Some(&payload))
+                        );
+                    }
+                }
+            }
         }
 
         /// clear_topic_validator restores default passthrough.

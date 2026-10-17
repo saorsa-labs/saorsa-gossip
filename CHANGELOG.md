@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.90] - 2026-10-17
+
+### Changed
+
+- **deps: ant-quic pinned to `=0.27.61`** (receive-path fixes; RFC 9221
+  datagram frame-size enforcement).
+
 ## [0.5.89] - 2026-10-17
 
 ### Security

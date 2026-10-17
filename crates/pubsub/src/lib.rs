@@ -7140,25 +7140,42 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         key_hasher.update(&topic.to_bytes());
         key_hasher.update(peer.as_bytes());
         key_hasher.update(op.as_bytes());
-        if let Ok((message, trailing)) = postcard::take_from_bytes::<GossipMessage>(bytes) {
-            if trailing.is_empty() {
-                key_hasher.update(&message.header.msg_id);
-                let family = *key_hasher.clone().finalize().as_bytes();
-                if let Some(payload) = message.payload {
-                    key_hasher.update(blake3::hash(&payload).as_bytes());
+        let key_cache_wire = key_cache::is_v3(bytes);
+        let message = if key_cache_wire {
+            key_cache::decode(bytes).ok().map(|decoded| match decoded {
+                key_cache::Decoded::Full(message, _) | key_cache::Decoded::Ref(message, _) => {
+                    message
                 }
-                return egress::RecoveryIntentKey {
-                    peer: peer.to_bytes(),
-                    scope: topic.to_bytes(),
-                    family,
-                    operation: *key_hasher.finalize().as_bytes(),
-                };
-            } else {
-                key_hasher.update(blake3::hash(bytes).as_bytes());
-            }
+            })
         } else {
-            key_hasher.update(blake3::hash(bytes).as_bytes());
+            postcard::take_from_bytes::<GossipMessage>(bytes)
+                .ok()
+                .filter(|(_, trailing)| trailing.is_empty())
+                .map(|(message, _)| message)
+        };
+        if let Some(message) = message {
+            // V3 retries re-sign the same control batch. Hashing their wire
+            // bytes would give every retry a fresh intent and lose its credit.
+            key_hasher.update(&message.header.msg_id);
+            let family = *key_hasher.clone().finalize().as_bytes();
+            if let Some(payload) = message.payload {
+                key_hasher.update(blake3::hash(&payload).as_bytes());
+            }
+            if key_cache_wire {
+                // A Full/Ref transition changes the charged size. Give it a
+                // distinct operation in the same family, retaining bounded
+                // replacement/credit semantics rather than a size mismatch.
+                key_hasher.update(key_cache::WIRE_MARKER);
+                key_hasher.update(&bytes.len().to_le_bytes());
+            }
+            return egress::RecoveryIntentKey {
+                peer: peer.to_bytes(),
+                scope: topic.to_bytes(),
+                family,
+                operation: *key_hasher.finalize().as_bytes(),
+            };
         }
+        key_hasher.update(blake3::hash(bytes).as_bytes());
         egress::RecoveryIntentKey {
             peer: peer.to_bytes(),
             scope: topic.to_bytes(),
@@ -11035,6 +11052,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let mut prior_failures = 0_u8;
             if let Some(entry) = state.outstanding_iwants.get(&msg_id) {
                 if entry.peer == from {
+                    // The bounded flush queue already owns this request.
+                    // Re-admission can duplicate its serialized intent and
+                    // renew requested_at indefinitely under repeated IHAVE.
+                    if entry.retry_pending {
+                        continue;
+                    }
                     if entry
                         .retry_not_before
                         .is_some_and(|not_before| Instant::now() < not_before)
@@ -13939,6 +13962,132 @@ mod tests {
         // Garbage / truncated frame decodes to None, never panics.
         assert_eq!(peek_message_kind(b""), None);
         assert_eq!(peek_message_kind(&[0xff, 0xff, 0xff]), None);
+    }
+
+    #[test]
+    fn key_cache_recovery_intent_coalesces_resigned_control_frames() {
+        let signing_key = test_signing_key();
+        let topic = TopicId::new([0x45; 32]);
+        let peer = test_peer_id(2);
+        for (kind, op) in [(MessageKind::IHave, "IHAVE"), (MessageKind::IWant, "IWANT")] {
+            for reference in [false, true] {
+                let make_wire = || {
+                    let payload = Bytes::from_static(b"same recovery batch");
+                    let mut message =
+                        signed_control_message(&signing_key, topic, [0x46; 32], kind, payload);
+                    message.header.seal_payload_hash(message.payload.as_deref());
+                    message.signature = signing_key
+                        .sign(&postcard::to_stdvec(&message.header).expect("header"))
+                        .expect("re-sign control");
+                    key_cache::encode(&message, reference).expect("V3 control")
+                };
+                let first = make_wire();
+                let first_key = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
+                    topic, peer, op, &first,
+                );
+                let limiter = egress::LeafEgressLimiter::disabled();
+                assert!(limiter.configure(Some(LeafEgressConfig {
+                    soft_bytes_per_second: 0,
+                    hard_bytes_per_second: 1,
+                    burst_bytes: u64::try_from(first.len()).expect("frame length"),
+                    max_serialized_frame_bytes: first.len(),
+                    policy: BytePolicy::ShedNormal,
+                })));
+                limiter.advance_virtual_clock_for_test(Duration::ZERO);
+                limiter
+                    .reserve_protected(first_key, first.len(), false)
+                    .expect("drain burst");
+                let mut last_key = first_key;
+                for _ in 0..8 {
+                    let wire = make_wire();
+                    assert_ne!(wire, first, "real ML-DSA retries have fresh signatures");
+                    assert_eq!(wire.len(), first.len());
+                    last_key = PlumtreePubSub::<RecordingTransport>::recovery_intent_key(
+                        topic, peer, op, &wire,
+                    );
+                    assert_eq!(
+                        limiter.try_reserve_recovery(last_key, wire.len()),
+                        Err(egress::ReserveError::Deferred),
+                    );
+                }
+                assert_eq!(
+                    limiter.snapshot().pending_recovery_intents,
+                    1,
+                    "re-signing one V3 recovery batch must retain one intent"
+                );
+                assert_eq!(last_key, first_key);
+                limiter.refill_after_for_test(Duration::from_secs(
+                    u64::try_from(first.len()).expect("frame length"),
+                ));
+                let reservation = limiter
+                    .try_reserve_recovery(last_key, first.len())
+                    .expect("the retained intent completes after refill");
+                assert!(limiter.validate_reservation(Some(last_key), Some(reservation)));
+                assert_eq!(limiter.snapshot().pending_recovery_intents, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn key_cache_recovery_intent_preserves_encoding_and_payload_boundaries() {
+        let key = test_signing_key();
+        let topic = TopicId::new([0x47; 32]);
+        let peer = test_peer_id(2);
+        let message = signed_control_message(
+            &key,
+            topic,
+            [0x48; 32],
+            MessageKind::IHave,
+            Bytes::from_static(b"batch"),
+        );
+        let legacy = postcard::to_stdvec(&message).expect("legacy");
+        let full = key_cache::encode(&message, false).expect("full");
+        let reference = key_cache::encode(&message, true).expect("reference");
+        let intent = |wire: &[u8]| {
+            PlumtreePubSub::<RecordingTransport>::recovery_intent_key(topic, peer, "IHAVE", wire)
+        };
+        let legacy_key = intent(&legacy);
+        let full_key = intent(&full);
+        let ref_key = intent(&reference);
+        assert_eq!(legacy_key.family, full_key.family);
+        assert_eq!(full_key.family, ref_key.family);
+        assert_ne!(legacy_key.operation, full_key.operation);
+        assert_ne!(full_key.operation, ref_key.operation);
+
+        let limiter = egress::LeafEgressLimiter::disabled();
+        assert!(limiter.configure(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: u64::try_from(full.len()).expect("frame length"),
+            max_serialized_frame_bytes: full.len(),
+            policy: BytePolicy::ShedNormal,
+        })));
+        limiter
+            .reserve_protected(full_key, full.len(), false)
+            .expect("drain burst");
+        assert_eq!(
+            limiter.try_reserve_recovery(full_key, full.len()),
+            Err(egress::ReserveError::Deferred)
+        );
+        assert_eq!(
+            limiter.try_reserve_recovery(ref_key, reference.len()),
+            Err(egress::ReserveError::Deferred)
+        );
+        assert_eq!(limiter.snapshot().pending_recovery_intents, 1);
+
+        let mut changed = message.clone();
+        changed.payload = Some(Bytes::from_static(b"other batch"));
+        let changed = key_cache::encode(&changed, true).expect("changed payload");
+        assert_eq!(intent(&changed).family, ref_key.family);
+        assert_ne!(intent(&changed).operation, ref_key.operation);
+        let mut trailing = reference.to_vec();
+        trailing.push(0);
+        assert_ne!(
+            intent(&trailing),
+            ref_key,
+            "malformed V3 keeps the byte-hash fallback"
+        );
+        assert_ne!(intent(&reference[..reference.len() - 1]), ref_key);
     }
 
     #[test]
@@ -25173,6 +25322,44 @@ mod tests {
             .expect("IWANT byte accounting");
         assert_eq!(deferred.sent_bytes, 0);
         assert!(deferred.deferred >= 1, "first pull is byte-deferred");
+
+        // A byte-deferred request already belongs to the bounded retry queue.
+        // Re-advertising the same id must not replace its claim or re-admit
+        // another serialized request while that queue owns it.
+        let before = receiver.leaf_egress_snapshot();
+        let requested_at = {
+            let topics = receiver.topics.read_topic(&topic).await;
+            topics.get(&topic).unwrap().outstanding_iwants[&msg_id].requested_at
+        };
+        for _ in 0..8 {
+            receiver
+                .handle_ihave(publisher_id, topic, ids.clone())
+                .await
+                .expect("repeat advertiser");
+        }
+        let after = receiver.leaf_egress_snapshot();
+        let demand = |snapshot: &egress::LeafEgressSnapshot| {
+            snapshot
+                .by_topic_and_purpose
+                .iter()
+                .find(|row| row.topic == topic.to_bytes() && row.purpose == "IWANT")
+                .unwrap()
+                .demanded_bytes
+        };
+        assert_eq!(
+            demand(&after),
+            demand(&before),
+            "deferred claim must coalesce repeated IHAVE"
+        );
+        {
+            let topics = receiver.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).unwrap();
+            assert_eq!(
+                state.outstanding_iwants[&msg_id].requested_at, requested_at,
+                "repeated advertisements must not renew the retained request age"
+            );
+            assert_eq!(state.deferred_iwants.len(), 1);
+        }
 
         receiver
             .egress_limiter

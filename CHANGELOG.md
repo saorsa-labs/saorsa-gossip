@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **pubsub: native per-kind outer-signature verify meters (for x0x#1170 /
+  Track E M1).** `PlumtreePubSub::verify_by_kind_stats()` returns a cheap
+  `Copy` snapshot of per-`MessageKind` `{attempts, failures, total_ns}`
+  counters recorded at the ML-DSA verify call site under the frame's wire
+  kind. Counters are cumulative/monotonic (`Relaxed` atomics; never reset by
+  a read), lock-free on the receive hot path, and safe across concurrent
+  receive workers. The API does not go through `stage_stats()` and takes no
+  topic/peer locks. Additive public API only; no wire-format change.
+
 ## [0.5.90] - 2026-10-17
 
 ### Changed

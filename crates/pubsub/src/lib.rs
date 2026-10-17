@@ -747,6 +747,75 @@ impl PubSubMessageKindStats {
     }
 }
 
+/// Number of [`MessageKind`] variants (`to_u8()` ranges `0..=8`).
+const MESSAGE_KIND_VARIANT_COUNT: usize = 9;
+
+/// Cumulative ML-DSA verify counters for one [`MessageKind`].
+///
+/// Produced by [`PerKindVerifyMeterSnapshot`]; never reset by a read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KindVerifyCounters {
+    /// Times an outer ML-DSA signature verify was attempted for this kind.
+    pub attempts: u64,
+    /// Times that verify returned invalid (or errored).
+    pub failures: u64,
+    /// Cumulative wall time spent in those verifies, in nanoseconds.
+    pub total_ns: u64,
+}
+
+/// Cheap snapshot of per-[`MessageKind`] outer-signature verify meters.
+///
+/// Indexed by [`MessageKind::to_u8`] as `usize` (`0..=8`). Cumulative and
+/// monotonic: reads never reset the underlying counters. Independent of
+/// [`PlumtreePubSub::stage_stats`] — atomic loads only, no topic/peer locks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PerKindVerifyMeterSnapshot {
+    /// Per-kind counters; index `kind.to_u8() as usize`.
+    pub by_kind: [KindVerifyCounters; MESSAGE_KIND_VARIANT_COUNT],
+}
+
+impl PerKindVerifyMeterSnapshot {
+    /// Counters for a single wire kind.
+    #[must_use]
+    pub fn for_kind(self, kind: MessageKind) -> KindVerifyCounters {
+        self.by_kind[kind.to_u8() as usize]
+    }
+}
+
+/// Lock-free per-kind outer ML-DSA verify meters (x0x#1170 / Track E M1).
+///
+/// Recorded at the signature-verify call site under the frame's
+/// [`MessageKind`]. `Relaxed` atomics; safe across concurrent receive workers.
+#[derive(Debug, Default)]
+struct PerKindVerifyMeter {
+    attempts: [AtomicU64; MESSAGE_KIND_VARIANT_COUNT],
+    failures: [AtomicU64; MESSAGE_KIND_VARIANT_COUNT],
+    total_ns: [AtomicU64; MESSAGE_KIND_VARIANT_COUNT],
+}
+
+impl PerKindVerifyMeter {
+    fn record(&self, kind: MessageKind, success: bool, duration: Duration) {
+        let idx = kind.to_u8() as usize;
+        self.attempts[idx].fetch_add(1, Ordering::Relaxed);
+        if !success {
+            self.failures[idx].fetch_add(1, Ordering::Relaxed);
+        }
+        self.total_ns[idx].fetch_add(duration_to_ns(duration), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PerKindVerifyMeterSnapshot {
+        let mut by_kind = [KindVerifyCounters::default(); MESSAGE_KIND_VARIANT_COUNT];
+        for (idx, slot) in by_kind.iter_mut().enumerate() {
+            *slot = KindVerifyCounters {
+                attempts: self.attempts[idx].load(Ordering::Relaxed),
+                failures: self.failures[idx].load(Ordering::Relaxed),
+                total_ns: self.total_ns[idx].load(Ordering::Relaxed),
+            };
+        }
+        PerKindVerifyMeterSnapshot { by_kind }
+    }
+}
+
 /// Timing counters for one PubSub processing stage.
 #[derive(Debug, Default)]
 pub struct StageTimingStats {
@@ -6990,6 +7059,9 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     signing_key: Arc<saorsa_gossip_identity::MlDsaKeyPair>,
     /// Low-overhead timing counters for inbound PubSub processing stages.
     stage_stats: Arc<PubSubStageStats>,
+    /// Per-[`MessageKind`] outer ML-DSA verify meters (attempts / failures /
+    /// cumulative ns). Independent of [`Self::stage_stats`]; lock-free reads.
+    verify_by_kind: Arc<PerKindVerifyMeter>,
     /// Verified outer signer keys and negotiated per-session wire capability.
     key_cache: Arc<Mutex<key_cache::KeyCache>>,
     /// Last complete peer-score diagnostics snapshot.
@@ -7816,6 +7888,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             transport,
             signing_key,
             stage_stats: Arc::new(PubSubStageStats::default()),
+            verify_by_kind: Arc::new(PerKindVerifyMeter::default()),
             key_cache,
             peer_score_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
             topic_cache_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
@@ -8071,6 +8144,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         snapshot.topic_shard_count = self.topics.shard_count();
         snapshot.peer_scoring_lock_wait = self.peer_scoring.lock_wait_snapshot();
         snapshot
+    }
+
+    /// Cumulative per-[`MessageKind`] outer ML-DSA verify counters.
+    ///
+    /// Recorded at the signature-verify call site under the kind of the frame
+    /// being verified. Cheap: atomic loads only — does **not** call
+    /// [`Self::stage_stats`] and does not take topic/peer locks. Reads never
+    /// reset the counters (monotonic for the lifetime of this pubsub instance).
+    ///
+    /// Intended for x0x Track E per-kind verify cost (x0x#1170): sample this
+    /// instead of diffing [`Self::stage_stats`] around each inbound frame.
+    #[must_use]
+    pub fn verify_by_kind_stats(&self) -> PerKindVerifyMeterSnapshot {
+        self.verify_by_kind.snapshot()
     }
 
     /// Snapshot only the bounded per-topic outbound meters.
@@ -8390,9 +8477,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         ) {
             return false;
         }
-        let verified =
-            self.verify_signature(&message.header, &message.signature, &message.public_key)
-                && self.verify_payload_covering_signature(message);
+        let crypto_started = Instant::now();
+        let sig_ok =
+            self.verify_signature(&message.header, &message.signature, &message.public_key);
+        self.verify_by_kind
+            .record(message.header.kind, sig_ok, crypto_started.elapsed());
+        let verified = sig_ok && self.verify_payload_covering_signature(message);
         self.record_stage(PubSubStage::Verify, verify_started);
         verified
     }
@@ -13849,6 +13939,147 @@ mod tests {
         // Garbage / truncated frame decodes to None, never panics.
         assert_eq!(peek_message_kind(b""), None);
         assert_eq!(peek_message_kind(&[0xff, 0xff, 0xff]), None);
+    }
+
+    #[test]
+    fn verify_by_kind_attributes_only_the_verified_kind() {
+        let peer_id = test_peer_id(1);
+        let key = test_signing_key();
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(peer_id, transport, key.clone(), false);
+        let topic = TopicId::new([0xa1; 32]);
+
+        let eager = signed_eager_message(&key, topic, [1u8; 32], Bytes::from_static(b"e"));
+        assert!(pubsub.verify_message_signature(&eager));
+        let ihave = signed_control_message(
+            &key,
+            topic,
+            [2u8; 32],
+            MessageKind::IHave,
+            Bytes::from_static(b"h"),
+        );
+        assert!(pubsub.verify_message_signature(&ihave));
+
+        let snap = pubsub.verify_by_kind_stats();
+        let eager_c = snap.for_kind(MessageKind::Eager);
+        let ihave_c = snap.for_kind(MessageKind::IHave);
+        let iwant_c = snap.for_kind(MessageKind::IWant);
+        assert_eq!(eager_c.attempts, 1);
+        assert_eq!(eager_c.failures, 0);
+        assert!(eager_c.total_ns > 0);
+        assert_eq!(ihave_c.attempts, 1);
+        assert_eq!(ihave_c.failures, 0);
+        assert!(ihave_c.total_ns > 0);
+        assert_eq!(iwant_c.attempts, 0);
+        assert_eq!(iwant_c.failures, 0);
+        assert_eq!(iwant_c.total_ns, 0);
+    }
+
+    #[test]
+    fn verify_by_kind_counts_bad_signature_failures() {
+        let peer_id = test_peer_id(2);
+        let key = test_signing_key();
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(peer_id, transport, key.clone(), false);
+        let topic = TopicId::new([0xa2; 32]);
+
+        let mut bad = signed_control_message(
+            &key,
+            topic,
+            [3u8; 32],
+            MessageKind::IWant,
+            Bytes::from_static(b"w"),
+        );
+        bad.signature[0] ^= 0xff;
+        assert!(!pubsub.verify_message_signature(&bad));
+
+        let c = pubsub.verify_by_kind_stats().for_kind(MessageKind::IWant);
+        assert_eq!(c.attempts, 1);
+        assert_eq!(c.failures, 1);
+        assert!(c.total_ns > 0);
+        assert_eq!(
+            pubsub
+                .verify_by_kind_stats()
+                .for_kind(MessageKind::Eager)
+                .attempts,
+            0
+        );
+    }
+
+    #[test]
+    fn verify_by_kind_stats_reads_do_not_reset() {
+        let peer_id = test_peer_id(3);
+        let key = test_signing_key();
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(peer_id, transport, key.clone(), false);
+        let topic = TopicId::new([0xa3; 32]);
+        let msg = signed_eager_message(&key, topic, [4u8; 32], Bytes::from_static(b"n"));
+        assert!(pubsub.verify_message_signature(&msg));
+
+        let first = pubsub.verify_by_kind_stats().for_kind(MessageKind::Eager);
+        let second = pubsub.verify_by_kind_stats().for_kind(MessageKind::Eager);
+        assert_eq!(first, second);
+        assert_eq!(first.attempts, 1);
+
+        assert!(pubsub.verify_message_signature(&msg));
+        let third = pubsub.verify_by_kind_stats().for_kind(MessageKind::Eager);
+        assert_eq!(third.attempts, 2);
+        assert!(third.total_ns >= first.total_ns);
+    }
+
+    #[test]
+    fn verify_by_kind_concurrent_workers_sum_exactly() {
+        let peer_id = test_peer_id(4);
+        let key = test_signing_key();
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            transport,
+            key.clone(),
+            false,
+        ));
+        let topic = TopicId::new([0xa4; 32]);
+        let kinds = [
+            MessageKind::Eager,
+            MessageKind::IHave,
+            MessageKind::IWant,
+            MessageKind::AntiEntropy,
+        ];
+        let per_kind = 8usize;
+        let mut handles = Vec::new();
+        for (worker, kind) in kinds.into_iter().enumerate() {
+            let pubsub = Arc::clone(&pubsub);
+            let key = key.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_kind {
+                    let mut msg_id = [0u8; 32];
+                    msg_id[0] = worker as u8;
+                    msg_id[1] = i as u8;
+                    let msg =
+                        signed_control_message(&key, topic, msg_id, kind, Bytes::from_static(b"c"));
+                    assert!(pubsub.verify_message_signature(&msg));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker finished");
+        }
+
+        let snap = pubsub.verify_by_kind_stats();
+        let mut total_attempts = 0u64;
+        let mut total_failures = 0u64;
+        for kind in kinds {
+            let c = snap.for_kind(kind);
+            assert_eq!(c.attempts, per_kind as u64, "{kind:?}");
+            assert_eq!(c.failures, 0, "{kind:?}");
+            assert!(c.total_ns > 0, "{kind:?}");
+            total_attempts += c.attempts;
+            total_failures += c.failures;
+        }
+        assert_eq!(total_attempts, (kinds.len() * per_kind) as u64);
+        assert_eq!(total_failures, 0);
+        // Untouched kinds stay at zero.
+        assert_eq!(snap.for_kind(MessageKind::Ping).attempts, 0);
     }
 
     #[test]

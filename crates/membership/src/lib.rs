@@ -1115,6 +1115,11 @@ enum CommitLock {
 
 impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     /// Create a new HyParView membership manager with the given configuration.
+    ///
+    /// Every ten seconds, degree maintenance moves disconnected active peers
+    /// to the bounded passive view and promotes connected passive candidates.
+    /// The transport must report live peers via [`GossipTransport::connected_peer_ids`];
+    /// an empty report means no live connections, including after a total outage.
     pub fn new(local_peer_id: PeerId, config: MembershipConfig, transport: Arc<T>) -> Self {
         let membership = Self {
             local_peer_id,
@@ -2036,9 +2041,13 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         let passive = self.passive.clone();
         let seen_peers = self.seen_peers.clone();
         let config = self.config.clone();
+        let transport = self.transport.clone();
+        let swim = self.swim.clone();
+        let local_peer_id = self.local_peer_id;
 
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(10));
+            let period = Duration::from_secs(10);
+            let mut interval = time::interval_at(time::Instant::now() + period, period);
             let mut prev_active_target = config.active_degree;
             let mut prev_passive_max = config.max_passive_degree;
 
@@ -2095,21 +2104,57 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                 prev_active_target = smoothed_active;
                 prev_passive_max = smoothed_passive;
 
+                // Transport connectivity is authoritative, even when the report
+                // is empty. Do no transport I/O while holding membership locks.
+                let connected: HashSet<_> =
+                    transport.connected_peer_ids().await.into_iter().collect();
+
+                // Take every lock before changing any state. Order: probe tables,
+                // SWIM, active, passive (compatible with the probe-timeout task
+                // and JOIN commit). A cancelled wait leaves the views unchanged.
+                let mut pending = swim.pending_probes.write().await;
+                let mut indirect = swim.pending_indirect_probes.write().await;
+                let mut states = swim.states.write().await;
                 let mut active_guard = active.write().await;
                 let mut passive_guard = passive.write().await;
 
-                let active_count = active_guard.len();
-                let passive_count = passive_guard.len();
+                active_guard.retain(|peer| {
+                    if connected.contains(peer) {
+                        return true;
+                    }
+                    if *peer != local_peer_id {
+                        passive_guard.insert(*peer);
+                    }
+                    debug!(peer_id = %peer, "Degree maintenance: disconnected peer moved to passive");
+                    false
+                });
+                // Also clear disconnected SWIM-only peers (for example, peers
+                // learned through indirect ACKs). Otherwise they remain probe
+                // targets after removal from the active view.
+                states.retain(|peer, _| connected.contains(peer));
+                pending.retain(|peer, _| connected.contains(peer));
+                indirect.retain(|(target, requester), _| {
+                    connected.contains(target) && connected.contains(requester)
+                });
+                passive_guard.retain(|peer| *peer != local_peer_id && !active_guard.contains(peer));
 
-                // Promote from passive if active is low
+                let active_count = active_guard.len();
+
+                // Keep disconnected candidates passive for a later reconnect.
+                // Promote before trimming so a full passive view can still heal.
                 if active_count < smoothed_active && !passive_guard.is_empty() {
                     let to_promote = smoothed_active - active_count;
-                    let peers: Vec<PeerId> =
-                        passive_guard.iter().take(to_promote).copied().collect();
+                    let peers: Vec<PeerId> = passive_guard
+                        .iter()
+                        .filter(|peer| connected.contains(peer))
+                        .take(to_promote)
+                        .copied()
+                        .collect();
 
                     for peer in peers {
                         passive_guard.remove(&peer);
                         active_guard.insert(peer);
+                        SwimDetector::<T>::set_alive(&mut states, peer);
                         debug!(peer_id = %peer, "Degree maintenance: promoted to active");
                     }
                 }
@@ -2129,6 +2174,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                 }
 
                 // Trim passive if over capacity
+                let passive_count = passive_guard.len();
                 if passive_count > smoothed_passive {
                     let to_remove = passive_count - smoothed_passive;
                     let peers: Vec<PeerId> =
@@ -2142,6 +2188,9 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
 
                 drop(active_guard);
                 drop(passive_guard);
+                drop(states);
+                drop(indirect);
+                drop(pending);
 
                 // Clean up stale seen_peers entries (older than 5 minutes)
                 let mut seen = seen_peers.write().await;
@@ -2254,6 +2303,9 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
 
 #[cfg(test)]
 mod join_budget_tests;
+
+#[cfg(test)]
+mod connectivity_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

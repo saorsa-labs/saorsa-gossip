@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **pubsub: expose validated `MessageHeader.msg_id` on subscription delivery
+  (#100).** Additive `SubscriptionMessage` plus `PubSub::subscribe_with_msg_id`
+  / `subscribe_ready_with_msg_id` carry the authenticated wire header id beside
+  peer and payload. Legacy `(PeerId, Bytes)` subscribe channels are unchanged.
+  `msg_id` is `Some` only after header authentication (locally signed publish or
+  signature-verified inbound); it is never a synthesized payload hash. No wire
+  format change.
+
 ## [0.5.90] - 2026-10-17
 
 ### Changed

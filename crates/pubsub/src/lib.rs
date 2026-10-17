@@ -9045,7 +9045,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let lock_wait = lock_started.elapsed();
         self.stage_stats
             .record(PubSubStage::DedupeLockAcquire, lock_wait);
-        let (attempts, permits, skips) = if let Some(state) = topics.get_mut(&topic) {
+        // The reply may have been pruned or disconnected while waiting
+        // for this lock. Check ownership before arming a recovery probe:
+        // a stale reply cannot attach it or book its completion.
+        let stale_reply = reply.is_some_and(|reply| {
+            topics
+                .get(&topic)
+                .and_then(|state| state.eager_reply_claims.get(&(reply.peer, reply.msg_id)))
+                .is_none_or(|claim| claim.token != reply.token)
+        });
+        let (attempts, permits, skips) = if stale_reply {
+            (Vec::new(), Vec::new(), SendClaimSkips::default())
+        } else if let Some(state) = topics.get_mut(&topic) {
             let claim_context = SendClaimContext {
                 stage_stats: self.stage_stats.as_ref(),
                 outbound_budgets: &self.outbound_budgets,
@@ -18520,6 +18531,115 @@ mod tests {
             .get(&topic)
             .and_then(|state| state.peer_cooling.get(&peer))
             .is_some_and(|cooling| cooling.recovery_probe_in_flight)
+    }
+
+    /// Issue #109: invalidate the IWANT reply while its attempt claim is
+    /// blocked on the topic lock. Polling under the held lock forces the
+    /// ordering without sleeps or scheduler assumptions.
+    async fn assert_stale_iwant_attempt_does_not_arm_probe(disconnect: bool) {
+        let local = test_peer_id(1);
+        let peer = test_peer_id(2);
+        let transport = RecordingTransport::new(local);
+        transport.set_connected_peer_ids(vec![peer]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        store_connected_peers_snapshot(
+            pubsub.connected_peers_snapshot.as_ref(),
+            Some(HashSet::from([peer])),
+        );
+        let topic = TopicId::new([0x79; 32]);
+        let msg_id = [0x7a; 32];
+        let now = Instant::now();
+        let mut topics = pubsub.topics.write_topic(&topic).await;
+        let state = topics
+            .entry(topic)
+            .or_insert_with(|| pubsub.new_topic_state());
+        state.peer_cooling.insert(peer, probe_due_cooling(now));
+        let token = state
+            .claim_eager_reply_for_iwant(peer, msg_id, now)
+            .expect("the IWANT serve owns the reply");
+        let reply = EagerReplyCompletion {
+            peer,
+            msg_id,
+            token,
+            own_custody: None,
+        };
+        let mut claim = tokio_test::task::spawn(pubsub.claim_topic_send_attempts_for_reply(
+            topic,
+            vec![peer],
+            "EAGER",
+            true,
+            Some(reply),
+        ));
+        assert!(claim.poll().is_pending(), "the attempt waits for the lock");
+
+        let replacement_token = if disconnect {
+            let _ = state.evict_not_connected_peer(peer);
+            assert!(!state.eager_reply_claimed(peer, msg_id));
+            // A reconnected peer can have a fresh claim and cooling state
+            // before the old serve acquires the lock. Match the token, not
+            // just the presence of a claim for the same peer/message.
+            state.peer_cooling.insert(peer, probe_due_cooling(now));
+            Some(state.insert_eager_reply_claim(peer, msg_id, now))
+        } else {
+            state.prune_eager_reply_claims(now + EAGER_REPLY_CLAIM_TTL);
+            assert!(!state.eager_reply_claimed(peer, msg_id));
+            None
+        };
+        drop(topics);
+
+        let (claims, _) = tokio_test::assert_ready!(claim.poll());
+        assert!(
+            !recovery_probe_in_flight(&pubsub, topic, peer).await,
+            "a stale IWANT reply must not arm a recovery probe"
+        );
+        assert!(claims.is_empty(), "a stale reply cannot claim a send");
+        assert!(claims.permits.is_empty(), "a stale reply holds no permit");
+        drop(claims);
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert_eq!(
+                state
+                    .eager_reply_claims
+                    .get(&(peer, msg_id))
+                    .map(|claim| (claim.token, claim.probe)),
+                replacement_token.map(|token| (token, None)),
+                "the stale serve leaves any newer reply claim untouched"
+            );
+        }
+
+        let outcome = pubsub
+            .send_to_peer_bounded_outcome(
+                topic,
+                peer,
+                GossipStreamType::PubSub,
+                Bytes::from_static(b"later-send"),
+                "EAGER",
+                true,
+            )
+            .await
+            .expect("later send succeeds");
+        assert!(
+            matches!(outcome, PeerSendOutcome::Sent { .. }),
+            "a later send to the peer is not suppressed"
+        );
+        assert_eq!(transport.send_count_to(peer), 1);
+        assert!(!recovery_probe_in_flight(&pubsub, topic, peer).await);
+    }
+
+    #[tokio::test]
+    async fn stale_iwant_attempt_after_ttl_prune_does_not_arm_probe() {
+        assert_stale_iwant_attempt_does_not_arm_probe(false).await;
+    }
+
+    #[tokio::test]
+    async fn stale_iwant_attempt_after_disconnect_does_not_arm_probe() {
+        assert_stale_iwant_attempt_does_not_arm_probe(true).await;
     }
 
     /// PR #106 review r5, residual 1 scenario: a reply that is a recovery

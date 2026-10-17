@@ -788,10 +788,13 @@ impl UdpTransportAdapter {
 
         let ant_peer_id = peer_id.map(|id| gossip_peer_id_to_ant(&id));
 
-        let strategy_config = StrategyConfig::default();
-
         match endpoint
-            .connect_with_fallback(target_ipv4, target_ipv6, Some(strategy_config), ant_peer_id)
+            .connect_with_fallback(
+                target_ipv4,
+                target_ipv6,
+                nat_fallback_strategy(),
+                ant_peer_id,
+            )
             .await
         {
             Ok((peer_conn, method)) => {
@@ -816,6 +819,19 @@ impl UdpTransportAdapter {
             )),
         }
     }
+}
+
+/// Strategy passed to ant-quic's `connect_with_fallback` by
+/// [`UdpTransportAdapter::connect_with_nat_fallback`].
+///
+/// ant-quic treats an explicit strategy as authoritative: it does not fill in
+/// a coordinator or relay addresses, so `StrategyConfig::default()` restricts
+/// the dial to the direct stage (#113). This adapter has no coordinator or
+/// relay configuration of its own, so it passes `None` and lets ant-quic pick
+/// its coordinator and relays from its configuration and runtime discovery and
+/// set adaptive stage budgets.
+fn nat_fallback_strategy() -> Option<StrategyConfig> {
+    None
 }
 
 fn addr_is_usable(addr: &SocketAddr) -> bool {
@@ -1565,6 +1581,20 @@ impl TransportAdapter for UdpTransportAdapter {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nat_fallback_dial_does_not_pin_a_direct_only_strategy() {
+        // An explicit strategy without a coordinator or relays stops the dial
+        // after the direct stage (#113). The dial path must either defer to
+        // ant-quic (None) or supply a strategy that can get past direct.
+        if let Some(strategy) = nat_fallback_strategy() {
+            assert!(
+                strategy.coordinator.is_some() || !strategy.relay_addrs.is_empty(),
+                "explicit strategy {strategy:?} has no coordinator or relay, \
+                 so hole punching and relay are disabled"
+            );
+        }
+    }
 
     #[test]
     fn queued_source_generation_is_never_relabelled_after_reconnect() {

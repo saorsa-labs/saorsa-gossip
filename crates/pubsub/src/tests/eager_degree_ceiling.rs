@@ -171,7 +171,7 @@ fn cooling_rescue_replaces_at_capacity() {
         state.peer_cooling.insert(peer, cooling);
     }
     let (tx, _rx) = mpsc::unbounded_channel();
-    state.subscribers.push(tx);
+    state.subscribers.push(LocalSubscriber::BytesOnly(tx));
     assert_eq!(
         state.rescue_suppressed_eager_peer_if_needed_at(now),
         Some(lazy)

@@ -480,24 +480,30 @@ impl OutboundTopicMeters {
     }
 }
 
-/// Local subscriber delivery with optional authenticated transport identity.
+/// Delivery envelope for [`PubSub::subscribe_with_msg_id`] (issue #100).
 ///
-/// Issue #100: the wire header carries a validated `MessageHeader.msg_id`, but
-/// the legacy `(PeerId, Bytes)` subscription channel drops it. This type is the
-/// additive surface that preserves that id for correlation without changing the
-/// wire format.
+/// Additive surface beside the legacy `(PeerId, Bytes)` channel: carries the
+/// wire `MessageHeader.msg_id` for correlation without a wire-format change.
 ///
-/// `msg_id` is `Some` only when the delivery path authenticated the header
-/// (signature-verified inbound, or locally originated and signed). It is never
-/// a synthesized payload hash. `None` means no trusted header id is available
-/// for this delivery — callers must not invent one from `payload`.
+/// `msg_id` is a **correlation id**, not a publisher identity. When `Some`, the
+/// header signature verified against the **public key carried in the message**
+/// (or the local node just signed the header on publish). The signer chooses
+/// the id; receivers do **not** recompute it with `calculate_msg_id`, so it
+/// must not be treated as identifying the publisher.
+///
+/// Under a policy that accepts v1 header-only signatures (ADR-012/013; default
+/// is [`SignaturePolicy::RejectV1`] per ADR-014), the signature does not cover
+/// the payload — `msg_id` still reflects the verified header, not payload
+/// integrity. `None` means no verified header id is available; callers must
+/// not invent one from `payload`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionMessage {
     /// Peer associated with this delivery (local publisher or inbound sender).
     pub from: PeerId,
     /// Application payload bytes.
     pub payload: Bytes,
-    /// Validated `MessageHeader.msg_id`, when trusted.
+    /// Wire `MessageHeader.msg_id` after header-signature verification, when
+    /// available. Signer-chosen correlation id; not a publisher identity.
     pub msg_id: Option<[u8; 32]>,
 }
 
@@ -4855,8 +4861,8 @@ impl TopicState {
 
     /// Fan out an accepted message to every live local subscriber.
     ///
-    /// `msg_id` must be the authenticated header id, or `None` when no trusted
-    /// id exists. Never pass a synthesized payload hash.
+    /// `msg_id` must be the wire header id after signature verification, or
+    /// `None` when unavailable. Never pass a synthesized payload hash.
     fn deliver_to_local_subscribers(
         &mut self,
         from: PeerId,
@@ -6862,44 +6868,30 @@ pub trait PubSub: Send + Sync {
         self.subscribe(topic)
     }
 
-    /// Subscribe with validated transport `msg_id` metadata (issue #100).
+    /// Subscribe with wire `msg_id` correlation metadata (issue #100).
     ///
     /// Additive companion to [`Self::subscribe`]. The default maps the legacy
-    /// channel and sets `msg_id` to `None` (untrusted / unavailable) — it never
-    /// synthesizes an id from payload bytes. Implementations that authenticate
-    /// headers should override and supply `Some(validated_header_msg_id)`.
+    /// channel and sets `msg_id` to `None` (unavailable) — it never synthesizes
+    /// an id from payload bytes. Implementations that verify header signatures
+    /// should override and supply `Some(header.msg_id)` after verification.
+    /// See [`SubscriptionMessage`] for what `msg_id` does and does not mean.
     fn subscribe_with_msg_id(
         &self,
         topic: TopicId,
     ) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
-        let mut rx = self.subscribe(topic);
-        let (tx, meta_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            while let Some((from, payload)) = rx.recv().await {
-                if tx
-                    .send(SubscriptionMessage {
-                        from,
-                        payload,
-                        msg_id: None,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        meta_rx
+        adapt_bytes_subscribe_to_msg_id(self.subscribe(topic))
     }
 
     /// Readiness barrier for [`Self::subscribe_with_msg_id`].
     ///
-    /// Default delegates to [`Self::subscribe_with_msg_id`]. Override alongside
-    /// a true [`Self::subscribe_ready`] barrier when registration is async.
+    /// Default maps [`Self::subscribe_ready`] through the same adapter as
+    /// [`Self::subscribe_with_msg_id`], so an implementer that overrides only
+    /// [`Self::subscribe_ready`] keeps that barrier on the meta path.
     async fn subscribe_ready_with_msg_id(
         &self,
         topic: TopicId,
     ) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
-        self.subscribe_with_msg_id(topic)
+        adapt_bytes_subscribe_to_msg_id(self.subscribe_ready(topic).await)
     }
 
     /// Unsubscribe from a topic
@@ -6943,6 +6935,56 @@ pub trait PubSub: Send + Sync {
     /// automatically via the background task.
     async fn trigger_anti_entropy(&self, _topic: TopicId) -> Result<()> {
         Ok(()) // Default no-op
+    }
+}
+
+/// Default adapter: legacy `(PeerId, Bytes)` subscribe → [`SubscriptionMessage`].
+///
+/// Sets `msg_id` to `None` and ends the forwarder (dropping the upstream
+/// receiver) when either side closes — including when the metadata consumer
+/// is dropped while the topic is idle.
+fn adapt_bytes_subscribe_to_msg_id(
+    mut rx: mpsc::UnboundedReceiver<(PeerId, Bytes)>,
+) -> mpsc::UnboundedReceiver<SubscriptionMessage> {
+    let (tx, meta_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some((from, payload)) => {
+                            if tx
+                                .send(SubscriptionMessage {
+                                    from,
+                                    payload,
+                                    msg_id: None,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
+    meta_rx
+}
+
+/// Local publish may expose `msg_id` only when signing produced a non-empty
+/// signature. `sign_message` returns an empty buffer on failure; that must not
+/// be reported as a verified header id, and the publish must not proceed.
+fn msg_id_after_local_sign(signature: &[u8], msg_id: [u8; 32]) -> Result<[u8; 32]> {
+    if signature.is_empty() {
+        Err(anyhow!(
+            "message signing failed; refusing local publish and msg_id delivery"
+        ))
+    } else {
+        Ok(msg_id)
     }
 }
 
@@ -10413,6 +10455,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         header.seal_payload_hash(Some(&payload));
 
         let signature = self.sign_message(&header);
+        // `sign_message` returns an empty buffer on failure — do not proceed
+        // with an unsigned frame or expose `Some(msg_id)` to local subscribers.
+        let msg_id = msg_id_after_local_sign(&signature, msg_id)?;
 
         let _message = GossipMessage {
             header: header.clone(),
@@ -10508,7 +10553,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             len = payload.len(),
             zero_tail = payload_zero_tail(&payload),
         );
-        // Local origin: header was just signed, so msg_id is trusted.
+        // Local origin: header was just signed successfully (empty-signature
+        // failure already returned above).
         state.deliver_to_local_subscribers(self.peer_id, payload, Some(msg_id));
 
         drop(topics); // Release lock before network I/O
@@ -11016,8 +11062,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
         self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
 
-        // Deliver to local subscribers. Signature verification already passed,
-        // so the header msg_id is trusted metadata (issue #100).
+        // Deliver to local subscribers. Signature verification already passed
+        // against the key carried in the message; msg_id is the signer-chosen
+        // wire header id (issue #100).
         let fanout_started = Instant::now();
         let sub_count = state.subscribers.len();
         debug!(
@@ -21885,7 +21932,7 @@ mod tests {
         assert_eq!(payload, data);
     }
 
-    /// Issue #100: one transport message keeps the same validated header
+    /// Issue #100: one transport message keeps the same wire header
     /// `msg_id` across every local meta-subscriber delivery.
     #[tokio::test]
     async fn subscription_meta_retains_validated_msg_id_across_subscribers() {
@@ -21920,11 +21967,11 @@ mod tests {
         );
         let msg_id = a
             .msg_id
-            .expect("locally signed publish exposes a trusted msg_id");
+            .expect("locally signed publish exposes a wire msg_id");
         let payload_digest = *blake3::hash(payload.as_ref()).as_bytes();
         assert_ne!(
             msg_id, payload_digest,
-            "trusted msg_id must not be a synthesized payload hash"
+            "wire msg_id must not be a synthesized payload hash"
         );
     }
 
@@ -22015,7 +22062,7 @@ mod tests {
         );
     }
 
-    /// Issue #100: unvalidated headers must not surface trusted msg_id metadata.
+    /// Issue #100: unvalidated headers must not surface wire msg_id metadata.
     #[tokio::test]
     async fn subscription_meta_does_not_expose_unvalidated_msg_id() {
         let local = test_peer_id(1);
@@ -22051,8 +22098,92 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(50), rx.recv())
                 .await
                 .is_err(),
-            "unvalidated header must not deliver trusted msg_id metadata"
+            "unvalidated header must not deliver wire msg_id metadata"
         );
+    }
+
+    /// Issue #100 / Codex P2: empty signature (sign_message failure) must not
+    /// expose `Some(msg_id)` — publish fails before local delivery.
+    #[test]
+    fn local_sign_failure_refuses_msg_id_delivery() {
+        let msg_id = [0xDDu8; 32];
+        assert!(
+            msg_id_after_local_sign(&[], msg_id).is_err(),
+            "empty signature must propagate as publish failure"
+        );
+        assert_eq!(
+            msg_id_after_local_sign(&[0x01], msg_id).expect("non-empty signature"),
+            msg_id
+        );
+    }
+
+    /// Minimal PubSub that only implements the legacy subscribe channel so the
+    /// default `subscribe_with_msg_id` adapter is exercised.
+    struct DefaultAdapterProbe {
+        upstream_tx: Mutex<Option<mpsc::UnboundedSender<(PeerId, Bytes)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PubSub for DefaultAdapterProbe {
+        async fn publish(&self, _topic: TopicId, _data: Bytes) -> Result<()> {
+            Ok(())
+        }
+
+        fn subscribe(&self, _topic: TopicId) -> mpsc::UnboundedReceiver<(PeerId, Bytes)> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            *self.upstream_tx.lock().expect("lock") = Some(tx);
+            rx
+        }
+
+        async fn unsubscribe(&self, _topic: TopicId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn initialize_topic_peers(&self, _topic: TopicId, _peers: Vec<PeerId>) {}
+
+        async fn handle_message(&self, _from: PeerId, _data: Bytes) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Issue #100 / Codex P2: dropping the metadata receiver on an idle topic
+    /// must cancel the default adapter (and thus the upstream subscription)
+    /// without waiting for another publication.
+    #[tokio::test]
+    async fn default_subscribe_with_msg_id_cancels_when_meta_receiver_dropped() {
+        let probe = DefaultAdapterProbe {
+            upstream_tx: Mutex::new(None),
+        };
+        let topic = TopicId::new([0x13; 32]);
+        let meta_rx = probe.subscribe_with_msg_id(topic);
+
+        let upstream = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if let Some(tx) = probe.upstream_tx.lock().expect("lock").clone() {
+                    return tx;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upstream subscribe registered");
+        assert!(
+            !upstream.is_closed(),
+            "upstream must stay open while meta consumer is alive"
+        );
+
+        drop(meta_rx);
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if upstream.is_closed() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping meta receiver must close upstream without another publish");
     }
 
     #[tokio::test]

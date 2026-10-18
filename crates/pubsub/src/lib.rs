@@ -2087,7 +2087,7 @@ struct SendClaimContext<'a> {
 struct SendClaimSkips {
     /// Peers skipped because the transport reports them disconnected.
     transport_disconnected: usize,
-    /// Peers skipped by cooling/suppression (`claim_send_attempt_at` → None).
+    /// Peers skipped by cooling/suppression (`claim_send_attempt_at_for` → None).
     cooling: usize,
     /// Peers skipped because `try_acquire` had no permit (Critical FIFO gate
     /// full, or best-effort/control lane exhausted).
@@ -3565,7 +3565,7 @@ impl PeerCoolingState {
     }
 
     /// Cooldown expired and no probe in flight — exactly the state in
-    /// which [`Self::claim_send_attempt_at`] converts the next claimed
+    /// which [`Self::claim_send_attempt_at_for`] converts the next claimed
     /// send into a `RecoveryProbe` (issue #63).
     fn recovery_probe_due_at(&self, now: Instant) -> bool {
         self.suppression_expired_at(now) && !self.recovery_probe_in_flight
@@ -3593,7 +3593,7 @@ impl PeerCoolingState {
 
     /// Claim a send attempt, optionally treating Critical *Data* as exempt
     /// from cooling/suppression (issue #24 — aligns claim/gate with
-    /// [`AdmissionControl::admit`]'s Critical always-admit contract).
+    /// [`admission::AdmissionControl::admit`]'s Critical always-admit contract).
     ///
     /// When `critical_data` is true:
     /// - active suppression admits as [`SendAttemptKind::Normal`] (does not
@@ -5998,7 +5998,7 @@ impl TopicState {
     }
 
     /// Issue #105: roll back a recovery-probe claim whose outbound permit
-    /// was refused. `claim_send_attempt_at` marks the probe in flight before
+    /// was refused. `claim_send_attempt_at_for` marks the probe in flight before
     /// the claim layer tries for a permit; when none is available no probe
     /// is sent, so no send outcome would ever clear the flag and the peer
     /// would stay suppressed (never graftable, every claim skipped) until it
@@ -12951,7 +12951,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// suppression). EXCEPTION (r3 review item 1): RecoveryProbe-kind
     /// attempts ARE re-booked — the claim set `recovery_probe_in_flight`
     /// for the peer, and a dropped probe outcome would leave that flag set
-    /// forever, permanently blocking `claim_send_attempt_at` for the
+    /// forever, permanently blocking `claim_send_attempt_at_for` for the
     /// peer/topic. A probe timeout re-suppresses with backoff (it does not
     /// feed the `PEER_TIMEOUT_THRESHOLD` window), which is the correct
     /// probe outcome; a probe not-connected failure books the #380
@@ -13207,7 +13207,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // without feeding the threshold window, a probe not-connected
             // failure books the #380 eviction, and either outcome releases
             // `recovery_probe_in_flight` — dropping it would permanently block
-            // `claim_send_attempt_at` for the peer/topic.
+            // `claim_send_attempt_at_for` for the peer/topic.
             let probe_timed_out: Vec<PeerSendAttempt> = timed_out
                 .iter()
                 .copied()
@@ -21859,7 +21859,7 @@ mod tests {
     /// Recording the probe outcome releases the in-flight marker (with
     /// backoff re-suppression, which does not feed
     /// `PEER_TIMEOUT_THRESHOLD`); dropping it — the r2 implementation —
-    /// left the flag set forever and `claim_send_attempt_at` returned None
+    /// left the flag set forever and `claim_send_attempt_at_for` returned None
     /// for the peer/topic permanently.
     #[tokio::test(start_paused = true)]
     async fn stranded_publish_retry_probe_timeout_releases_in_flight_marker() {
@@ -31730,6 +31730,125 @@ mod tests {
             assert!(
                 state.is_peer_suppressed_at(target, Instant::now()),
                 "Critical Data Normal sends must not clear active suppression"
+            );
+        }
+    }
+
+    /// Issue #24: Critical Data must claim as `Normal` while a recovery probe
+    /// is already in flight (the new branch at `claim_send_attempt_at_for`).
+    /// A Normal timeout must not clear that probe marker — only the probe's
+    /// own outcome (or a matching abandon) may — so a late probe result is
+    /// still applied.
+    #[tokio::test]
+    async fn issue24_critical_data_timeout_while_recovery_probe_in_flight() {
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        transport.set_connected_peer_ids(vec![target]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([49u8; 32]);
+        pubsub.initialize_topic_peers(topic, vec![target]).await;
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Critical);
+
+        const PROBE_ID: RecoveryProbeId = 42;
+        {
+            let now = Instant::now();
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic exists");
+            let mut cooling = PeerCoolingState::new(now);
+            cooling.suppressed_until = Some(now - Duration::from_millis(1));
+            cooling.cooldown = PEER_SUPPRESSION_COOLDOWN;
+            cooling.last_suppression_timeout_count = PEER_TIMEOUT_THRESHOLD;
+            cooling.recovery_probe_in_flight = true;
+            cooling.recovery_probe_id = Some(PROBE_ID);
+            state.peer_cooling.insert(target, cooling);
+        }
+
+        // Non-critical Data would be blocked by the in-flight probe; Critical
+        // Data must still claim as Normal without stealing the probe id.
+        let (claims, _) = pubsub
+            .claim_topic_send_attempts(topic, vec![target], "EAGER", true)
+            .await;
+        assert_eq!(
+            claims.attempts().len(),
+            1,
+            "Critical Data admits during in-flight probe"
+        );
+        assert_eq!(claims.attempts()[0].kind, SendAttemptKind::Normal);
+        assert_eq!(claims.attempts()[0].recovery_probe_id, None);
+        drop(claims);
+
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic exists");
+            let cooling = state.peer_cooling.get(&target).expect("cooling state");
+            assert!(
+                cooling.recovery_probe_in_flight && cooling.recovery_probe_id == Some(PROBE_ID),
+                "Critical Data Normal claim must leave the in-flight probe untouched"
+            );
+        }
+
+        // Normal timeout while the probe is in flight: score may move, but the
+        // probe marker stays until the probe outcome itself is recorded.
+        pubsub
+            .record_topic_send_attempt_results(
+                topic,
+                Vec::new(),
+                vec![PeerSendAttempt {
+                    peer: target,
+                    kind: SendAttemptKind::Normal,
+                    recovery_probe_id: None,
+                }],
+            )
+            .await;
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic exists");
+            let cooling = state.peer_cooling.get(&target).expect("cooling state");
+            assert!(
+                cooling.recovery_probe_in_flight && cooling.recovery_probe_id == Some(PROBE_ID),
+                "Normal Critical Data timeout must not clear the in-flight recovery probe"
+            );
+            assert!(
+                cooling
+                    .suppressed_until
+                    .is_some_and(|until| until <= Instant::now()),
+                "Normal timeout must not re-suppress while the recovery probe owns the marker"
+            );
+        }
+
+        // Matching probe timeout still owns the marker and re-suppresses.
+        pubsub
+            .record_topic_send_attempt_results(
+                topic,
+                Vec::new(),
+                vec![PeerSendAttempt {
+                    peer: target,
+                    kind: SendAttemptKind::RecoveryProbe,
+                    recovery_probe_id: Some(PROBE_ID),
+                }],
+            )
+            .await;
+        {
+            let now = Instant::now();
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic exists");
+            let cooling = state.peer_cooling.get(&target).expect("cooling state");
+            assert!(
+                !cooling.recovery_probe_in_flight && cooling.recovery_probe_id.is_none(),
+                "matching RecoveryProbe timeout must release the in-flight marker"
+            );
+            assert!(
+                cooling.suppressed_until.is_some_and(|until| until > now),
+                "matching RecoveryProbe timeout must re-suppress with backoff"
             );
         }
     }

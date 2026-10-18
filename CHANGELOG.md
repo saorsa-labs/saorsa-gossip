@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **pubsub: Critical Data claims no longer skip cooled peers (#24).**
+  Admission already always admits `TopicPriority::Critical`, but the
+  claim/gate layer returned `None` while a peer was suppressed (aside from
+  the WP6 rate-limited cooldown bypass), so Critical *Data* EAGER sends —
+  including TreeKEM Welcome / membership traffic — were dropped and counted
+  as `dropped_critical_cooling`. Claim/gate now admits Critical Data as a
+  normal attempt through active cooling and in-flight recovery probes,
+  without consuming the bypass trickle slot or clearing suppression on
+  success. Critical *control* (IWANT/GRAFT/…) keeps the WP6 bypass
+  behaviour. No wire-format or public API change.
+
 ### Added
 
 - **pubsub: native per-kind outer-signature verify meters (for x0x#1170 /

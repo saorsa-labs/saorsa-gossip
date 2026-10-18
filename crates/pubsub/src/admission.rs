@@ -17,13 +17,14 @@
 //!
 //! - **Critical** → always admit at the admission layer and use a dedicated
 //!   per-peer outbound Data lane. Normal/Bulk work cannot occupy that lane,
-//!   so Critical only fails to claim a permit when another Critical send to
-//!   the same peer is already in flight; that records
-//!   `dropped_critical_hard_error`, which must remain zero in production.
-//!   Two benign skip reasons are counted separately so the hard-error
-//!   contract holds: peer cooling/suppression → `dropped_critical_cooling`,
-//!   and a Critical *control* send whose entire target set is
-//!   transport-disconnected → `dropped_critical_no_target`.
+//!   so Critical Data only fails to claim a permit when the per-peer Critical
+//!   FIFO gate is full; that records `dropped_critical_hard_error`, which
+//!   must remain zero in production. Issue #24: Critical *Data* is also
+//!   exempt from peer cooling/suppression at the claim/gate layer (same
+//!   contract as admission). Two benign skip reasons remain for Critical
+//!   *control* so the hard-error contract holds: peer cooling/suppression →
+//!   `dropped_critical_cooling`, and a Critical control send whose entire
+//!   target set is transport-disconnected → `dropped_critical_no_target`.
 //! - **Normal** → admit unless `H ∈ {Dead, Suspect}`. The Suspect drop
 //!   matches the X0X-0074 ticket text ("admitted unless peer is under
 //!   suspicion or peer score below threshold"); the score check is
@@ -219,10 +220,12 @@ impl AdmissionStats {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// X0X-0074d: record a Critical send skipped because the peer is
-    /// actively cooling/suppressed (or has a recovery probe in flight).
-    /// Distinct from [`Self::record_critical_hard_error`] — this is
-    /// legitimate transient backpressure and does NOT block the soak gate.
+    /// X0X-0074d / #24: record a Critical *control* send skipped because the
+    /// peer is actively cooling/suppressed (or has a recovery probe in
+    /// flight). Critical *Data* no longer takes this path — claim/gate
+    /// aligns with admission and admits cooled peers. Distinct from
+    /// [`Self::record_critical_hard_error`] — this is legitimate transient
+    /// backpressure and does NOT block the soak gate.
     pub fn record_critical_cooling(&self) {
         self.dropped_critical_cooling
             .fetch_add(1, Ordering::Relaxed);

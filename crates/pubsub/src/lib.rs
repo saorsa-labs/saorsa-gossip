@@ -3591,15 +3591,34 @@ impl PeerCoolingState {
         self.last_bypass_probe_at = Some(now);
     }
 
-    fn claim_send_attempt_at(
+    /// Claim a send attempt, optionally treating Critical *Data* as exempt
+    /// from cooling/suppression (issue #24 — aligns claim/gate with
+    /// [`AdmissionControl::admit`]'s Critical always-admit contract).
+    ///
+    /// When `critical_data` is true:
+    /// - active suppression admits as [`SendAttemptKind::Normal`] (does not
+    ///   consume the WP6 cooldown-bypass trickle slot);
+    /// - an in-flight recovery probe no longer blocks the claim;
+    /// - a due recovery probe is still claimed so Critical traffic can
+    ///   clear suppression on success.
+    ///
+    /// Critical *control* keeps `critical_data = false` so IWANT/GRAFT
+    /// remain rate-limited by the WP6 bypass during cooldown.
+    fn claim_send_attempt_at_for(
         &mut self,
         now: Instant,
+        critical_data: bool,
     ) -> Option<(
         SendAttemptKind,
         Option<RecoveryProbeId>,
         Option<PeerRecoveryProbeEvent>,
     )> {
         if self.suppressed_until.is_some_and(|until| until > now) {
+            // Issue #24: Critical Data bypasses cooling entirely (Normal
+            // kind — no bypass-slot burn, no CooldownBypass success decay).
+            if critical_data {
+                return Some((SendAttemptKind::Normal, None, None));
+            }
             // WP6 recovery bypass: suppression previously blocked BOTH
             // eager push and lazy IHAVE/anti-entropy to this peer, so a
             // message published during the cooldown was undeliverable
@@ -3626,6 +3645,11 @@ impl PeerCoolingState {
         }
         if self.suppression_expired_at(now) {
             if self.recovery_probe_in_flight {
+                // Issue #24: Critical Data is not gated on the in-flight
+                // probe — admission already exempted it from cooling.
+                if critical_data {
+                    return Some((SendAttemptKind::Normal, None, None));
+                }
                 return None;
             }
             let recovery_probe_id = NEXT_RECOVERY_PROBE_ID.fetch_add(1, Ordering::Relaxed);
@@ -5924,10 +5948,22 @@ impl TopicState {
         snapshots
     }
 
+    /// Test helper: claim without the Critical-Data cooling exemption.
+    #[cfg(test)]
     fn claim_send_attempt_at(
         &mut self,
         peer: PeerId,
         now: Instant,
+    ) -> Option<(PeerSendAttempt, Option<PeerRecoveryProbeEvent>)> {
+        self.claim_send_attempt_at_for(peer, now, false)
+    }
+
+    /// See [`PeerCoolingState::claim_send_attempt_at_for`].
+    fn claim_send_attempt_at_for(
+        &mut self,
+        peer: PeerId,
+        now: Instant,
+        critical_data: bool,
     ) -> Option<(PeerSendAttempt, Option<PeerRecoveryProbeEvent>)> {
         let Some(cooling) = self.peer_cooling.get_mut(&peer) else {
             return Some((
@@ -5940,7 +5976,8 @@ impl TopicState {
             ));
         };
 
-        let (kind, recovery_probe_id, recovery_event) = cooling.claim_send_attempt_at(now)?;
+        let (kind, recovery_probe_id, recovery_event) =
+            cooling.claim_send_attempt_at_for(now, critical_data)?;
         Some((
             PeerSendAttempt {
                 peer,
@@ -9410,7 +9447,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 );
                 continue;
             }
-            match state.claim_send_attempt_at(peer, now) {
+            // Issue #24: Critical *Data* is exempt from cooling at the claim
+            // layer, matching `AdmissionControl::admit`. Critical *control*
+            // keeps the WP6 rate-limited bypass (see
+            // `critical_control_send_to_cooling_peer_counts_cooling_only`).
+            let critical_data = claim_context.priority == TopicPriority::Critical
+                && matches!(claim_context.send_class, OutboundSendClass::Data);
+            match state.claim_send_attempt_at_for(peer, now, critical_data) {
                 Some((attempt, recovery_event)) => {
                     let Some(permit) = claim_context.outbound_budgets.try_acquire_for_origin(
                         peer,
@@ -9428,17 +9471,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             state.abandon_unsent_recovery_probe(peer, attempt.recovery_probe_id);
                         }
                         skips.budget_exhausted += 1;
-                        if claim_context.priority == TopicPriority::Critical
-                            && matches!(claim_context.send_class, OutboundSendClass::Data)
-                        {
+                        if critical_data {
                             // X0X-0074d: Critical no longer fails on a budget
                             // lane — a None here means the per-peer Critical
                             // FIFO gate is full (genuine overload). Record the
-                            // hard error and immediately cool the peer/topic. A
-                            // full 64-deep Critical FIFO is threshold-equivalent
-                            // pressure: this peer/path is not draining fast enough,
-                            // and feeding it through five more WARNing attempts
-                            // turns controlled backpressure into log spam.
+                            // hard error. A full 64-deep Critical FIFO is
+                            // threshold-equivalent pressure: this peer/path is
+                            // not draining fast enough, and feeding it through
+                            // five more WARNing attempts turns controlled
+                            // backpressure into log spam. (Peer cooling on
+                            // overflow was removed in x0x #380 round 2.)
                             claim_context
                                 .send_path
                                 .admission
@@ -9506,19 +9548,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 None => {
                     skips.cooling += 1;
-                    if claim_context.priority == TopicPriority::Critical
-                        && matches!(claim_context.send_class, OutboundSendClass::Data)
-                    {
-                        // X0X-0074d: Critical send skipped because the peer is
-                        // actively cooling/suppressed (or has a recovery probe
-                        // in flight). Legitimate transient backpressure — NOT a
-                        // hard-error budget/gate violation.
-                        claim_context
-                            .send_path
-                            .admission
-                            .stats()
-                            .record_critical_cooling();
-                    }
+                    // Critical Data never reaches this arm (#24). Critical
+                    // control still can (WP6 bypass interval), and the
+                    // control caller records `dropped_critical_cooling`.
                     trace!(
                         peer_id = %peer,
                         topic = ?claim_context.topic,
@@ -10081,12 +10113,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         }
 
-        // X0X-0074d: per-peer Critical accounting now happens inside
-        // `claim_topic_send_attempts`, where the skip reason is known —
-        // cooling/suppression → `dropped_critical_cooling`, Critical FIFO gate
-        // overflow → `dropped_critical_hard_error`. Counting a bare
-        // attempts-vs-admitted shortfall here (the old behaviour) conflated the
-        // two and double-counted, so it is removed.
+        // X0X-0074d / #24: per-peer Critical *Data* accounting for gate
+        // overflow → `dropped_critical_hard_error` happens inside
+        // `claim_topic_send_attempts`. Critical Data no longer skips on
+        // cooling (aligned with admission). Critical *control* cooling
+        // skips are still counted at the control caller as
+        // `dropped_critical_cooling`.
 
         if claims.is_empty() {
             // No peers got attempts. Bulk reservations release when
@@ -31613,6 +31645,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue24_critical_data_claim_bypasses_active_cooling() {
+        // Regression for #24: admission always admits Critical, but the
+        // claim/gate layer used to return None for cooled peers and drop
+        // Critical *Data* (TreeKEM Welcome / membership DMs). Critical Data
+        // must keep claiming through active suppression — including multiple
+        // sends inside the WP6 bypass interval — without recording
+        // `dropped_critical_cooling`. Critical *control* remains rate-limited
+        // (see `critical_control_send_to_cooling_peer_counts_cooling_only`).
+        let peer_id = test_peer_id(1);
+        let target = test_peer_id(2);
+        let transport = RecordingTransport::new(peer_id);
+        transport.set_connected_peer_ids(vec![target]);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            peer_id,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([47u8; 32]);
+        pubsub.initialize_topic_peers(topic, vec![target]).await;
+        pubsub
+            .admission()
+            .registry()
+            .register(topic, TopicPriority::Critical);
+
+        for _ in 0..PEER_TIMEOUT_THRESHOLD {
+            pubsub
+                .record_topic_send_results(topic, Vec::new(), vec![target])
+                .await;
+        }
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic exists");
+            assert!(
+                state.is_peer_suppressed_at(target, Instant::now()),
+                "precondition: peer must be actively cooling"
+            );
+        }
+
+        // Several rapid Critical Data claims must all succeed — not just the
+        // first WP6 bypass trickle.
+        const CLAIMS: usize = 5;
+        for i in 0..CLAIMS {
+            let (claims, _) = pubsub
+                .claim_topic_send_attempts(topic, vec![target], "EAGER", true)
+                .await;
+            assert_eq!(
+                claims.attempts().len(),
+                1,
+                "Critical Data claim {i} must admit a cooled peer"
+            );
+            assert_eq!(
+                claims.skips().cooling,
+                0,
+                "Critical Data claim {i} must not skip for cooling"
+            );
+            assert_eq!(
+                claims.attempts()[0].kind,
+                SendAttemptKind::Normal,
+                "Critical Data during cooling uses Normal, not CooldownBypass"
+            );
+            // Drop permits so the Critical FIFO gate does not fill.
+            drop(claims);
+        }
+
+        let stats = pubsub.admission().stats().snapshot();
+        assert_eq!(
+            stats.dropped_critical_cooling, 0,
+            "Critical Data must never book dropped_critical_cooling"
+        );
+        assert_eq!(
+            stats.dropped_critical_hard_error, 0,
+            "cooling bypass must not be misclassified as gate overflow"
+        );
+        assert_eq!(
+            pubsub.stage_stats().cooldown_bypass_probes,
+            0,
+            "Critical Data must not consume the WP6 bypass trickle slot"
+        );
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic exists");
+            assert!(
+                state.is_peer_suppressed_at(target, Instant::now()),
+                "Critical Data Normal sends must not clear active suppression"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn critical_control_send_to_cooling_peer_counts_cooling_only() {
         // Why: the no-target split must not swallow other zero-attempt
         // causes. With WP6 the first send to an actively-cooling peer is
@@ -31621,6 +31743,7 @@ mod tests {
         // bypass probe counter increments instead, and the send reaches the
         // transport. A SECOND send inside the bypass interval IS skipped and
         // must land in cooling (not in hard-error or no-target).
+        // Issue #24 exempts Critical *Data* only; control stays here.
         let peer_id = test_peer_id(1);
         let target = test_peer_id(2);
         let transport = RecordingTransport::new(peer_id);

@@ -42,7 +42,9 @@ saorsa-pqc = "0.5"
 # QUIC transport
 # 0.27.53: receive-generation (#272), guarded-send (#298), fatal-send driver
 # retirement (#300), ENOBUFS-transient and Rustls security fixes.
-ant-quic = "=0.27.61"
+# 0.27.62: additive per-stream connection_generation() (ant-quic #327), needed
+# by x0x #1346; x0x pins ant-quic exactly, so this crate must match it.
+ant-quic = "=0.27.62"
 
 # Shared transport layer
 

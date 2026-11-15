@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.91] - 2026-11-15
+
 ### Fixed
 
+- **transport: let ant-quic choose the NAT fallback strategy (#120).** Removes
+  the hard-coded fallback selection; ant-quic now picks the best traversal path
+  based on its own connectivity probes. No wire-format change.
+- **membership: prune disconnected active peers and repair from passive (#121).**
+  Disconnected peers are removed from the active view and filled from passive,
+  keeping the fan-out stable after connection loss.
+- **pubsub: reject stale IWANT reply send claims (#123).** Claims whose sequence
+  numbers have already been superseded are dropped at admission, preventing
+  spurious retransmissions.
 - **pubsub: Critical Data claims no longer skip cooled peers (#24).**
   Admission already always admits `TopicPriority::Critical`, but the
   claim/gate layer returned `None` while a peer was suppressed (aside from
@@ -19,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without consuming the bypass trickle slot or clearing suppression on
   success. Critical *control* (IWANT/GRAFT/…) keeps the WP6 bypass
   behaviour. No wire-format or public API change.
+- **Preserve recovery intents across V3 key-cache retries (#115).** Recovery
+  intents are now carried through key-cache miss retries so that V3 recovery
+  completes correctly when the key is not yet cached on the first attempt.
 
 ### Added
 
@@ -39,6 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature-verified inbound); it is a signer-chosen correlation id, not a
   publisher identity, and never a synthesized payload hash. No wire format
   change.
+
+### Changed
+
+- **deps: ant-quic pinned to `=0.27.62`** (additive per-stream
+  `connection_generation()`, ant-quic #327; required by x0x #1346).
 
 ## [0.5.90] - 2026-10-17
 

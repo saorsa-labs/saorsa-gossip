@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.92] - 2026-11-18
+
+### Changed
+
+- **deps: ant-quic pinned to `=0.28.0`** (relay-serving opt-out, ant-quic
+  ADR-019; needed by x0x #1642). x0x pins ant-quic exactly so this crate must
+  match. Source-compatible with 0.27.x for this codebase (new
+  `NatTraversalError::AllRelaysRefused` variant and new pub fields on
+  `EndpointStats` / `NodeConfig` are additive; no exhaustive matches on those
+  types here).
+
 ## [0.5.91] - 2026-11-15
 
 ### Fixed

@@ -578,6 +578,9 @@ mod tests {
             GossipStreamType::from_ant_quic(StreamType::GossipBulk),
             Some(GossipStreamType::Bulk)
         );
-        assert_eq!(GossipStreamType::from_ant_quic(StreamType::DhtQuery), None);
+        assert_eq!(
+            GossipStreamType::from_ant_quic(StreamType::ServiceQuery),
+            None
+        );
     }
 }

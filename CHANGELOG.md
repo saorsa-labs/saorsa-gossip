@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.93] - 2026-11-19
+
 ### Added
 
 - **pubsub: replay and fan-out cause counters (x0x #1964).** Additive fields on

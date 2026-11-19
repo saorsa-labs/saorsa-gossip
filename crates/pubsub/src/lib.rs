@@ -56,6 +56,9 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 mod egress;
 pub use egress::{BytePolicy, LeafEgressConfig, LeafEgressPurposeSnapshot, LeafEgressSnapshot};
+mod ingress_meters;
+use ingress_meters::{EagerSendCause, EagerSendCauseMeters, TopicIngressMeters};
+pub use ingress_meters::{EagerSendCauseSnapshot, SignerCountSnapshot, TopicIngressSnapshot};
 use tokio::time;
 use tracing::{debug, error, info, trace, warn};
 
@@ -1117,6 +1120,11 @@ pub struct PubSubStageStats {
     outbound_kind_bytes: [AtomicU64; 5],
     /// x0x #380: EAGER publish traffic split local vs relay.
     outbound_publish_origin: OutboundPublishOriginMeters,
+    /// x0x #1964: outbound EAGER sends split by the code path that caused them.
+    eager_send_causes: EagerSendCauseMeters,
+    /// x0x #1964: bounded per-topic inbound counters (unique accepts, payload
+    /// replays, distinct and top gossip signers).
+    topic_ingress: TopicIngressMeters,
     suppression_cleanup: SuppressionCleanupStats,
 }
 
@@ -1320,6 +1328,20 @@ pub struct PubSubStageStatsSnapshot {
     /// duplicates before the ML-DSA-65 verify (the cache is the verify
     /// memo). Distinct from `verify.count`, which they never touch.
     pub eager_duplicate_dropped_pre_verify: u64,
+    /// x0x #1964: cumulative signature-valid inbound EAGER frames with a new
+    /// msg_id whose payload hash was already in the topic's payload replay
+    /// cache. Each paid one ML-DSA verify and was then dropped (not
+    /// delivered, not forwarded). Per topic in `ingress_by_topic`.
+    pub payload_replay_dropped: u64,
+    /// x0x #1964: per-topic inbound EAGER counters: unique accepts (the
+    /// per-message denominator), payload replays, distinct signers and the
+    /// top 8 signers. Bounded at 256 topics.
+    pub ingress_by_topic: BTreeMap<String, TopicIngressSnapshot>,
+    /// x0x #1964: ingress events on topics beyond the `ingress_by_topic` cap.
+    pub ingress_topics_uncounted: u64,
+    /// x0x #1964: outbound EAGER sends split by cause. For production paths
+    /// the causes sum to `outbound_by_kind["eager"].msgs`.
+    pub eager_send_causes: EagerSendCauseSnapshot,
     /// Time spent delivering accepted messages to local PlumTree subscribers.
     pub eager_fanout: StageTimingStatsSnapshot,
     /// Time spent re-publishing/forwarding messages to remote peers.
@@ -1487,6 +1509,8 @@ struct BoundedSendOrigin {
     /// IWANT serve). The send's results are then booked only through the
     /// reply lifecycle gate.
     reply: Option<EagerReplyCompletion>,
+    /// x0x #1964: cause booked with the metered EAGER send, if any.
+    eager_cause: Option<EagerSendCause>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2880,6 +2904,10 @@ impl PubSubStageStats {
             eager_duplicate_dropped_pre_verify: self
                 .eager_duplicate_dropped_pre_verify
                 .load(Ordering::Relaxed),
+            payload_replay_dropped: self.topic_ingress.payload_replay_dropped(),
+            ingress_by_topic: self.topic_ingress.snapshot(),
+            ingress_topics_uncounted: self.topic_ingress.topics_uncounted(),
+            eager_send_causes: self.eager_send_causes.snapshot(),
             eager_fanout: self.eager_fanout.snapshot(),
             republish: self.republish.snapshot(),
             republish_per_peer_timeout: self.republish_per_peer_timeout.load(Ordering::Relaxed),
@@ -3170,6 +3198,22 @@ impl PubSubStageStats {
     fn record_eager_duplicate_dropped_pre_verify(&self) {
         self.eager_duplicate_dropped_pre_verify
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// x0x #1964: `sends` metered EAGER wire sends caused by `cause`.
+    fn record_eager_send_cause(&self, cause: EagerSendCause, sends: usize) {
+        self.eager_send_causes.record(cause, sends);
+    }
+
+    /// x0x #1964: a verified EAGER with a new msg_id and a new payload.
+    fn record_ingress_accepted(&self, topic: TopicId, signer: &PeerId) {
+        self.topic_ingress.record_accepted(topic, signer);
+    }
+
+    /// x0x #1964: a verified EAGER with a new msg_id dropped as a payload
+    /// replay.
+    fn record_payload_replay_dropped(&self, topic: TopicId, signer: &PeerId) {
+        self.topic_ingress.record_payload_replay(topic, signer);
     }
 
     fn record_grafts(&self, count: usize) {
@@ -8003,12 +8047,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if message.header.topic == key_cache::control_topic() {
             return;
         }
+        self.note_verified_inbound_key_from(
+            PeerId::from_pubkey(&message.public_key),
+            message,
+            session,
+        );
+    }
+
+    /// `note_verified_inbound_key` with the signer PeerId already derived
+    /// from `message.public_key` (x0x #1964: the EAGER path derives it once
+    /// for both the key cache and the ingress signer meters).
+    fn note_verified_inbound_key_from(
+        &self,
+        signer: PeerId,
+        message: &GossipMessage,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+    ) {
+        if message.header.topic == key_cache::control_topic() {
+            return;
+        }
         if let Ok(mut cache) = self.key_cache.lock() {
-            cache.note_verified_key(
-                PeerId::from_pubkey(&message.public_key),
-                message.public_key.clone(),
-                session,
-            );
+            cache.note_verified_key(signer, message.public_key.clone(), session);
         }
     }
 
@@ -8865,6 +8924,31 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         op: &'static str,
         local_origin: bool,
     ) -> Result<PeerSendOutcome> {
+        self.send_to_peer_bounded_outcome_caused(
+            topic,
+            peer,
+            stream_type,
+            bytes,
+            op,
+            local_origin,
+            None,
+        )
+        .await
+    }
+
+    /// `send_to_peer_bounded_outcome` that also books `eager_cause` (x0x
+    /// #1964) when the EAGER send is metered. Same send behaviour.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_to_peer_bounded_outcome_caused(
+        &self,
+        topic: TopicId,
+        peer: PeerId,
+        stream_type: GossipStreamType,
+        bytes: Bytes,
+        op: &'static str,
+        local_origin: bool,
+        eager_cause: Option<EagerSendCause>,
+    ) -> Result<PeerSendOutcome> {
         self.send_to_peer_bounded_outcome_tracked(
             topic,
             peer,
@@ -8875,6 +8959,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 local: local_origin,
                 meter_publish: true,
                 reply: None,
+                eager_cause,
             },
         )
         .await
@@ -9113,6 +9198,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if op == "EAGER" && origin.meter_publish {
             self.stage_stats
                 .record_publish_origin_bytes(local_origin, bytes.len());
+        }
+        if op == "EAGER" {
+            if let Some(cause) = origin.eager_cause {
+                self.stage_stats.record_eager_send_cause(cause, 1);
+            }
         }
         let transport = Arc::clone(&self.transport);
         let egress_limiter = Arc::clone(&self.egress_limiter);
@@ -9813,6 +9903,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// dispatcher.
     ///
     /// `op` is the short label that appears in WARN logs ("EAGER", "IHAVE").
+    ///
+    /// Test entry point without an EAGER cause; production callers use
+    /// `parallel_send_to_peers_caused`, which books the x0x #1964 cause.
+    #[cfg(test)]
     async fn parallel_send_to_peers(
         &self,
         topic: TopicId,
@@ -9821,6 +9915,31 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         bytes: Bytes,
         op: &'static str,
         detach_accounting: bool,
+    ) -> (Duration, FanoutCounts, Vec<PeerId>) {
+        self.parallel_send_to_peers_caused(
+            topic,
+            peers,
+            stream_type,
+            bytes,
+            op,
+            detach_accounting,
+            None,
+        )
+        .await
+    }
+
+    /// `parallel_send_to_peers` that also books `eager_cause` (x0x #1964)
+    /// for every metered EAGER attempt. Same send behaviour.
+    #[allow(clippy::too_many_arguments)]
+    async fn parallel_send_to_peers_caused(
+        &self,
+        topic: TopicId,
+        peers: Vec<PeerId>,
+        stream_type: GossipStreamType,
+        bytes: Bytes,
+        op: &'static str,
+        detach_accounting: bool,
+        eager_cause: Option<EagerSendCause>,
     ) -> (Duration, FanoutCounts, Vec<PeerId>) {
         // Leaf byte admission precedes all existing peer/transport admission.
         // Data never waits or retains another payload copy: denied EAGER peers
@@ -9857,6 +9976,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 local: !detach_accounting,
                                 meter_publish: true,
                                 reply: None,
+                                eager_cause,
                             },
                         )
                         .await;
@@ -10165,6 +10285,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             if op == "EAGER" {
                 self.stage_stats
                     .record_publish_origin_bytes(!detach_accounting, wire_len);
+                if let Some(cause) = eager_cause {
+                    self.stage_stats.record_eager_send_cause(cause, 1);
+                }
             }
         }
         // x0x #613: the attempted peer list is returned to the caller so a
@@ -10614,19 +10737,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Publish path: await accounting (detach_accounting = false) so
         // publish() returns only after its EAGER sends are attempted and
         // outcomes are observable (succeeded is valid here).
-        let ordinary = self.parallel_send_to_peers(
+        let ordinary = self.parallel_send_to_peers_caused(
             topic,
             eager_peers,
             GossipStreamType::PubSub,
             bytes.clone(),
             "EAGER",
             false,
+            Some(EagerSendCause::PublishFanout),
         );
         let targeted = async {
             let (peer, deadline) = target?;
             let outcome = tokio::time::timeout(
                 deadline,
-                self.send_to_peer_bounded_outcome(
+                self.send_to_peer_bounded_outcome_caused(
                     topic,
                     peer,
                     GossipStreamType::PubSub,
@@ -10634,6 +10758,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     "EAGER",
                     // The targeted leg of a local publish.
                     true,
+                    Some(EagerSendCause::PublishTargeted),
                 ),
             )
             .await;
@@ -10909,7 +11034,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
 
         self.transport.migration.ingress(from, session, &message)?;
-        self.note_verified_inbound_key(&message, session);
+        // x0x #1964: the gossip signer, derived once from the verified key.
+        let signer = PeerId::from_pubkey(&message.public_key);
+        self.note_verified_inbound_key_from(signer, &message, session);
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
@@ -11020,8 +11147,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 "Payload replay detected — msg_id new but payload hash seen before"
             );
             self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+            drop(topics);
+            self.stage_stats
+                .record_payload_replay_dropped(topic, &signer);
             return Ok(());
         }
+        // x0x #1964: the per-topic "unique message" denominator — verified,
+        // new msg_id, new payload; before the validator verdict.
+        self.stage_stats.record_ingress_accepted(topic, &signer);
 
         // Storm-control validator: signature-valid, non-replay payloads
         // only. Drop keeps the msg-id in the dedupe cache (inserted above)
@@ -11171,13 +11304,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // true) so a slow peer cannot pin this worker for its full timeout
         // and starve the shared recv channel (recv_pump.dropped_full).
         let lock_wait = self
-            .parallel_send_to_peers(
+            .parallel_send_to_peers_caused(
                 topic,
                 eager_peers,
                 GossipStreamType::PubSub,
                 bytes,
                 "EAGER",
                 true,
+                Some(EagerSendCause::RelayForward),
             )
             .await
             .0;
@@ -11626,6 +11760,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     local: local_origin_only || cached.local_origin,
                     meter_publish: false,
                     reply: Some(completion),
+                    eager_cause: Some(EagerSendCause::IwantReply),
                 },
             )
             .await
@@ -11769,7 +11904,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         self.stage_stats
                             .record_publish_origin(cached.local_origin, 0, 1);
                         let _ = self
-                            .send_to_peer_bounded_with_origin(
+                            .send_to_peer_bounded_outcome_caused(
                                 topic,
                                 from,
                                 GossipStreamType::PubSub,
@@ -11779,6 +11914,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 // message this node authored is still our own
                                 // speech and must not be shed for bytes.
                                 cached.local_origin,
+                                Some(EagerSendCause::AntiEntropyPush),
                             )
                             .await;
                     }
@@ -12890,6 +13026,10 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 own_custody: Some(entry),
             });
             stage_stats.record_outbound(topic, "EAGER", bytes.len(), claims.attempts().len());
+            stage_stats.record_eager_send_cause(
+                EagerSendCause::IwantReplyDeferredRetry,
+                claims.attempts().len(),
+            );
             for _ in claims.attempts() {
                 stage_stats.record_publish_origin_bytes(cached.local_origin, bytes.len());
             }
@@ -13199,6 +13339,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let wire_len = retry_frames.get(&attempt.peer).unwrap_or(&bytes).len();
                 ctx.stage_stats.record_outbound(topic, "EAGER", wire_len, 1);
                 ctx.stage_stats.record_publish_origin_bytes(true, wire_len);
+                ctx.stage_stats
+                    .record_eager_send_cause(EagerSendCause::StrandedPublishRetry, 1);
             }
             let send_tasks = Self::spawn_bounded_send_tasks(
                 FanoutSendContext {
@@ -34004,6 +34146,324 @@ mod tests {
             "the bypass must fire immediately once a permit is available"
         );
         assert_eq!(pubsub.stage_stats().cooldown_bypass_probes, 1);
+    }
+
+    fn x0x_1964_signer_hex(key: &saorsa_gossip_identity::MlDsaKeyPair) -> String {
+        PeerId::from_pubkey(key.public_key())
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// x0x #1964: a signature-valid frame with a new msg_id and a seen
+    /// payload counts in `payload_replay_dropped` (global and per topic) and
+    /// is attributed to its gossip signer. It still pays one verify, and its
+    /// msg_id is still cached: that cache entry is why the replay lookup is
+    /// NOT moved before verify (an unverified msg_id must never enter the
+    /// cache, and without the entry later IHAVE/anti-entropy rounds would
+    /// re-pull the replay).
+    #[tokio::test]
+    async fn x0x_1964_payload_replay_counted_per_topic_and_signer() {
+        let local = test_peer_id(1);
+        let transport = RecordingTransport::new(local);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(local, transport, test_signing_key(), false);
+        let topic = TopicId::new([0x64; 32]);
+        let author = test_signing_key();
+        let republisher = test_signing_key();
+
+        let original = key_cache_eager(&author, topic, 1, b"announce-record");
+        pubsub
+            .handle_eager(test_peer_id(2), topic, original)
+            .await
+            .expect("original accepted");
+        let replay = key_cache_eager(&republisher, topic, 2, b"announce-record");
+        pubsub
+            .handle_eager(test_peer_id(3), topic, replay)
+            .await
+            .expect("replay dropped quietly");
+
+        let stats = pubsub.stage_stats();
+        assert_eq!(stats.payload_replay_dropped, 1);
+        assert_eq!(stats.ingress_topics_uncounted, 0);
+        let row = &stats.ingress_by_topic[&topic.to_string()];
+        assert_eq!(row.accepted_unique, 1);
+        assert_eq!(row.payload_replay_dropped, 1);
+        assert!((1..=2).contains(&row.distinct_signers_estimate));
+        let republisher_row = row
+            .top_signers
+            .iter()
+            .find(|s| s.signer == x0x_1964_signer_hex(&republisher))
+            .expect("republisher listed");
+        assert_eq!(republisher_row.msgs, 1);
+        assert_eq!(republisher_row.payload_replays, 1);
+        let author_row = row
+            .top_signers
+            .iter()
+            .find(|s| s.signer == x0x_1964_signer_hex(&author))
+            .expect("author listed");
+        assert_eq!(author_row.payload_replays, 0);
+
+        // Unchanged verify order: both frames were verified once.
+        assert_eq!(
+            pubsub
+                .verify_by_kind_stats()
+                .for_kind(MessageKind::Eager)
+                .attempts,
+            2
+        );
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        assert!(state.has_message(&[2u8; 32]), "replay msg_id stays cached");
+    }
+
+    /// x0x #1964: a badly signed frame with a NEW payload never seeds the
+    /// payload replay cache, so the genuine copy that follows is accepted.
+    #[tokio::test]
+    async fn x0x_1964_bad_signature_does_not_seed_replay_cache() {
+        let local = test_peer_id(1);
+        let transport = RecordingTransport::new(local);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(local, transport, test_signing_key(), false);
+        let topic = TopicId::new([0x65; 32]);
+        let author = test_signing_key();
+        let mut rx = pubsub.subscribe_ready(topic).await;
+
+        let mut forged = key_cache_eager(&author, topic, 7, b"fresh-payload");
+        if let Some(byte) = forged.signature.first_mut() {
+            *byte ^= 0xff;
+        }
+        assert!(pubsub
+            .handle_eager(test_peer_id(2), topic, forged)
+            .await
+            .is_err());
+        {
+            let key = *blake3::hash(b"fresh-payload").as_bytes();
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let seeded = topics
+                .get(&topic)
+                .is_some_and(|state| state.replay_cache.peek(&key).is_some());
+            assert!(
+                !seeded,
+                "unverified payload must not enter the replay cache"
+            );
+        }
+
+        let genuine = key_cache_eager(&author, topic, 8, b"fresh-payload");
+        pubsub
+            .handle_eager(test_peer_id(3), topic, genuine)
+            .await
+            .expect("genuine accepted");
+        let delivered = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("delivery")
+            .expect("channel open");
+        assert_eq!(delivered.1, Bytes::from_static(b"fresh-payload"));
+        let stats = pubsub.stage_stats();
+        assert_eq!(stats.payload_replay_dropped, 0);
+        assert_eq!(
+            stats.ingress_by_topic[&topic.to_string()].accepted_unique,
+            1
+        );
+    }
+
+    type X0x1964Node = (
+        PeerId,
+        Arc<RecordingTransport>,
+        Arc<PlumtreePubSub<RecordingTransport>>,
+    );
+
+    /// Deliver every recorded PubSub frame to its destination node until the
+    /// in-memory network is quiet (detached relay sends included).
+    async fn x0x_1964_pump(nodes: &[X0x1964Node], cursors: &mut [usize]) {
+        let mut idle_rounds = 0;
+        for _ in 0..500 {
+            let mut moved = false;
+            for (index, (from, transport, _)) in nodes.iter().enumerate() {
+                let frames = transport.sent_frames();
+                let fresh = frames[cursors[index]..].to_vec();
+                cursors[index] = frames.len();
+                for (to, stream, data) in fresh {
+                    if stream != GossipStreamType::PubSub {
+                        continue;
+                    }
+                    if let Some((_, _, destination)) = nodes.iter().find(|(p, _, _)| *p == to) {
+                        let _ = destination.handle_message(*from, data).await;
+                        moved = true;
+                    }
+                }
+            }
+            if moved {
+                idle_rounds = 0;
+            } else {
+                idle_rounds += 1;
+                if idle_rounds >= 5 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    /// x0x #1964: in a 5-node in-memory network (A-D a topic mesh, E only
+    /// connected), every metered EAGER send is booked under exactly one
+    /// cause, the causes sum to `outbound_by_kind["eager"]` on every node,
+    /// and both equal the EAGER frames the transports actually carried.
+    #[tokio::test]
+    async fn x0x_1964_eager_send_causes_sum_to_total_eager_sends() {
+        let topic = TopicId::new([0x66; 32]);
+        let keys: Vec<_> = (0..5).map(|_| test_signing_key()).collect();
+        let peers: Vec<PeerId> = (10..15).map(test_peer_id).collect();
+        let mesh: Vec<PeerId> = peers[..4].to_vec();
+        let nodes: Vec<X0x1964Node> = peers
+            .iter()
+            .zip(&keys)
+            .map(|(&peer, key)| {
+                let transport = RecordingTransport::new(peer);
+                transport
+                    .set_connected_peer_ids(peers.iter().copied().filter(|p| *p != peer).collect());
+                let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+                    peer,
+                    Arc::clone(&transport),
+                    key.clone(),
+                    false,
+                ));
+                (peer, transport, pubsub)
+            })
+            .collect();
+        for (peer, _, pubsub) in &nodes[..4] {
+            pubsub
+                .initialize_topic_peers(topic, mesh.iter().copied().filter(|p| p != peer).collect())
+                .await;
+        }
+        let mut cursors = vec![0usize; nodes.len()];
+        let (a, b, d, e) = (&nodes[0], &nodes[1], &nodes[3], &nodes[4]);
+
+        // Publisher fan-out, then relay forwards.
+        a.2.publish(topic, Bytes::from_static(b"m1"))
+            .await
+            .expect("publish m1");
+        x0x_1964_pump(&nodes, &mut cursors).await;
+
+        // Targeted publish leg to E, which is outside A's topic mesh. (A
+        // target already in the eager set gets no second copy: the send
+        // claim of the ordinary fan-out refuses the duplicate.)
+        let targeted =
+            a.2.publish_local_with_target(
+                topic,
+                Bytes::from_static(b"m2"),
+                e.0,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("targeted publish");
+        assert_eq!(targeted.target, TargetedPublishOutcome::Sent);
+        x0x_1964_pump(&nodes, &mut cursors).await;
+
+        // IWANT reply.
+        let m1_id = {
+            let mut topics = a.2.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("publisher topic");
+            state
+                .cached_message_ids()
+                .into_iter()
+                .find(|id| {
+                    state
+                        .get_message(id)
+                        .is_some_and(|m| m.payload.as_ref() == b"m1")
+                })
+                .expect("m1 cached")
+        };
+        a.2.handle_iwant(b.0, topic, vec![m1_id])
+            .await
+            .expect("iwant served");
+        x0x_1964_pump(&nodes, &mut cursors).await;
+
+        // Anti-entropy push: D reports an empty digest to A.
+        let digest = Bytes::from(
+            postcard::to_stdvec(&AntiEntropyPayload::Digest {
+                msg_ids: Vec::new(),
+            })
+            .expect("digest"),
+        );
+        let mut header = MessageHeader::new(topic, MessageKind::AntiEntropy, 1);
+        header.seal_payload_hash(Some(&digest));
+        let signature = keys[3]
+            .sign(&postcard::to_stdvec(&header).expect("header"))
+            .expect("sign");
+        let ae = GossipMessage {
+            header,
+            payload: Some(digest),
+            signature,
+            public_key: keys[3].public_key().to_vec(),
+        };
+        a.2.handle_anti_entropy(d.0, topic, ae)
+            .await
+            .expect("anti-entropy handled");
+        x0x_1964_pump(&nodes, &mut cursors).await;
+
+        // A targeted leg to a peer already in the eager set: one copy only.
+        let a_to_b_before = a.1.sent_frames_of_kind_to(b.0, MessageKind::Eager).len();
+        let in_mesh =
+            a.2.publish_local_with_target(
+                topic,
+                Bytes::from_static(b"m3"),
+                b.0,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("in-mesh targeted publish");
+        x0x_1964_pump(&nodes, &mut cursors).await;
+        assert_eq!(in_mesh.target, TargetedPublishOutcome::Deferred);
+        assert_eq!(
+            a.1.sent_frames_of_kind_to(b.0, MessageKind::Eager).len() - a_to_b_before,
+            1
+        );
+
+        let mut causes_total = EagerSendCauseSnapshot::default();
+        let mut eager_total = 0u64;
+        let mut eager_frames = 0u64;
+        for (peer, transport, pubsub) in &nodes {
+            let stats = pubsub.stage_stats();
+            let eager = stats.outbound_by_kind["eager"].msgs;
+            assert_eq!(
+                stats.eager_send_causes.total(),
+                eager,
+                "node {peer}: causes {:?} vs eager {eager}",
+                stats.eager_send_causes
+            );
+            eager_total += eager;
+            eager_frames += transport
+                .sent_frames()
+                .iter()
+                .filter(|(_, _, data)| peek_message_kind(data) == Some(MessageKind::Eager))
+                .count() as u64;
+            let c = &stats.eager_send_causes;
+            causes_total.publish_fanout += c.publish_fanout;
+            causes_total.publish_targeted += c.publish_targeted;
+            causes_total.relay_forward += c.relay_forward;
+            causes_total.iwant_reply += c.iwant_reply;
+            causes_total.iwant_reply_deferred_retry += c.iwant_reply_deferred_retry;
+            causes_total.anti_entropy_push += c.anti_entropy_push;
+            causes_total.stranded_publish_retry += c.stranded_publish_retry;
+            if *peer != a.0 {
+                let row = &stats.ingress_by_topic[&topic.to_string()];
+                let expected = if *peer == e.0 { 1 } else { 3 };
+                assert_eq!(row.accepted_unique, expected, "node {peer} unique accepts");
+                assert_eq!(row.payload_replay_dropped, 0);
+            }
+        }
+        assert_eq!(eager_total, eager_frames, "meters match carried frames");
+        assert_eq!(causes_total.total(), eager_total);
+        assert_eq!(
+            causes_total.publish_fanout, 9,
+            "three publishes x 3 eager peers"
+        );
+        assert_eq!(causes_total.publish_targeted, 1);
+        assert!(causes_total.relay_forward > 0);
+        assert_eq!(causes_total.iwant_reply, 1);
+        assert_eq!(causes_total.anti_entropy_push, 2, "m1 and m2 pushed to D");
     }
 }
 

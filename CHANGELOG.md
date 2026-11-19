@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **pubsub: replay and fan-out cause counters (x0x #1964).** Additive fields on
+  `PubSubStageStatsSnapshot`: `payload_replay_dropped`, `ingress_by_topic`
+  (per topic: `accepted_unique`, `payload_replay_dropped`,
+  `distinct_signers_estimate`, top 8 `top_signers`; bounded at 256 topics x 32
+  Space-Saving slots + a 256-byte HyperLogLog sketch), `ingress_topics_uncounted`
+  and `eager_send_causes` (`publish_fanout`, `publish_targeted`, `relay_forward`,
+  `iwant_reply`, `iwant_reply_deferred_retry`, `anti_entropy_push`,
+  `stranded_publish_retry`; they sum to `outbound_by_kind["eager"].msgs`).
+  Instrumentation only: no wire change and no behaviour change. The payload
+  replay lookup stays after the signature verify (see PR for why).
+
 ## [0.5.92] - 2026-11-18
 
 ### Changed

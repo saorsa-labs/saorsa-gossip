@@ -1493,10 +1493,10 @@ impl LeafEgressLimiter {
                 .fetch_add(bytes, Ordering::Relaxed);
         }
         self.charge_ready_recovery(&mut state);
-        if !state
+        if state
             .intents
             .get(&key)
-            .is_some_and(|intent| intent.charged >= intent.bytes)
+            .is_none_or(|intent| intent.charged < intent.bytes)
         {
             return Err(ReserveError::Deferred);
         }

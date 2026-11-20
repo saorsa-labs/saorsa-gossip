@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.94] - 2026-11-20
+
+### Changed
+
+- **deps: ant-quic pinned to `=0.29.0`** (hybrid MASQUE relay negotiation,
+  opt-in migration, Happy Eyeballs; ant-quic #372; needed by x0x). x0x pins
+  ant-quic exactly so this crate must match. Dependency bump only; no behaviour
+  change in saorsa-gossip. Hybrid relay mode stays off unless the embedding app
+  enables it.
+
 ## [0.5.93] - 2026-11-19
 
 ### Added

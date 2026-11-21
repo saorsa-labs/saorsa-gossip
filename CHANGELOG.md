@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.95] - 2026-11-21
+
+### Added
+
+- **crdt-sync: `OrSet::retained_tags` and `OrSet::changelog_len` (x0x
+  #2110).** `retained_tags(&element)` returns a `RetainedTags` with the
+  number of live and tombstoned tags the set holds for one element, or
+  `None` for a map slot it does not have. The two tag maps are the only
+  part of the encoding that depends on the element, so an embedding app
+  can keep the encoded size of a compacted set exact in O(touched
+  elements) instead of walking the whole set. x0x needs this for its
+  retained-image admission measure. Additive; no behaviour change.
+
 ## [0.5.94] - 2026-11-20
 
 ### Changed

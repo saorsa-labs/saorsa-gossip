@@ -66,6 +66,15 @@ pub struct OrSet<T: Hash + Eq + Clone> {
     changelog: HashMap<u64, ChangelogEntry<T>>,
 }
 
+/// What an [`OrSet`] retains for one element; see [`OrSet::retained_tags`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetainedTags {
+    /// Live tags, or `None` when the element has no live slot.
+    pub live: Option<usize>,
+    /// Tombstoned tags, or `None` when the element has no tombstone slot.
+    pub tombstoned: Option<usize>,
+}
+
 /// Deterministic, bincode-layout-compatible retained state for an [`OrSet`].
 ///
 /// It preserves every live tag and tombstone while normalizing local delta
@@ -217,6 +226,29 @@ impl<T: Hash + Eq + Clone> OrSet<T> {
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.elements.is_empty()
+    }
+
+    /// The tags this set retains for `element`: its live tags and its
+    /// tombstoned tags. `None` means the set has no map slot for it; a slot
+    /// can hold zero tags.
+    ///
+    /// The two maps are the only part of the set's serde encoding that
+    /// depends on `element`. So a caller that knows its codec can keep the
+    /// encoded size of the set up to date in O(touched elements): each slot
+    /// costs the encoded element, a length and one encoded tag per tag.
+    #[must_use]
+    pub fn retained_tags(&self, element: &T) -> RetainedTags {
+        RetainedTags {
+            live: self.elements.get(element).map(HashSet::len),
+            tombstoned: self.tombstones.get(element).map(HashSet::len),
+        }
+    }
+
+    /// The number of changelog entries this set holds. It is zero after
+    /// `compact(0)`.
+    #[must_use]
+    pub fn changelog_len(&self) -> usize {
+        self.changelog.len()
     }
 
     fn record_changelog_entry(
@@ -713,6 +745,111 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// bincode size of `set` computed from `retained_tags` over `keys`
+    /// (every element the set has ever seen), for a set with no changelog.
+    fn size_from_retained_tags(set: &OrSet<String>, keys: &[String]) -> u64 {
+        let tag = bincode::serialized_size(&(peer(0), 0u64)).unwrap();
+        let empty = bincode::serialized_size(&OrSet::<String>::new()).unwrap();
+        keys.iter().fold(empty, |sum, key| {
+            let r = set.retained_tags(key);
+            let slot =
+                |n: Option<usize>| n.map_or(0, |n| 8 + key.len() as u64 + 8 + n as u64 * tag);
+            sum + slot(r.live) + slot(r.tombstoned)
+        })
+    }
+
+    #[test]
+    fn retained_tags_reports_live_and_tombstoned_slots() {
+        let mut set = OrSet::new();
+        let k = "k".to_string();
+        assert_eq!(set.retained_tags(&k), RetainedTags::default());
+        set.add(k.clone(), (peer(1), 1)).unwrap();
+        set.add(k.clone(), (peer(2), 1)).unwrap();
+        set.add(k.clone(), (peer(2), 1)).unwrap();
+        assert_eq!(
+            set.retained_tags(&k),
+            RetainedTags {
+                live: Some(2),
+                tombstoned: None
+            }
+        );
+        set.remove(&k).unwrap();
+        assert_eq!(
+            set.retained_tags(&k),
+            RetainedTags {
+                live: None,
+                tombstoned: Some(2)
+            }
+        );
+        // An add of a tombstoned tag takes it back out of the tombstones.
+        set.add(k.clone(), (peer(1), 1)).unwrap();
+        assert_eq!(
+            set.retained_tags(&k),
+            RetainedTags {
+                live: Some(1),
+                tombstoned: Some(1)
+            }
+        );
+        assert!(set.changelog_len() > 0);
+        set.compact(0);
+        assert_eq!(set.changelog_len(), 0);
+    }
+
+    #[test]
+    fn a_merged_empty_tombstone_set_keeps_its_slot() {
+        let mut set = OrSet::<String>::new();
+        let k = "k".to_string();
+        let delta = OrSetDelta {
+            added: HashMap::new(),
+            removed: HashMap::from([(k.clone(), HashSet::new())]),
+            version: 1,
+        };
+        DeltaCrdt::merge(&mut set, &delta).unwrap();
+        assert_eq!(
+            set.retained_tags(&k),
+            RetainedTags {
+                live: None,
+                tombstoned: Some(0)
+            }
+        );
+        set.compact(0);
+        assert_eq!(
+            bincode::serialized_size(&set).unwrap(),
+            size_from_retained_tags(&set, &[k])
+        );
+    }
+
+    proptest::proptest! {
+        /// The encoded size of a compacted set is the empty set's size plus
+        /// what `retained_tags` reports, element by element.
+        #[test]
+        fn retained_tags_account_for_the_encoded_size(
+            ops in proptest::collection::vec((0u8..4, 0u8..5, 0u8..3, 0u64..4), 0..60)
+        ) {
+            let keys: Vec<String> = (0..5).map(|i| "k".repeat(i + 1)).collect();
+            let mut set = OrSet::new();
+            let mut other = OrSet::new();
+            for (op, key, p, seq) in ops {
+                let key = keys[key as usize].clone();
+                match op {
+                    0 => set.add(key, (peer(p), seq)).unwrap(),
+                    1 => set.remove(&key).unwrap(),
+                    2 => other.add(key, (peer(p), seq)).unwrap(),
+                    _ => {
+                        other.remove(&key).unwrap();
+                        set.merge_state(&other).unwrap();
+                    }
+                }
+            }
+            set.compact(0);
+            proptest::prop_assert_eq!(set.changelog_len(), 0);
+            proptest::prop_assert_eq!(
+                bincode::serialized_size(&set).unwrap(),
+                size_from_retained_tags(&set, &keys)
+            );
+        }
+    }
 
     fn peer(n: u8) -> PeerId {
         PeerId::new([n; 32])

@@ -76,6 +76,35 @@ pub struct RetainedTags {
     pub tombstoned: Option<usize>,
 }
 
+/// An undo log for an [`OrSet`]; see [`OrSet::begin_undo`].
+///
+/// It holds the set's `version`, changelog floor and changelog from when it
+/// began, and the slots of each element saved with
+/// [`OrSet::save_for_undo`]. Pass it to [`OrSet::undo`] on the same set.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct OrSetUndo<T: Hash + Eq + Clone> {
+    version: u64,
+    changelog_floor: u64,
+    changelog: HashMap<u64, ChangelogEntry<T>>,
+    saved: HashMap<T, SavedSlots>,
+}
+
+impl<T: Hash + Eq + Clone> OrSetUndo<T> {
+    /// The number of elements this log has saved.
+    #[must_use]
+    pub fn saved_len(&self) -> usize {
+        self.saved.len()
+    }
+}
+
+/// One element's live and tombstone slots, as saved for an undo.
+#[derive(Debug, Clone)]
+struct SavedSlots {
+    live: Option<HashSet<UniqueTag>>,
+    tombstoned: Option<HashSet<UniqueTag>>,
+}
+
 /// Deterministic, bincode-layout-compatible retained state for an [`OrSet`].
 ///
 /// It preserves every live tag and tombstone while normalizing local delta
@@ -253,6 +282,83 @@ impl<T: Hash + Eq + Clone> OrSet<T> {
     #[must_use]
     pub fn changelog_len(&self) -> usize {
         self.changelog.len()
+    }
+
+    /// Start an undo log for changes this set is about to take.
+    ///
+    /// The log keeps this set's `version`, changelog floor and a copy of its
+    /// changelog. Before each change, the caller passes every element that
+    /// change can touch to [`save_for_undo`](Self::save_for_undo).
+    /// [`undo`](Self::undo) then puts the set back to its state at this call.
+    ///
+    /// Cost: O(changelog entries now held), which is O(1) after
+    /// `compact(0)`. The log does not copy the live tags or tombstones.
+    #[must_use]
+    pub fn begin_undo(&self) -> OrSetUndo<T> {
+        OrSetUndo {
+            version: self.version,
+            changelog_floor: self.changelog_floor,
+            changelog: self.changelog.clone(),
+            saved: HashMap::new(),
+        }
+    }
+
+    /// Record in `undo` the live and tombstone slots `element` has now,
+    /// unless `undo` already holds them.
+    ///
+    /// Call it before any change that can touch `element`: `add` and
+    /// `remove` of that element, and `merge_state` or a delta merge whose
+    /// live or tombstone maps name it. The first call for an element wins,
+    /// so calling it again after a change keeps the state from before the
+    /// first change. Cost: O(tags this set holds for `element`).
+    pub fn save_for_undo(&self, undo: &mut OrSetUndo<T>, element: &T) {
+        if undo.saved.contains_key(element) {
+            return;
+        }
+        let slots = SavedSlots {
+            live: self.elements.get(element).cloned(),
+            tombstoned: self.tombstones.get(element).cloned(),
+        };
+        undo.saved.insert(element.clone(), slots);
+    }
+
+    /// Put this set back to its state when `undo` began.
+    ///
+    /// The result is exact (live tags, tombstones, `version`, changelog
+    /// floor and changelog) when the caller kept the invariant of
+    /// [`save_for_undo`](Self::save_for_undo): every element that a change
+    /// after [`begin_undo`](Self::begin_undo) touched was saved before that
+    /// change. `compact` after `begin_undo` is allowed. The order of
+    /// entries inside the internal hash maps, and so the order of entries
+    /// in this set's own serialization, can differ from the order before;
+    /// [`canonical_retained_wire`](Self::canonical_retained_wire) does not
+    /// depend on it.
+    ///
+    /// Cost: O(saved elements and their tags + changelog entries held by
+    /// `undo` or by this set). An error means `undo` cannot come from this
+    /// set (its version is later than this set's); the set is not changed.
+    pub fn undo(&mut self, undo: OrSetUndo<T>) -> Result<()> {
+        if undo.version > self.version {
+            anyhow::bail!(
+                "undo log version {} is later than the set version {}",
+                undo.version,
+                self.version
+            );
+        }
+        for (element, slots) in undo.saved {
+            match slots.live {
+                Some(tags) => self.elements.insert(element.clone(), tags),
+                None => self.elements.remove(&element),
+            };
+            match slots.tombstoned {
+                Some(tags) => self.tombstones.insert(element, tags),
+                None => self.tombstones.remove(&element),
+            };
+        }
+        self.version = undo.version;
+        self.changelog_floor = undo.changelog_floor;
+        self.changelog = undo.changelog;
+        Ok(())
     }
 
     fn record_changelog_entry(
@@ -855,6 +961,189 @@ mod tests {
                 bincode::serialized_size(&set.canonical_retained_wire()).unwrap(),
                 expected
             );
+        }
+    }
+
+    fn sorted_tags(tags: &HashSet<UniqueTag>) -> Vec<([u8; 32], u64)> {
+        let mut tags: Vec<_> = tags.iter().map(|(p, s)| (*p.as_bytes(), *s)).collect();
+        tags.sort_unstable();
+        tags
+    }
+
+    fn sorted_map(map: &HashMap<String, HashSet<UniqueTag>>) -> CanonicalMap {
+        map.iter()
+            .map(|(k, v)| (k.clone(), sorted_tags(v)))
+            .collect()
+    }
+
+    type CanonicalMap = BTreeMap<String, Vec<([u8; 32], u64)>>;
+
+    /// Every field of `set` in a deterministic encoding: live tags,
+    /// tombstones, version, changelog floor and changelog.
+    fn full_state_bytes(set: &OrSet<String>) -> Vec<u8> {
+        let changelog: BTreeMap<u64, (CanonicalMap, CanonicalMap)> = set
+            .changelog
+            .iter()
+            .map(|(v, (a, r))| (*v, (sorted_map(a), sorted_map(r))))
+            .collect();
+        bincode::serialize(&(
+            sorted_map(&set.elements),
+            sorted_map(&set.tombstones),
+            set.version,
+            set.changelog_floor,
+            changelog,
+        ))
+        .unwrap()
+    }
+
+    /// One step of a random OR-Set history. `set` takes ops 0, 1, 4 and 5
+    /// directly; ops 2 and 3 build concurrent state in `other` and merge it.
+    /// Each element a step can touch is saved in `undo` first.
+    fn apply_step(
+        set: &mut OrSet<String>,
+        other: &mut OrSet<String>,
+        mut undo: Option<&mut OrSetUndo<String>>,
+        (op, key, p, seq): (u8, String, u8, u64),
+    ) {
+        let mut save = |set: &OrSet<String>, keys: Vec<String>| {
+            if let Some(undo) = undo.as_deref_mut() {
+                for k in &keys {
+                    set.save_for_undo(undo, k);
+                }
+            }
+        };
+        match op {
+            0 => {
+                save(set, vec![key.clone()]);
+                set.add(key, (peer(p), seq)).unwrap();
+            }
+            1 => {
+                save(set, vec![key.clone()]);
+                set.remove(&key).unwrap();
+            }
+            2 => {
+                other.add(key, (peer(p), seq)).unwrap();
+                let keys = other
+                    .elements
+                    .keys()
+                    .chain(other.tombstones.keys())
+                    .cloned()
+                    .collect();
+                save(set, keys);
+                set.merge_state(other).unwrap();
+            }
+            3 => {
+                other.remove(&key).unwrap();
+                if let Some(delta) = other.delta(0) {
+                    let keys = delta
+                        .added
+                        .keys()
+                        .chain(delta.removed.keys())
+                        .cloned()
+                        .collect();
+                    save(set, keys);
+                    DeltaCrdt::merge(set, &delta).unwrap();
+                }
+            }
+            4 => set.compact(seq),
+            _ => {
+                // Re-add a tag this set has tombstoned, if it has one.
+                let tag = set
+                    .tombstones
+                    .get(&key)
+                    .and_then(|t| t.iter().min_by_key(|(p, s)| (*p.as_bytes(), *s)))
+                    .copied()
+                    .unwrap_or((peer(p), seq));
+                save(set, vec![key.clone()]);
+                set.add(key, tag).unwrap();
+            }
+        }
+    }
+
+    fn assert_same_state(after: &OrSet<String>, before: &OrSet<String>, keys: &[String]) {
+        assert_eq!(full_state_bytes(after), full_state_bytes(before));
+        assert_eq!(after.elements, before.elements);
+        assert_eq!(after.tombstones, before.tombstones);
+        assert_eq!(after.changelog, before.changelog);
+        assert_eq!(after.version(), before.version());
+        assert_eq!(after.changelog_len(), before.changelog_len());
+        assert_eq!(after.changelog_floor, before.changelog_floor);
+        assert_eq!(
+            bincode::serialized_size(after).unwrap(),
+            bincode::serialized_size(before).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&after.canonical_retained_wire()).unwrap(),
+            bincode::serialize(&before.canonical_retained_wire()).unwrap()
+        );
+        for k in keys {
+            assert_eq!(after.retained_tags(k), before.retained_tags(k));
+        }
+        for since in 0..=before.version() + 1 {
+            let canon = |d: Option<OrSetDelta<String>>| {
+                d.map(|d| (sorted_map(&d.added), sorted_map(&d.removed), d.version))
+            };
+            assert_eq!(canon(after.delta(since)), canon(before.delta(since)));
+        }
+    }
+
+    #[test]
+    fn undo_restores_a_removed_element_and_the_changelog() {
+        let k = "k".to_string();
+        let mut set = OrSet::new();
+        set.add(k.clone(), (peer(1), 1)).unwrap();
+        set.add("other".to_string(), (peer(1), 2)).unwrap();
+        let before = set.clone();
+        let mut undo = set.begin_undo();
+        set.save_for_undo(&mut undo, &k);
+        set.remove(&k).unwrap();
+        set.save_for_undo(&mut undo, &"new".to_string());
+        set.add("new".to_string(), (peer(2), 1)).unwrap();
+        // A second save after a change keeps the first saved slots.
+        set.save_for_undo(&mut undo, &k);
+        set.compact(0);
+        assert_eq!(undo.saved_len(), 2);
+        set.undo(undo).unwrap();
+        assert_same_state(&set, &before, &[k, "new".to_string()]);
+    }
+
+    #[test]
+    fn undo_refuses_a_log_later_than_the_set() {
+        let mut ahead = OrSet::new();
+        ahead.add("k".to_string(), (peer(1), 1)).unwrap();
+        let undo = ahead.begin_undo();
+        let mut set = OrSet::<String>::new();
+        assert!(set.undo(undo).is_err());
+        assert_eq!(set.version(), 0);
+    }
+
+    proptest::proptest! {
+        /// Undo after any history of adds, re-adds, removes, concurrent
+        /// merges and compactions gives back the exact state from before,
+        /// and the set then behaves the same as a copy that never changed.
+        #[test]
+        fn undo_restores_the_exact_prior_state(
+            prefix in proptest::collection::vec((0u8..6, 0u8..5, 0u8..3, 0u64..4), 0..40),
+            changes in proptest::collection::vec((0u8..6, 0u8..5, 0u8..3, 0u64..4), 0..40)
+        ) {
+            let keys: Vec<String> = (0..5).map(|i| "k".repeat(i + 1)).collect();
+            let mut set = OrSet::new();
+            let mut other = OrSet::new();
+            for (op, key, p, seq) in prefix {
+                apply_step(&mut set, &mut other, None, (op, keys[key as usize].clone(), p, seq));
+            }
+            let mut before = set.clone();
+            let mut undo = set.begin_undo();
+            for (op, key, p, seq) in changes {
+                let step = (op, keys[key as usize].clone(), p, seq);
+                apply_step(&mut set, &mut other, Some(&mut undo), step);
+            }
+            set.undo(undo).unwrap();
+            assert_same_state(&set, &before, &keys);
+            // The next change gives the same state on both.
+            set.add(keys[0].clone(), (peer(9), 9)).unwrap();
+            before.add(keys[0].clone(), (peer(9), 9)).unwrap();
+            assert_same_state(&set, &before, &keys);
         }
     }
 

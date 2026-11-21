@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.96] - 2026-11-21
+
+### Added
+
+- **crdt-sync: O(delta) undo for `OrSet` (x0x #2146).**
+  `OrSet::begin_undo() -> OrSetUndo<T>` starts an undo log that keeps the
+  set's `version`, changelog floor and changelog (O(changelog), O(1) after
+  `compact(0)`). `OrSet::save_for_undo(&self, &mut OrSetUndo<T>, &T)`
+  saves one element's live and tombstone slots before a change that can
+  touch it (first save wins; O(that element's tags)).
+  `OrSet::undo(&mut self, OrSetUndo<T>) -> Result<()>` puts back the saved
+  slots, `version`, changelog floor and changelog, so the set equals its
+  state at `begin_undo` when every touched element was saved; `compact`
+  in between is allowed. The cost is O(saved elements and their tags), not
+  O(set). `OrSetUndo` is `#[non_exhaustive]` and has `saved_len()`. x0x
+  needs this to roll back a refused over-bound KV delta without cloning the
+  whole OR-Set. Additive; no behaviour change. The order of entries in the
+  set's own (hash-map) serialization can differ after an undo; the
+  canonical retained encoding does not.
+
 ## [0.5.95] - 2026-11-21
 
 ### Added

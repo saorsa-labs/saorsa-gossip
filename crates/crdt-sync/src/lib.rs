@@ -67,7 +67,8 @@ pub struct OrSet<T: Hash + Eq + Clone> {
 }
 
 /// What an [`OrSet`] retains for one element; see [`OrSet::retained_tags`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub struct RetainedTags {
     /// Live tags, or `None` when the element has no live slot.
     pub live: Option<usize>,
@@ -232,10 +233,13 @@ impl<T: Hash + Eq + Clone> OrSet<T> {
     /// tombstoned tags. `None` means the set has no map slot for it; a slot
     /// can hold zero tags.
     ///
-    /// The two maps are the only part of the set's serde encoding that
-    /// depends on `element`. So a caller that knows its codec can keep the
-    /// encoded size of the set up to date in O(touched elements): each slot
-    /// costs the encoded element, a length and one encoded tag per tag.
+    /// The counts give the exact size of the canonical retained encoding
+    /// ([`OrSet::canonical_retained_wire`], fixint bincode), and of the
+    /// set's own encoding only while its changelog is empty (for example
+    /// after `compact(0)`). The two tag maps are the only part of that
+    /// encoding that depends on `element`, so a caller can keep its size up
+    /// to date in O(touched elements): each slot costs the encoded element,
+    /// a length and one encoded tag per tag. The changelog is not counted.
     #[must_use]
     pub fn retained_tags(&self, element: &T) -> RetainedTags {
         RetainedTags {
@@ -821,8 +825,9 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// The encoded size of a compacted set is the empty set's size plus
-        /// what `retained_tags` reports, element by element.
+        /// The encoded size of a compacted set, and of its canonical
+        /// retained form, is the empty set's size plus what `retained_tags`
+        /// reports, element by element.
         #[test]
         fn retained_tags_account_for_the_encoded_size(
             ops in proptest::collection::vec((0u8..4, 0u8..5, 0u8..3, 0u64..4), 0..60)
@@ -844,9 +849,11 @@ mod tests {
             }
             set.compact(0);
             proptest::prop_assert_eq!(set.changelog_len(), 0);
+            let expected = size_from_retained_tags(&set, &keys);
+            proptest::prop_assert_eq!(bincode::serialized_size(&set).unwrap(), expected);
             proptest::prop_assert_eq!(
-                bincode::serialized_size(&set).unwrap(),
-                size_from_retained_tags(&set, &keys)
+                bincode::serialized_size(&set.canonical_retained_wire()).unwrap(),
+                expected
             );
         }
     }

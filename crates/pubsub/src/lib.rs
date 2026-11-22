@@ -169,6 +169,9 @@ const MIN_EAGER_DEGREE: usize = 6;
 const MAX_EAGER_DEGREE: usize = 12;
 /// Maximum number of preferred eager peers supplied by a topic owner.
 const MAX_PREFERRED_EAGER_PEERS: usize = 8;
+/// Wave 1 (#136): backoff after duplicate-triggered local PRUNE so the 30 s
+/// `maintain_degree_at` pass does not immediately re-graft a redundant eager peer.
+const DUPLICATE_PRUNE_BACKOFF: Duration = Duration::from_secs(10);
 
 /// Per-peer budget for an EAGER republish / IHAVE flush send.
 ///
@@ -3741,6 +3744,19 @@ impl PeerCoolingState {
     }
 }
 
+/// Verified origin authentication retained in [`CachedMessage`] so IWANT
+/// replies and anti-entropy pushes forward the origin-signed frame verbatim
+/// without re-signing with the forwarder's own key (Wave 1, #136).
+///
+/// The public key is stored as a shared `Arc<[u8]>` (interned via `KeyCache`
+/// when available) so repeated messages from the same signer share one
+/// 1,952-byte allocation.
+#[derive(Clone)]
+struct CachedOriginAuth {
+    signature: Vec<u8>,
+    public_key: Arc<[u8]>,
+}
+
 /// Cached message entry
 #[derive(Clone)]
 struct CachedMessage {
@@ -3748,6 +3764,9 @@ struct CachedMessage {
     payload: Bytes,
     /// Message header
     header: MessageHeader,
+    /// Verified origin signature + shared public key for verbatim repair serve.
+    /// `None` only for synthetic test-injected entries that bypass publish/ingress.
+    origin_auth: Option<CachedOriginAuth>,
     /// Storm-control: a validator dropped this message. It stays cached
     /// for dedupe (PRUNE/GRAFT coherence) but must never leave this node
     /// — IWANT service and anti-entropy reconciliation refuse to serve it.
@@ -4557,6 +4576,9 @@ struct TopicState {
     last_activity: Instant,
     /// Send-side timeout/cooldown state keyed by peer for this topic.
     peer_cooling: HashMap<PeerId, PeerCoolingState>,
+    /// Wave 1 (#136): peers recently demoted on duplicate receipt are held out
+    /// of eager re-graft until the deadline expires (`DUPLICATE_PRUNE_BACKOFF`).
+    prune_backoff: HashMap<PeerId, Instant>,
     /// Last score-driven eager replacement pass.
     last_opportunistic_graft: Option<Instant>,
     /// Local publishes whose eligible eager fan-out set was empty (issue
@@ -4892,6 +4914,7 @@ impl TopicState {
             replay_ttl: Duration::from_secs(REPLAY_CACHE_TTL_SECS),
             last_activity: Instant::now(),
             peer_cooling: HashMap::new(),
+            prune_backoff: HashMap::new(),
             last_opportunistic_graft: None,
             zero_fanout_publishes: 0,
             last_zero_fanout_warn: None,
@@ -4939,6 +4962,18 @@ impl TopicState {
     ) {
         self.subscribers
             .retain(|tx| tx.send(from, payload.clone(), msg_id));
+    }
+
+    /// Read-only payload replay probe (Wave 1, #136): returns `true` when the
+    /// payload hash is already present in `replay_cache` and within `replay_ttl`.
+    /// Never mutates or inserts into `replay_cache`, so it is safe to run
+    /// pre-verify under a read lock without allowing unverified frames to
+    /// poison the cache.
+    fn has_live_payload_replay(&self, payload: &[u8]) -> bool {
+        let key: [u8; 32] = *blake3::hash(payload).as_bytes();
+        self.replay_cache
+            .peek(&key)
+            .is_some_and(|entry| entry.inserted_at.elapsed() < self.replay_ttl)
     }
 
     /// Check if a payload has been seen before (replay detection).
@@ -5384,13 +5419,26 @@ impl TopicState {
             .retain(|entry| !ids.contains(&entry.msg_id) || entry.has_unresolved_retained_target());
     }
 
-    /// Add message to cache
+    /// Add message to cache without origin auth (retained for synthetic unit tests).
+    #[cfg(test)]
     fn cache_message(
         &mut self,
         msg_id: MessageIdType,
         payload: Bytes,
         header: MessageHeader,
         local_origin: bool,
+    ) -> bool {
+        self.cache_message_with_auth(msg_id, payload, header, local_origin, None)
+    }
+
+    /// Add message to cache along with verified origin auth for verbatim repair.
+    fn cache_message_with_auth(
+        &mut self,
+        msg_id: MessageIdType,
+        payload: Bytes,
+        header: MessageHeader,
+        local_origin: bool,
+        origin_auth: Option<CachedOriginAuth>,
     ) -> bool {
         debug!(
             target: "sg.payload.trace",
@@ -5413,6 +5461,7 @@ impl TopicState {
         let cached = CachedMessage {
             payload,
             header,
+            origin_auth,
             dropped: false,
             local_origin,
             inner_proof: None,
@@ -5641,6 +5690,8 @@ impl TopicState {
             state.suppressed_until.is_some_and(|until| until > now)
                 || state.recovery_probe_in_flight
         });
+        self.prune_backoff
+            .retain(|peer, until| is_member(peer) && *until > now);
     }
 
     fn clean_cache(&mut self) {
@@ -5889,6 +5940,10 @@ impl TopicState {
         self.peer_cooling
             .get(&peer)
             .is_none_or(|state| state.can_graft_at(now))
+            && self
+                .prune_backoff
+                .get(&peer)
+                .is_none_or(|&until| until <= now)
     }
 
     fn record_inbound_peer_activity_at(&mut self, peer: PeerId, now: Instant) -> bool {
@@ -6341,6 +6396,7 @@ impl TopicState {
         // outlive the connection (the disconnect transition).
         self.drop_eager_reply_records_for_peer(peer);
         let cooling = self.peer_cooling.remove(&peer).is_some();
+        self.prune_backoff.remove(&peer);
         NotConnectedEviction {
             eager,
             lazy,
@@ -6358,6 +6414,8 @@ impl TopicState {
         for peer in &removed {
             self.peer_cooling.remove(peer);
         }
+        self.prune_backoff
+            .retain(|peer, _| connected_set.contains(peer));
         removed
     }
 
@@ -6366,6 +6424,19 @@ impl TopicState {
         if self.eager_peers.remove(&peer) {
             self.lazy_peers.insert(peer);
             debug!(peer_id = %peer, "PRUNE: moved peer from eager to lazy");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move peer from eager to lazy due to duplicate EAGER receipt and record
+    /// a `DUPLICATE_PRUNE_BACKOFF` (10 s) window so `maintain_degree_at` does
+    /// not immediately re-graft it (Wave 1, #136).
+    fn prune_peer_for_duplicate_at(&mut self, peer: PeerId, now: Instant) -> bool {
+        if self.prune_peer(peer) {
+            self.prune_backoff
+                .insert(peer, now + DUPLICATE_PRUNE_BACKOFF);
             true
         } else {
             false
@@ -6434,6 +6505,21 @@ impl TopicState {
         self.preferred_eager_peers.contains(&peer) && self.is_score_eligible_for_eager_at(peer, now)
     }
 
+    /// Wave 1 (#136): cap non-prunable healthy preferred eager slots to
+    /// `min(preferred_count, 1)` per topic. If another healthy preferred peer
+    /// is already present in `eager_peers`, `peer` may be demoted to lazy on
+    /// duplicate EAGER receipts (remaining eligible for fast IHAVE/IWANT repair
+    /// and re-graft after `DUPLICATE_PRUNE_BACKOFF`).
+    fn is_pinned_preferred_eager_at(&self, peer: PeerId, now: Instant) -> bool {
+        if !self.is_healthy_preferred_at(peer, now) {
+            return false;
+        }
+        !self
+            .eager_peers
+            .iter()
+            .any(|&other| other != peer && self.is_healthy_preferred_at(other, now))
+    }
+
     fn apply_preferred_eager_at(&mut self, now: Instant) -> (usize, usize) {
         let mut pruned = 0;
         let mut grafted = 0;
@@ -6470,6 +6556,7 @@ impl TopicState {
     }
 
     fn maintain_degree_at(&mut self, now: Instant) -> (usize, usize) {
+        self.prune_backoff.retain(|_, until| *until > now);
         let (mut pruned, mut grafted) = self.apply_preferred_eager_at(now);
 
         if self.eager_peers.len() > self.max_eager_degree {
@@ -6525,6 +6612,32 @@ impl TopicState {
             }
             for peer in peers {
                 if self.graft_peer_at(peer, now) {
+                    grafted += 1;
+                }
+            }
+        }
+
+        // Liveness guard (Wave 1, #136): if duplicate-prune backoff left a tiny
+        // topic with zero eager peers while a non-cooled lazy peer is available,
+        // release the highest-scoring non-cooled lazy peer from prune backoff
+        // so the topic never stalls with 0 eager peers.
+        if self.eager_peers.is_empty() && !self.lazy_peers.is_empty() {
+            if let Some(best) = self
+                .lazy_peers
+                .iter()
+                .copied()
+                .filter(|peer| {
+                    self.peer_cooling
+                        .get(peer)
+                        .is_none_or(|state| state.can_graft_at(now))
+                })
+                .max_by(|a, b| {
+                    self.peer_score_at(*a, now)
+                        .total_cmp(&self.peer_score_at(*b, now))
+                })
+            {
+                self.prune_backoff.remove(&best);
+                if self.graft_peer_at(best, now) {
                     grafted += 1;
                 }
             }
@@ -7847,13 +7960,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             "hop-local v3 control signer is not adjacent peer"
                         );
                     }
-                    // The sender compresses to a reference using ITS
-                    // priority table, which can disagree with ours (Normal
-                    // there, Critical here). Hard-rejecting here would
-                    // silently lose the message, so the skew only counts and
-                    // the frame resolves through the ordinary cache path —
-                    // a miss queues the frame and requests the key.
-                    let priority_skew = self
+                    // Wave 1 (#136): Critical topics may use key references
+                    // once the receiver has acknowledged the signer on this
+                    // session generation. Count `critical_ref_mismatches` only
+                    // when a Critical reference actually misses the local cache
+                    // (e.g. eviction or un-acknowledged priority skew).
+                    let is_critical = self
                         .admission
                         .registry()
                         .priority_for(&message.header.topic)
@@ -7863,10 +7975,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             .key_cache
                             .lock()
                             .map_err(|_| anyhow!("key cache poisoned"))?;
-                        if priority_skew {
+                        let resolved = cache.lookup(key_id);
+                        if is_critical && resolved.is_none() {
                             cache.record_critical_ref_mismatch();
                         }
-                        cache.lookup(key_id)
+                        resolved
                     };
                     let Some(key) = key else {
                         if let Ok(mut cache) = self.key_cache.lock() {
@@ -8069,6 +8182,41 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if let Ok(mut cache) = self.key_cache.lock() {
             cache.note_verified_key(signer, message.public_key.clone(), session);
         }
+    }
+
+    /// Wave 1 (#136): queue a key-cache Ack on the pre-verify duplicate path
+    /// ONLY if `KeyCache::resolved` already holds this verified key matching
+    /// byte-for-byte. Never learns an unverified key.
+    fn note_duplicate_inbound_key(
+        &self,
+        message: &GossipMessage,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+    ) {
+        if message.header.topic == key_cache::control_topic()
+            || message.public_key.len() != key_cache::KEY_BYTES
+        {
+            return;
+        }
+        let signer = PeerId::from_pubkey(&message.public_key);
+        if let Ok(mut cache) = self.key_cache.lock() {
+            cache.note_duplicate_known_key(signer, &message.public_key, session);
+        }
+    }
+
+    /// Share one `Arc<[u8]>` public-key allocation per signer with `KeyCache`
+    /// when available, avoiding per-message copies in `CachedMessage`.
+    fn intern_pubkey(&self, pubkey: &[u8]) -> Arc<[u8]> {
+        if pubkey.len() == key_cache::KEY_BYTES {
+            let signer = PeerId::from_pubkey(pubkey);
+            if let Ok(cache) = self.key_cache.lock() {
+                if let Some(shared) = cache.lookup_arc(signer) {
+                    if shared.as_ref() == pubkey {
+                        return shared;
+                    }
+                }
+            }
+        }
+        Arc::from(pubkey)
     }
 
     /// Create a new Plumtree pub/sub instance
@@ -10689,8 +10837,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .entry(topic)
             .or_insert_with(|| self.new_topic_state());
 
-        // Add to cache
-        if state.cache_message(msg_id, payload.clone(), header, true) {
+        // Add to cache (retaining verified origin signature + shared pubkey for
+        // verbatim IWANT / anti-entropy repair, Wave 1 #136).
+        let origin_auth = CachedOriginAuth {
+            signature: _message.signature.clone(),
+            public_key: self.intern_pubkey(&_message.public_key),
+        };
+        if state.cache_message_with_auth(msg_id, payload.clone(), header, true, Some(origin_auth)) {
             state.set_inner_proof(msg_id, inner_proof);
         }
 
@@ -10981,11 +11134,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let lock_started = Instant::now();
             let topics = self.topics.read_topic(&topic).await;
             self.record_stage(PubSubStage::DedupeLockAcquireRead, lock_started);
-            let duplicate = topics
-                .get(&topic)
-                .is_some_and(|state| state.has_message(&msg_id));
+            let (duplicate, payload_replay) = topics.get(&topic).map_or((false, false), |state| {
+                let dup = state.has_message(&msg_id);
+                let replay = !dup
+                    && message
+                        .payload
+                        .as_deref()
+                        .is_some_and(|p| state.has_live_payload_replay(p));
+                (dup, replay)
+            });
             drop(topics);
             if duplicate {
+                // Wave 1 (#136): ACK an already-verified signer key on the
+                // duplicate path without learning unverified keys or spending
+                // ML-DSA verification CPU.
+                self.note_duplicate_inbound_key(&message, session);
                 let lock_started = Instant::now();
                 let mut topics = self.topics.write_topic(&topic).await;
                 self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
@@ -11001,10 +11164,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     .filter(|state| state.has_message(&msg_id))
                 {
                     state.touch();
-                    // Keep healthy preferred eager peers stable across
-                    // duplicate paths; score/cooling veto remains decisive.
-                    if !state.is_healthy_preferred_at(from, Instant::now())
-                        && state.prune_peer(from)
+                    // Wave 1 (#136): cap non-prunable healthy preferred eager
+                    // slots to min(preferred_count, 1) and apply a 10 s prune
+                    // backoff on duplicate-triggered demotion.
+                    let now = Instant::now();
+                    if !state.is_pinned_preferred_eager_at(from, now)
+                        && state.prune_peer_for_duplicate_at(from, now)
                     {
                         self.stage_stats.record_prune();
                         // X0X-0071 P3b: a prune bumps the (topic, peer)
@@ -11015,6 +11180,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
                     return Ok(());
                 }
+            } else if payload_replay {
+                // Wave 1 (#136, P2b): drop known live payload replays BEFORE
+                // ML-DSA-65 verification. Cache insertion stays strictly
+                // post-verify so an attacker cannot poison `replay_cache`.
+                // Attribution uses the authenticated adjacent peer `from`
+                // rather than an unverified outer public key.
+                self.stage_stats.record_payload_replay_dropped(topic, &from);
+                return Ok(());
             }
             // The pre-verify cache miss is a sub-microsecond lookup and is
             // left unrecorded: `DedupeCheck` continues to measure exactly
@@ -11059,8 +11232,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 Instant::now(),
                 message.header.kind,
             );
-            // A healthy preferred sender stays eager on duplicate receipt.
-            if !state.is_healthy_preferred_at(from, Instant::now()) && state.prune_peer(from) {
+            // Wave 1 (#136): cap non-prunable healthy preferred eager slots to
+            // min(preferred_count, 1) and apply a 10 s prune backoff.
+            let now = Instant::now();
+            if !state.is_pinned_preferred_eager_at(from, now)
+                && state.prune_peer_for_duplicate_at(from, now)
+            {
                 self.stage_stats.record_prune();
                 // X0X-0071 P3b: a prune bumps the (topic, peer) delivery
                 // deficit — sticky across a later re-graft.
@@ -11108,7 +11285,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             len = payload.len(),
             zero_tail = payload_zero_tail(&payload),
         );
-        if state.cache_message(msg_id, payload.clone(), message.header.clone(), false) {
+        let origin_auth = CachedOriginAuth {
+            signature: message.signature.clone(),
+            public_key: self.intern_pubkey(&message.public_key),
+        };
+        if state.cache_message_with_auth(
+            msg_id,
+            payload.clone(),
+            message.header.clone(),
+            false,
+            Some(origin_auth),
+        ) {
             state.set_inner_proof(msg_id, inner_proof);
         }
 
@@ -11710,6 +11897,28 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         Ok(sent_any)
     }
 
+    /// Materialize a cached EAGER frame for IWANT / anti-entropy repair.
+    ///
+    /// Wave 1 (#136): forward the stored origin signature and public key
+    /// verbatim whenever present (all real publish and ingress paths), avoiding
+    /// per-repair ML-DSA-65 re-signing and preserving origin provenance. Falls
+    /// back to local signing only for synthetic test-injected cache entries.
+    fn build_cached_eager_message(&self, cached: &CachedMessage) -> GossipMessage {
+        let (signature, public_key) = match &cached.origin_auth {
+            Some(auth) => (auth.signature.clone(), auth.public_key.to_vec()),
+            None => (
+                self.sign_message(&cached.header),
+                self.signing_key.public_key().to_vec(),
+            ),
+        };
+        GossipMessage {
+            header: cached.header.clone(),
+            payload: Some(cached.payload.clone()),
+            signature,
+            public_key,
+        }
+    }
+
     /// Admit, sign and send one claimed IWANT reply. An error is returned as
     /// `Err` so that the caller settles the claim before it reports the
     /// error.
@@ -11737,12 +11946,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             zero_tail = payload_zero_tail(&cached.payload),
         );
 
-        let message = GossipMessage {
-            header: cached.header.clone(),
-            payload: Some(cached.payload.clone()),
-            signature: self.sign_message(&cached.header),
-            public_key: self.signing_key.public_key().to_vec(),
-        };
+        let message = self.build_cached_eager_message(cached);
         let bytes =
             postcard::to_stdvec(&message).map_err(|e| anyhow!("Serialization failed: {}", e))?;
         let send_result = self
@@ -11892,12 +12096,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         len = cached.payload.len(),
                         zero_tail = payload_zero_tail(&cached.payload),
                     );
-                    let eager_msg = GossipMessage {
-                        header: cached.header.clone(),
-                        payload: Some(cached.payload.clone()),
-                        signature: self.sign_message(&cached.header),
-                        public_key: self.signing_key.public_key().to_vec(),
-                    };
+                    let eager_msg = self.build_cached_eager_message(cached);
                     if let Ok(bytes) = postcard::to_stdvec(&eager_msg) {
                         // The byte count is booked on the final per-peer
                         // encoded frame in the bounded send path.
@@ -14217,7 +14416,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
 
-    fn test_peer_id(id: u8) -> PeerId {
+    pub(super) fn test_peer_id(id: u8) -> PeerId {
         let mut bytes = [0u8; 32];
         bytes[0] = id;
         PeerId::new(bytes)
@@ -14248,7 +14447,7 @@ mod tests {
         )
     }
 
-    fn test_signing_key() -> saorsa_gossip_identity::MlDsaKeyPair {
+    pub(super) fn test_signing_key() -> saorsa_gossip_identity::MlDsaKeyPair {
         saorsa_gossip_identity::MlDsaKeyPair::generate().expect("Failed to generate test key pair")
     }
 
@@ -14697,7 +14896,7 @@ mod tests {
         assert_eq!(inspect_message_header(&v3_wrong_kind), None);
     }
 
-    fn key_cache_eager(
+    pub(super) fn key_cache_eager(
         key: &saorsa_gossip_identity::MlDsaKeyPair,
         topic: TopicId,
         id: u8,
@@ -14718,7 +14917,7 @@ mod tests {
         }
     }
 
-    async fn flush_key_cache_control(
+    pub(super) async fn flush_key_cache_control(
         source: &PlumtreePubSub<RecordingTransport>,
         destination: &PlumtreePubSub<RecordingTransport>,
         source_transport: &RecordingTransport,
@@ -14900,17 +15099,18 @@ mod tests {
             Bytes::from_static(b"warm")
         );
 
+        // Wave 1 (#136): Critical topics use key references once the receiver
+        // has explicitly acknowledged the signer on this session generation.
         let critical_message = key_cache_eager(&author_key, topic, 6, b"critical");
         let critical_legacy: Bytes = postcard::to_stdvec(&critical_message).expect("wire").into();
         let critical = a.wire_bytes_for_peer(receiver, &critical_legacy, TopicPriority::Critical);
         assert!(matches!(
-            key_cache::decode(&critical).expect("critical full"),
-            key_cache::Decoded::Full(_, _)
+            key_cache::decode(&critical).expect("critical ref once acked"),
+            key_cache::Decoded::Ref(_, _)
         ));
         b.admission
             .registry()
             .register(topic, TopicPriority::Critical);
-        b.key_cache.lock().expect("cache").evict_key(author);
         b.handle_authenticated_message(
             saorsa_gossip_transport::AuthenticatedSession {
                 peer: author,
@@ -14919,7 +15119,7 @@ mod tests {
             critical,
         )
         .await
-        .expect("cold Critical Full delivery");
+        .expect("warm Critical Ref delivery");
         assert_eq!(
             received.try_recv().expect("Critical delivery").1,
             Bytes::from_static(b"critical")
@@ -14927,8 +15127,18 @@ mod tests {
         assert_eq!(
             b.key_cache_stats().pending_frames_high_water,
             0,
-            "Critical bypasses pending recovery"
+            "warm acked Critical Ref delivers immediately with zero pending recovery"
         );
+        // Un-acknowledged signers on Critical still travel Full.
+        let unacked_key = test_signing_key();
+        let unacked_critical = key_cache_eager(&unacked_key, topic, 7, b"critical-unacked");
+        let unacked_legacy: Bytes = postcard::to_stdvec(&unacked_critical).expect("wire").into();
+        let unacked_wire =
+            a.wire_bytes_for_peer(receiver, &unacked_legacy, TopicPriority::Critical);
+        assert!(matches!(
+            key_cache::decode(&unacked_wire).expect("unacked critical full"),
+            key_cache::Decoded::Full(_, _)
+        ));
         b.admission
             .registry()
             .register(topic, TopicPriority::Normal);
@@ -15353,7 +15563,9 @@ mod tests {
             received.try_recv().expect("replayed skew delivery").1,
             Bytes::from_static(b"skew")
         );
-        assert_eq!(b.key_cache_stats().critical_ref_mismatches, 2);
+        // Wave 1 (#136): critical_ref_mismatches counts cache misses on
+        // Critical Ref frames (1 on the evicted miss; 0 on replay/warm hits).
+        assert_eq!(b.key_cache_stats().critical_ref_mismatches, 1);
 
         // With the key resolved, the next skewed reference delivers
         // immediately from cache.
@@ -15377,7 +15589,7 @@ mod tests {
             received.try_recv().expect("warm skew delivery").1,
             Bytes::from_static(b"skew-warm")
         );
-        assert_eq!(b.key_cache_stats().critical_ref_mismatches, 3);
+        assert_eq!(b.key_cache_stats().critical_ref_mismatches, 1);
     }
 
     fn unsigned_control_message(
@@ -15432,6 +15644,7 @@ mod tests {
         CachedMessage {
             payload: Bytes::from(vec![0u8; payload_len]),
             header: test_header(topic, msg_id),
+            origin_auth: None,
             dropped: false,
             local_origin: false,
             inner_proof: None,
@@ -15505,7 +15718,7 @@ mod tests {
         }
     }
 
-    struct RecordingTransport {
+    pub(super) struct RecordingTransport {
         local_peer: PeerId,
         sessions: Mutex<HashMap<PeerId, saorsa_gossip_transport::AuthenticatedSession>>,
         send_counts: Mutex<HashMap<PeerId, usize>>,
@@ -15533,7 +15746,7 @@ mod tests {
     }
 
     impl ShutdownLivelockTransport {
-        fn new(local_peer: PeerId) -> Arc<Self> {
+        pub(super) fn new(local_peer: PeerId) -> Arc<Self> {
             Arc::new(Self {
                 local_peer,
                 closed: std::sync::atomic::AtomicBool::new(false),
@@ -15603,7 +15816,7 @@ mod tests {
     }
 
     impl RecordingTransport {
-        fn new(local_peer: PeerId) -> Arc<Self> {
+        pub(super) fn new(local_peer: PeerId) -> Arc<Self> {
             Arc::new(Self {
                 local_peer,
                 sessions: Mutex::new(HashMap::new()),
@@ -15649,7 +15862,7 @@ mod tests {
                 .expect("connected peers lock") = peers;
         }
 
-        fn set_session(&self, peer: PeerId, generation: u64) {
+        pub(super) fn set_session(&self, peer: PeerId, generation: u64) {
             self.sessions.lock().expect("sessions lock").insert(
                 peer,
                 saorsa_gossip_transport::AuthenticatedSession { peer, generation },
@@ -15681,7 +15894,11 @@ mod tests {
 
         /// Decoded outbound GossipMessages of one wire kind to one peer
         /// (#59).
-        fn sent_messages_of_kind_to(&self, peer: PeerId, kind: MessageKind) -> Vec<GossipMessage> {
+        pub(super) fn sent_messages_of_kind_to(
+            &self,
+            peer: PeerId,
+            kind: MessageKind,
+        ) -> Vec<GossipMessage> {
             self.sent_frames_of_kind_to(peer, kind)
                 .iter()
                 .filter_map(|data| postcard::from_bytes(data).ok())
@@ -15690,7 +15907,7 @@ mod tests {
     }
 
     impl PanicTransport {
-        fn new(local_peer: PeerId) -> Arc<Self> {
+        pub(super) fn new(local_peer: PeerId) -> Arc<Self> {
             Arc::new(Self { local_peer })
         }
     }
@@ -21605,7 +21822,7 @@ mod tests {
     }
 
     impl ToggleTransport {
-        fn new(local_peer: PeerId) -> Arc<Self> {
+        pub(super) fn new(local_peer: PeerId) -> Arc<Self> {
             Self::with_hang_budget(local_peer, 0)
         }
 
@@ -26826,6 +27043,7 @@ mod tests {
                 CachedMessage {
                     payload: Bytes::from_static(b"expired-local"),
                     header: test_header(topic, id),
+                    origin_auth: None,
                     dropped: false,
                     local_origin: true,
                     inner_proof: None,
@@ -27902,6 +28120,7 @@ mod tests {
         let local_cached = |id: MessageIdType| CachedMessage {
             payload: Bytes::from(vec![0u8; 256]),
             header: test_header(topic, id),
+            origin_auth: None,
             dropped: false,
             local_origin: true,
             inner_proof: None,
@@ -27909,6 +28128,7 @@ mod tests {
         let relayed_cached = |id: MessageIdType| CachedMessage {
             payload: Bytes::from(vec![0u8; 256]),
             header: test_header(topic, id),
+            origin_auth: None,
             dropped: false,
             local_origin: false,
             inner_proof: None,
@@ -28118,6 +28338,7 @@ mod tests {
                 CachedMessage {
                     payload: Bytes::from_static(b"expired"),
                     header: test_header(topic, expired),
+                    origin_auth: None,
                     dropped: false,
                     local_origin: true,
                     inner_proof: None,
@@ -28498,6 +28719,7 @@ mod tests {
             CachedMessage {
                 payload: Bytes::from_static(b"expired"),
                 header: test_header(topic, expired_id),
+                origin_auth: None,
                 dropped: false,
                 local_origin: true,
                 inner_proof: None,
@@ -33400,13 +33622,21 @@ mod tests {
                 {
                     let mut topics = pubsub.topics.write_topic(&topic).await;
                     let state = topics.get_mut(&topic).expect("topic cached");
-                    for id in ids {
-                        assert_eq!(
-                            state.get_message(&id).expect("dedupe retained").dropped,
-                            refuse,
-                            "each ID must preserve the validator refusal for IWANT/anti-entropy"
-                        );
-                    }
+                    assert_eq!(
+                        state
+                            .get_message(&ids[0])
+                            .expect("original dedupe retained")
+                            .dropped,
+                        refuse,
+                        "original ID must preserve the validator refusal for IWANT/anti-entropy"
+                    );
+                    // Wave 1 (#136): re-wrapped payload replay is dropped
+                    // pre-verify and never enters message_cache, so refused
+                    // bytes can never be served and duplicates are not cached twice.
+                    assert!(
+                        state.get_message(&ids[1]).is_none(),
+                        "pre-verify payload replay must not insert an unverified ID into cache"
+                    );
                 }
                 assert_eq!(
                     pubsub.stage_stats().validator.dropped,
@@ -33427,8 +33657,8 @@ mod tests {
                     .map_or(0, |m| m.msgs);
                 assert_eq!(
                     attempts,
-                    if refuse { 0 } else { 2 },
-                    "refused bytes must never be served"
+                    if refuse { 0 } else { 1 },
+                    "refused bytes must never be served; accepted original serves once"
                 );
                 if !refuse {
                     tokio::time::timeout(Duration::from_secs(2), async {
@@ -33436,7 +33666,7 @@ mod tests {
                             if transport
                                 .sent_messages_of_kind_to(requester, MessageKind::Eager)
                                 .len()
-                                == 2
+                                == 1
                             {
                                 break;
                             }
@@ -33446,14 +33676,12 @@ mod tests {
                     .await
                     .expect("accepted IDs remain recoverable");
                     let frames = transport.sent_messages_of_kind_to(requester, MessageKind::Eager);
-                    for id in ids {
-                        assert!(
-                            frames
-                                .iter()
-                                .any(|m| m.header.msg_id == id
-                                    && m.payload.as_ref() == Some(&payload))
-                        );
-                    }
+                    assert!(
+                        frames
+                            .iter()
+                            .any(|m| m.header.msg_id == ids[0]
+                                && m.payload.as_ref() == Some(&payload))
+                    );
                 }
             }
         }
@@ -34157,12 +34385,11 @@ mod tests {
     }
 
     /// x0x #1964: a signature-valid frame with a new msg_id and a seen
-    /// payload counts in `payload_replay_dropped` (global and per topic) and
-    /// is attributed to its gossip signer. It still pays one verify, and its
-    /// msg_id is still cached: that cache entry is why the replay lookup is
-    /// NOT moved before verify (an unverified msg_id must never enter the
-    /// cache, and without the entry later IHAVE/anti-entropy rounds would
-    /// re-pull the replay).
+    /// Wave 1 (#136, P2b): a re-wrapped payload replay with a fresh msg_id
+    /// drops BEFORE ML-DSA-65 verification (saving verify CPU), counts in
+    /// `payload_replay_dropped` attributed to the authenticated transport peer
+    /// `from` (never an unverified outer public key), and does not insert the
+    /// unverified msg_id into `message_cache`.
     #[tokio::test]
     async fn x0x_1964_payload_replay_counted_per_topic_and_signer() {
         let local = test_peer_id(1);
@@ -34172,6 +34399,7 @@ mod tests {
         let topic = TopicId::new([0x64; 32]);
         let author = test_signing_key();
         let republisher = test_signing_key();
+        let replay_peer = test_peer_id(3);
 
         let original = key_cache_eager(&author, topic, 1, b"announce-record");
         pubsub
@@ -34180,9 +34408,9 @@ mod tests {
             .expect("original accepted");
         let replay = key_cache_eager(&republisher, topic, 2, b"announce-record");
         pubsub
-            .handle_eager(test_peer_id(3), topic, replay)
+            .handle_eager(replay_peer, topic, replay)
             .await
-            .expect("replay dropped quietly");
+            .expect("replay dropped quietly pre-verify");
 
         let stats = pubsub.stage_stats();
         assert_eq!(stats.payload_replay_dropped, 1);
@@ -34191,11 +34419,16 @@ mod tests {
         assert_eq!(row.accepted_unique, 1);
         assert_eq!(row.payload_replay_dropped, 1);
         assert!((1..=2).contains(&row.distinct_signers_estimate));
+        let replay_peer_hex: String = replay_peer
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let republisher_row = row
             .top_signers
             .iter()
-            .find(|s| s.signer == x0x_1964_signer_hex(&republisher))
-            .expect("republisher listed");
+            .find(|s| s.signer == replay_peer_hex)
+            .expect("authenticated replay forwarder listed");
         assert_eq!(republisher_row.msgs, 1);
         assert_eq!(republisher_row.payload_replays, 1);
         let author_row = row
@@ -34205,17 +34438,22 @@ mod tests {
             .expect("author listed");
         assert_eq!(author_row.payload_replays, 0);
 
-        // Unchanged verify order: both frames were verified once.
+        // Wave 1 (#136): only the original frame paid ML-DSA verification;
+        // the payload replay was dropped pre-verify and never entered cache.
         assert_eq!(
             pubsub
                 .verify_by_kind_stats()
                 .for_kind(MessageKind::Eager)
                 .attempts,
-            2
+            1
         );
         let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).expect("topic state");
-        assert!(state.has_message(&[2u8; 32]), "replay msg_id stays cached");
+        assert!(state.has_message(&[1u8; 32]), "original msg_id cached");
+        assert!(
+            !state.has_message(&[2u8; 32]),
+            "unverified pre-verify replay msg_id must not enter cache"
+        );
     }
 
     /// x0x #1964: a badly signed frame with a NEW payload never seeds the
@@ -34537,5 +34775,314 @@ mod zero_tail_forward_guard_tests {
         ));
         assert!(!forwardable_payload("test", &id, &frame(4096, 1448)));
         assert!(!forwardable_payload("test", &id, &frame(3000, 2896)));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod wave1_136_tests {
+    use super::tests::{
+        flush_key_cache_control, key_cache_eager, test_peer_id, test_signing_key,
+        RecordingTransport,
+    };
+    use super::*;
+
+    #[test]
+    fn duplicate_prune_backoff_holds_for_10s_then_allows_and_guards_empty_eager() {
+        let mut state = TopicState::new();
+        let now = Instant::now();
+        let p1 = test_peer_id(10);
+        let p2 = test_peer_id(11);
+        state.configured_max_eager_degree = 6;
+        state.max_eager_degree = 6;
+        state.eager_peers.extend([p1, p2]);
+
+        // Duplicate-prune p2: must stay lazy across maintain_degree_at during the 10 s backoff.
+        assert!(state.prune_peer_for_duplicate_at(p2, now));
+        assert!(!state.can_graft_peer_at(p2, now + Duration::from_secs(5)));
+        let (_, grafted_during_backoff) = state.maintain_degree_at(now + Duration::from_secs(5));
+        assert_eq!(grafted_during_backoff, 0);
+        assert!(state.lazy_peers.contains(&p2));
+        assert!(state.eager_peers.contains(&p1));
+
+        // After DUPLICATE_PRUNE_BACKOFF (10 s) expires, maintain_degree_at can re-graft p2.
+        assert!(state.can_graft_peer_at(p2, now + DUPLICATE_PRUNE_BACKOFF));
+        let (_, grafted_after_backoff) = state.maintain_degree_at(now + DUPLICATE_PRUNE_BACKOFF);
+        assert_eq!(grafted_after_backoff, 1);
+        assert!(state.eager_peers.contains(&p2));
+
+        // Liveness guard: if EVERY eager peer is duplicate-pruned on a tiny topic,
+        // maintain_degree_at rescues one non-cooled lazy peer so eager_peers never stays empty.
+        let t2 = now + Duration::from_secs(20);
+        assert!(state.prune_peer_for_duplicate_at(p1, t2));
+        assert!(state.prune_peer_for_duplicate_at(p2, t2));
+        assert!(state.eager_peers.is_empty());
+        let (_, rescued) = state.maintain_degree_at(t2 + Duration::from_secs(1));
+        assert_eq!(rescued, 1);
+        assert_eq!(state.eager_peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preferred_eager_cap_pins_one_and_prunes_excess_preferred_on_duplicate() {
+        let local = test_peer_id(1);
+        let transport = RecordingTransport::new(local);
+        let pubsub =
+            PlumtreePubSub::new_with_task_control(local, transport, test_signing_key(), false);
+        let topic = TopicId::new([0x71; 32]);
+        let p1 = test_peer_id(2);
+        let p2 = test_peer_id(3);
+        let p3 = test_peer_id(4);
+        pubsub.initialize_topic_peers(topic, vec![p1, p2, p3]).await;
+        pubsub
+            .set_topic_preferred_eager_set(topic, &[p1, p2, p3])
+            .await;
+
+        let author = test_signing_key();
+        let msg = key_cache_eager(&author, topic, 41, b"backbone-frame");
+        pubsub
+            .handle_eager(p1, topic, msg.clone())
+            .await
+            .expect("first delivery from p1");
+
+        // Duplicates from p2 and p3 prune them to lazy because another healthy
+        // preferred peer (p1) remains eager.
+        pubsub
+            .handle_eager(p2, topic, msg.clone())
+            .await
+            .expect("duplicate from p2");
+        pubsub
+            .handle_eager(p3, topic, msg.clone())
+            .await
+            .expect("duplicate from p3");
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert!(state.eager_peers.contains(&p1));
+            assert!(state.lazy_peers.contains(&p2));
+            assert!(state.lazy_peers.contains(&p3));
+        }
+
+        // Duplicate from the last remaining healthy preferred eager peer (p1)
+        // must keep p1 pinned (min(preferred_count, 1) = 1).
+        pubsub
+            .handle_eager(p1, topic, msg)
+            .await
+            .expect("duplicate from pinned p1");
+        let topics = pubsub.topics.read_topic(&topic).await;
+        let state = topics.get(&topic).expect("topic state");
+        assert!(state.eager_peers.contains(&p1));
+        assert!(!state.lazy_peers.contains(&p1));
+    }
+
+    #[tokio::test]
+    async fn iwant_and_anti_entropy_serve_origin_signed_frame_verbatim() {
+        let local = test_peer_id(1);
+        let transport = RecordingTransport::new(local);
+        let relay_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            relay_key.clone(),
+            false,
+        );
+        let topic = TopicId::new([0x72; 32]);
+        let sender = test_peer_id(2);
+        let requester = test_peer_id(3);
+        let ae_peer = test_peer_id(4);
+        pubsub
+            .initialize_topic_peers(topic, vec![sender, requester, ae_peer])
+            .await;
+
+        let origin_key = test_signing_key();
+        let origin_msg_1 = key_cache_eager(&origin_key, topic, 51, b"origin-payload-1");
+        let origin_msg_2 = key_cache_eager(&origin_key, topic, 52, b"origin-payload-2");
+        let expected_sig = origin_msg_1.signature.clone();
+        let expected_pk = origin_msg_1.public_key.clone();
+        assert_ne!(
+            expected_pk,
+            relay_key.public_key().to_vec(),
+            "origin and relay keys must differ"
+        );
+
+        pubsub
+            .handle_eager(sender, topic, origin_msg_1)
+            .await
+            .expect("origin msg 1 admitted");
+        pubsub
+            .handle_eager(sender, topic, origin_msg_2)
+            .await
+            .expect("origin msg 2 admitted");
+
+        // Verify shared Arc<[u8]> pubkey allocation across cached messages from the same signer.
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            let c1 = state.get_message(&[51u8; 32]).expect("cached 1");
+            let c2 = state.get_message(&[52u8; 32]).expect("cached 2");
+            let a1 = c1.origin_auth.expect("origin auth 1");
+            let a2 = c2.origin_auth.expect("origin auth 2");
+            assert!(
+                Arc::ptr_eq(&a1.public_key, &a2.public_key),
+                "cached messages from the same signer should share one Arc<[u8]> pubkey"
+            );
+        }
+
+        // 1. IWANT reply serves the origin signature and origin public key verbatim.
+        pubsub
+            .handle_iwant(requester, topic, vec![[51u8; 32]])
+            .await
+            .expect("iwant handled");
+        let iwant_served = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frames = transport.sent_messages_of_kind_to(requester, MessageKind::Eager);
+                if let Some(frame) = frames.into_iter().find(|m| m.header.msg_id == [51u8; 32]) {
+                    return frame;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("iwant EAGER served");
+        assert_eq!(iwant_served.signature, expected_sig);
+        assert_eq!(iwant_served.public_key, expected_pk);
+
+        // 2. Anti-entropy digest push also serves the origin signature and public key verbatim.
+        let digest_payload = Bytes::from(
+            postcard::to_stdvec(&AntiEntropyPayload::Digest {
+                msg_ids: Vec::new(),
+            })
+            .expect("ae"),
+        );
+        let mut ae_header = MessageHeader::new(topic, MessageKind::AntiEntropy, 1);
+        ae_header.seal_payload_hash(Some(&digest_payload));
+        let ae_peer_key = test_signing_key();
+        let ae_sig = ae_peer_key
+            .sign(&postcard::to_stdvec(&ae_header).expect("ae hdr"))
+            .expect("ae sign");
+        let ae_msg = GossipMessage {
+            header: ae_header,
+            payload: Some(digest_payload),
+            signature: ae_sig,
+            public_key: ae_peer_key.public_key().to_vec(),
+        };
+        pubsub
+            .handle_anti_entropy(ae_peer, topic, ae_msg)
+            .await
+            .expect("anti-entropy handled");
+        let ae_served = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frames = transport.sent_messages_of_kind_to(ae_peer, MessageKind::Eager);
+                if let Some(frame) = frames.into_iter().find(|m| m.header.msg_id == [51u8; 32]) {
+                    return frame;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("anti-entropy EAGER served");
+        assert_eq!(ae_served.signature, expected_sig);
+        assert_eq!(ae_served.public_key, expected_pk);
+    }
+
+    #[tokio::test]
+    async fn duplicate_path_acks_verified_signer_over_second_session() {
+        let now = Instant::now();
+        let author_key = test_signing_key();
+        let author_id = PeerId::from_pubkey(author_key.public_key());
+        let peer1_key = test_signing_key();
+        let peer1_id = PeerId::from_pubkey(peer1_key.public_key());
+        let peer2_key = test_signing_key();
+        let peer2_id = PeerId::from_pubkey(peer2_key.public_key());
+        let recv_key = test_signing_key();
+        let recv_id = PeerId::from_pubkey(recv_key.public_key());
+
+        let recv_transport = RecordingTransport::new(recv_id);
+        let peer2_transport = RecordingTransport::new(peer2_id);
+        let receiver = PlumtreePubSub::new_with_task_control(
+            recv_id,
+            Arc::clone(&recv_transport),
+            recv_key,
+            false,
+        );
+        let peer2 = PlumtreePubSub::new_with_task_control(
+            peer2_id,
+            Arc::clone(&peer2_transport),
+            peer2_key,
+            false,
+        );
+        let topic = TopicId::new([0x73; 32]);
+        let s1 = saorsa_gossip_transport::AuthenticatedSession {
+            peer: peer1_id,
+            generation: 1,
+        };
+        let s2 = saorsa_gossip_transport::AuthenticatedSession {
+            peer: peer2_id,
+            generation: 1,
+        };
+        let s2_rev = saorsa_gossip_transport::AuthenticatedSession {
+            peer: recv_id,
+            generation: 1,
+        };
+
+        // Establish v3 key-cache Hello between receiver and peer2.
+        recv_transport.set_session(peer1_id, 1);
+        recv_transport.set_session(peer2_id, 1);
+        peer2_transport.set_session(recv_id, 1);
+        receiver
+            .key_cache
+            .lock()
+            .expect("kc")
+            .observe_session(s2, now);
+        peer2
+            .key_cache
+            .lock()
+            .expect("kc")
+            .observe_session(s2_rev, now);
+        assert!(matches!(
+            flush_key_cache_control(&receiver, &peer2, &recv_transport, now).await,
+            key_cache::Control::Hello { .. }
+        ));
+        assert!(matches!(
+            flush_key_cache_control(&peer2, &receiver, &peer2_transport, now).await,
+            key_cache::Control::Hello { .. }
+        ));
+
+        // First copy arrives from peer1 and verifies author_key into receiver's KeyCache.
+        let msg = key_cache_eager(&author_key, topic, 61, b"multi-path-msg");
+        let wire: Bytes = postcard::to_stdvec(&msg).expect("wire").into();
+        receiver
+            .handle_authenticated_message(s1, wire.clone())
+            .await
+            .expect("first delivery from peer1");
+
+        // Duplicate copy arrives from peer2: drops pre-verify AND queues Ack(author_id) for peer2.
+        let verifies_before = receiver
+            .verify_by_kind_stats()
+            .for_kind(MessageKind::Eager)
+            .attempts;
+        receiver
+            .handle_authenticated_message(s2, wire)
+            .await
+            .expect("duplicate from peer2");
+        assert_eq!(
+            receiver
+                .verify_by_kind_stats()
+                .for_kind(MessageKind::Eager)
+                .attempts,
+            verifies_before,
+            "duplicate must not spend another ML-DSA verify"
+        );
+        assert!(matches!(
+            flush_key_cache_control(&receiver, &peer2, &recv_transport, now).await,
+            key_cache::Control::Ack { key_ids } if key_ids == vec![author_id]
+        ));
+        assert!(
+            peer2
+                .key_cache
+                .lock()
+                .expect("kc")
+                .supports_ref(s2_rev, author_id),
+            "peer2 can now compress author_id frames to 32 B references"
+        );
     }
 }

@@ -12,6 +12,7 @@ use saorsa_gossip_types::{PeerId, TopicId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) const WIRE_MARKER: &[u8; 6] = b"\xffSGKC\x03";
@@ -28,7 +29,11 @@ const MAX_PENDING_BYTES_PER_SESSION: usize = 256 * 1024;
 const MAX_PENDING_GLOBAL: usize = 1_024;
 const MAX_PENDING_BYTES_GLOBAL: usize = 8 * 1024 * 1024;
 const PENDING_TTL: Duration = Duration::from_secs(5);
-const CONTROL_BURST: f64 = 2.0;
+/// Wave 1 (#136): allow new sessions to exchange Hello + initial Ack/Request
+/// controls in one RTT instead of stalling behind a 1/s (burst 2) bucket,
+/// while still bounding control traffic against DoS.
+const CONTROL_BURST: f64 = 8.0;
+const CONTROL_REFILL_PER_SEC: f64 = 4.0;
 
 pub(crate) fn control_topic() -> TopicId {
     TopicId::from_entity(CONTROL_DOMAIN)
@@ -430,8 +435,9 @@ impl SessionState {
         self.tokens = (self.tokens
             + now
                 .saturating_duration_since(self.last_refill)
-                .as_secs_f64())
-        .min(CONTROL_BURST);
+                .as_secs_f64()
+                * CONTROL_REFILL_PER_SEC)
+            .min(CONTROL_BURST);
         self.last_refill = now;
         if self.tokens < 1.0 {
             return false;
@@ -442,7 +448,7 @@ impl SessionState {
 }
 
 pub(crate) struct KeyCache {
-    resolved: LruCache<PeerId, Vec<u8>>,
+    resolved: LruCache<PeerId, Arc<[u8]>>,
     acknowledged: LruCache<(PeerId, u64, PeerId), ()>,
     announced_inbound: LruCache<(PeerId, u64, PeerId), ()>,
     sessions: HashMap<PeerId, SessionState>,
@@ -579,10 +585,43 @@ impl KeyCache {
             self.stats.hash_mismatches = self.stats.hash_mismatches.saturating_add(1);
             return;
         }
-        if !self.resolved.contains(&key_id) && self.resolved.len() == self.resolved.cap().get() {
-            self.stats.cache_evictions = self.stats.cache_evictions.saturating_add(1);
+        if self
+            .resolved
+            .get(&key_id)
+            .is_none_or(|existing| existing.as_ref() != key.as_slice())
+        {
+            if !self.resolved.contains(&key_id) && self.resolved.len() == self.resolved.cap().get()
+            {
+                self.stats.cache_evictions = self.stats.cache_evictions.saturating_add(1);
+            }
+            self.resolved.put(key_id, Arc::from(key));
         }
-        self.resolved.put(key_id, key);
+        self.queue_ack_for_session(key_id, session);
+    }
+
+    /// Wave 1 (#136): queue an Ack on the pre-verify duplicate path ONLY when
+    /// `key_id` is already resolved in the verified key cache and `key` matches
+    /// byte-for-byte. Never inserts an unverified key into `resolved` and never
+    /// spends ML-DSA verification CPU.
+    pub(crate) fn note_duplicate_known_key(
+        &mut self,
+        key_id: PeerId,
+        key: &[u8],
+        session: Option<AuthenticatedSession>,
+    ) {
+        if key.len() != KEY_BYTES {
+            return;
+        }
+        let Some(cached) = self.resolved.peek(&key_id) else {
+            return;
+        };
+        if cached.as_ref() != key {
+            return;
+        }
+        self.queue_ack_for_session(key_id, session);
+    }
+
+    fn queue_ack_for_session(&mut self, key_id: PeerId, session: Option<AuthenticatedSession>) {
         if let Some(session) = session {
             let announcement = (session.peer, session.generation, key_id);
             let novel = !self.announced_inbound.contains(&announcement);
@@ -630,13 +669,19 @@ impl KeyCache {
     }
 
     pub(crate) fn lookup(&mut self, key_id: PeerId) -> Option<Vec<u8>> {
-        let key = self.resolved.get(&key_id).cloned();
+        let key = self.resolved.get(&key_id).map(|k| k.to_vec());
         if key.is_some() {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
         } else {
             self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
         }
         key
+    }
+
+    /// Share an existing verified `Arc<[u8]>` public-key allocation without
+    /// mutating hit/miss stats (used by `CachedMessage` for verbatim repair).
+    pub(crate) fn lookup_arc(&self, key_id: PeerId) -> Option<Arc<[u8]>> {
+        self.resolved.peek(&key_id).cloned()
     }
 
     #[cfg(test)]
@@ -812,7 +857,7 @@ impl KeyCache {
             let key_ids = take_ids(&mut state.queued_responses);
             let entries: Vec<_> = key_ids
                 .into_iter()
-                .filter_map(|id| self.resolved.get(&id).cloned().map(|key| (id, key)))
+                .filter_map(|id| self.resolved.get(&id).map(|key| (id, key.to_vec())))
                 .collect();
             if entries.is_empty() {
                 return None;
@@ -1184,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_control_bucket_sustains_one_frame_per_second() {
+    fn shared_control_bucket_sustains_wave1_burst_and_refill_rate() {
         let now = Instant::now();
         let mut cache = KeyCache::default();
         let session = session(1, 1);
@@ -1193,22 +1238,67 @@ mod tests {
         cache.note_verified_key(PeerId::new([1; 32]), vec![1; KEY_BYTES], None);
         let hello = cache.next_control(session, now).expect("hello");
         cache.control_result(session, &hello, true);
+        // Remaining burst (CONTROL_BURST - 1 = 7) drains immediately in 1 RTT.
+        for i in 2u8..9 {
+            cache
+                .sessions
+                .get_mut(&session.peer)
+                .expect("session")
+                .queued_acks
+                .insert(PeerId::new([i; 32]));
+            assert!(cache.next_control(session, now).is_some());
+        }
+        // Bucket is now empty until tokens refill at CONTROL_REFILL_PER_SEC (4/s).
         cache
             .sessions
             .get_mut(&session.peer)
             .expect("session")
             .queued_acks
-            .insert(PeerId::new([2; 32]));
-        assert!(cache.next_control(session, now).is_some());
-        cache
-            .sessions
-            .get_mut(&session.peer)
-            .expect("session")
-            .queued_acks
-            .insert(PeerId::new([3; 32]));
+            .insert(PeerId::new([9; 32]));
         assert!(cache.next_control(session, now).is_none());
         assert!(cache
-            .next_control(session, now + Duration::from_secs(1))
+            .next_control(session, now + Duration::from_millis(250))
             .is_some());
+    }
+
+    #[test]
+    fn duplicate_path_acks_known_verified_key_but_never_learns_unknown_key() {
+        let now = Instant::now();
+        let mut cache = KeyCache::default();
+        let s1 = session(1, 1);
+        let s2 = session(2, 1);
+        cache.observe_session(s1, now);
+        cache.observe_session(s2, now);
+        for s in [s1, s2] {
+            let hello = cache.next_control(s, now).expect("hello");
+            cache.control_result(s, &hello, true);
+            cache.received_hello(s);
+        }
+
+        let known_key = vec![0x42; KEY_BYTES];
+        let known_id = PeerId::from_pubkey(&known_key);
+        let unknown_key = vec![0x99; KEY_BYTES];
+        let unknown_id = PeerId::from_pubkey(&unknown_key);
+
+        // Learn known_key via verified frame on s1.
+        cache.note_verified_key(known_id, known_key.clone(), Some(s1));
+
+        // Duplicate on s2 carrying unknown_key must NOT learn or queue Ack.
+        cache.note_duplicate_known_key(unknown_id, &unknown_key, Some(s2));
+        assert!(cache.lookup(unknown_id).is_none());
+        assert!(cache.next_control(s2, now).is_none());
+
+        // Duplicate on s2 carrying mismatched bytes for known_id must NOT Ack.
+        let mut forged = known_key.clone();
+        forged[0] ^= 0xff;
+        cache.note_duplicate_known_key(known_id, &forged, Some(s2));
+        assert!(cache.next_control(s2, now).is_none());
+
+        // Duplicate on s2 carrying exact verified known_key queues Ack for s2.
+        cache.note_duplicate_known_key(known_id, &known_key, Some(s2));
+        assert!(matches!(
+            cache.next_control(s2, now),
+            Some(Control::Ack { key_ids }) if key_ids == vec![known_id]
+        ));
     }
 }

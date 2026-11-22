@@ -95,11 +95,12 @@ const MAX_CACHE_BYTES_PER_TOPIC: usize = 16 * 1024 * 1024;
 /// under-accounted anti-entropy payloads.
 const MESSAGE_HEADER_OVERHEAD_BYTES: usize = 256;
 
-/// Estimated ML-DSA-65 signature plus public-key bytes on replayed EAGER data.
+/// Estimated ML-DSA-65 signature plus public-key bytes on cached EAGER data.
 ///
-/// Cached messages store the payload and header; IWANT/anti-entropy replay
-/// re-signs them, so the cache byte budget includes the eventual wire crypto
-/// overhead rather than only heap bytes.
+/// `CachedMessage` retains the verified origin ML-DSA-65 signature (~3.3 KiB)
+/// and a shared `Arc<[u8]>` public key (~1.95 KiB) for verbatim IWANT and
+/// anti-entropy repair, so the cache byte budget includes crypto overhead
+/// alongside payload and header bytes.
 const MESSAGE_CRYPTO_OVERHEAD_BYTES: usize = 5_500;
 
 /// Maximum payload replay cache size per topic.
@@ -3219,6 +3220,12 @@ impl PubSubStageStats {
         self.topic_ingress.record_payload_replay(topic, signer);
     }
 
+    /// Wave 1 (#136): an EAGER dropped pre-verify as a live payload replay
+    /// without mixing adjacent forwarder PeerIds into `top_signers`.
+    fn record_payload_replay_dropped_pre_verify(&self, topic: TopicId) {
+        self.topic_ingress.record_payload_replay_pre_verify(topic);
+    }
+
     fn record_grafts(&self, count: usize) {
         self.message_kinds.record_grafts(count);
     }
@@ -4568,6 +4575,12 @@ struct TopicState {
     /// Catches replays where the same application payload is wrapped in a
     /// different gossip envelope (different epoch, sender, msg_id).
     replay_cache: LruCache<[u8; 32], PayloadReplayEntry>,
+    /// Wave 1 (#136): bounded dedupe-only cache of msg_ids dropped pre-verify
+    /// as live payload replays (`(dropped_at, refused)`). Consulted by
+    /// `has_message` so IHAVE / anti-entropy rounds do not re-pull dropped
+    /// replay IDs and refused-payload replays retain their #116 refusal mark,
+    /// without inserting unverified IDs into `message_cache`.
+    replay_dropped_ids: LruCache<MessageIdType, (Instant, bool)>,
     /// TTL for replay cache entries.
     replay_ttl: Duration,
     /// Last time this topic saw any activity (publish, incoming, IHAVE, etc).
@@ -4911,6 +4924,7 @@ impl TopicState {
             peer_scores: HashMap::new(),
             subscribers: Vec::new(),
             replay_cache: LruCache::new(replay_cache_capacity()),
+            replay_dropped_ids: LruCache::new(replay_cache_capacity()),
             replay_ttl: Duration::from_secs(REPLAY_CACHE_TTL_SECS),
             last_activity: Instant::now(),
             peer_cooling: HashMap::new(),
@@ -5021,9 +5035,36 @@ impl TopicState {
         self.message_cache.ids()
     }
 
-    /// Check if message is in cache
+    /// Record a msg_id dropped pre-verify as a live payload replay in the
+    /// bounded dedupe-only LRU (`replay_dropped_ids`), carrying forward any
+    /// `#116` validator refusal mark without touching `message_cache`.
+    fn record_replay_dropped_id(&mut self, msg_id: MessageIdType, refused: bool) {
+        self.replay_dropped_ids
+            .put(msg_id, (Instant::now(), refused));
+    }
+
+    /// Read-only check for whether `msg_id` was dropped pre-verify as a live
+    /// payload replay within `self.replay_ttl`.
+    fn has_live_replay_dropped_id(&self, msg_id: &MessageIdType) -> bool {
+        self.replay_dropped_ids
+            .peek(msg_id)
+            .is_some_and(|(dropped_at, _)| dropped_at.elapsed() < self.replay_ttl)
+    }
+
+    /// Test helper verifying `#116` refusal carry-forward on pre-verify
+    /// payload-replay drops.
+    #[cfg(test)]
+    fn replay_dropped_id_was_refused(&self, msg_id: &MessageIdType) -> bool {
+        self.replay_dropped_ids
+            .peek(msg_id)
+            .is_some_and(|(dropped_at, refused)| dropped_at.elapsed() < self.replay_ttl && *refused)
+    }
+
+    /// Check if message is already known (cached or recently dropped as a
+    /// live payload replay). Never serves unverified IDs — all serve paths
+    /// read `message_cache` directly via `get_message`.
     fn has_message(&self, msg_id: &MessageIdType) -> bool {
-        self.message_cache.contains(msg_id)
+        self.message_cache.contains(msg_id) || self.has_live_replay_dropped_id(msg_id)
     }
 
     /// Queue a self-IHAVE for a stranded publish (x0x #613): `peers` were
@@ -5931,6 +5972,8 @@ impl TopicState {
                     self.prune_peer(worst);
                 }
             }
+            // #32 rescue must not be silently blocked by a prior duplicate-prune backoff.
+            self.prune_backoff.remove(&best);
             self.graft_peer_at(best, now);
         }
         Some(best)
@@ -6433,7 +6476,16 @@ impl TopicState {
     /// Move peer from eager to lazy due to duplicate EAGER receipt and record
     /// a `DUPLICATE_PRUNE_BACKOFF` (10 s) window so `maintain_degree_at` does
     /// not immediately re-graft it (Wave 1, #136).
+    ///
+    /// Refuses to prune the last remaining eager peer when other (`lazy_peers`)
+    /// peers exist in the topic, so duplicate bursts on a multi-peer mesh
+    /// cannot leave `eager_peers` empty between maintenance passes while
+    /// single-peer topics (empty `lazy_peers`, including vetoed-peer demotion)
+    /// remain prunable.
     fn prune_peer_for_duplicate_at(&mut self, peer: PeerId, now: Instant) -> bool {
+        if self.eager_peers.len() <= 1 && !self.lazy_peers.is_empty() {
+            return false;
+        }
         if self.prune_peer(peer) {
             self.prune_backoff
                 .insert(peer, now + DUPLICATE_PRUNE_BACKOFF);
@@ -7396,6 +7448,9 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     transport: Arc<PolicyTransport<T>>,
     /// ML-DSA key pair for signing messages
     signing_key: Arc<saorsa_gossip_identity::MlDsaKeyPair>,
+    /// Shared `Arc<[u8]>` copy of our own ML-DSA-65 public key, allocated once
+    /// at construction so local publishes never re-allocate 1,952 B per publish.
+    own_public_key: Arc<[u8]>,
     /// Low-overhead timing counters for inbound PubSub processing stages.
     stage_stats: Arc<PubSubStageStats>,
     /// Per-[`MessageKind`] outer ML-DSA verify meters (attempts / failures /
@@ -8281,6 +8336,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             signing_key.public_key().to_vec(),
             None,
         );
+        let own_public_key: Arc<[u8]> = key_cache_state
+            .lookup_arc(signing_key.peer_id())
+            .unwrap_or_else(|| Arc::from(signing_key.public_key()));
         let key_cache = Arc::new(Mutex::new(key_cache_state));
         let transport = Arc::new(PolicyTransport::new_with_key_cache(
             transport,
@@ -8293,6 +8351,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             epoch_start: std::time::SystemTime::UNIX_EPOCH,
             transport,
             signing_key,
+            own_public_key,
             stage_stats: Arc::new(PubSubStageStats::default()),
             verify_by_kind: Arc::new(PerKindVerifyMeter::default()),
             key_cache,
@@ -10779,7 +10838,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // with an unsigned frame or expose `Some(msg_id)` to local subscribers.
         let msg_id = msg_id_after_local_sign(&signature, msg_id)?;
 
-        let _message = GossipMessage {
+        let message = GossipMessage {
             header: header.clone(),
             payload: Some(payload.clone()),
             signature,
@@ -10801,7 +10860,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // `ReserveError::Oversized` arm applies it.
         let leaf_wire_bytes = if self.egress_limiter.enabled() {
             Some::<Bytes>(
-                postcard::to_stdvec(&_message)
+                postcard::to_stdvec(&message)
                     .map_err(|error| anyhow!("EAGER serialize failed: {error}"))?
                     .into(),
             )
@@ -10820,7 +10879,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // budget), not a fire-and-forget spawn that can accumulate.
         let bytes: Bytes = match leaf_wire_bytes {
             Some(bytes) => bytes,
-            None => postcard::to_stdvec(&_message)
+            None => postcard::to_stdvec(&message)
                 .map(Bytes::from)
                 .map_err(|error| {
                     warn!(msg_id = ?msg_id, "EAGER serialize failed: {error}");
@@ -10840,8 +10899,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // Add to cache (retaining verified origin signature + shared pubkey for
         // verbatim IWANT / anti-entropy repair, Wave 1 #136).
         let origin_auth = CachedOriginAuth {
-            signature: _message.signature.clone(),
-            public_key: self.intern_pubkey(&_message.public_key),
+            signature: message.signature,
+            public_key: Arc::clone(&self.own_public_key),
         };
         if state.cache_message_with_auth(msg_id, payload.clone(), header, true, Some(origin_auth)) {
             state.set_inner_proof(msg_id, inner_proof);
@@ -11182,12 +11241,47 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             } else if payload_replay {
                 // Wave 1 (#136, P2b): drop known live payload replays BEFORE
-                // ML-DSA-65 verification. Cache insertion stays strictly
-                // post-verify so an attacker cannot poison `replay_cache`.
-                // Attribution uses the authenticated adjacent peer `from`
-                // rather than an unverified outer public key.
-                self.stage_stats.record_payload_replay_dropped(topic, &from);
-                return Ok(());
+                // ML-DSA-65 verification. Re-check under the write lock so
+                // an entry that expired between probe and upgrade falls
+                // through to full verification. On confirmed replay:
+                // 1. Record `msg_id` (plus any #116 refusal mark) in the
+                //    bounded dedupe-only `replay_dropped_ids` LRU (never
+                //    touching `message_cache`), so IHAVE and anti-entropy
+                //    rounds never re-pull this replay ID.
+                // 2. Settle any `outstanding_iwants` / `deferred_iwants`
+                //    claim for `msg_id` without booking a peer failure, so
+                //    honest repair peers are not penalized and the 1024-slot
+                //    IHAVE cap is not starved.
+                // 3. Increment `payload_replay_dropped` without mixing the
+                //    adjacent forwarder into `top_signers`.
+                let lock_started = Instant::now();
+                let mut topics = self.topics.write_topic(&topic).await;
+                self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
+                let dedupe_started = Instant::now();
+                if let Some(state) = topics.get_mut(&topic) {
+                    if let Some(payload_bytes) = message.payload.as_deref() {
+                        if state.has_live_payload_replay(payload_bytes) {
+                            let refused = state.payload_replay_was_refused(payload_bytes);
+                            state.record_replay_dropped_id(msg_id, refused);
+                            if state.outstanding_iwants.remove(&msg_id).is_some() {
+                                state
+                                    .peer_scores
+                                    .entry(from)
+                                    .or_insert_with(PeerScore::new)
+                                    .record_iwant_response();
+                            }
+                            state.deferred_iwants.retain_mut(|entry| {
+                                entry.msg_ids.retain(|id| *id != msg_id);
+                                !entry.msg_ids.is_empty()
+                            });
+                            self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+                            drop(topics);
+                            self.stage_stats
+                                .record_payload_replay_dropped_pre_verify(topic);
+                            return Ok(());
+                        }
+                    }
+                }
             }
             // The pre-verify cache miss is a sub-microsecond lookup and is
             // left unrecorded: `DedupeCheck` continues to measure exactly
@@ -13096,37 +13190,47 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 continue;
             }
             signed += 1;
-            let header_bytes = match postcard::to_stdvec(&cached.header) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    warn!(topic = %LogTopicId::from(topic), "deferred EAGER header serialize failed: {error}");
-                    let mut guard = topics.write_topic(&topic).await;
-                    if let Some(state) = guard.get_mut(&topic) {
-                        state
-                            .deferred_eager_replies
-                            .retain(|candidate| *candidate != entry);
-                    }
-                    continue;
-                }
-            };
-            let signature = match signing_key.sign(&header_bytes) {
-                Ok(signature) => signature,
-                Err(error) => {
-                    warn!(topic = %LogTopicId::from(topic), "deferred EAGER signing failed: {error}");
-                    let mut guard = topics.write_topic(&topic).await;
-                    if let Some(state) = guard.get_mut(&topic) {
-                        state
-                            .deferred_eager_replies
-                            .retain(|candidate| *candidate != entry);
-                    }
-                    continue;
+            // Wave 1 (#136): forward the stored origin ML-DSA-65 signature and
+            // public key verbatim on deferred IWANT-reply retries too, falling
+            // back to local signing only for synthetic test cache entries that
+            // have `origin_auth: None`.
+            let (signature, public_key) = match &cached.origin_auth {
+                Some(auth) => (auth.signature.clone(), auth.public_key.to_vec()),
+                None => {
+                    let header_bytes = match postcard::to_stdvec(&cached.header) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            warn!(topic = %LogTopicId::from(topic), "deferred EAGER header serialize failed: {error}");
+                            let mut guard = topics.write_topic(&topic).await;
+                            if let Some(state) = guard.get_mut(&topic) {
+                                state
+                                    .deferred_eager_replies
+                                    .retain(|candidate| *candidate != entry);
+                            }
+                            continue;
+                        }
+                    };
+                    let signature = match signing_key.sign(&header_bytes) {
+                        Ok(signature) => signature,
+                        Err(error) => {
+                            warn!(topic = %LogTopicId::from(topic), "deferred EAGER signing failed: {error}");
+                            let mut guard = topics.write_topic(&topic).await;
+                            if let Some(state) = guard.get_mut(&topic) {
+                                state
+                                    .deferred_eager_replies
+                                    .retain(|candidate| *candidate != entry);
+                            }
+                            continue;
+                        }
+                    };
+                    (signature, signing_key.public_key().to_vec())
                 }
             };
             let message = GossipMessage {
                 header: cached.header.clone(),
                 payload: Some(cached.payload.clone()),
                 signature,
-                public_key: signing_key.public_key().to_vec(),
+                public_key,
             };
             let bytes = match postcard::to_stdvec(&message).map(Bytes::from) {
                 Ok(bytes) => bytes,
@@ -15855,7 +15959,7 @@ mod tests {
                 .insert(peer, count);
         }
 
-        fn set_connected_peer_ids(&self, peers: Vec<PeerId>) {
+        pub(super) fn set_connected_peer_ids(&self, peers: Vec<PeerId>) {
             *self
                 .connected_peer_ids
                 .lock()
@@ -15884,7 +15988,7 @@ mod tests {
         }
 
         /// Outbound frames of one wire kind to one peer (#59).
-        fn sent_frames_of_kind_to(&self, peer: PeerId, kind: MessageKind) -> Vec<Bytes> {
+        pub(super) fn sent_frames_of_kind_to(&self, peer: PeerId, kind: MessageKind) -> Vec<Bytes> {
             self.sent_frames()
                 .into_iter()
                 .filter(|(to, _stream, data)| *to == peer && peek_message_kind(data) == Some(kind))
@@ -34418,19 +34522,18 @@ mod tests {
         let row = &stats.ingress_by_topic[&topic.to_string()];
         assert_eq!(row.accepted_unique, 1);
         assert_eq!(row.payload_replay_dropped, 1);
-        assert!((1..=2).contains(&row.distinct_signers_estimate));
+        assert_eq!(row.distinct_signers_estimate, 1);
+        // Wave 1 (#136): pre-verify payload replay drop must NOT pollute
+        // `top_signers` with the adjacent forwarder PeerId.
         let replay_peer_hex: String = replay_peer
             .as_bytes()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let republisher_row = row
-            .top_signers
-            .iter()
-            .find(|s| s.signer == replay_peer_hex)
-            .expect("authenticated replay forwarder listed");
-        assert_eq!(republisher_row.msgs, 1);
-        assert_eq!(republisher_row.payload_replays, 1);
+        assert!(
+            row.top_signers.iter().all(|s| s.signer != replay_peer_hex),
+            "adjacent forwarder must not be mixed into verified top_signers"
+        );
         let author_row = row
             .top_signers
             .iter()
@@ -34439,7 +34542,9 @@ mod tests {
         assert_eq!(author_row.payload_replays, 0);
 
         // Wave 1 (#136): only the original frame paid ML-DSA verification;
-        // the payload replay was dropped pre-verify and never entered cache.
+        // the replay msg_id is recorded in dedupe-only `replay_dropped_ids`
+        // (`has_message == true` so IHAVE/AE will not re-pull it) while NEVER
+        // entering `message_cache`.
         assert_eq!(
             pubsub
                 .verify_by_kind_stats()
@@ -34449,10 +34554,17 @@ mod tests {
         );
         let topics = pubsub.topics.read_topic(&topic).await;
         let state = topics.get(&topic).expect("topic state");
-        assert!(state.has_message(&[1u8; 32]), "original msg_id cached");
         assert!(
-            !state.has_message(&[2u8; 32]),
-            "unverified pre-verify replay msg_id must not enter cache"
+            state.message_cache.contains(&[1u8; 32]),
+            "original msg_id cached"
+        );
+        assert!(
+            !state.message_cache.contains(&[2u8; 32]),
+            "unverified pre-verify replay msg_id must not enter message_cache"
+        );
+        assert!(
+            state.has_message(&[2u8; 32]),
+            "replay msg_id must be deduped via replay_dropped_ids so IHAVE/AE will not re-pull"
         );
     }
 
@@ -34811,15 +34923,276 @@ mod wave1_136_tests {
         assert_eq!(grafted_after_backoff, 1);
         assert!(state.eager_peers.contains(&p2));
 
-        // Liveness guard: if EVERY eager peer is duplicate-pruned on a tiny topic,
-        // maintain_degree_at rescues one non-cooled lazy peer so eager_peers never stays empty.
+        // Last-eager guard: `prune_peer_for_duplicate_at` refuses to prune the
+        // last remaining eager peer so duplicate bursts cannot empty eager_peers
+        // between maintenance passes.
         let t2 = now + Duration::from_secs(20);
         assert!(state.prune_peer_for_duplicate_at(p1, t2));
-        assert!(state.prune_peer_for_duplicate_at(p2, t2));
-        assert!(state.eager_peers.is_empty());
-        let (_, rescued) = state.maintain_degree_at(t2 + Duration::from_secs(1));
+        assert!(
+            !state.prune_peer_for_duplicate_at(p2, t2),
+            "must not duplicate-prune the last remaining eager peer"
+        );
+        assert_eq!(state.eager_peers.len(), 1);
+        assert!(state.eager_peers.contains(&p2));
+
+        // #32 rescue guard: if the sole remaining eager peer is suppressed while
+        // a lazy peer is under duplicate-prune backoff, rescue clears the
+        // backoff and promotes the rescued peer.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscribers.push(LocalSubscriber::BytesOnly(tx));
+        state.peer_cooling.insert(
+            p1,
+            PeerCoolingState {
+                suppressed_until: Some(t2 + Duration::from_secs(5)),
+                ..PeerCoolingState::new(t2)
+            },
+        );
+        state.peer_cooling.insert(
+            p2,
+            PeerCoolingState {
+                suppressed_until: Some(t2 + Duration::from_secs(30)),
+                ..PeerCoolingState::new(t2)
+            },
+        );
+        let rescued_peer =
+            state.rescue_suppressed_eager_peer_if_needed_at(t2 + Duration::from_secs(1));
+        assert_eq!(rescued_peer, Some(p1));
+        assert!(
+            state.eager_peers.contains(&p1),
+            "#32 rescue must clear prune_backoff and promote p1"
+        );
+
+        // Liveness guard: if eager_peers was emptied externally (e.g. peer
+        // removal) while all lazy peers are under duplicate-prune backoff,
+        // maintain_degree_at still rescues one non-cooled lazy peer.
+        let t3 = t2 + Duration::from_secs(40);
+        state.peer_cooling.clear();
+        state.eager_peers.clear();
+        state.lazy_peers.extend([p1, p2]);
+        state.prune_backoff.insert(p1, t3 + DUPLICATE_PRUNE_BACKOFF);
+        state.prune_backoff.insert(p2, t3 + DUPLICATE_PRUNE_BACKOFF);
+        let (_, rescued) = state.maintain_degree_at(t3 + Duration::from_secs(1));
         assert_eq!(rescued, 1);
         assert_eq!(state.eager_peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_verify_payload_replay_settles_outstanding_iwant_and_preserves_refusal() {
+        let local = test_peer_id(1);
+        let transport = RecordingTransport::new(local);
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            test_signing_key(),
+            false,
+        );
+        let topic = TopicId::new([0x74; 32]);
+        let author = test_signing_key();
+        let peer_a = test_peer_id(2);
+        let peer_b = test_peer_id(3);
+
+        // Install a validator that refuses `b"refused-body"` (#116).
+        pubsub.set_topic_validator(
+            topic,
+            Arc::new(|_topic: &TopicId, payload: &[u8]| {
+                if payload == b"refused-body" {
+                    ValidationAction::Drop
+                } else {
+                    ValidationAction::ForwardAndDeliver
+                }
+            }),
+        );
+
+        // First copy of refused payload arrives and is refused post-verify.
+        let first_refused = key_cache_eager(&author, topic, 71, b"refused-body");
+        pubsub
+            .handle_eager(peer_a, topic, first_refused)
+            .await
+            .expect("first refused handled");
+
+        // Simulate an in-flight IWANT for a re-wrapped copy (`msg_id = [72; 32]`).
+        let replay_id = [72u8; 32];
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            state.outstanding_iwants.insert(
+                replay_id,
+                OutstandingIwant {
+                    peer: peer_b,
+                    requested_at: Instant::now(),
+                    retry_pending: false,
+                    failures: 0,
+                    retry_not_before: None,
+                },
+            );
+            state.deferred_iwants.push(DeferredIwant {
+                peer: peer_b,
+                msg_ids: vec![replay_id],
+                requested_at: Instant::now(),
+            });
+        }
+
+        // The IWANT reply arrives as an EAGER frame carrying the refused payload.
+        let verifies_before = pubsub
+            .verify_by_kind_stats()
+            .for_kind(MessageKind::Eager)
+            .attempts;
+        let rewrapped = key_cache_eager(&author, topic, 72, b"refused-body");
+        pubsub
+            .handle_eager(peer_b, topic, rewrapped)
+            .await
+            .expect("pre-verify replay dropped cleanly");
+        assert_eq!(
+            pubsub
+                .verify_by_kind_stats()
+                .for_kind(MessageKind::Eager)
+                .attempts,
+            verifies_before,
+            "replay must drop pre-verify"
+        );
+
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert!(
+                !state.outstanding_iwants.contains_key(&replay_id),
+                "outstanding_iwants must be settled at the pre-verify replay drop site"
+            );
+            assert!(
+                state.deferred_iwants.is_empty(),
+                "deferred_iwants for replay_id must be cleared"
+            );
+            assert!(
+                state.has_message(&replay_id),
+                "replay_id must be deduped via replay_dropped_ids"
+            );
+            assert!(
+                !state.message_cache.contains(&replay_id),
+                "unverified replay_id must never enter message_cache"
+            );
+            assert!(
+                state.replay_dropped_id_was_refused(&replay_id),
+                "#116 refusal mark must carry forward into replay_dropped_ids"
+            );
+        }
+
+        // Subsequent IHAVE advertising `replay_id` must NOT issue a new IWANT!
+        let iwants_before = transport
+            .sent_frames_of_kind_to(peer_b, MessageKind::IWant)
+            .len();
+        pubsub
+            .handle_ihave(peer_b, topic, vec![replay_id])
+            .await
+            .expect("ihave handled");
+        assert_eq!(
+            transport
+                .sent_frames_of_kind_to(peer_b, MessageKind::IWant)
+                .len(),
+            iwants_before,
+            "IHAVE must not re-pull a pre-verify dropped replay msg_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_iwant_reply_retry_preserves_origin_auth_verbatim() {
+        let local = test_peer_id(1);
+        let transport = RecordingTransport::new(local);
+        let relay_key = test_signing_key();
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            local,
+            Arc::clone(&transport),
+            relay_key.clone(),
+            false,
+        );
+        let topic = TopicId::new([0x75; 32]);
+        let sender = test_peer_id(2);
+        let requester = test_peer_id(3);
+        transport.set_connected_peer_ids(vec![sender, requester]);
+        // Only `sender` is in the topic mesh so `handle_eager` does not relay-forward
+        // to `requester`; the sole EAGER frame `requester` receives must come from
+        // `EagerSendCause::IwantReplyDeferredRetry`.
+        pubsub.initialize_topic_peers(topic, vec![sender]).await;
+
+        let origin_key = test_signing_key();
+        let origin_msg = key_cache_eager(&origin_key, topic, 81, b"deferred-origin-payload");
+        let expected_sig = origin_msg.signature.clone();
+        let expected_pk = origin_msg.public_key.clone();
+        assert_ne!(expected_pk, relay_key.public_key().to_vec());
+
+        pubsub
+            .handle_eager(sender, topic, origin_msg)
+            .await
+            .expect("origin admitted");
+        assert!(
+            transport
+                .sent_messages_of_kind_to(requester, MessageKind::Eager)
+                .is_empty(),
+            "requester must not have received an eager relay forward before deferred retry"
+        );
+
+        // Enqueue a deferred IWANT reply (simulating byte-limiter/permit deferral).
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            state.deferred_eager_replies.push(DeferredEagerReply {
+                id: 1,
+                peer: requester,
+                msg_id: [81u8; 32],
+                requested_at: Instant::now(),
+            });
+        }
+
+        let mut late_rotation = LateOfferRotation::default();
+        PlumtreePubSub::<RecordingTransport>::flush_ihave_batches(
+            &pubsub.topics,
+            &pubsub.transport,
+            &pubsub.signing_key,
+            &pubsub.stage_stats,
+            &pubsub.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &pubsub.send_path_context(),
+                egress_limiter: &pubsub.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+
+        let deferred_served = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frames = transport.sent_messages_of_kind_to(requester, MessageKind::Eager);
+                if let Some(frame) = frames.into_iter().find(|m| m.header.msg_id == [81u8; 32]) {
+                    return frame;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deferred EAGER reply served");
+
+        assert_eq!(
+            deferred_served.signature, expected_sig,
+            "deferred IWANT retry must forward origin signature verbatim"
+        );
+        assert_eq!(
+            deferred_served.public_key, expected_pk,
+            "deferred IWANT retry must forward origin public key verbatim"
+        );
+        // The detached send task records the cause immediately after transport send.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if pubsub
+                    .stage_stats()
+                    .eager_send_causes
+                    .iwant_reply_deferred_retry
+                    == 1
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("iwant_reply_deferred_retry cause recorded");
     }
 
     #[tokio::test]

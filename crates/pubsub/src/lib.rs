@@ -4578,8 +4578,9 @@ struct TopicState {
     /// Wave 1 (#136): bounded dedupe-only cache of msg_ids dropped pre-verify
     /// as live payload replays (`(dropped_at, refused)`). Consulted by
     /// `has_message` so IHAVE / anti-entropy rounds do not re-pull dropped
-    /// replay IDs and refused-payload replays retain their #116 refusal mark,
-    /// without inserting unverified IDs into `message_cache`.
+    /// replay IDs without inserting unverified IDs into `message_cache`.
+    /// The `refused` bit carries forward the #116 validator-refusal state for
+    /// diagnostics/observability (`replay_dropped_id_was_refused`).
     replay_dropped_ids: LruCache<MessageIdType, (Instant, bool)>,
     /// TTL for replay cache entries.
     replay_ttl: Duration,
@@ -11161,23 +11162,30 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // production traffic takes the fast path.
         //
         // Safety of deciding on an unverified msg_id claim:
-        // - A cache entry only exists for a message that previously passed
-        //   `verify_message_signature`, and msg_id commits to the
-        //   publisher's peer_id and payload (`calculate_msg_id`), so a
-        //   forged frame can only ever *hit* an existing entry — it can
-        //   never seed an entry, and it cannot suppress a genuine message
-        //   (the genuine copy is already cached and delivered).
-        // - Every effect below is keyed on `from`, which the transport
+        // - For `message_cache` hits, an entry only exists for a message that
+        //   previously passed `verify_message_signature`, and msg_id commits to
+        //   the publisher's peer_id and payload (`calculate_msg_id`), so a
+        //   forged frame can only ever *hit* an existing cached entry.
+        // - For pre-verify payload-replay drops (`replay_dropped_ids`), the
+        //   bounded TTL tombstone IS seeded from the unverified `msg_id` when
+        //   `BLAKE3(payload)` matches a live previously-verified payload. That
+        //   tombstone never enters `message_cache` (never advertised or served),
+        //   and shares the pre-existing predictable-msg_id suppression class
+        //   from the prior post-verify path (without requiring a throwaway
+        //   signature); Wave 2 P2c content-bound `msg_id` (receiver recompute,
+        //   saorsa-labs/saorsa-gossip#137) closes the class completely.
+        // - Every mesh effect below is keyed on `from`, which the transport
         //   has already authenticated. A duplicate normally demotes its
         //   sender, but a healthy preferred eager peer retains its role;
         //   cooling or score veto removes that protection. An attacker
         //   cannot use this path to prune a different legitimate peer.
-        // - Peer-benefiting bookkeeping is withheld from the unverified
-        //   frame: `record_inbound_peer_activity_for_state` (recency
-        //   score, mesh-side cooling clear, send-side suppression clear)
-        //   still runs only for verified receipts, so a peer cannot farm
-        //   recency or clear its own cooling with cheap forged frames.
-        // - A late duplicate arriving after the cache TTL evicted the
+        // - Peer-benefiting bookkeeping is withheld from uninvolved or forged
+        //   frames: `record_inbound_peer_activity_for_state` runs only for
+        //   verified receipts, and pre-verify `outstanding_iwants` settlement
+        //   credits `record_iwant_response` ONLY when `entry.peer == from`
+        //   (so an adjacent peer cannot farm response-rate score by cancelling
+        //   another peer's in-flight IWANT with an unsigned frame).
+        // - A late duplicate arriving after the cache/replay TTL evicted the
         //   entry falls through to the normal verify-and-admit path.
         if !self.transport.migration.registered(topic) {
             // Issue #58: probe with a READ lock first. The common case on a
@@ -11263,12 +11271,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         if state.has_live_payload_replay(payload_bytes) {
                             let refused = state.payload_replay_was_refused(payload_bytes);
                             state.record_replay_dropped_id(msg_id, refused);
-                            if state.outstanding_iwants.remove(&msg_id).is_some() {
-                                state
-                                    .peer_scores
-                                    .entry(from)
-                                    .or_insert_with(PeerScore::new)
-                                    .record_iwant_response();
+                            if let Some(entry) = state.outstanding_iwants.remove(&msg_id) {
+                                // Only credit `from` when `from` actually owned
+                                // the in-flight IWANT claim; otherwise settle
+                                // without crediting so an adjacent peer cannot
+                                // farm response-rate score with unsigned frames.
+                                if entry.peer == from {
+                                    state
+                                        .peer_scores
+                                        .entry(from)
+                                        .or_insert_with(PeerScore::new)
+                                        .record_iwant_response();
+                                }
                             }
                             state.deferred_iwants.retain_mut(|entry| {
                                 entry.msg_ids.retain(|id| *id != msg_id);
@@ -35073,6 +35087,56 @@ mod wave1_136_tests {
             assert!(
                 state.replay_dropped_id_was_refused(&replay_id),
                 "#116 refusal mark must carry forward into replay_dropped_ids"
+            );
+            assert_eq!(
+                state
+                    .peer_scores
+                    .get(&peer_b)
+                    .map_or(0, |s| s.iwant_responses),
+                1,
+                "owner peer_b should be credited for answering its own IWANT claim"
+            );
+        }
+
+        // Non-owner score-farming check: if `peer_c` sends an unsigned replay
+        // matching `peer_b`'s in-flight IWANT claim, the claim settles cleanly
+        // WITHOUT crediting `peer_c`'s `iwant_responses`.
+        let peer_c = test_peer_id(4);
+        let replay_id_2 = [73u8; 32];
+        {
+            let mut topics = pubsub.topics.write_topic(&topic).await;
+            let state = topics.get_mut(&topic).expect("topic state");
+            state.outstanding_iwants.insert(
+                replay_id_2,
+                OutstandingIwant {
+                    peer: peer_b,
+                    requested_at: Instant::now(),
+                    retry_pending: false,
+                    failures: 0,
+                    retry_not_before: None,
+                },
+            );
+        }
+        let mut forged_replay = key_cache_eager(&author, topic, 73, b"refused-body");
+        forged_replay.signature = vec![0u8; 16]; // garbage unsigned frame
+        pubsub
+            .handle_eager(peer_c, topic, forged_replay)
+            .await
+            .expect("non-owner replay dropped pre-verify");
+        {
+            let topics = pubsub.topics.read_topic(&topic).await;
+            let state = topics.get(&topic).expect("topic state");
+            assert!(
+                !state.outstanding_iwants.contains_key(&replay_id_2),
+                "non-owner replay must still settle the outstanding_iwants slot"
+            );
+            assert_eq!(
+                state
+                    .peer_scores
+                    .get(&peer_c)
+                    .map_or(0, |s| s.iwant_responses),
+                0,
+                "non-owner peer_c must NOT receive iwant_responses score credit"
             );
         }
 

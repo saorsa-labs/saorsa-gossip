@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.97] - 2026-11-23
+
+### Changed
+
+- **pubsub: Wave 1 zero-wire efficiency (#136, PR #138).** No wire-format
+  change and no public API change; all changes are inside
+  `saorsa-gossip-pubsub`.
+  - **Less eager/lazy churn.** A peer demoted to lazy because it sent a
+    duplicate cannot be grafted back for 10 s (`DUPLICATE_PRUNE_BACKOFF`).
+    A topic never loses its last eager peer to a duplicate prune while it
+    has lazy peers, and degree maintenance rescues a lazy peer if the eager
+    set becomes empty.
+  - **Preferred peers can be pruned.** At most one healthy preferred peer
+    per topic is protected from duplicate pruning. Other preferred peers
+    can move to lazy and still get IHAVE.
+  - **Cheaper replay drop.** A payload replay that is already known is
+    dropped before ML-DSA-65 verification. The replay cache is still only
+    written after verification. The dropped message ID goes to a bounded
+    TTL dedupe list (not the message cache), and an IWANT that waited for
+    it is settled without a peer failure. The existing
+    `payload_replay_dropped` ingress meter counts these drops.
+  - **SG76 key-cache fixes.** A duplicate frame causes a key ACK only when
+    its key equals a key the receiver already verified. The key-cache
+    control token bucket is now burst 8, refill 4/s (was burst 2). Key
+    references are now allowed on `Critical` topics after the receiver
+    acknowledged the signer in the current session;
+    `critical_ref_mismatches` counts only cache misses on such references.
+    If an acknowledged key was evicted, a `Critical` reference now goes
+    through the 5 s pending-key recovery path (before, `Critical` always
+    carried the full key).
+  - **Verbatim repair.** IWANT replies, deferred IWANT retries and
+    anti-entropy repair forward the origin-signed frame as received, not
+    re-signed by the relaying node.
+- **Mixed-version note.** Receivers older than 0.5.97 still accept key
+  references on `Critical` topics, but count each one in
+  `critical_ref_mismatches`. Expect that counter to rise on old nodes
+  during a rollout.
+
 ## [0.5.96] - 2026-11-21
 
 ### Added

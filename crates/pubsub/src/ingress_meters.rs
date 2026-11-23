@@ -331,6 +331,17 @@ impl TopicIngressMeters {
         });
     }
 
+    /// Wave 1 (#136): an EAGER message dropped pre-verify as a live payload
+    /// replay. Increments the replay counters without mixing an adjacent
+    /// forwarder PeerId (or an unverified outer key) into `top_signers` or
+    /// `distinct_signers_estimate`.
+    pub(crate) fn record_payload_replay_pre_verify(&self, topic: TopicId) {
+        self.payload_replay_dropped.fetch_add(1, Ordering::Relaxed);
+        self.with_topic(topic, |meter| {
+            meter.payload_replay_dropped = meter.payload_replay_dropped.saturating_add(1);
+        });
+    }
+
     fn with_topic(&self, topic: TopicId, update: impl FnOnce(&mut TopicIngressMeter)) {
         let mut guard = match self.topics.lock() {
             Ok(guard) => guard,

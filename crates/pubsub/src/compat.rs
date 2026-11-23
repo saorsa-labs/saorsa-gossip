@@ -1014,7 +1014,7 @@ impl<T: GossipTransport + 'static> PolicyTransport<T> {
         &self,
         peer: PeerId,
         bytes: &Bytes,
-        priority: TopicPriority,
+        _priority: TopicPriority,
         encoded: &mut HashMap<([u8; 32], bool), Bytes>,
     ) -> Bytes {
         if crate::key_cache::is_v3(bytes) {
@@ -1054,10 +1054,12 @@ impl<T: GossipTransport + 'static> PolicyTransport<T> {
             return prepared;
         }
         let signer = PeerId::from_pubkey(&message.public_key);
-        let reference = priority != TopicPriority::Critical
-            && cache
-                .lock()
-                .is_ok_and(|mut state| state.supports_ref(session, signer));
+        // Wave 1 (#136): allow key references on Critical topics once the
+        // receiver has explicitly acknowledged this signer on the current
+        // session generation. Un-acknowledged signers still travel Full.
+        let reference = cache
+            .lock()
+            .is_ok_and(|mut state| state.supports_ref(session, signer));
         let cache_key = (*blake3::hash(&prepared).as_bytes(), reference);
         if let Some(wire) = encoded.get(&cache_key) {
             return wire.clone();

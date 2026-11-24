@@ -991,6 +991,18 @@ impl<T: GossipTransport + 'static> PolicyTransport<T> {
         self.wire_bytes_for_peer_cached(peer, bytes, priority, &mut HashMap::new())
     }
 
+    pub(crate) fn supports_unsigned_control_v1(&self, peer: PeerId) -> bool {
+        let Some(cache) = &self.key_cache else {
+            return false;
+        };
+        let Some(session) = self.authenticated_session(peer) else {
+            return false;
+        };
+        cache.lock().is_ok_and(|state| {
+            state.supports_cap(session, crate::key_cache::CAP_UNSIGNED_CONTROL_V1)
+        })
+    }
+
     pub(crate) fn wire_bytes_for_peers(
         &self,
         peers: &[PeerId],
@@ -1017,7 +1029,7 @@ impl<T: GossipTransport + 'static> PolicyTransport<T> {
         _priority: TopicPriority,
         encoded: &mut HashMap<([u8; 32], bool), Bytes>,
     ) -> Bytes {
-        if crate::key_cache::is_v3(bytes) {
+        if crate::key_cache::is_v3(bytes) || crate::control_batch::is_control_batch(bytes) {
             return bytes.clone();
         }
         let Some(cache) = &self.key_cache else {
@@ -1128,6 +1140,43 @@ impl<T: GossipTransport + 'static> GossipTransport for PolicyTransport<T> {
         stream: GossipStreamType,
         bytes: Bytes,
     ) -> Result<()> {
+        if crate::control_batch::is_control_batch(&bytes) {
+            let cache = self
+                .key_cache
+                .as_ref()
+                .ok_or_else(|| anyhow!("key-cache transport state unavailable"))?;
+            let session = self
+                .authenticated_session(peer)
+                .ok_or_else(|| anyhow!("unsigned control batch requires authenticated session"))?;
+            let batch = crate::control_batch::decode_control_batch(&bytes)?;
+            for op in &batch.ops {
+                ensure!(
+                    !self.migration.registered(op.topic()),
+                    "unsigned control batch forbidden on registered legacy-compat topic"
+                );
+            }
+            {
+                let state = cache.lock().map_err(|_| anyhow!("key cache poisoned"))?;
+                ensure!(
+                    state.supports_cap(session, crate::key_cache::CAP_UNSIGNED_CONTROL_V1),
+                    "unsigned control batch capability expired before send"
+                );
+            }
+            return self
+                .inner
+                .send_to_peer_guarded(
+                    peer,
+                    stream,
+                    Arc::new(move |actual| {
+                        ensure!(
+                            actual == session,
+                            "unsigned control batch session changed before send"
+                        );
+                        Ok(bytes.clone())
+                    }),
+                )
+                .await;
+        }
         if crate::key_cache::is_v3(&bytes) {
             let cache = self
                 .key_cache

@@ -162,6 +162,12 @@ pub enum MessageKind {
     AntiEntropy = 7,
     /// HyParView shuffle
     Shuffle = 8,
+    /// Wave 2 (#137): Plumtree wire PRUNE (demote sender eager -> lazy)
+    Prune = 9,
+    /// Wave 2 (#137): Plumtree wire GRAFT (promote sender lazy -> eager, optional msg_id repair)
+    Graft = 10,
+    /// Wave 2 (#137): GossipSub v1.2 IDONTWANT (suppress duplicate EAGER pushes >= 1 KiB)
+    IDontWant = 11,
 }
 
 impl MessageKind {
@@ -177,6 +183,9 @@ impl MessageKind {
             6 => Some(Self::Presence),
             7 => Some(Self::AntiEntropy),
             8 => Some(Self::Shuffle),
+            9 => Some(Self::Prune),
+            10 => Some(Self::Graft),
+            11 => Some(Self::IDontWant),
             _ => None,
         }
     }
@@ -190,17 +199,21 @@ impl MessageKind {
 /// Wire format header for control frames (ML-DSA signed)
 /// Format: ver:u8, topic:\[u8;32\], msg_id:\[u8;32\], kind:u8, hop:u8, ttl:u8
 /// — v1, and exactly that. ADR-012 v2 appends
-/// `payload_hash: Option<[u8;32]>` after `ttl`; the tail is serialized only
-/// when `version >= 2`, so a v1 header re-serializes byte-identically (its
-/// existing signature must keep verifying) and a v1 buffer never misparses
-/// into v2.
+/// `payload_hash: Option<[u8;32]>` after `ttl`; Wave 2 (#137, P2c) v3 appends
+/// `created_at_secs: Option<u64>` after `payload_hash` and binds `msg_id` to
+/// `BLAKE3("saorsa-gossip.msg-id.v3" || topic || payload_hash)`. Each tail is
+/// serialized only when `version` reaches that level, so v1 and v2 headers
+/// re-serialize byte-identically (existing signatures keep verifying) and older
+/// buffers never misparse into newer versions.
 #[derive(Debug, Clone)]
 pub struct MessageHeader {
-    /// Protocol version
+    /// Protocol version (`1` legacy, `2` ADR-012 payload-covering, `3` Wave 2 content-bound)
     pub version: u8,
     /// Topic identifier
     pub topic: TopicId,
-    /// Message ID: BLAKE3(topic || epoch || signer || payload_hash)\[:32\]
+    /// Message ID:
+    /// - v1/v2: `BLAKE3(topic || epoch || signer || payload_hash)[:32]`
+    /// - v3 (Wave 2, P2c): `BLAKE3("saorsa-gossip.msg-id.v3" || topic || payload_hash)`
     pub msg_id: [u8; 32],
     /// Message kind
     pub kind: MessageKind,
@@ -208,13 +221,21 @@ pub struct MessageHeader {
     pub hop: u8,
     /// Time-to-live
     pub ttl: u8,
-    /// ADR-012 v2: BLAKE3 of the payload bytes the header signature covers.
+    /// ADR-012 v2+: BLAKE3 of the payload bytes the header signature covers.
     /// `None` for v1 headers (the header-only-signature era) and for
     /// payload-less control frames it is `Some` of the empty-input hash.
     pub payload_hash: Option<[u8; 32]>,
+    /// Wave 2 (#137, P2c) v3+: origin Unix timestamp in seconds covered by the
+    /// ML-DSA-65 signature so content-bound `msg_id` frames have a bounded
+    /// freshness window aligned with the receiver's seen-ID cache. `None` for
+    /// v1 and v2 headers.
+    pub created_at_secs: Option<u64>,
 }
 
 impl MessageHeader {
+    /// Domain separation prefix for Wave 2 (P2c) content-bound message IDs.
+    pub const CONTENT_BOUND_MSG_ID_DOMAIN: &'static [u8] = b"saorsa-gossip.msg-id.v3";
+
     /// Create a new message header
     pub fn new(topic: TopicId, kind: MessageKind, ttl: u8) -> Self {
         Self {
@@ -225,6 +246,7 @@ impl MessageHeader {
             hop: 0,
             ttl,
             payload_hash: None,
+            created_at_secs: None,
         }
     }
 
@@ -237,10 +259,25 @@ impl MessageHeader {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(hash.as_bytes());
         self.payload_hash = Some(bytes);
+        self.created_at_secs = None;
         self.version = 2;
     }
 
-    /// Calculate message ID from components
+    /// Wave 2 (#137, P2c): stamp `payload_hash`, derive the deterministic
+    /// content-bound `msg_id = BLAKE3("saorsa-gossip.msg-id.v3" || topic || payload_hash)`,
+    /// record the signed freshness timestamp (`created_at_secs`), and set wire
+    /// `version = 3`.
+    pub fn seal_content_bound_v3(&mut self, payload: Option<&[u8]>, created_at_secs: u64) {
+        let hash = blake3::hash(payload.unwrap_or(&[]));
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(hash.as_bytes());
+        self.msg_id = Self::calculate_content_bound_msg_id(&self.topic, &bytes);
+        self.payload_hash = Some(bytes);
+        self.created_at_secs = Some(created_at_secs);
+        self.version = 3;
+    }
+
+    /// Calculate v1/v2 message ID from components
     pub fn calculate_msg_id(
         topic: &TopicId,
         epoch: u64,
@@ -256,6 +293,20 @@ impl MessageHeader {
         let mut msg_id = [0u8; 32];
         msg_id.copy_from_slice(&hash.as_bytes()[..32]);
         msg_id
+    }
+
+    /// Calculate Wave 2 (P2c) content-bound message ID:
+    /// `BLAKE3("saorsa-gossip.msg-id.v3" || topic || payload_hash)`.
+    ///
+    /// Independent of epoch and signer so every envelope carrying the same
+    /// `(topic, payload)` deterministically maps to one verifiable ID before
+    /// ML-DSA-65 verification.
+    pub fn calculate_content_bound_msg_id(topic: &TopicId, payload_hash: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(Self::CONTENT_BOUND_MSG_ID_DOMAIN);
+        hasher.update(topic.as_bytes());
+        hasher.update(payload_hash);
+        *hasher.finalize().as_bytes()
     }
 
     /// Increment hop count
@@ -277,17 +328,24 @@ impl MessageHeader {
     }
 }
 
-// ADR-012: manual, version-dispatched serde for the header. Postcard (and
-// any other self-describing-free format) serializes a struct as its field
-// sequence, so these seq-form impls are wire-identical to the previous
-// derive for the shared prefix. The v2 tail (`payload_hash`) is written only
-// when `version >= 2`, and read only then — a v1 buffer decodes with
-// `payload_hash: None` and never misparses into v2, and a decoded v1 header
-// re-serializes byte-identically so its existing signature keeps verifying.
+// ADR-012 / Wave 2 (#137): manual, version-dispatched serde for the header.
+// Postcard (and any other self-describing-free format) serializes a struct as
+// its field sequence, so these seq-form impls are wire-identical to the
+// previous derive for the shared prefix. The v2 tail (`payload_hash`) is
+// written only when `version >= 2`, and the v3 tail (`created_at_secs`) is
+// written only when `version >= 3` — v1 and v2 buffers re-serialize
+// byte-identically so existing signatures keep verifying.
 impl Serialize for MessageHeader {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple as _;
-        let mut seq = serializer.serialize_tuple(if self.version >= 2 { 7 } else { 6 })?;
+        let len = if self.version >= 3 {
+            8
+        } else if self.version >= 2 {
+            7
+        } else {
+            6
+        };
+        let mut seq = serializer.serialize_tuple(len)?;
         seq.serialize_element(&self.version)?;
         seq.serialize_element(&self.topic)?;
         seq.serialize_element(&self.msg_id)?;
@@ -296,6 +354,9 @@ impl Serialize for MessageHeader {
         seq.serialize_element(&self.ttl)?;
         if self.version >= 2 {
             seq.serialize_element(&self.payload_hash)?;
+        }
+        if self.version >= 3 {
+            seq.serialize_element(&self.created_at_secs)?;
         }
         seq.end()
     }
@@ -334,6 +395,11 @@ impl<'de> Deserialize<'de> for MessageHeader {
                 } else {
                     None
                 };
+                let created_at_secs = if version >= 3 {
+                    field!(Option<u64>)
+                } else {
+                    None
+                };
                 Ok(MessageHeader {
                     version,
                     topic,
@@ -342,11 +408,12 @@ impl<'de> Deserialize<'de> for MessageHeader {
                     hop,
                     ttl,
                     payload_hash,
+                    created_at_secs,
                 })
             }
         }
 
-        deserializer.deserialize_tuple(7, HeaderVisitor)
+        deserializer.deserialize_tuple(8, HeaderVisitor)
     }
 }
 
@@ -1063,6 +1130,61 @@ mod tests {
         let v2_bytes = postcard::to_stdvec(&v1).expect("v2 serialize");
         let decoded_v2: MessageHeader = postcard::from_bytes(&v2_bytes).expect("v2 decode");
         assert_eq!(decoded_v2.payload_hash, Some(sealed_hash));
+        assert_eq!(decoded_v2.created_at_secs, None);
+        assert_eq!(
+            postcard::to_stdvec(&decoded_v2).expect("v2 re-serialize"),
+            v2_bytes,
+            "decoded v2 header re-serializes byte-identically"
+        );
+
+        let created_at = 1_795_447_600_u64;
+        v1.seal_content_bound_v3(Some(payload), created_at);
+        assert_eq!(v1.version, 3);
+        assert_eq!(v1.payload_hash, Some(sealed_hash));
+        assert_eq!(v1.created_at_secs, Some(created_at));
+        assert_eq!(
+            v1.msg_id,
+            MessageHeader::calculate_content_bound_msg_id(&topic, &sealed_hash)
+        );
+        let v3_bytes = postcard::to_stdvec(&v1).expect("v3 serialize");
+        let (decoded_v3, trailing): (MessageHeader, _) =
+            postcard::take_from_bytes(&v3_bytes).expect("v3 decode");
+        assert!(trailing.is_empty());
+        assert_eq!(decoded_v3.version, 3);
+        assert_eq!(decoded_v3.payload_hash, Some(sealed_hash));
+        assert_eq!(decoded_v3.created_at_secs, Some(created_at));
+        assert_eq!(decoded_v3.msg_id, v1.msg_id);
+        assert_eq!(
+            postcard::to_stdvec(&decoded_v3).expect("v3 re-serialize"),
+            v3_bytes
+        );
+    }
+
+    #[test]
+    fn wave2_message_kinds_and_content_bound_msg_id() {
+        assert_eq!(MessageKind::from_u8(9), Some(MessageKind::Prune));
+        assert_eq!(MessageKind::from_u8(10), Some(MessageKind::Graft));
+        assert_eq!(MessageKind::from_u8(11), Some(MessageKind::IDontWant));
+        assert_eq!(MessageKind::from_u8(12), None);
+        assert_eq!(MessageKind::Prune.to_u8(), 9);
+        assert_eq!(MessageKind::Graft.to_u8(), 10);
+        assert_eq!(MessageKind::IDontWant.to_u8(), 11);
+
+        let topic_a = TopicId::new([1u8; 32]);
+        let topic_b = TopicId::new([2u8; 32]);
+        let h1 = *blake3::hash(b"payload-1").as_bytes();
+        let h2 = *blake3::hash(b"payload-2").as_bytes();
+
+        let id1 = MessageHeader::calculate_content_bound_msg_id(&topic_a, &h1);
+        let id1_again = MessageHeader::calculate_content_bound_msg_id(&topic_a, &h1);
+        let id_diff_payload = MessageHeader::calculate_content_bound_msg_id(&topic_a, &h2);
+        let id_diff_topic = MessageHeader::calculate_content_bound_msg_id(&topic_b, &h1);
+        let legacy_id = MessageHeader::calculate_msg_id(&topic_a, 0, &PeerId::new([0u8; 32]), &h1);
+
+        assert_eq!(id1, id1_again);
+        assert_ne!(id1, id_diff_payload);
+        assert_ne!(id1, id_diff_topic);
+        assert_ne!(id1, legacy_id);
     }
 
     #[test]

@@ -168,6 +168,26 @@ fn take_bytes<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
 /// exact-body consumption (`rest.is_empty()`), hard op/ID/byte caps, and
 /// rejects ops targeting the reserved signed key-cache control topic.
 pub(crate) fn preflight_control_batch(body: &[u8]) -> Result<()> {
+    preflight_control_batch_body(body, |_| Ok(()))
+}
+
+/// Allocation-free validation of a full framed unsigned control batch (including
+/// [`CONTROL_BATCH_MARKER`]) that also validates each op's [`TopicId`] via
+/// `check_topic` without allocating a decoded [`UnsignedControlBatch`].
+pub(crate) fn preflight_framed_control_batch(
+    bytes: &[u8],
+    check_topic: impl FnMut(TopicId) -> Result<()>,
+) -> Result<()> {
+    let body = bytes
+        .strip_prefix(CONTROL_BATCH_MARKER)
+        .ok_or_else(|| anyhow!("missing unsigned control batch marker"))?;
+    preflight_control_batch_body(body, check_topic)
+}
+
+fn preflight_control_batch_body(
+    body: &[u8],
+    mut check_topic: impl FnMut(TopicId) -> Result<()>,
+) -> Result<()> {
     ensure!(
         CONTROL_BATCH_MARKER.len().saturating_add(body.len()) <= MAX_CONTROL_BATCH_BYTES,
         "unsigned control batch exceeds byte cap"
@@ -187,6 +207,9 @@ pub(crate) fn preflight_control_batch(body: &[u8]) -> Result<()> {
             topic_slice != reserved.as_bytes(),
             "key-cache control topic must remain ML-DSA-65 signed"
         );
+        let mut topic_bytes = [0u8; 32];
+        topic_bytes.copy_from_slice(topic_slice);
+        check_topic(TopicId::new(topic_bytes))?;
         match variant {
             // IHave (0), IWant (1), IDontWant (4), AntiEntropyDigest (5), AntiEntropyResponse (6)
             0 | 1 | 4 | 5 | 6 => {

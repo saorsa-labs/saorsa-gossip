@@ -1148,13 +1148,13 @@ impl<T: GossipTransport + 'static> GossipTransport for PolicyTransport<T> {
             let session = self
                 .authenticated_session(peer)
                 .ok_or_else(|| anyhow!("unsigned control batch requires authenticated session"))?;
-            let batch = crate::control_batch::decode_control_batch(&bytes)?;
-            for op in &batch.ops {
+            crate::control_batch::preflight_framed_control_batch(&bytes, |topic| {
                 ensure!(
-                    !self.migration.registered(op.topic()),
+                    !self.migration.registered(topic),
                     "unsigned control batch forbidden on registered legacy-compat topic"
                 );
-            }
+                Ok(())
+            })?;
             {
                 let state = cache.lock().map_err(|_| anyhow!("key cache poisoned"))?;
                 ensure!(

@@ -561,8 +561,9 @@ async fn run_mesh_scenario(keypairs: &[MlDsaKeyPair], wave2_enabled: bool) -> Ga
         }
     }
 
-    // Warm up session Hello + 2-phase Capabilities confirmation across ALL pairs
-    // (~1.4 s covers Hello + Capabilities + confirmation echo cleanly).
+    // Warm up session Hello + 2-phase Capabilities confirmation across ALL pairs.
+    // Poll deterministically on `confirmed_wave2_session_count()` when Wave 2 is
+    // enabled so slow 2-vCPU CI runners NEVER race the measurement window.
     let warmup_topic = TopicId::new([0x99; 32]);
     for (idx, (node, _)) in nodes.iter().enumerate() {
         let others: Vec<PeerId> = peer_ids
@@ -577,11 +578,37 @@ async fn run_mesh_scenario(keypairs: &[MlDsaKeyPair], wave2_enabled: bool) -> Ga
             .publish_local(warmup_topic, Bytes::from(format!("warmup-{i}")))
             .await;
     }
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
     if wave2_enabled {
+        let expected_sessions = node_count - 1;
+        let warmup_deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < warmup_deadline {
+            if nodes
+                .iter()
+                .all(|(n, _)| n.confirmed_wave2_session_count() == expected_sessions)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            nodes
+                .iter()
+                .all(|(n, _)| n.confirmed_wave2_session_count() == expected_sessions),
+            "all {} nodes must reach {} confirmed Wave 2 sessions before measurement (got {:?})",
+            node_count,
+            expected_sessions,
+            nodes
+                .iter()
+                .map(|(n, _)| n.confirmed_wave2_session_count())
+                .collect::<Vec<_>>()
+        );
+        // Let any in-flight warmup frames drain before snapshotting start_totals.
+        tokio::time::sleep(Duration::from_millis(250)).await;
         for (node, _) in &nodes {
             node.set_content_bound_msg_id_policy(ContentBoundMsgIdPolicy::PublishV3);
         }
+    } else {
+        tokio::time::sleep(Duration::from_millis(600)).await;
     }
 
     let snapshot_totals = |nodes: &[(Arc<PlumtreePubSub<BusTransport>>, Arc<BusTransport>)]| {
@@ -960,12 +987,34 @@ async fn wave2_mixed_fleet_interop_with_legacy_0597_peers_delivers_100_percent()
         node.initialize_topic_peers(topic, others).await;
     }
 
-    // Warm up Hello + 2-phase Capabilities across mixed mesh.
-    let _ = nodes[0]
-        .0
-        .publish_local(topic, Bytes::from_static(b"mixed-warmup"))
-        .await;
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // Warm up Hello + 2-phase Capabilities across mixed mesh (publish from all
+    // 3 Wave-2 nodes so every Wave-2 pair completes confirmation deterministically).
+    for (i, (node, _, is_w2)) in nodes.iter().enumerate() {
+        if *is_w2 {
+            let _ = node
+                .publish_local(topic, Bytes::from(format!("mixed-warmup-{i}")))
+                .await;
+        }
+    }
+    let warmup_deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < warmup_deadline {
+        if nodes
+            .iter()
+            .filter(|(_, _, is_w2)| *is_w2)
+            .all(|(n, _, _)| n.confirmed_wave2_session_count() == 2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        nodes
+            .iter()
+            .filter(|(_, _, is_w2)| *is_w2)
+            .all(|(n, _, _)| n.confirmed_wave2_session_count() == 2),
+        "all 3 Wave-2 nodes must confirm capabilities with their 2 Wave-2 peers"
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
     for rx in &mut rxs {
         while rx.try_recv().is_ok() {}
     }
@@ -1026,18 +1075,81 @@ async fn wave2_mixed_fleet_interop_with_legacy_0597_peers_delivers_100_percent()
     }
 
     // Also test defense-in-depth per-peer v3 egress gating (Opus Major #1):
-    // even if a Wave-2 node switches to `PublishV3` in a mixed fleet, ZERO v3
-    // headers may leak on the wire to any legacy 0.5.97 peer (neither direct
-    // nor via Wave-2 relay forwarding!).
+    // even if a Wave-2 node switches to `PublishV3` in a mixed fleet, all 3
+    // Wave-2 nodes receive the v3 payload while ZERO v3 headers AND ZERO v3
+    // IHAVEs leak on the wire to any legacy 0.5.97 peer (neither direct nor
+    // via Wave-2 relay forwarding, stranded retry, or deferred replies!).
+    let legacy_iwants_before: u64 = nodes
+        .iter()
+        .filter(|(_, _, is_w2)| !*is_w2)
+        .map(|(n, _, _)| {
+            n.stage_stats()
+                .outbound_by_kind
+                .get("iwant")
+                .map_or(0, |m| m.msgs)
+        })
+        .sum();
+    let v3_payload = Bytes::from(vec![0xee; 1500]);
     nodes[0]
         .0
         .set_content_bound_msg_id_policy(ContentBoundMsgIdPolicy::PublishV3);
     nodes[0]
         .0
-        .publish_local(topic, Bytes::from(vec![0xee; 1500]))
+        .publish_local(topic, v3_payload.clone())
         .await
         .expect("v3 pub in mixed fleet");
-    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut v3_received = [false; NODE_COUNT];
+    let v3_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < v3_deadline {
+        for (idx, rx) in rxs.iter_mut().enumerate() {
+            while let Ok((_, data)) = rx.try_recv() {
+                if data == v3_payload {
+                    v3_received[idx] = true;
+                }
+            }
+        }
+        if v3_received[..3].iter().all(|&got| got) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Wait past >=2 legacy 100 ms flush cycles to catch any late v3 IHAVE/retry leak.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for (idx, rx) in rxs.iter_mut().enumerate() {
+        while let Ok((_, data)) = rx.try_recv() {
+            if data == v3_payload {
+                v3_received[idx] = true;
+            }
+        }
+    }
+    for (idx, &got) in v3_received.iter().enumerate() {
+        if idx < 3 {
+            assert!(
+                got,
+                "Wave-2 node {idx} must receive the PublishV3 message in a mixed fleet"
+            );
+        } else {
+            assert!(
+                !got,
+                "legacy 0.5.97 node {idx} must NOT receive a PublishV3 message"
+            );
+        }
+    }
+    let legacy_iwants_after: u64 = nodes
+        .iter()
+        .filter(|(_, _, is_w2)| !*is_w2)
+        .map(|(n, _, _)| {
+            n.stage_stats()
+                .outbound_by_kind
+                .get("iwant")
+                .map_or(0, |m| m.msgs)
+        })
+        .sum();
+    assert_eq!(
+        legacy_iwants_after, legacy_iwants_before,
+        "legacy 0.5.97 nodes must not emit wasted IWANT pulls for filtered v3 IDs"
+    );
 
     // Raw wire-level 0.5.97 decoder audit on EVERY legacy peer!
     for (idx, (node, tr, is_wave2)) in nodes.iter().enumerate() {

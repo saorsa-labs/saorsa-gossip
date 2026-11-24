@@ -12,6 +12,7 @@ use saorsa_gossip_types::{PeerId, TopicId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -497,6 +498,14 @@ impl SessionState {
         self.tokens -= 1.0;
         true
     }
+    fn is_wave2_confirmed(&self, local_caps: u64) -> bool {
+        local_caps != 0
+            && self.hello_sent
+            && self.hello_received
+            && self.caps_received
+            && self.peer_acked_our_caps
+            && (local_caps & self.peer_caps) != 0
+    }
 }
 
 pub(crate) struct KeyCache {
@@ -508,6 +517,9 @@ pub(crate) struct KeyCache {
     pending_frames: usize,
     pending_bytes: usize,
     local_caps: u64,
+    /// Lock-free count of active sessions with confirmed mutual Wave 2
+    /// capabilities, kept in sync on every session/capability state transition.
+    confirmed_wave2_sessions: Arc<AtomicUsize>,
     stats: KeyCacheSnapshot,
 }
 
@@ -532,6 +544,7 @@ impl Default for KeyCache {
             pending_frames: 0,
             pending_bytes: 0,
             local_caps: LOCAL_WAVE2_CAPS,
+            confirmed_wave2_sessions: Arc::new(AtomicUsize::new(0)),
             stats: KeyCacheSnapshot::default(),
         }
     }
@@ -552,6 +565,26 @@ impl KeyCache {
             self.sessions
                 .insert(session.peer, SessionState::new(session.generation, now));
         }
+    }
+
+    fn sync_confirmed_wave2_sessions(&self) {
+        let count = if self.local_caps == 0 {
+            0
+        } else {
+            self.sessions
+                .values()
+                .filter(|state| state.is_wave2_confirmed(self.local_caps))
+                .count()
+        };
+        self.confirmed_wave2_sessions
+            .store(count, Ordering::Release);
+    }
+
+    /// Lock-free shared counter of active sessions with confirmed mutual Wave 2
+    /// capabilities, read by background flusher ticks without acquiring the
+    /// `KeyCache` mutex.
+    pub(crate) fn confirmed_wave2_sessions_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.confirmed_wave2_sessions)
     }
 
     fn clear_peer(&mut self, peer: PeerId) {
@@ -581,6 +614,7 @@ impl KeyCache {
         for key in inbound_keys {
             self.announced_inbound.pop(&key);
         }
+        self.sync_confirmed_wave2_sessions();
     }
 
     pub(crate) fn forget_stale(&mut self, session: AuthenticatedSession) {
@@ -610,6 +644,7 @@ impl KeyCache {
 
     pub(crate) fn set_local_caps(&mut self, caps: u64) {
         self.local_caps = caps;
+        self.sync_confirmed_wave2_sessions();
     }
 
     #[cfg(test)]
@@ -649,18 +684,11 @@ impl KeyCache {
             })
     }
 
-    /// Fast O(1)-when-legacy check for whether at least one active session has
-    /// confirmed mutual Wave 2 capabilities. Used by the background flusher so
-    /// all-legacy fleets take ZERO extra topic write locks on Wave 2 ticks.
+    /// Fast lock-free check for whether at least one active session has
+    /// confirmed mutual Wave 2 capabilities.
+    #[cfg(test)]
     pub(crate) fn has_any_wave2_peer(&self) -> bool {
-        self.local_caps != 0
-            && self.sessions.values().any(|state| {
-                state.hello_sent
-                    && state.hello_received
-                    && state.caps_received
-                    && state.peer_acked_our_caps
-                    && (self.local_caps & state.peer_caps) != 0
-            })
+        self.confirmed_wave2_sessions.load(Ordering::Acquire) > 0
     }
 
     /// Record a peer's `Control::Capabilities` advertisement (and optional
@@ -698,6 +726,7 @@ impl KeyCache {
                 }
             }
         }
+        self.sync_confirmed_wave2_sessions();
         Ok(())
     }
 
@@ -707,6 +736,7 @@ impl KeyCache {
                 state.hello_received = true;
             }
         }
+        self.sync_confirmed_wave2_sessions();
     }
 
     pub(crate) fn acknowledge(&mut self, session: AuthenticatedSession, keys: &[PeerId]) {
@@ -1108,6 +1138,7 @@ impl KeyCache {
             }
             _ => {}
         }
+        self.sync_confirmed_wave2_sessions();
     }
 
     pub(crate) fn sessions(&self) -> Vec<AuthenticatedSession> {

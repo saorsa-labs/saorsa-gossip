@@ -1003,6 +1003,18 @@ impl<T: GossipTransport + 'static> PolicyTransport<T> {
         })
     }
 
+    pub(crate) fn supports_content_bound_msg_id(&self, peer: PeerId) -> bool {
+        let Some(cache) = &self.key_cache else {
+            return false;
+        };
+        let Some(session) = self.authenticated_session(peer) else {
+            return false;
+        };
+        cache.lock().is_ok_and(|state| {
+            state.supports_cap(session, crate::key_cache::CAP_CONTENT_BOUND_MSG_ID)
+        })
+    }
+
     pub(crate) fn wire_bytes_for_peers(
         &self,
         peers: &[PeerId],
@@ -1186,12 +1198,12 @@ impl<T: GossipTransport + 'static> GossipTransport for PolicyTransport<T> {
                 .authenticated_session(peer)
                 .ok_or_else(|| anyhow!("v3 send requires authenticated session"))?;
             let decoded = crate::key_cache::decode(&bytes)?;
-            let (topic, signer, reference) = match decoded {
+            let (topic, header_version, signer, reference) = match decoded {
                 crate::key_cache::Decoded::Full(message, signer) => {
-                    (message.header.topic, signer, false)
+                    (message.header.topic, message.header.version, signer, false)
                 }
                 crate::key_cache::Decoded::Ref(message, signer) => {
-                    (message.header.topic, signer, true)
+                    (message.header.topic, message.header.version, signer, true)
                 }
             };
             {
@@ -1200,6 +1212,12 @@ impl<T: GossipTransport + 'static> GossipTransport for PolicyTransport<T> {
                     state.supports_v3(session),
                     "v3 capability expired before send"
                 );
+                if header_version == 3 {
+                    ensure!(
+                        state.supports_cap(session, crate::key_cache::CAP_CONTENT_BOUND_MSG_ID),
+                        "MessageHeader v3 requires negotiated CAP_CONTENT_BOUND_MSG_ID"
+                    );
+                }
                 if reference {
                     ensure!(
                         state.supports_ref(session, signer),
@@ -1210,6 +1228,58 @@ impl<T: GossipTransport + 'static> GossipTransport for PolicyTransport<T> {
             }
             return self
                 .send_v3_guarded(peer, session, stream, topic, bytes)
+                .await;
+        }
+        // Single transport-layer choke point for raw postcard `MessageHeader` v3
+        // frames (version byte == 3): no caller (publish, relay, IWANT/GRAFT
+        // reply, AE push, stranded retry, or deferred reply) can leak a v3
+        // header onto a peer lacking confirmed `CAP_CONTENT_BOUND_MSG_ID` or
+        // onto a registered legacy-compat topic.
+        if bytes.first() == Some(&3) {
+            let cache = self
+                .key_cache
+                .as_ref()
+                .ok_or_else(|| anyhow!("key-cache transport state unavailable"))?;
+            let session = self
+                .authenticated_session(peer)
+                .ok_or_else(|| anyhow!("MessageHeader v3 requires authenticated session"))?;
+            let has_registered_topics = !self
+                .migration
+                .state
+                .lock()
+                .map_err(|_| anyhow!("migration policy poisoned"))?
+                .topics
+                .is_empty();
+            if has_registered_topics {
+                let (header, _) =
+                    postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(&bytes)
+                        .map_err(|e| anyhow!("invalid MessageHeader v3 frame: {e}"))?;
+                ensure!(
+                    !self.migration.registered(header.topic),
+                    "MessageHeader v3 forbidden on registered legacy-compat topic"
+                );
+            }
+            {
+                let state = cache.lock().map_err(|_| anyhow!("key cache poisoned"))?;
+                ensure!(
+                    state.supports_cap(session, crate::key_cache::CAP_CONTENT_BOUND_MSG_ID),
+                    "MessageHeader v3 requires negotiated CAP_CONTENT_BOUND_MSG_ID"
+                );
+            }
+            record_legacy_full_outbound(self.key_cache.as_ref(), &bytes);
+            return self
+                .inner
+                .send_to_peer_guarded(
+                    peer,
+                    stream,
+                    Arc::new(move |actual| {
+                        ensure!(
+                            actual == session,
+                            "MessageHeader v3 session changed before send"
+                        );
+                        Ok(bytes.clone())
+                    }),
+                )
                 .await;
         }
         let enabled = !self

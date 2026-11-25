@@ -1206,6 +1206,12 @@ impl<T: GossipTransport + 'static> GossipTransport for PolicyTransport<T> {
                     (message.header.topic, message.header.version, signer, true)
                 }
             };
+            if header_version == 3 {
+                ensure!(
+                    !self.migration.registered(topic),
+                    "MessageHeader v3 forbidden on registered legacy-compat topic"
+                );
+            }
             {
                 let mut state = cache.lock().map_err(|_| anyhow!("key cache poisoned"))?;
                 ensure!(

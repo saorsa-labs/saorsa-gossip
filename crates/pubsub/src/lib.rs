@@ -4762,7 +4762,8 @@ struct Wave2BatchSendTask {
     wire: Bytes,
     op_count: usize,
     is_critical: bool,
-    reservation: Option<egress::ByteReservation>,
+    local_origin: bool,
+    weights: Vec<(TopicId, &'static str, usize)>,
     topic_batches: Vec<(TopicId, Vec<MessageIdType>, Vec<PeerId>)>,
 }
 
@@ -4775,7 +4776,6 @@ struct PreparedWave2Work {
 enum Wave2SendCompletion {
     BatchSent {
         peer: PeerId,
-        is_critical: bool,
         topic_batches: Vec<(TopicId, Vec<MessageIdType>, Vec<PeerId>)>,
         sent: bool,
     },
@@ -5596,13 +5596,16 @@ impl TopicState {
         self.pending_graft_timers.remove(msg_id).is_some()
     }
 
-    /// Drain all pending GRAFT timers whose deadline has arrived (`<= now`).
+    /// Drain up to `max_take` pending GRAFT timers whose deadline has arrived (`<= now`).
     /// Returns `(peer, msg_id, is_fallback, has_more_fallbacks, retry_count)`
-    /// tuples. If fallback advertisers remain, re-arms the timer for `120 ms`
+    /// tuples. Already-cached due timers are pruned without consuming `max_take`.
+    /// Any remaining due timers above `max_take` stay armed for the next tick.
+    /// If fallback advertisers remain, re-arms the timer for `120 ms`
     /// (`GRAFT_FALLBACK_DELAY`); otherwise removes the timer once fired.
     fn take_due_graft_timers_at(
         &mut self,
         now: Instant,
+        max_take: usize,
     ) -> Vec<(PeerId, MessageIdType, bool, bool, u8)> {
         if self.pending_graft_timers.is_empty() {
             return Vec::new();
@@ -5616,6 +5619,9 @@ impl TopicState {
         for msg_id in due_ids {
             if self.has_message(&msg_id) {
                 self.pending_graft_timers.remove(&msg_id);
+                continue;
+            }
+            if fired.len() >= max_take {
                 continue;
             }
             let Some(timer) = self.pending_graft_timers.get_mut(&msg_id) else {
@@ -6293,6 +6299,7 @@ impl TopicState {
         &mut self,
         peer: PeerId,
         now: Instant,
+        include_v3: bool,
         // cfg(test): the owning map's contention counters — threaded in
         // because the scan-side increments must fire wherever the scan
         // physically runs (the revert-detection for "selection moved
@@ -6320,6 +6327,7 @@ impl TopicState {
                 let key = (entry.inserted_at, *id);
                 (entry.message.local_origin
                     && !entry.message.dropped
+                    && (include_v3 || entry.message.header.version != 3)
                     && entry.inserted_at <= offer.cutoff
                     && offer.cursor.is_none_or(|cursor| key > cursor))
                 .then_some(key)
@@ -6342,7 +6350,7 @@ impl TopicState {
         // Direct unit tests drive this on a bare TopicState with no map,
         // so hand the selector throwaway per-call instrumentation.
         let contention = TopicContentionInstrumentation::default();
-        let mut eligible = self.late_local_offer_keys(peer, now, &contention)?;
+        let mut eligible = self.late_local_offer_keys(peer, now, true, &contention)?;
         eligible.sort_unstable();
         eligible.truncate(MAX_IHAVE_BATCH_SIZE);
         let last = eligible.last().copied()?;
@@ -14352,10 +14360,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     ///
     /// Collects cached message IDs and sends them as an `AntiEntropyPayload::Digest`.
     async fn send_anti_entropy_digest(&self, topic: TopicId, peer: PeerId) -> Result<()> {
+        let registered = self.transport.migration.registered(topic);
+        let peer_supports_v3 = registered || self.transport.supports_content_bound_msg_id(peer);
         let topics = self.topics.read_topic(&topic).await;
         let msg_ids = if let Some(state) = topics.get(&topic) {
             let mut ids = state.cached_message_ids();
-            if self.transport.migration.registered(topic) {
+            if !peer_supports_v3 {
+                ids.retain(|id| {
+                    !state
+                        .message_cache
+                        .lru
+                        .peek(id)
+                        .is_some_and(|cached| cached.message.header.version == 3)
+                });
+            }
+            if registered {
                 ids.truncate(1024);
             }
             ids
@@ -14564,6 +14583,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let mut wave2_in_flight: tokio::task::JoinSet<Wave2SendCompletion> =
                 tokio::task::JoinSet::new();
             let mut in_flight_normal_peers: HashMap<PeerId, usize> = HashMap::new();
+            let mut in_flight_normal_tasks: HashMap<tokio::task::Id, PeerId> = HashMap::new();
+            let critical_cap = WAVE2_FLUSH_MAX_CONCURRENT_SENDS + 32;
 
             loop {
                 tokio::select! {
@@ -14571,17 +14592,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         debug!("PubSub IHAVE flusher stopping for shutdown: running one final flush");
                         let now = Instant::now();
                         coalesce_tick = coalesce_tick.wrapping_add(1);
+                        let max_due_grafts = critical_cap.saturating_sub(wave2_in_flight.len());
                         let work = Self::prepare_wave2_flush_work(
                             &topics,
                             &transport,
                             &key_cache,
                             &stage_stats,
-                            &egress_limiter,
                             &send_path,
                             &confirmed_wave2_sessions,
                             &graft_timers_pending,
                             &critical_ihave_pending,
                             &in_flight_normal_peers,
+                            max_due_grafts,
                             now,
                             true,
                             coalesce_tick,
@@ -14590,6 +14612,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         Self::spawn_wave2_work_into(
                             &mut wave2_in_flight,
                             &mut in_flight_normal_peers,
+                            &mut in_flight_normal_tasks,
+                            &critical_ihave_pending,
                             &transport,
                             &key_cache,
                             &signing_key,
@@ -14603,27 +14627,35 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         // on healthy links before aborting stragglers (stays well within
                         // BACKGROUND_SHUTDOWN_GRACE = 1 s).
                         let _ = tokio::time::timeout(Duration::from_millis(250), async {
-                            while let Some(completed) = wave2_in_flight.join_next().await {
-                                if let Ok(completion) = completed {
-                                    if let Wave2SendCompletion::BatchSent { peer, is_critical: false, .. } = &completion {
-                                        if let Some(count) = in_flight_normal_peers.get_mut(peer) {
-                                            *count = count.saturating_sub(1);
-                                            if *count == 0 {
-                                                in_flight_normal_peers.remove(peer);
-                                            }
-                                        }
+                            while let Some(completed) = wave2_in_flight.join_next_with_id().await {
+                                match completed {
+                                    Ok((task_id, completion)) => {
+                                        Self::release_in_flight_normal_task(
+                                            task_id,
+                                            &mut in_flight_normal_peers,
+                                            &mut in_flight_normal_tasks,
+                                        );
+                                        Self::apply_wave2_send_completion(
+                                            &topics,
+                                            &graft_timers_pending,
+                                            completion,
+                                        )
+                                        .await;
                                     }
-                                    Self::apply_wave2_send_completion(
-                                        &topics,
-                                        &graft_timers_pending,
-                                        completion,
-                                    )
-                                    .await;
+                                    Err(join_err) => {
+                                        Self::release_in_flight_normal_task(
+                                            join_err.id(),
+                                            &mut in_flight_normal_peers,
+                                            &mut in_flight_normal_tasks,
+                                        );
+                                    }
                                 }
                             }
                         })
                         .await;
                         wave2_in_flight.abort_all();
+                        in_flight_normal_peers.clear();
+                        in_flight_normal_tasks.clear();
                         Self::flush_ihave_batches(
                             &topics,
                             &transport,
@@ -14639,37 +14671,44 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         debug!("PubSub IHAVE flusher stopped by shutdown signal");
                         break;
                     }
-                    Some(completed) = wave2_in_flight.join_next(), if !wave2_in_flight.is_empty() => {
-                        if let Ok(completion) = completed {
-                            if let Wave2SendCompletion::BatchSent { peer, is_critical: false, .. } = &completion {
-                                if let Some(count) = in_flight_normal_peers.get_mut(peer) {
-                                    *count = count.saturating_sub(1);
-                                    if *count == 0 {
-                                        in_flight_normal_peers.remove(peer);
-                                    }
-                                }
+                    Some(completed) = wave2_in_flight.join_next_with_id(), if !wave2_in_flight.is_empty() => {
+                        match completed {
+                            Ok((task_id, completion)) => {
+                                Self::release_in_flight_normal_task(
+                                    task_id,
+                                    &mut in_flight_normal_peers,
+                                    &mut in_flight_normal_tasks,
+                                );
+                                Self::apply_wave2_send_completion(
+                                    &topics,
+                                    &graft_timers_pending,
+                                    completion,
+                                )
+                                .await;
                             }
-                            Self::apply_wave2_send_completion(
-                                &topics,
-                                &graft_timers_pending,
-                                completion,
-                            )
-                            .await;
+                            Err(join_err) => {
+                                Self::release_in_flight_normal_task(
+                                    join_err.id(),
+                                    &mut in_flight_normal_peers,
+                                    &mut in_flight_normal_tasks,
+                                );
+                            }
                         }
                     }
                     _ = critical_notify.notified() => {
                         // Immediate Critical-topic flush (<= 25 ms under A06).
+                        let max_due_grafts = critical_cap.saturating_sub(wave2_in_flight.len());
                         let work = Self::prepare_wave2_flush_work(
                             &topics,
                             &transport,
                             &key_cache,
                             &stage_stats,
-                            &egress_limiter,
                             &send_path,
                             &confirmed_wave2_sessions,
                             &graft_timers_pending,
                             &critical_ihave_pending,
                             &in_flight_normal_peers,
+                            max_due_grafts,
                             Instant::now(),
                             false,
                             coalesce_tick,
@@ -14678,6 +14717,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         Self::spawn_wave2_work_into(
                             &mut wave2_in_flight,
                             &mut in_flight_normal_peers,
+                            &mut in_flight_normal_tasks,
+                            &critical_ihave_pending,
                             &transport,
                             &key_cache,
                             &signing_key,
@@ -14689,17 +14730,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         );
                     }
                     _ = fast_interval.tick() => {
+                        let max_due_grafts = critical_cap.saturating_sub(wave2_in_flight.len());
                         let work = Self::prepare_wave2_flush_work(
                             &topics,
                             &transport,
                             &key_cache,
                             &stage_stats,
-                            &egress_limiter,
                             &send_path,
                             &confirmed_wave2_sessions,
                             &graft_timers_pending,
                             &critical_ihave_pending,
                             &in_flight_normal_peers,
+                            max_due_grafts,
                             Instant::now(),
                             false,
                             coalesce_tick,
@@ -14708,6 +14750,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         Self::spawn_wave2_work_into(
                             &mut wave2_in_flight,
                             &mut in_flight_normal_peers,
+                            &mut in_flight_normal_tasks,
+                            &critical_ihave_pending,
                             &transport,
                             &key_cache,
                             &signing_key,
@@ -14720,17 +14764,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     }
                     _ = normal_coalesce_interval.tick() => {
                         coalesce_tick = coalesce_tick.wrapping_add(1);
+                        let max_due_grafts = critical_cap.saturating_sub(wave2_in_flight.len());
                         let work = Self::prepare_wave2_flush_work(
                             &topics,
                             &transport,
                             &key_cache,
                             &stage_stats,
-                            &egress_limiter,
                             &send_path,
                             &confirmed_wave2_sessions,
                             &graft_timers_pending,
                             &critical_ihave_pending,
                             &in_flight_normal_peers,
+                            max_due_grafts,
                             Instant::now(),
                             true,
                             coalesce_tick,
@@ -14739,6 +14784,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         Self::spawn_wave2_work_into(
                             &mut wave2_in_flight,
                             &mut in_flight_normal_peers,
+                            &mut in_flight_normal_tasks,
+                            &critical_ihave_pending,
                             &transport,
                             &key_cache,
                             &signing_key,
@@ -14769,6 +14816,21 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         self.retain_background_task(handle);
     }
 
+    fn release_in_flight_normal_task(
+        task_id: tokio::task::Id,
+        in_flight_normal_peers: &mut HashMap<PeerId, usize>,
+        in_flight_normal_tasks: &mut HashMap<tokio::task::Id, PeerId>,
+    ) {
+        if let Some(peer) = in_flight_normal_tasks.remove(&task_id) {
+            if let Some(count) = in_flight_normal_peers.get_mut(&peer) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    in_flight_normal_peers.remove(&peer);
+                }
+            }
+        }
+    }
+
     /// Wave 2 (#137): snapshot due GRAFT timers and cross-topic per-peer
     /// unsigned control batches without awaiting any network I/O.
     ///
@@ -14782,12 +14844,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         transport: &Arc<PolicyTransport<T>>,
         key_cache: &Arc<Mutex<key_cache::KeyCache>>,
         stage_stats: &Arc<PubSubStageStats>,
-        egress_limiter: &Arc<egress::LeafEgressLimiter>,
         send_path: &SendPathContext,
         confirmed_wave2_sessions: &Arc<AtomicUsize>,
         graft_timers_pending: &Arc<AtomicUsize>,
         critical_ihave_pending: &Arc<AtomicBool>,
         in_flight_normal_peers: &HashMap<PeerId, usize>,
+        max_due_grafts: usize,
         now: Instant,
         include_normal_bulk: bool,
         coalesce_tick: u64,
@@ -14870,8 +14932,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let mut topics_guard = topics.write_all().await;
             for shard in topics_guard.iter_mut() {
                 for (&topic_id, state) in shard.iter_mut() {
-                    // Expire due GRAFT timers (80 ms primary / 120 ms fallback).
-                    let fired = state.take_due_graft_timers_at(now);
+                    // Expire up to remaining `critical_cap` due GRAFT timers
+                    // (80 ms primary / 120 ms fallback). Timers beyond the
+                    // current slot budget stay armed for the next 20 ms tick.
+                    let graft_budget = max_due_grafts.saturating_sub(due_grafts.len());
+                    let fired = state.take_due_graft_timers_at(now, graft_budget);
                     remaining_graft_timers =
                         remaining_graft_timers.saturating_add(state.pending_graft_timers.len());
                     for (peer, msg_id, is_fallback, has_more_fallbacks, retry_count) in fired {
@@ -15063,36 +15128,6 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let Ok(wire) = control_batch::encode_control_batch(ops) else {
                     continue;
                 };
-                let wire_len = wire.len();
-                let priority = if any_critical {
-                    TopicPriority::Critical
-                } else {
-                    TopicPriority::Normal
-                };
-                let (mut reserved, _) = Self::reserve_recovery_targets(
-                    egress_limiter,
-                    primary_topic,
-                    vec![peer],
-                    "IHAVE",
-                    &wire,
-                    any_local,
-                    priority,
-                );
-                let Some((_, reservation)) = reserved.pop() else {
-                    continue;
-                };
-                let total_weight: usize = weights.iter().map(|(_, _, w)| *w).sum::<usize>().max(1);
-                let mut attributed_sum = 0usize;
-                for (idx, (t, label, weight)) in weights.iter().enumerate() {
-                    let share = if idx + 1 == weights.len() {
-                        wire_len.saturating_sub(attributed_sum)
-                    } else {
-                        let s = (wire_len * *weight) / total_weight;
-                        attributed_sum = attributed_sum.saturating_add(s);
-                        s
-                    };
-                    stage_stats.record_outbound(*t, label, share, 1);
-                }
                 let topic_batches = meta
                     .into_iter()
                     .map(|m| (m.topic, m.full_batch, m.unsampled_wave2))
@@ -15103,11 +15138,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     wire,
                     op_count,
                     is_critical: any_critical,
-                    reservation,
+                    local_origin: any_local,
+                    weights,
                     topic_batches,
                 });
             }
         }
+        // Spawn Critical batches before Normal/Bulk batches so Critical never
+        // competes behind Normal traffic when approaching `critical_cap`.
+        batch_tasks.sort_by_key(|task| !task.is_critical);
 
         PreparedWave2Work {
             due_grafts,
@@ -15135,10 +15174,14 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     /// Synchronous, non-blocking spawner for Wave 2 GRAFT and coalesced batch
     /// sends. Never awaits inside `tokio::select!`; Critical batches and GRAFTs
     /// receive dedicated headroom (`+32`) above the Normal/Bulk cap (`64`).
+    /// Egress reservations and outbound metrics are charged ONLY for tasks
+    /// that pass the concurrency cap and are actually spawned.
     #[allow(clippy::too_many_arguments)]
     fn spawn_wave2_work_into(
         in_flight: &mut tokio::task::JoinSet<Wave2SendCompletion>,
         in_flight_normal_peers: &mut HashMap<PeerId, usize>,
+        in_flight_normal_tasks: &mut HashMap<tokio::task::Id, PeerId>,
+        critical_ihave_pending: &Arc<AtomicBool>,
         transport: &Arc<PolicyTransport<T>>,
         key_cache: &Arc<Mutex<key_cache::KeyCache>>,
         signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
@@ -15202,13 +15245,52 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             };
             if in_flight.len() >= cap {
                 // Never block `tokio::select!`; pending_ihave remains intact
-                // and drains on the next tick once in-flight slots open.
+                // without burning egress budget or inflating outbound stats.
+                // Re-arm the Critical flag so saturated Critical work retries
+                // on the next 20 ms fast tick instead of waiting 300 ms.
+                if task.is_critical {
+                    critical_ihave_pending.store(true, Ordering::Release);
+                }
                 continue;
             }
-            if !task.is_critical {
-                *in_flight_normal_peers.entry(task.peer).or_insert(0) += 1;
-            }
+            let priority = if task.is_critical {
+                TopicPriority::Critical
+            } else {
+                TopicPriority::Normal
+            };
+            let (mut reserved, _) = Self::reserve_recovery_targets(
+                egress_limiter,
+                task.primary_topic,
+                vec![task.peer],
+                "IHAVE",
+                &task.wire,
+                task.local_origin,
+                priority,
+            );
+            let Some((_, reservation)) = reserved.pop() else {
+                if task.is_critical {
+                    critical_ihave_pending.store(true, Ordering::Release);
+                }
+                continue;
+            };
             let wire_len = task.wire.len();
+            let total_weight: usize = task
+                .weights
+                .iter()
+                .map(|(_, _, w)| *w)
+                .sum::<usize>()
+                .max(1);
+            let mut attributed_sum = 0usize;
+            for (idx, (t, label, weight)) in task.weights.iter().enumerate() {
+                let share = if idx + 1 == task.weights.len() {
+                    wire_len.saturating_sub(attributed_sum)
+                } else {
+                    let s = (wire_len * *weight) / total_weight;
+                    attributed_sum = attributed_sum.saturating_add(s);
+                    s
+                };
+                stage_stats.record_outbound(*t, label, share, 1);
+            }
             wave2_stats
                 .unsigned_control_batches_sent
                 .fetch_add(1, Ordering::Relaxed);
@@ -15222,16 +15304,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let egress_limiter = Arc::clone(egress_limiter);
             let stage_stats = Arc::clone(stage_stats);
             let rtt_tracker = Arc::clone(&send_path.rtt_tracker);
-            in_flight.spawn(async move {
+            let peer = task.peer;
+            let is_critical = task.is_critical;
+            let abort_handle = in_flight.spawn(async move {
                 let sent = Self::send_to_peer_with_timeout(
                     transport,
                     egress_limiter,
                     stage_stats,
                     rtt_tracker,
                     PeerSendRequest {
-                        reservation: task.reservation,
+                        reservation,
                         topic: task.primary_topic,
-                        peer: task.peer,
+                        peer,
                         stream_type: GossipStreamType::PubSub,
                         bytes: task.wire,
                         op: "IHAVE",
@@ -15241,12 +15325,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 .await
                 .is_ok_and(|o| matches!(o, PeerSendOutcome::Sent { .. }));
                 Wave2SendCompletion::BatchSent {
-                    peer: task.peer,
-                    is_critical: task.is_critical,
+                    peer,
                     topic_batches: task.topic_batches,
                     sent,
                 }
             });
+            if !is_critical {
+                *in_flight_normal_peers.entry(peer).or_insert(0) += 1;
+                in_flight_normal_tasks.insert(abort_handle.id(), peer);
+            }
         }
     }
 
@@ -15402,17 +15489,18 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     async fn drive_wave2_flush_at(&self, now: Instant, include_normal_bulk: bool, tick: u64) {
         let send_path = self.send_path_context();
         let mut in_flight_normal_peers = HashMap::new();
+        let mut in_flight_normal_tasks = HashMap::new();
         let work = Self::prepare_wave2_flush_work(
             &self.topics,
             &self.transport,
             &self.key_cache,
             &self.stage_stats,
-            &self.egress_limiter,
             &send_path,
             &self.confirmed_wave2_sessions,
             &self.wave2_graft_timers_pending,
             &self.wave2_critical_ihave_pending,
             &in_flight_normal_peers,
+            WAVE2_FLUSH_MAX_CONCURRENT_SENDS + 32,
             now,
             include_normal_bulk,
             tick,
@@ -15422,6 +15510,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         Self::spawn_wave2_work_into(
             &mut in_flight,
             &mut in_flight_normal_peers,
+            &mut in_flight_normal_tasks,
+            &self.wave2_critical_ihave_pending,
             &self.transport,
             &self.key_cache,
             &self.signing_key,
@@ -15431,14 +15521,28 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             &send_path,
             work,
         );
-        while let Some(completed) = in_flight.join_next().await {
-            if let Ok(completion) = completed {
-                Self::apply_wave2_send_completion(
-                    &self.topics,
-                    &self.wave2_graft_timers_pending,
-                    completion,
-                )
-                .await;
+        while let Some(completed) = in_flight.join_next_with_id().await {
+            match completed {
+                Ok((task_id, completion)) => {
+                    Self::release_in_flight_normal_task(
+                        task_id,
+                        &mut in_flight_normal_peers,
+                        &mut in_flight_normal_tasks,
+                    );
+                    Self::apply_wave2_send_completion(
+                        &self.topics,
+                        &self.wave2_graft_timers_pending,
+                        completion,
+                    )
+                    .await;
+                }
+                Err(join_err) => {
+                    Self::release_in_flight_normal_task(
+                        join_err.id(),
+                        &mut in_flight_normal_peers,
+                        &mut in_flight_normal_tasks,
+                    );
+                }
             }
         }
     }
@@ -15530,81 +15634,196 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         }
                         // Never advertise cached v3 content-bound IDs to legacy
                         // peers lacking CAP_CONTENT_BOUND_MSG_ID (they cannot
-                        // decode v3 headers and would waste IWANT pulls).
-                        let mut legacy_batch = batch.clone();
-                        if unregistered && !ihave_targets.is_empty() {
-                            let mut v3_ids = Vec::new();
-                            legacy_batch.retain(|id| {
-                                let is_v3 = state
-                                    .message_cache
-                                    .lru
-                                    .peek(id)
-                                    .is_some_and(|cached| cached.message.header.version == 3);
-                                if is_v3 {
-                                    v3_ids.push(*id);
-                                    false
-                                } else {
-                                    true
-                                }
-                            });
-                            if !v3_ids.is_empty() {
-                                for &peer in &ihave_targets {
-                                    if !transport.supports_content_bound_msg_id(peer) {
-                                        state.record_ihave_handoff(&v3_ids, peer);
-                                    }
-                                }
-                            }
-                        }
-                        // Only meaningful when an advert could have been
-                        // byte-deferred or partially handed off across passes.
-                        if env.egress_limiter.enforcing() || unregistered {
-                            ihave_targets
-                                .retain(|peer| state.ihave_target_pending(&legacy_batch, *peer));
-                        }
-                        if unregistered
-                            && (ihave_targets.is_empty() || legacy_batch.is_empty())
-                            && Self::all_ihave_targets_done(state, &batch)
-                        {
-                            state.consume_flushed_ihave_batch(&batch);
-                        } else if !legacy_batch.is_empty() {
-                            let local_origin = legacy_batch.iter().any(|id| {
+                        // decode v3 headers and would waste IWANT pulls). Only
+                        // clone/partition when at least one cached v3 ID exists
+                        // (N4/N6: partial-caps peers with CB without UNSIGNED
+                        // still receive signed IHAVEs for the full batch).
+                        let has_v3 = unregistered
+                            && !ihave_targets.is_empty()
+                            && batch.iter().any(|id| {
                                 state
                                     .message_cache
                                     .lru
                                     .peek(id)
-                                    .is_some_and(|cached| cached.message.local_origin)
+                                    .is_some_and(|cached| cached.message.header.version == 3)
                             });
-                            work.push(IhaveFlushWork {
-                                topic: *topic_id,
-                                batch: legacy_batch,
-                                targets: ihave_targets,
-                                late_offer: None,
-                                kind: MessageKind::IHave,
-                                local_origin,
-                                retained_announce: false,
-                            });
+                        if has_v3 {
+                            let (mut cb_targets, mut legacy_targets): (Vec<PeerId>, Vec<PeerId>) =
+                                ihave_targets.into_iter().partition(|peer| {
+                                    transport.supports_content_bound_msg_id(*peer)
+                                });
+                            let mut v3_ids = Vec::new();
+                            let mut non_v3_batch = Vec::with_capacity(batch.len());
+                            for &id in &batch {
+                                let is_v3 = state
+                                    .message_cache
+                                    .lru
+                                    .peek(&id)
+                                    .is_some_and(|cached| cached.message.header.version == 3);
+                                if is_v3 {
+                                    v3_ids.push(id);
+                                } else {
+                                    non_v3_batch.push(id);
+                                }
+                            }
+                            for &peer in &legacy_targets {
+                                state.record_ihave_handoff(&v3_ids, peer);
+                            }
+                            cb_targets.retain(|peer| state.ihave_target_pending(&batch, *peer));
+                            legacy_targets
+                                .retain(|peer| state.ihave_target_pending(&non_v3_batch, *peer));
+                            let pushed_cb = !cb_targets.is_empty();
+                            let pushed_legacy =
+                                !legacy_targets.is_empty() && !non_v3_batch.is_empty();
+                            if !pushed_cb && !pushed_legacy {
+                                if Self::all_ihave_targets_done(state, &batch) {
+                                    state.consume_flushed_ihave_batch(&batch);
+                                }
+                            } else {
+                                if pushed_cb {
+                                    let local_origin = batch.iter().any(|id| {
+                                        state
+                                            .message_cache
+                                            .lru
+                                            .peek(id)
+                                            .is_some_and(|cached| cached.message.local_origin)
+                                    });
+                                    work.push(IhaveFlushWork {
+                                        topic: *topic_id,
+                                        batch,
+                                        targets: cb_targets,
+                                        late_offer: None,
+                                        kind: MessageKind::IHave,
+                                        local_origin,
+                                        retained_announce: false,
+                                    });
+                                }
+                                if pushed_legacy {
+                                    let local_origin = non_v3_batch.iter().any(|id| {
+                                        state
+                                            .message_cache
+                                            .lru
+                                            .peek(id)
+                                            .is_some_and(|cached| cached.message.local_origin)
+                                    });
+                                    work.push(IhaveFlushWork {
+                                        topic: *topic_id,
+                                        batch: non_v3_batch,
+                                        targets: legacy_targets,
+                                        late_offer: None,
+                                        kind: MessageKind::IHave,
+                                        local_origin,
+                                        retained_announce: false,
+                                    });
+                                }
+                            }
+                        } else {
+                            // Only meaningful when an advert could have been
+                            // byte-deferred or partially handed off across passes.
+                            if env.egress_limiter.enforcing() || unregistered {
+                                ihave_targets
+                                    .retain(|peer| state.ihave_target_pending(&batch, *peer));
+                            }
+                            if unregistered
+                                && ihave_targets.is_empty()
+                                && Self::all_ihave_targets_done(state, &batch)
+                            {
+                                state.consume_flushed_ihave_batch(&batch);
+                            } else {
+                                let local_origin = batch.iter().any(|id| {
+                                    state
+                                        .message_cache
+                                        .lru
+                                        .peek(id)
+                                        .is_some_and(|cached| cached.message.local_origin)
+                                });
+                                work.push(IhaveFlushWork {
+                                    topic: *topic_id,
+                                    batch,
+                                    targets: ihave_targets,
+                                    late_offer: None,
+                                    kind: MessageKind::IHave,
+                                    local_origin,
+                                    retained_announce: false,
+                                });
+                            }
                         }
                     }
 
                     // Issue #104 (PR #106 review r1): retained announce
                     // targets whose batch was already consumed get their own
                     // IHAVE until each handoff succeeds or the entry expires.
-                    if let Some((mut batch, targets)) = state.retained_announce_work() {
-                        if !transport.migration.registered(*topic_id) {
-                            let all_legacy = targets
-                                .iter()
-                                .all(|peer| !transport.supports_content_bound_msg_id(*peer));
-                            if all_legacy {
-                                batch.retain(|id| {
-                                    !state
+                    // N5: partition mixed targets so legacy peers never receive
+                    // v3 IDs even when Wave-2 and legacy targets share a batch.
+                    if let Some((batch, targets)) = state.retained_announce_work() {
+                        let unregistered = !transport.migration.registered(*topic_id);
+                        let has_v3 = unregistered
+                            && batch.iter().any(|id| {
+                                state
+                                    .message_cache
+                                    .lru
+                                    .peek(id)
+                                    .is_some_and(|cached| cached.message.header.version == 3)
+                            });
+                        if has_v3 {
+                            let (cb_targets, legacy_targets): (Vec<PeerId>, Vec<PeerId>) = targets
+                                .into_iter()
+                                .partition(|peer| transport.supports_content_bound_msg_id(*peer));
+                            let mut v3_ids = Vec::new();
+                            let mut non_v3_batch = Vec::with_capacity(batch.len());
+                            for &id in &batch {
+                                let is_v3 = state
+                                    .message_cache
+                                    .lru
+                                    .peek(&id)
+                                    .is_some_and(|cached| cached.message.header.version == 3);
+                                if is_v3 {
+                                    v3_ids.push(id);
+                                } else {
+                                    non_v3_batch.push(id);
+                                }
+                            }
+                            if !legacy_targets.is_empty() {
+                                state.record_lazy_withheld_advertised(&v3_ids, &legacy_targets);
+                                state.drop_resolved_retained_announces();
+                            }
+                            if !cb_targets.is_empty() {
+                                let local_origin = batch.iter().any(|id| {
+                                    state
                                         .message_cache
                                         .lru
                                         .peek(id)
-                                        .is_some_and(|cached| cached.message.header.version == 3)
+                                        .is_some_and(|cached| cached.message.local_origin)
+                                });
+                                work.push(IhaveFlushWork {
+                                    topic: *topic_id,
+                                    batch,
+                                    targets: cb_targets,
+                                    late_offer: None,
+                                    kind: MessageKind::IHave,
+                                    local_origin,
+                                    retained_announce: true,
                                 });
                             }
-                        }
-                        if !batch.is_empty() {
+                            if !legacy_targets.is_empty() && !non_v3_batch.is_empty() {
+                                let local_origin = non_v3_batch.iter().any(|id| {
+                                    state
+                                        .message_cache
+                                        .lru
+                                        .peek(id)
+                                        .is_some_and(|cached| cached.message.local_origin)
+                                });
+                                work.push(IhaveFlushWork {
+                                    topic: *topic_id,
+                                    batch: non_v3_batch,
+                                    targets: legacy_targets,
+                                    late_offer: None,
+                                    kind: MessageKind::IHave,
+                                    local_origin,
+                                    retained_announce: true,
+                                });
+                            }
+                        } else if !batch.is_empty() {
                             let local_origin = batch.iter().any(|id| {
                                 state
                                     .message_cache
@@ -15710,6 +15929,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // cap above is what bounds the work instead.
             let mut late_work = Vec::new();
             for (_, topic_id, peer) in late_candidates {
+                let include_v3 = transport.migration.registered(topic_id)
+                    || transport.supports_content_bound_msg_id(peer);
                 let keys = {
                     let now = Instant::now();
                     let mut guard = topics.write_topic(&topic_id).await;
@@ -15719,6 +15940,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     state.late_local_offer_keys(
                         peer,
                         now,
+                        include_v3,
                         #[cfg(test)]
                         &topics.contention,
                     )
@@ -16526,7 +16748,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     debug!(
                         topic = %LogTopicId::from(topic),
                         msg_id = ?msg_id,
-                        "stranded publish retry: eager set empty, nothing pulled"
+                        "stranded publish retry: no eligible eager targets remaining (mesh emptied or filtered by peer capability), nothing pulled"
                     );
                     ctx.stage_stats.record_stranded_publish_retry_failed();
                 }
@@ -40325,5 +40547,391 @@ mod wave1_136_tests {
             "Critical IHAVE took {:?} — slow Normal peer (450 ms) must NEVER stall Critical notify!",
             elapsed
         );
+    }
+
+    #[tokio::test]
+    async fn wave2_hardening_n1_through_n6_regression() {
+        let now = Instant::now();
+        let host_key = test_signing_key();
+        let w2_key = test_signing_key();
+        let legacy_key = test_signing_key();
+        let cb_only_key = test_signing_key();
+
+        let host_tr = RecordingTransport::new(host_key.peer_id());
+        let w2_tr = RecordingTransport::new(w2_key.peer_id());
+        let legacy_tr = RecordingTransport::new(legacy_key.peer_id());
+
+        let host = PlumtreePubSub::new_with_task_control(
+            host_key.peer_id(),
+            Arc::clone(&host_tr),
+            host_key.clone(),
+            false,
+        );
+        let w2 = PlumtreePubSub::new_with_task_control(
+            w2_key.peer_id(),
+            Arc::clone(&w2_tr),
+            w2_key,
+            false,
+        );
+        let legacy = PlumtreePubSub::new_with_task_control(
+            legacy_key.peer_id(),
+            Arc::clone(&legacy_tr),
+            legacy_key,
+            false,
+        );
+        legacy.set_wave2_capabilities_enabled(false);
+        negotiate_wave2_pair(&host, &host_tr, &w2, &w2_tr, 1, now).await;
+        negotiate_wave2_pair(&host, &host_tr, &legacy, &legacy_tr, 1, now).await;
+
+        // Register a partial-caps peer with CAP_CONTENT_BOUND_MSG_ID ONLY (no CAP_UNSIGNED_CONTROL_V1).
+        let cb_only_peer = cb_only_key.peer_id();
+        host_tr.set_session(cb_only_peer, 1);
+        let cb_session = saorsa_gossip_transport::AuthenticatedSession {
+            peer: cb_only_peer,
+            generation: 1,
+        };
+        {
+            let mut kc = host.key_cache.lock().expect("kc");
+            kc.observe_session(cb_session, now);
+            let h = kc.next_control(cb_session, now).expect("hello");
+            kc.control_result(cb_session, &h, true);
+            kc.received_hello(cb_session);
+            let c = kc.next_control(cb_session, now).expect("caps");
+            kc.control_result(cb_session, &c, true);
+            kc.received_capabilities(
+                cb_session,
+                key_cache::CAP_CONTENT_BOUND_MSG_ID,
+                Some(key_cache::LOCAL_WAVE2_CAPS),
+            )
+            .expect("cb-only caps");
+        }
+
+        let topic = TopicId::new([0x81; 32]);
+        let reg_spec = crate::compat::SignedKvTopic::new(
+            "fixture/n3-reg",
+            crate::compat::SignedKvFamily::Delta,
+            1,
+            [host_key.peer_id()],
+        )
+        .expect("reg spec");
+        let reg_topic = reg_spec.topic();
+        host.legacy_migration()
+            .register(reg_spec)
+            .expect("register");
+
+        let payload_v3 = Bytes::from_static(b"hardening-v3-payload");
+        let payload_v2 = Bytes::from_static(b"hardening-v2-payload");
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let mut hdr_v3 = MessageHeader::new(topic, MessageKind::Eager, 10);
+        hdr_v3.seal_content_bound_v3(Some(&payload_v3), created_at);
+        let id_v3 = hdr_v3.msg_id;
+        let mut hdr_v2 = MessageHeader::new(topic, MessageKind::Eager, 10);
+        hdr_v2.seal_payload_hash(Some(&payload_v2));
+        let id_v2 = hdr_v2.msg_id;
+
+        // N1 + N2(crit re-arm) + N6(JoinError cleanup):
+        // Fill JoinSet to WAVE2_FLUSH_MAX_CONCURRENT_SENDS; a Normal task must be
+        // skipped with ZERO outbound stats incremented; at critical_cap a Critical
+        // task re-arms critical_ihave_pending; an aborted normal task still cleans
+        // up in_flight_normal_peers via join_next_with_id().
+        let mut in_flight: tokio::task::JoinSet<Wave2SendCompletion> = tokio::task::JoinSet::new();
+        let mut in_flight_normal_peers = HashMap::new();
+        let mut in_flight_normal_tasks = HashMap::new();
+        let send_path = host.send_path_context();
+        let wire_sample =
+            control_batch::encode_control_batch(vec![control_batch::HopControlOp::IHave {
+                topic,
+                msg_ids: vec![id_v2],
+            }])
+            .expect("wire");
+        for _ in 0..WAVE2_FLUSH_MAX_CONCURRENT_SENDS {
+            in_flight.spawn(async move {
+                std::future::pending::<()>().await;
+                Wave2SendCompletion::BatchSent {
+                    peer: w2.peer_id,
+                    topic_batches: Vec::new(),
+                    sent: false,
+                }
+            });
+        }
+        let ihave_msgs_before = host
+            .stage_stats()
+            .outbound_by_kind
+            .get("ihave")
+            .map_or(0, |m| m.msgs);
+        PlumtreePubSub::spawn_wave2_work_into(
+            &mut in_flight,
+            &mut in_flight_normal_peers,
+            &mut in_flight_normal_tasks,
+            &host.wave2_critical_ihave_pending,
+            &host.transport,
+            &host.key_cache,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.wave2_stats,
+            &host.egress_limiter,
+            &send_path,
+            PreparedWave2Work {
+                due_grafts: Vec::new(),
+                batch_tasks: vec![Wave2BatchSendTask {
+                    peer: w2.peer_id,
+                    primary_topic: topic,
+                    wire: wire_sample.clone(),
+                    op_count: 1,
+                    is_critical: false,
+                    local_origin: true,
+                    weights: vec![(topic, "IHAVE", wire_sample.len())],
+                    topic_batches: Vec::new(),
+                }],
+            },
+        );
+        let ihave_msgs_after = host
+            .stage_stats()
+            .outbound_by_kind
+            .get("ihave")
+            .map_or(0, |m| m.msgs);
+        assert_eq!(
+            ihave_msgs_after, ihave_msgs_before,
+            "N1: cap-skipped batch task must not inflate outbound IHAVE stats"
+        );
+        // Fill remaining 32 Critical headroom slots -> Critical task skips & re-arms flag!
+        for _ in 0..32 {
+            in_flight.spawn(async move {
+                std::future::pending::<()>().await;
+                Wave2SendCompletion::BatchSent {
+                    peer: w2.peer_id,
+                    topic_batches: Vec::new(),
+                    sent: false,
+                }
+            });
+        }
+        host.wave2_critical_ihave_pending
+            .store(false, Ordering::Release);
+        PlumtreePubSub::spawn_wave2_work_into(
+            &mut in_flight,
+            &mut in_flight_normal_peers,
+            &mut in_flight_normal_tasks,
+            &host.wave2_critical_ihave_pending,
+            &host.transport,
+            &host.key_cache,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.wave2_stats,
+            &host.egress_limiter,
+            &send_path,
+            PreparedWave2Work {
+                due_grafts: Vec::new(),
+                batch_tasks: vec![Wave2BatchSendTask {
+                    peer: w2.peer_id,
+                    primary_topic: topic,
+                    wire: wire_sample,
+                    op_count: 1,
+                    is_critical: true,
+                    local_origin: true,
+                    weights: vec![(topic, "IHAVE", 64)],
+                    topic_batches: Vec::new(),
+                }],
+            },
+        );
+        assert!(
+            host.wave2_critical_ihave_pending.load(Ordering::Acquire),
+            "N2: Critical batch skipped at critical_cap must re-arm wave2_critical_ihave_pending"
+        );
+        in_flight.abort_all();
+        while in_flight.join_next().await.is_some() {}
+
+        // N6: JoinError (aborted task) releases in_flight_normal_peers refcount cleanly.
+        let mut abort_set: tokio::task::JoinSet<Wave2SendCompletion> = tokio::task::JoinSet::new();
+        let handle = abort_set.spawn(async move {
+            std::future::pending::<()>().await;
+            Wave2SendCompletion::BatchSent {
+                peer: w2.peer_id,
+                topic_batches: Vec::new(),
+                sent: false,
+            }
+        });
+        *in_flight_normal_peers.entry(w2.peer_id).or_insert(0) += 1;
+        in_flight_normal_tasks.insert(handle.id(), w2.peer_id);
+        handle.abort();
+        let completed = abort_set.join_next_with_id().await.expect("join result");
+        let err = completed.err().expect("aborted task yields JoinError");
+        PlumtreePubSub::<RecordingTransport>::release_in_flight_normal_task(
+            err.id(),
+            &mut in_flight_normal_peers,
+            &mut in_flight_normal_tasks,
+        );
+        assert!(
+            in_flight_normal_peers.is_empty(),
+            "N6: JoinError must release in_flight_normal_peers refcount"
+        );
+
+        // N2: take_due_graft_timers_at(now, 1) leaves excess due GRAFT timers armed.
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.entry(topic).or_insert_with(|| host.new_topic_state());
+            assert!(state.schedule_graft_timer_at([0x31; 32], w2.peer_id, now));
+            assert!(state.schedule_graft_timer_at([0x32; 32], w2.peer_id, now));
+            let fired = state.take_due_graft_timers_at(now + Duration::from_millis(100), 1);
+            assert_eq!(fired.len(), 1);
+            assert_eq!(
+                state.pending_graft_timers.len(),
+                1,
+                "N2: second due GRAFT timer above slot budget must stay armed"
+            );
+            state.pending_graft_timers.clear();
+        }
+
+        // N3: SG76-wrapped MessageHeader v3 on a registered legacy-compat topic MUST fail!
+        let mut reg_hdr = MessageHeader::new(reg_topic, MessageKind::Eager, 10);
+        reg_hdr.seal_content_bound_v3(Some(&payload_v3), created_at);
+        let reg_sig = host_key
+            .sign(&postcard::to_stdvec(&reg_hdr).expect("reg hdr"))
+            .expect("sign");
+        let reg_msg = GossipMessage {
+            header: reg_hdr,
+            payload: Some(payload_v3.clone()),
+            signature: reg_sig,
+            public_key: host_key.public_key().to_vec(),
+        };
+        let sg76_reg_v3 = key_cache::encode(&reg_msg, false).expect("sg76 reg v3");
+        assert!(
+            host.transport
+                .send_to_peer(w2.peer_id, GossipStreamType::PubSub, sg76_reg_v3)
+                .await
+                .is_err(),
+            "N3: SG76-wrapped MessageHeader v3 must be rejected on registered legacy-compat topic"
+        );
+
+        // N4 + N5: partial-caps CB-only peer gets signed IHAVE for v3 ID; legacy
+        // peer gets ZERO v3 IDs in flush_ihave_batches, retained_announce_work,
+        // and send_anti_entropy_digest; pending_ihave drains cleanly.
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.get_mut(&topic).expect("topic");
+            state.cache_message(id_v3, payload_v3.clone(), hdr_v3.clone(), true);
+            state.cache_message(id_v2, payload_v2.clone(), hdr_v2.clone(), true);
+            state.lazy_peers.insert(cb_only_peer);
+            state.lazy_peers.insert(legacy.peer_id);
+            state.push_pending_ihave(id_v3);
+        }
+        let mut late_rotation = LateOfferRotation::default();
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &host.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+        assert!(
+            !host_tr
+                .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+                .is_empty(),
+            "N4: partial-caps CB-only peer must receive signed IHAVE for v3 ID"
+        );
+        assert!(
+            host_tr
+                .sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave)
+                .is_empty(),
+            "N4: legacy peer must receive zero IHAVEs for a v3-only batch"
+        );
+        {
+            let guard = host.topics.read_topic(&topic).await;
+            assert!(
+                guard.get(&topic).expect("topic").pending_ihave.is_empty(),
+                "N4: pending_ihave must consume cleanly with partial-caps + legacy peers"
+            );
+        }
+
+        // N5: Anti-entropy digest to legacy peer excludes id_v3 while retaining id_v2.
+        host.send_anti_entropy_digest(topic, legacy.peer_id)
+            .await
+            .expect("ae digest");
+        let ae_frames = host_tr.sent_frames_of_kind_to(legacy.peer_id, MessageKind::AntiEntropy);
+        assert_eq!(ae_frames.len(), 1);
+        let ae_payload_bytes = if key_cache::is_v3(&ae_frames[0]) {
+            match key_cache::decode(&ae_frames[0]).expect("decode sg76 ae") {
+                key_cache::Decoded::Full(msg, _) => msg.payload.expect("sg76 full ae payload"),
+                key_cache::Decoded::Ref(msg, _) => msg.payload.expect("sg76 ref ae payload"),
+            }
+        } else {
+            let ae_msg: GossipMessage = postcard::from_bytes(&ae_frames[0]).expect("decode ae");
+            ae_msg.payload.expect("raw ae payload")
+        };
+        let ae_payload: AntiEntropyPayload =
+            postcard::from_bytes(&ae_payload_bytes).expect("ae body");
+        match ae_payload {
+            AntiEntropyPayload::Digest { msg_ids } => {
+                assert!(msg_ids.contains(&id_v2), "AE digest must keep v2 ID");
+                assert!(
+                    !msg_ids.contains(&id_v3),
+                    "N5: AE digest to legacy peer must exclude cached v3 ID"
+                );
+            }
+            other => panic!("expected AE Digest, got {other:?}"),
+        }
+
+        // N5: Mixed-target retained_announce_work delivers v3 ID to Wave-2 target
+        // and resolves legacy target cleanly with ZERO v3 IHAVE sent to legacy.
+        let legacy_ihaves_before = host_tr
+            .sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave)
+            .len();
+        let cb_ihaves_before = host_tr
+            .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+            .len();
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.get_mut(&topic).expect("topic");
+            state.queue_lazy_withheld(id_v3, &[cb_only_peer, legacy.peer_id], false);
+            if let Some(entry) = state.lazy_withheld.iter_mut().find(|e| e.msg_id == id_v3) {
+                entry.retain_until = Some(now + Duration::from_secs(10));
+            }
+        }
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &host.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+        assert!(
+            host_tr
+                .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+                .len()
+                > cb_ihaves_before,
+            "N5: mixed-target retained_announce must still advertise v3 ID to capable peer"
+        );
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave)
+                .len(),
+            legacy_ihaves_before,
+            "N5: mixed-target retained_announce must never advertise v3 ID to legacy peer"
+        );
+        {
+            let guard = host.topics.read_topic(&topic).await;
+            assert!(
+                guard
+                    .get(&topic)
+                    .expect("topic")
+                    .retained_announce_work()
+                    .is_none(),
+                "N5: mixed-target retained_announce must resolve cleanly without stalling on legacy peer"
+            );
+        }
     }
 }

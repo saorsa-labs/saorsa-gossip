@@ -1074,6 +1074,11 @@ async fn wave2_mixed_fleet_interop_with_legacy_0597_peers_delivers_100_percent()
         );
     }
 
+    // Let any in-flight 100 ms legacy IHAVE/IWANT frames from the warmup or v2
+    // phase finish draining before snapshotting `legacy_iwants_before` so slow
+    // CI runners (Windows) cannot attribute a late v2 pull to the PublishV3 phase.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
     // Also test defense-in-depth per-peer v3 egress gating (Opus Major #1):
     // even if a Wave-2 node switches to `PublishV3` in a mixed fleet, all 3
     // Wave-2 nodes receive the v3 payload while ZERO v3 headers AND ZERO v3

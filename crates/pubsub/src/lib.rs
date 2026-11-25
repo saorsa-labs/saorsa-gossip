@@ -15994,6 +15994,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             (work, deferred_replies)
         };
 
+        // #144: track topics whose non-final CB partition was scheduled in this
+        // flush and did not complete all its intended targets (e.g. early
+        // `continue` on serialize/budget/admission or empty/partial claims).
+        // Under a non-enforcing limiter, the legacy sibling must not consume
+        // the full batch while its CB sibling was skipped before handoff.
+        let mut incomplete_cb_partitions: HashSet<TopicId> = HashSet::new();
+
         for IhaveFlushWork {
             topic: topic_id,
             batch,
@@ -16005,51 +16012,77 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             partition_union,
         } in work
         {
+            let is_non_final_cb = matches!(partition_union, Some((_, _, false)));
+            if is_non_final_cb {
+                incomplete_cb_partitions.insert(topic_id);
+            }
             if ihave_targets.is_empty() {
                 continue;
             }
             let intended_targets = ihave_targets.clone();
 
-            let ihave_payload = match postcard::to_stdvec(&batch) {
-                Ok(bytes) => Bytes::from(bytes),
-                Err(e) => {
-                    warn!(topic = %LogTopicId::from(topic_id), "IHAVE batch serialize failed: {e}");
-                    continue;
-                }
-            };
-            // ADR-012: the IHAVE batch payload is covered by the sealed
-            // header hash.
-            let mut ihave_header = MessageHeader {
-                version: 1,
-                payload_hash: None,
-                created_at_secs: None,
-                topic: topic_id,
-                msg_id: batch[0],
-                kind,
-                hop: 0,
-                ttl: 10,
-            };
-            ihave_header.seal_payload_hash(Some(ihave_payload.as_ref()));
+            let use_unsigned_iwant = kind == MessageKind::IWant
+                && ihave_targets.len() == 1
+                && !transport.migration.registered(topic_id)
+                && transport.supports_unsigned_control_v1(ihave_targets[0]);
 
-            let signature = match postcard::to_stdvec(&ihave_header) {
-                Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
-                Err(e) => {
-                    warn!(topic = %LogTopicId::from(topic_id), "IHAVE header serialize failed: {e}");
-                    continue;
+            let bytes: Bytes = if use_unsigned_iwant {
+                let mut msg_ids = batch.clone();
+                msg_ids.truncate(control_batch::MAX_IDS_PER_CONTROL_OP);
+                match control_batch::encode_control_batch(vec![
+                    control_batch::HopControlOp::IWant {
+                        topic: topic_id,
+                        msg_ids,
+                    },
+                ]) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        warn!(topic = %LogTopicId::from(topic_id), "unsigned IWANT control batch serialize failed: {e}");
+                        continue;
+                    }
                 }
-            };
+            } else {
+                let ihave_payload = match postcard::to_stdvec(&batch) {
+                    Ok(bytes) => Bytes::from(bytes),
+                    Err(e) => {
+                        warn!(topic = %LogTopicId::from(topic_id), "IHAVE batch serialize failed: {e}");
+                        continue;
+                    }
+                };
+                // ADR-012: the IHAVE batch payload is covered by the sealed
+                // header hash.
+                let mut ihave_header = MessageHeader {
+                    version: 1,
+                    payload_hash: None,
+                    created_at_secs: None,
+                    topic: topic_id,
+                    msg_id: batch[0],
+                    kind,
+                    hop: 0,
+                    ttl: 10,
+                };
+                ihave_header.seal_payload_hash(Some(ihave_payload.as_ref()));
 
-            let ihave_msg = GossipMessage {
-                header: ihave_header,
-                payload: Some(ihave_payload),
-                signature,
-                public_key: signing_key.public_key().to_vec(),
-            };
-            let bytes: Bytes = match postcard::to_stdvec(&ihave_msg) {
-                Ok(bytes) => bytes.into(),
-                Err(e) => {
-                    warn!(topic = %LogTopicId::from(topic_id), "IHAVE message serialize failed: {e}");
-                    continue;
+                let signature = match postcard::to_stdvec(&ihave_header) {
+                    Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
+                    Err(e) => {
+                        warn!(topic = %LogTopicId::from(topic_id), "IHAVE header serialize failed: {e}");
+                        continue;
+                    }
+                };
+
+                let ihave_msg = GossipMessage {
+                    header: ihave_header,
+                    payload: Some(ihave_payload),
+                    signature,
+                    public_key: signing_key.public_key().to_vec(),
+                };
+                match postcard::to_stdvec(&ihave_msg) {
+                    Ok(bytes) => bytes.into(),
+                    Err(e) => {
+                        warn!(topic = %LogTopicId::from(topic_id), "IHAVE message serialize failed: {e}");
+                        continue;
+                    }
                 }
             };
 
@@ -16059,7 +16092,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 "IHAVE"
             };
             let flush_priority = env.send_path.admission.registry().priority_for(&topic_id);
-            let frames = transport.wire_bytes_for_peers(&ihave_targets, &bytes, flush_priority);
+            let frames = if use_unsigned_iwant {
+                HashMap::new()
+            } else {
+                transport.wire_bytes_for_peers(&ihave_targets, &bytes, flush_priority)
+            };
             let (reserved_targets, budget_deferred) = Self::reserve_recovery_targets_encoded(
                 env.egress_limiter,
                 topic_id,
@@ -16151,6 +16188,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
                 let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
                 let attempts = claims.attempts().to_vec();
+                let attempted_count = attempts.len();
                 let permits = claims.take_permits();
                 for (attempt, permit) in attempts.into_iter().zip(permits) {
                     let reservation = reservations.remove(&attempt.peer);
@@ -16239,6 +16277,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             state.record_ihave_handoff(&batch, peer);
                             state.record_stranded_ihave_advertised(&batch, peer);
                         }
+                        if is_non_final_cb
+                            && budget_deferred.is_empty()
+                            && attempted_count == intended_targets.len()
+                        {
+                            incomplete_cb_partitions.remove(&topic_id);
+                        }
                         let (consume_batch, completion_targets, is_final_partition) =
                             match partition_union.as_ref() {
                                 Some((full_batch, union_targets, is_final)) => {
@@ -16246,6 +16290,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 }
                                 None => (batch.as_slice(), intended_targets.as_slice(), true),
                             };
+                        let cb_sibling_incomplete =
+                            is_final_partition && incomplete_cb_partitions.contains(&topic_id);
                         let wave2_still_pending = !transport.migration.registered(topic_id)
                             && state
                                 .lazy_peers
@@ -16258,7 +16304,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                         && state.ihave_target_pending(consume_batch, peer)
                                 });
                         let all_handed_off = !wave2_still_pending
-                            && ((!env.egress_limiter.enforcing() && is_final_partition)
+                            && ((!env.egress_limiter.enforcing()
+                                && is_final_partition
+                                && !cb_sibling_incomplete)
                                 || completion_targets
                                     .iter()
                                     .all(|peer| !state.ihave_target_pending(consume_batch, *peer)));
@@ -40758,11 +40806,9 @@ mod wave1_136_tests {
             1,
             "N1: prepare_wave2_flush_work must pack the pending Wave-2 IHAVE batch"
         );
-        assert_eq!(
-            n1_limiter.snapshot().demanded_bytes,
-            0,
-            "N1: prepare_wave2_flush_work must not demand egress budget before spawning"
-        );
+        // N1 (#144): `prepare_wave2_flush_work` takes no `egress_limiter`
+        // parameter, enforcing zero egress reservation during preparation at
+        // the type level; verify outbound stats also remain untouched until spawn.
         assert_eq!(
             host.stage_stats()
                 .outbound_by_kind
@@ -41261,13 +41307,214 @@ mod wave1_136_tests {
             );
         }
 
+        // #144: non-enforcing limiter CB partition early-skip guard.
+        // When `egress_limiter` is NOT enforcing and the CB partition skips
+        // handoff (e.g. CB peer's outbound control permits are saturated so
+        // `claims.is_empty()`), the legacy sibling MUST NOT consume `full_batch`
+        // and strand the CB peer until periodic anti-entropy.
+        let n4_non_enf_topic = TopicId::new([0x86; 32]);
+        let mut ne_hdr_v3 = MessageHeader::new(n4_non_enf_topic, MessageKind::Eager, 10);
+        ne_hdr_v3.seal_content_bound_v3(Some(&payload_v3), created_at);
+        let ne_id_v3 = ne_hdr_v3.msg_id;
+        let mut ne_hdr_v2 = MessageHeader::new(n4_non_enf_topic, MessageKind::Eager, 10);
+        ne_hdr_v2.seal_payload_hash(Some(&payload_v2));
+        let ne_id_v2 = ne_hdr_v2.msg_id;
+        {
+            let mut guard = host.topics.write_topic(&n4_non_enf_topic).await;
+            let state = guard
+                .entry(n4_non_enf_topic)
+                .or_insert_with(|| host.new_topic_state());
+            state.cache_message(ne_id_v3, payload_v3.clone(), ne_hdr_v3, false);
+            state.cache_message(ne_id_v2, payload_v2.clone(), ne_hdr_v2, false);
+            state.lazy_peers.insert(cb_only_peer);
+            state.lazy_peers.insert(legacy.peer_id);
+            state.push_pending_ihave(ne_id_v3);
+            state.push_pending_ihave(ne_id_v2);
+        }
+        let cb_ihaves_before_ne = host_tr
+            .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+            .len();
+        let legacy_ihaves_before_ne = host_tr
+            .sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave)
+            .len();
+        // Saturate cb_only_peer's Control outbound permits so its CB partition
+        // yields empty claims while legacy.peer_id sends normally.
+        let mut held_cb_permits = Vec::new();
+        while let Some(p) = host.outbound_budgets.try_acquire(
+            cb_only_peer,
+            OutboundSendClass::Control,
+            TopicPriority::Normal,
+            now,
+        ) {
+            held_cb_permits.push(p);
+        }
+        assert!(
+            !held_cb_permits.is_empty(),
+            "#144: must hold cb_only_peer Control permits to force CB partition skip"
+        );
+        assert!(
+            !host.egress_limiter.enforcing(),
+            "#144: default host egress_limiter must be non-enforcing"
+        );
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &host.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+                .len(),
+            cb_ihaves_before_ne,
+            "#144 tick 1: permit-saturated CB peer must not send"
+        );
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave)
+                .len(),
+            legacy_ihaves_before_ne + 1,
+            "#144 tick 1: legacy sibling must still send its v2-only IHAVE"
+        );
+        {
+            let guard = host.topics.read_topic(&n4_non_enf_topic).await;
+            let state = guard.get(&n4_non_enf_topic).expect("n4_non_enf_topic");
+            assert!(
+                state.pending_ihave.contains(&ne_id_v3) && state.pending_ihave.contains(&ne_id_v2),
+                "#144 tick 1: legacy sibling must NOT consume pending_ihave when non-final CB sibling skipped handoff"
+            );
+            assert!(
+                state.ihave_target_pending(&[ne_id_v3, ne_id_v2], cb_only_peer),
+                "#144 tick 1: skipped CB peer must remain pending for retry"
+            );
+            assert!(
+                !state.ihave_target_pending(&[ne_id_v2], legacy.peer_id),
+                "#144 tick 1: legacy handoff must remain recorded in ihave_advertised"
+            );
+        }
+        // Release CB peer's permits and flush tick 2: CB peer receives the full
+        // v3+v2 IHAVE, legacy gets zero duplicates, and pending_ihave consumes.
+        drop(held_cb_permits);
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &host.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+                .len(),
+            cb_ihaves_before_ne + 1,
+            "#144 tick 2: CB peer must receive the v3+v2 IHAVE once permits free"
+        );
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave)
+                .len(),
+            legacy_ihaves_before_ne + 1,
+            "#144 tick 2: legacy peer must not receive duplicate IHAVE"
+        );
+        {
+            let guard = host.topics.read_topic(&n4_non_enf_topic).await;
+            assert!(
+                guard
+                    .get(&n4_non_enf_topic)
+                    .expect("n4_non_enf_topic")
+                    .pending_ihave
+                    .is_empty(),
+                "#144 tick 2: pending_ihave must consume cleanly once CB peer completes"
+            );
+        }
+
+        // #144: deferred IWANT flushed to a confirmed Wave-2 peer must emit an
+        // unsigned control batch (`HopControlOp::IWant`), never a signed ML-DSA-65
+        // `MessageKind::IWant` frame.
+        let deferred_iwant_id = [0x99; 32];
+        let w2_signed_iwants_before = host_tr
+            .sent_frames_of_kind_to(w2.peer_id, MessageKind::IWant)
+            .len();
+        {
+            let mut guard = host.topics.write_topic(&n4_non_enf_topic).await;
+            let state = guard.get_mut(&n4_non_enf_topic).expect("n4_non_enf_topic");
+            state.outstanding_iwants.insert(
+                deferred_iwant_id,
+                OutstandingIwant {
+                    peer: w2.peer_id,
+                    requested_at: now,
+                    retry_pending: true,
+                    failures: 0,
+                    retry_not_before: None,
+                },
+            );
+            assert!(state.retain_deferred_iwant(w2.peer_id, &[deferred_iwant_id], now));
+        }
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &host.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(w2.peer_id, MessageKind::IWant)
+                .len(),
+            w2_signed_iwants_before,
+            "#144: deferred IWANT to confirmed Wave-2 peer must NOT send a signed IWANT frame"
+        );
+        let saw_unsigned_deferred_iwant = host_tr
+            .sent_frames()
+            .into_iter()
+            .filter(|(p, _, wire)| *p == w2.peer_id && control_batch::is_control_batch(wire))
+            .filter_map(|(_, _, wire)| control_batch::decode_control_batch(&wire).ok())
+            .flat_map(|batch| batch.ops.into_iter())
+            .any(|op| match op {
+                control_batch::HopControlOp::IWant { topic, msg_ids } => {
+                    topic == n4_non_enf_topic && msg_ids == vec![deferred_iwant_id]
+                }
+                _ => false,
+            });
+        assert!(
+            saw_unsigned_deferred_iwant,
+            "#144: deferred IWANT to confirmed Wave-2 peer must emit unsigned HopControlOp::IWant"
+        );
+        {
+            let mut guard = host.topics.write_topic(&n4_non_enf_topic).await;
+            guard
+                .get_mut(&n4_non_enf_topic)
+                .expect("n4_non_enf_topic")
+                .deferred_iwants
+                .clear();
+        }
+
         // N5 HIGH (#143 review): periodic background AE loop (`run_periodic_anti_entropy_tick`)
         // MUST filter cached v3 IDs per selected peer — legacy peers receive only v2 IDs
         // (and 0 frames for v3-only topics), while Wave-2 peers receive both v3 and v2 IDs.
         {
             // Clear peers on earlier test topics so this periodic tick only targets
             // our three dedicated AE test topics below.
-            for t in [topic, n4_shed_topic] {
+            for t in [topic, n4_shed_topic, n4_non_enf_topic] {
                 let mut guard = host.topics.write_topic(&t).await;
                 if let Some(state) = guard.get_mut(&t) {
                     state.eager_peers.clear();

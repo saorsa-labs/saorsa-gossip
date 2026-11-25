@@ -72,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-process 6-node test. It compares the 0.5.97 wire with Wave 2, and
   checks a mixed fleet of 3 Wave 2 and 3 0.5.97-wire nodes with a strict
   0.5.97 frame decoder. In that test (PR #140 figures), total 1-hop control
-  bytes fell about 41x and 1-hop control ML-DSA-65 verifications fell to
+  bytes fell about 38-41x across runs and 1-hop control ML-DSA-65 verifications fell to
   zero, with all deliveries kept. These figures come from that in-repo test
   only, not from a real network.
 

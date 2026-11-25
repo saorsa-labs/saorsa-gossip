@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-25
+
+### Changed
+
+- **Minor version bump (0.5.97 -> 0.6.0).** This release adds public API
+  items that can break downstream code:
+  - `saorsa_gossip_types::MessageKind` (not `#[non_exhaustive]`) adds
+    `Prune = 9`, `Graft = 10` and `IDontWant = 11`. An exhaustive `match` on
+    `MessageKind` needs three new arms.
+  - `saorsa_gossip_types::MessageHeader` adds the public field
+    `created_at_secs: Option<u64>`. Struct literals need
+    `created_at_secs: None`.
+  - The README install snippets now say `saorsa-gossip = "0.6"`.
+
+### Added
+
+- **pubsub: Wave 2 capability-gated wire (#137, PR #140).** Each Wave 2
+  wire feature is used with a peer only after that peer negotiated the
+  related capability on the current session.
+  - **Capability negotiation.** After `Hello`, a node sends one
+    `Control::Capabilities { flags, acked_peer_flags }` on the signed
+    key-cache control topic. Flags: wire PRUNE/GRAFT (`1 << 0`), IDONTWANT
+    (`1 << 1`), unsigned control batches (`1 << 2`), content-bound
+    `msg_id` (`1 << 3`). A capability is used only when both sides
+    advertise it. Outbound use also needs the peer to echo our exact flags
+    back in `acked_peer_flags`. Capabilities are fixed per session
+    generation (a different repeat counts as malformed) and reset on
+    reconnect. Wave 2 is on by default;
+    `PlumtreePubSub::set_wave2_capabilities_enabled(false)` gives the
+    0.5.97 wire.
+  - **Wire PRUNE and GRAFT.** A duplicate eager receipt sends a
+    rate-limited wire `PRUNE`; an inbound `PRUNE` demotes the sender with a
+    10 s backoff. A Wave 2 `IHAVE` arms GRAFT timers that are cancelled when
+    the eager copy arrives. An inbound `GRAFT` is accepted only from a peer
+    already in the topic mesh, and obeys prune backoff, scoring and the
+    eager degree limit.
+  - **IDONTWANT for payloads of 1 KiB or more.** A peer that sent
+    IDONTWANT for a message does not get it as relay, deferred eager reply
+    or `IHAVE` for 10 s.
+  - **Unsigned coalesced 1-hop control batches.** IHAVE, IWANT, PRUNE,
+    GRAFT and IDONTWANT can go in one unsigned frame (`\xffSGCB\x01`
+    marker) over the authenticated ML-DSA-65/ML-KEM-768 QUIC session. Send
+    needs the confirmed unsigned-control capability; receive needs the
+    peer's advertised capability on the live session. Hard caps: 65,536
+    bytes, 64 ops, 1,024 IDs per op, 2,048 IDs per batch; the key-cache
+    control topic is not allowed in a batch. New
+    `PlumtreePubSub::set_inbound_topic_filter` lets a node skip batch
+    operations for topics it does not want.
+  - **Content-bound `msg_id` (`MessageHeader` v3).** v3 appends the signed
+    `created_at_secs` and sets `msg_id = BLAKE3("saorsa-gossip.msg-id.v3" ||
+    topic || payload_hash)` (`MessageHeader::calculate_content_bound_msg_id`).
+    v1 and v2 headers serialize byte-identically to before. A receiver
+    recomputes the ID before signature verification (a mismatch is
+    rejected and the sender is scored as invalid) and accepts a freshness
+    window of -300 s / +60 s.
+    `ContentBoundMsgIdPolicy::{AcceptOnly (default), PublishV3, RequireV3}`
+    is set with `PlumtreePubSub::set_content_bound_msg_id_policy`. A v3
+    header is sent only to peers with the confirmed content-bound
+    capability; the transport send path refuses it for other peers.
+  - **Telemetry.** `PlumtreePubSub::wave2_stats()` (`Wave2StatsSnapshot`)
+    and `PlumtreePubSub::confirmed_wave2_session_count()`.
+- **Gate test.** `crates/pubsub/tests/wave2_efficiency_gate.rs` is an
+  in-process 6-node test. It compares the 0.5.97 wire with Wave 2, and
+  checks a mixed fleet of 3 Wave 2 and 3 0.5.97-wire nodes with a strict
+  0.5.97 frame decoder. In that test (PR #140 figures), total 1-hop control
+  bytes fell about 41x and 1-hop control ML-DSA-65 verifications fell to
+  zero, with all deliveries kept. These figures come from that in-repo test
+  only, not from a real network.
+
+### Compatibility
+
+- Peers on 0.5.97 or older keep working. They never send `Capabilities`,
+  so no Wave 2 kind, unsigned batch or v3 header is sent to them, and the
+  default `AcceptOnly` policy publishes v2.
+- A 0.5.97-or-older peer cannot decode `Control::Capabilities`. Each
+  Wave 2 session therefore adds one `malformed_controls` tick on that peer,
+  with no score penalty or disconnect. Expect this counter to rise on old
+  nodes during a rollout.
+- With `PublishV3` or `RequireV3` in a mixed fleet, old peers do not get v3
+  messages.
+- Known follow-ups (per-peer filtering of v3 IDs in some announce and
+  anti-entropy paths, and other hardening) are tracked in #141.
+
 ## [0.5.97] - 2026-11-23
 
 ### Changed

@@ -4745,6 +4745,11 @@ struct IhaveFlushWork {
     /// entries whose `pending_ihave` batch was already consumed. A handoff
     /// resolves those targets only, not `pending_ihave`.
     retained_announce: bool,
+    /// N4 (#141): when a mixed v2/v3 batch is partitioned between content-bound
+    /// and legacy peers, carries `(full_batch, union_targets, is_final_partition)`
+    /// so neither partition can consume shared IDs from `pending_ihave` or wipe
+    /// `ihave_advertised` while the sibling partition still has pending targets.
+    partition_union: Option<(Vec<MessageIdType>, Vec<PeerId>, bool)>,
 }
 
 struct DueGraftTask {
@@ -15648,6 +15653,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                     .is_some_and(|cached| cached.message.header.version == 3)
                             });
                         if has_v3 {
+                            // Snapshot the full union of non-Wave-2 targets BEFORE
+                            // filtering out already-advertised peers so completion
+                            // checks gate consumption on ALL partitions (both CB
+                            // and legacy) over the full batch.
+                            let union_targets = ihave_targets.clone();
                             let (mut cb_targets, mut legacy_targets): (Vec<PeerId>, Vec<PeerId>) =
                                 ihave_targets.into_iter().partition(|peer| {
                                     transport.supports_content_bound_msg_id(*peer)
@@ -15688,14 +15698,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                             .peek(id)
                                             .is_some_and(|cached| cached.message.local_origin)
                                     });
+                                    let full_batch = batch.clone();
                                     work.push(IhaveFlushWork {
                                         topic: *topic_id,
-                                        batch,
+                                        batch: full_batch.clone(),
                                         targets: cb_targets,
                                         late_offer: None,
                                         kind: MessageKind::IHave,
                                         local_origin,
                                         retained_announce: false,
+                                        partition_union: Some((
+                                            full_batch,
+                                            union_targets.clone(),
+                                            !pushed_legacy,
+                                        )),
                                     });
                                 }
                                 if pushed_legacy {
@@ -15714,6 +15730,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                         kind: MessageKind::IHave,
                                         local_origin,
                                         retained_announce: false,
+                                        partition_union: Some((batch, union_targets, true)),
                                     });
                                 }
                             }
@@ -15745,6 +15762,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                     kind: MessageKind::IHave,
                                     local_origin,
                                     retained_announce: false,
+                                    partition_union: None,
                                 });
                             }
                         }
@@ -15803,6 +15821,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                     kind: MessageKind::IHave,
                                     local_origin,
                                     retained_announce: true,
+                                    partition_union: None,
                                 });
                             }
                             if !legacy_targets.is_empty() && !non_v3_batch.is_empty() {
@@ -15821,6 +15840,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                     kind: MessageKind::IHave,
                                     local_origin,
                                     retained_announce: true,
+                                    partition_union: None,
                                 });
                             }
                         } else if !batch.is_empty() {
@@ -15839,6 +15859,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 kind: MessageKind::IHave,
                                 local_origin,
                                 retained_announce: true,
+                                partition_union: None,
                             });
                         }
                     }
@@ -15883,6 +15904,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             // We are asking for a message we do not hold.
                             local_origin: false,
                             retained_announce: false,
+                            partition_union: None,
                         });
                     }
 
@@ -15965,6 +15987,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     // cache entries.
                     local_origin: true,
                     retained_announce: false,
+                    partition_union: None,
                 });
             }
             work.append(&mut late_work);
@@ -15979,6 +16002,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             kind,
             local_origin,
             retained_announce,
+            partition_union,
         } in work
         {
             if ihave_targets.is_empty() {
@@ -16215,18 +16239,31 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             state.record_ihave_handoff(&batch, peer);
                             state.record_stranded_ihave_advertised(&batch, peer);
                         }
+                        let (consume_batch, completion_targets, is_final_partition) =
+                            match partition_union.as_ref() {
+                                Some((full_batch, union_targets, is_final)) => {
+                                    (full_batch.as_slice(), union_targets.as_slice(), *is_final)
+                                }
+                                None => (batch.as_slice(), intended_targets.as_slice(), true),
+                            };
                         let wave2_still_pending = !transport.migration.registered(topic_id)
-                            && state.lazy_peers.iter().copied().any(|peer| {
-                                transport.supports_unsigned_control_v1(peer)
-                                    && state.ihave_target_pending(&batch, peer)
-                            });
+                            && state
+                                .lazy_peers
+                                .iter()
+                                .copied()
+                                .chain(state.stranded_ihave_targets_for(consume_batch))
+                                .chain(state.lazy_withheld_targets_for(consume_batch))
+                                .any(|peer| {
+                                    transport.supports_unsigned_control_v1(peer)
+                                        && state.ihave_target_pending(consume_batch, peer)
+                                });
                         let all_handed_off = !wave2_still_pending
-                            && (!env.egress_limiter.enforcing()
-                                || intended_targets
+                            && ((!env.egress_limiter.enforcing() && is_final_partition)
+                                || completion_targets
                                     .iter()
-                                    .all(|peer| !state.ihave_target_pending(&batch, *peer)));
+                                    .all(|peer| !state.ihave_target_pending(consume_batch, *peer)));
                         if budget_deferred.is_empty() && all_handed_off {
-                            state.consume_flushed_ihave_batch(&batch);
+                            state.consume_flushed_ihave_batch(consume_batch);
                         }
                     }
                 }
@@ -17092,6 +17129,294 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         self.retain_background_task(handle);
     }
 
+    /// Run one periodic anti-entropy reconciliation tick across all topics.
+    ///
+    /// For each topic with cached messages, picks one deterministic-random peer
+    /// and sends an anti-entropy digest containing only cached message IDs that
+    /// `selected_peer` can decode (filtering out cached v3 content-bound IDs
+    /// when `selected_peer` lacks `CAP_CONTENT_BOUND_MSG_ID` on an unregistered
+    /// topic, per N5/#141).
+    async fn run_periodic_anti_entropy_tick(
+        topics: &Arc<ShardedTopicMap>,
+        transport: &Arc<PolicyTransport<T>>,
+        signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
+        stage_stats: &Arc<PubSubStageStats>,
+        outbound_budgets: &Arc<PeerOutboundBudgets>,
+        egress_limiter: &Arc<egress::LeafEgressLimiter>,
+        send_path: &SendPathContext,
+    ) {
+        let topics_guard = topics.read_all().await;
+
+        // Collect work to do (topic, peer, msg_ids) while holding the read lock.
+        let mut work: Vec<(TopicId, PeerId, Vec<MessageIdType>)> = Vec::new();
+        for shard in &topics_guard {
+            for (topic_id, state) in shard.iter() {
+                if state.message_cache.lru.is_empty() {
+                    continue;
+                }
+
+                // Collect all peers (eager + lazy) for random selection
+                let all_peers: Vec<PeerId> = state
+                    .eager_peers
+                    .iter()
+                    .chain(state.lazy_peers.iter())
+                    .copied()
+                    .collect();
+
+                if all_peers.is_empty() {
+                    continue;
+                }
+
+                // Pick a deterministic-random peer using hash of topic + current time
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let hash_input =
+                    blake3::hash(&[topic_id.to_bytes().as_slice(), &now.to_le_bytes()].concat());
+                let hash_bytes = hash_input.as_bytes();
+                let index = (hash_bytes[0] as usize) % all_peers.len();
+                let selected_peer = all_peers[index];
+
+                let registered = transport.migration.registered(*topic_id);
+                let peer_supports_v3 =
+                    registered || transport.supports_content_bound_msg_id(selected_peer);
+                let mut msg_ids: Vec<MessageIdType> = state
+                    .cached_message_ids()
+                    .into_iter()
+                    .filter(|id| {
+                        peer_supports_v3
+                            || !state
+                                .message_cache
+                                .lru
+                                .peek(id)
+                                .is_some_and(|cached| cached.message.header.version == 3)
+                    })
+                    .collect();
+                if registered {
+                    msg_ids.truncate(1024);
+                }
+                if msg_ids.is_empty() {
+                    continue;
+                }
+
+                work.push((*topic_id, selected_peer, msg_ids));
+            }
+        }
+
+        drop(topics_guard);
+
+        // Send digests without holding the lock
+        for (topic_id, peer, msg_ids) in work {
+            let priority = send_path.admission.registry().priority_for(&topic_id);
+            let wire_bytes: Option<Bytes> = if !transport.migration.registered(topic_id)
+                && transport.supports_unsigned_control_v1(peer)
+            {
+                let mut capped = msg_ids;
+                capped.truncate(control_batch::MAX_IDS_PER_CONTROL_OP);
+                control_batch::encode_control_batch(vec![
+                    control_batch::HopControlOp::AntiEntropyDigest {
+                        topic: topic_id,
+                        msg_ids: capped,
+                    },
+                ])
+                .ok()
+            } else {
+                let ae_payload = AntiEntropyPayload::Digest { msg_ids };
+                let payload_bytes = match postcard::to_stdvec(&ae_payload) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        warn!("Anti-entropy: failed to serialize payload: {}", e);
+                        continue;
+                    }
+                };
+
+                // ADR-012: the AE payload is covered by the sealed
+                // header hash.
+                let mut header = MessageHeader {
+                    version: 1,
+                    payload_hash: None,
+                    created_at_secs: None,
+                    topic: topic_id,
+                    msg_id: [0u8; 32],
+                    kind: MessageKind::AntiEntropy,
+                    hop: 0,
+                    ttl: 1,
+                };
+                let ae_payload_bytes: Bytes = payload_bytes.into();
+                header.seal_payload_hash(Some(ae_payload_bytes.as_ref()));
+
+                let signature = match postcard::to_stdvec(&header) {
+                    Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                };
+
+                let message = GossipMessage {
+                    header,
+                    payload: Some(ae_payload_bytes),
+                    signature,
+                    public_key: signing_key.public_key().to_vec(),
+                };
+
+                postcard::to_stdvec(&message)
+                    .ok()
+                    .map(|b| transport.wire_bytes_for_peer(peer, &Bytes::from(b), priority))
+            };
+
+            if let Some(bytes) = wire_bytes {
+                let (mut budgeted, _) = Self::reserve_recovery_targets(
+                    egress_limiter,
+                    topic_id,
+                    vec![peer],
+                    "ANTI_ENTROPY",
+                    &bytes,
+                    // A digest of ids: no payload custody to protect.
+                    false,
+                    priority,
+                );
+                let Some((_, reservation)) = budgeted.pop() else {
+                    continue;
+                };
+                // X0X-0074: anti-entropy is bulk anti-entropy
+                // protocol traffic — filter through admission
+                // before claiming attempts. Bulk depth released
+                // exactly once at the end of this iteration via
+                // the explicit list captured here.
+                let (attempts, permits, bulk_admitted) = {
+                    let now = Instant::now();
+                    let mut topics_guard = topics.write_topic(&topic_id).await;
+                    let Some(state) = topics_guard.get_mut(&topic_id) else {
+                        continue;
+                    };
+                    let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
+                        send_path,
+                        state,
+                        &topic_id,
+                        vec![peer],
+                        "ANTI_ENTROPY",
+                        now,
+                    );
+                    if admitted.is_empty() {
+                        release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+                        continue;
+                    }
+                    let claim_context = SendClaimContext {
+                        stage_stats: stage_stats.as_ref(),
+                        outbound_budgets,
+                        send_path,
+                        topic: topic_id,
+                        op: "ANTI_ENTROPY",
+                        send_class: OutboundSendClass::for_op("ANTI_ENTROPY"),
+                        priority: send_path.admission.registry().priority_for(&topic_id),
+                        // Control-class; origin selects no lane.
+                        local_origin: false,
+                    };
+                    // Skip reasons are only consulted by the
+                    // single-peer Critical-control path.
+                    let (attempts, permits, _skips) = Self::claim_topic_send_attempts_for_state(
+                        &claim_context,
+                        state,
+                        admitted,
+                        now,
+                    );
+                    (attempts, permits, bulk_admitted)
+                };
+                let mut claims = SendAttemptClaims::new(
+                    topic_id,
+                    attempts,
+                    permits,
+                    Arc::clone(topics),
+                    Arc::clone(stage_stats),
+                    send_path.clone(),
+                );
+                let Some(attempt) = claims.attempts().first().copied() else {
+                    continue;
+                };
+                let Some(permit) = claims.take_permits().into_iter().next() else {
+                    continue;
+                };
+                // x0x #380: outbound demand metering — one claimed
+                // anti-entropy wire send. Instrumentation only.
+                stage_stats.record_outbound(topic_id, "ANTI_ENTROPY", bytes.len(), 1);
+                let send_transport = Arc::clone(transport);
+                let send_stage_stats = Arc::clone(stage_stats);
+                let send_rtt_tracker = Arc::clone(&send_path.rtt_tracker);
+                let send_egress_limiter = Arc::clone(egress_limiter);
+                let handle = AbortOnDropSendHandle::new(tokio::spawn(async move {
+                    let _permit = permit;
+                    Self::send_to_peer_with_timeout(
+                        send_transport,
+                        send_egress_limiter,
+                        send_stage_stats,
+                        send_rtt_tracker,
+                        PeerSendRequest {
+                            reservation,
+                            topic: topic_id,
+                            peer: attempt.peer,
+                            stream_type: GossipStreamType::PubSub,
+                            bytes,
+                            op: "ANTI_ENTROPY",
+                            send_timeout: None,
+                        },
+                    )
+                    .await
+                }));
+
+                match handle.join().await {
+                    Ok(Ok(PeerSendOutcome::Sent { observed })) => {
+                        claims
+                            .record_results(
+                                vec![PeerSendCompletion { attempt, observed }],
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                            .await;
+                    }
+                    Ok(Ok(PeerSendOutcome::TimedOut)) => {
+                        claims
+                            .record_results(Vec::new(), vec![attempt], Vec::new())
+                            .await;
+                    }
+                    Ok(Ok(PeerSendOutcome::NotConnected)) => {
+                        // x0x #380: eviction, not a timeout sample.
+                        claims
+                            .record_results(Vec::new(), Vec::new(), vec![attempt])
+                            .await;
+                    }
+                    Ok(Ok(PeerSendOutcome::Deferred)) => {
+                        claims
+                            .record_results(Vec::new(), recovery_probe_timeout(attempt), Vec::new())
+                            .await;
+                    }
+                    Ok(Err(_)) => {
+                        claims
+                            .record_results(Vec::new(), recovery_probe_timeout(attempt), Vec::new())
+                            .await;
+                    }
+                    Err(e) => {
+                        claims
+                            .record_results(Vec::new(), recovery_probe_timeout(attempt), Vec::new())
+                            .await;
+                        warn!(
+                            peer_id = %LogPeerId::from(attempt.peer),
+                            "ANTI_ENTROPY per-peer send task panicked: {e}"
+                        );
+                    }
+                }
+                // X0X-0074: release Bulk admission depth reserved
+                // above, exactly once. Covers panic / early-return
+                // paths uniformly.
+                release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
+            }
+
+            trace!(
+                peer_id = %peer,
+                topic = ?topic_id,
+                "Anti-entropy: sent digest"
+            );
+        }
+    }
+
     /// Spawn background task for anti-entropy reconciliation
     ///
     /// Every `ANTI_ENTROPY_INTERVAL_SECS` seconds, for each topic with cached messages,
@@ -17129,272 +17454,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     _ = interval.tick() => {}
                 }
 
-                let topics_guard = topics.read_all().await;
-
-                // Collect work to do (topic, peer, msg_ids) while holding the read lock.
-                let mut work: Vec<(TopicId, PeerId, Vec<MessageIdType>)> = Vec::new();
-                for shard in &topics_guard {
-                    for (topic_id, state) in shard.iter() {
-                        let mut msg_ids = state.cached_message_ids();
-                        if transport.migration.registered(*topic_id) {
-                            msg_ids.truncate(1024);
-                        }
-                        if msg_ids.is_empty() {
-                            continue;
-                        }
-
-                        // Collect all peers (eager + lazy) for random selection
-                        let all_peers: Vec<PeerId> = state
-                            .eager_peers
-                            .iter()
-                            .chain(state.lazy_peers.iter())
-                            .copied()
-                            .collect();
-
-                        if all_peers.is_empty() {
-                            continue;
-                        }
-
-                        // Pick a deterministic-random peer using hash of topic + current time
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let hash_input = blake3::hash(
-                            &[topic_id.to_bytes().as_slice(), &now.to_le_bytes()].concat(),
-                        );
-                        let hash_bytes = hash_input.as_bytes();
-                        let index = (hash_bytes[0] as usize) % all_peers.len();
-                        let selected_peer = all_peers[index];
-
-                        work.push((*topic_id, selected_peer, msg_ids));
-                    }
-                }
-
-                drop(topics_guard);
-
-                // Send digests without holding the lock
-                for (topic_id, peer, msg_ids) in work {
-                    let priority = send_path.admission.registry().priority_for(&topic_id);
-                    let wire_bytes: Option<Bytes> = if !transport.migration.registered(topic_id)
-                        && transport.supports_unsigned_control_v1(peer)
-                    {
-                        let mut capped = msg_ids;
-                        capped.truncate(control_batch::MAX_IDS_PER_CONTROL_OP);
-                        control_batch::encode_control_batch(vec![
-                            control_batch::HopControlOp::AntiEntropyDigest {
-                                topic: topic_id,
-                                msg_ids: capped,
-                            },
-                        ])
-                        .ok()
-                    } else {
-                        let ae_payload = AntiEntropyPayload::Digest { msg_ids };
-                        let payload_bytes = match postcard::to_stdvec(&ae_payload) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                warn!("Anti-entropy: failed to serialize payload: {}", e);
-                                continue;
-                            }
-                        };
-
-                        // ADR-012: the AE payload is covered by the sealed
-                        // header hash.
-                        let mut header = MessageHeader {
-                            version: 1,
-                            payload_hash: None,
-                            created_at_secs: None,
-                            topic: topic_id,
-                            msg_id: [0u8; 32],
-                            kind: MessageKind::AntiEntropy,
-                            hop: 0,
-                            ttl: 1,
-                        };
-                        let ae_payload_bytes: Bytes = payload_bytes.into();
-                        header.seal_payload_hash(Some(ae_payload_bytes.as_ref()));
-
-                        let signature = match postcard::to_stdvec(&header) {
-                            Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
-                            Err(_) => Vec::new(),
-                        };
-
-                        let message = GossipMessage {
-                            header,
-                            payload: Some(ae_payload_bytes),
-                            signature,
-                            public_key: signing_key.public_key().to_vec(),
-                        };
-
-                        postcard::to_stdvec(&message)
-                            .ok()
-                            .map(|b| transport.wire_bytes_for_peer(peer, &Bytes::from(b), priority))
-                    };
-
-                    if let Some(bytes) = wire_bytes {
-                        let (mut budgeted, _) = Self::reserve_recovery_targets(
-                            &egress_limiter,
-                            topic_id,
-                            vec![peer],
-                            "ANTI_ENTROPY",
-                            &bytes,
-                            // A digest of ids: no payload custody to protect.
-                            false,
-                            priority,
-                        );
-                        let Some((_, reservation)) = budgeted.pop() else {
-                            continue;
-                        };
-                        // X0X-0074: anti-entropy is bulk anti-entropy
-                        // protocol traffic — filter through admission
-                        // before claiming attempts. Bulk depth released
-                        // exactly once at the end of this iteration via
-                        // the explicit list captured here.
-                        let (attempts, permits, bulk_admitted) = {
-                            let now = Instant::now();
-                            let mut topics_guard = topics.write_topic(&topic_id).await;
-                            let Some(state) = topics_guard.get_mut(&topic_id) else {
-                                continue;
-                            };
-                            let (admitted, bulk_admitted) = filter_peers_through_admission_in_state(
-                                &send_path,
-                                state,
-                                &topic_id,
-                                vec![peer],
-                                "ANTI_ENTROPY",
-                                now,
-                            );
-                            if admitted.is_empty() {
-                                release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
-                                continue;
-                            }
-                            let claim_context = SendClaimContext {
-                                stage_stats: stage_stats.as_ref(),
-                                outbound_budgets: &outbound_budgets,
-                                send_path: &send_path,
-                                topic: topic_id,
-                                op: "ANTI_ENTROPY",
-                                send_class: OutboundSendClass::for_op("ANTI_ENTROPY"),
-                                priority: send_path.admission.registry().priority_for(&topic_id),
-                                // Control-class; origin selects no lane.
-                                local_origin: false,
-                            };
-                            // Skip reasons are only consulted by the
-                            // single-peer Critical-control path.
-                            let (attempts, permits, _skips) =
-                                Self::claim_topic_send_attempts_for_state(
-                                    &claim_context,
-                                    state,
-                                    admitted,
-                                    now,
-                                );
-                            (attempts, permits, bulk_admitted)
-                        };
-                        let mut claims = SendAttemptClaims::new(
-                            topic_id,
-                            attempts,
-                            permits,
-                            Arc::clone(&topics),
-                            Arc::clone(&stage_stats),
-                            send_path.clone(),
-                        );
-                        let Some(attempt) = claims.attempts().first().copied() else {
-                            continue;
-                        };
-                        let Some(permit) = claims.take_permits().into_iter().next() else {
-                            continue;
-                        };
-                        // x0x #380: outbound demand metering — one claimed
-                        // anti-entropy wire send. Instrumentation only.
-                        stage_stats.record_outbound(topic_id, "ANTI_ENTROPY", bytes.len(), 1);
-                        let send_transport = Arc::clone(&transport);
-                        let send_stage_stats = Arc::clone(&stage_stats);
-                        let send_rtt_tracker = Arc::clone(&send_path.rtt_tracker);
-                        let send_egress_limiter = Arc::clone(&egress_limiter);
-                        let handle = AbortOnDropSendHandle::new(tokio::spawn(async move {
-                            let _permit = permit;
-                            Self::send_to_peer_with_timeout(
-                                send_transport,
-                                send_egress_limiter,
-                                send_stage_stats,
-                                send_rtt_tracker,
-                                PeerSendRequest {
-                                    reservation,
-                                    topic: topic_id,
-                                    peer: attempt.peer,
-                                    stream_type: GossipStreamType::PubSub,
-                                    bytes,
-                                    op: "ANTI_ENTROPY",
-                                    send_timeout: None,
-                                },
-                            )
-                            .await
-                        }));
-
-                        match handle.join().await {
-                            Ok(Ok(PeerSendOutcome::Sent { observed })) => {
-                                claims
-                                    .record_results(
-                                        vec![PeerSendCompletion { attempt, observed }],
-                                        Vec::new(),
-                                        Vec::new(),
-                                    )
-                                    .await;
-                            }
-                            Ok(Ok(PeerSendOutcome::TimedOut)) => {
-                                claims
-                                    .record_results(Vec::new(), vec![attempt], Vec::new())
-                                    .await;
-                            }
-                            Ok(Ok(PeerSendOutcome::NotConnected)) => {
-                                // x0x #380: eviction, not a timeout sample.
-                                claims
-                                    .record_results(Vec::new(), Vec::new(), vec![attempt])
-                                    .await;
-                            }
-                            Ok(Ok(PeerSendOutcome::Deferred)) => {
-                                claims
-                                    .record_results(
-                                        Vec::new(),
-                                        recovery_probe_timeout(attempt),
-                                        Vec::new(),
-                                    )
-                                    .await;
-                            }
-                            Ok(Err(_)) => {
-                                claims
-                                    .record_results(
-                                        Vec::new(),
-                                        recovery_probe_timeout(attempt),
-                                        Vec::new(),
-                                    )
-                                    .await;
-                            }
-                            Err(e) => {
-                                claims
-                                    .record_results(
-                                        Vec::new(),
-                                        recovery_probe_timeout(attempt),
-                                        Vec::new(),
-                                    )
-                                    .await;
-                                warn!(
-                                    peer_id = %LogPeerId::from(attempt.peer),
-                                    "ANTI_ENTROPY per-peer send task panicked: {e}"
-                                );
-                            }
-                        }
-                        // X0X-0074: release Bulk admission depth reserved
-                        // above, exactly once. Covers panic / early-return
-                        // paths uniformly.
-                        release_bulk_admissions_free(&send_path.admission, &bulk_admitted);
-                    }
-
-                    trace!(
-                        peer_id = %peer,
-                        topic = ?topic_id,
-                        "Anti-entropy: sent digest"
-                    );
-                }
+                Self::run_periodic_anti_entropy_tick(
+                    &topics,
+                    &transport,
+                    &signing_key,
+                    &stage_stats,
+                    &outbound_budgets,
+                    &egress_limiter,
+                    &send_path,
+                )
+                .await;
             }
         });
         self.retain_background_task(handle);
@@ -40633,20 +40702,76 @@ mod wave1_136_tests {
         let id_v2 = hdr_v2.msg_id;
 
         // N1 + N2(crit re-arm) + N6(JoinError cleanup):
-        // Fill JoinSet to WAVE2_FLUSH_MAX_CONCURRENT_SENDS; a Normal task must be
-        // skipped with ZERO outbound stats incremented; at critical_cap a Critical
-        // task re-arms critical_ihave_pending; an aborted normal task still cleans
-        // up in_flight_normal_peers via join_next_with_id().
+        // Drive the REAL `prepare_wave2_flush_work` -> `spawn_wave2_work_into`
+        // path with an enforcing `LeafEgressLimiter`:
+        // 1. `prepare_wave2_flush_work` itself takes 0 egress budget & 0 outbound stats.
+        // 2. When `in_flight` is at `WAVE2_FLUSH_MAX_CONCURRENT_SENDS`, the Normal
+        //    task is skipped with 0 egress bytes demanded/charged & 0 outbound stats.
+        // 3. Positive control: when a slot frees up, `spawn_wave2_work_into` spawns
+        //    the task, charges egress budget, increments outbound stats, and registers
+        //    the task ID in `in_flight_normal_tasks` + `in_flight_normal_peers`.
+        // 4. N6: aborting that exact spawned task yields `JoinError`, and
+        //    `release_in_flight_normal_task(err.id(), ...)` clears BOTH maps cleanly.
+        let n1_limiter = Arc::new(egress::LeafEgressLimiter::disabled());
+        assert!(n1_limiter.configure(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 16_384,
+            max_serialized_frame_bytes: 16_384,
+            policy: BytePolicy::ShedNormal,
+        })));
+        n1_limiter.advance_virtual_clock_for_test(Duration::ZERO);
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.entry(topic).or_insert_with(|| host.new_topic_state());
+            state.cache_message(id_v2, payload_v2.clone(), hdr_v2.clone(), false);
+            state.lazy_peers.insert(w2.peer_id);
+            state.push_pending_ihave(id_v2);
+        }
         let mut in_flight: tokio::task::JoinSet<Wave2SendCompletion> = tokio::task::JoinSet::new();
         let mut in_flight_normal_peers = HashMap::new();
         let mut in_flight_normal_tasks = HashMap::new();
         let send_path = host.send_path_context();
-        let wire_sample =
-            control_batch::encode_control_batch(vec![control_batch::HopControlOp::IHave {
-                topic,
-                msg_ids: vec![id_v2],
-            }])
-            .expect("wire");
+        let ihave_msgs_before = host
+            .stage_stats()
+            .outbound_by_kind
+            .get("ihave")
+            .map_or(0, |m| m.msgs);
+        let prepared_n1 = PlumtreePubSub::prepare_wave2_flush_work(
+            &host.topics,
+            &host.transport,
+            &host.key_cache,
+            &host.stage_stats,
+            &send_path,
+            &host.confirmed_wave2_sessions,
+            &host.wave2_graft_timers_pending,
+            &host.wave2_critical_ihave_pending,
+            &in_flight_normal_peers,
+            32,
+            now,
+            true,
+            0,
+        )
+        .await;
+        assert_eq!(
+            prepared_n1.batch_tasks.len(),
+            1,
+            "N1: prepare_wave2_flush_work must pack the pending Wave-2 IHAVE batch"
+        );
+        assert_eq!(
+            n1_limiter.snapshot().demanded_bytes,
+            0,
+            "N1: prepare_wave2_flush_work must not demand egress budget before spawning"
+        );
+        assert_eq!(
+            host.stage_stats()
+                .outbound_by_kind
+                .get("ihave")
+                .map_or(0, |m| m.msgs),
+            ihave_msgs_before,
+            "N1: prepare_wave2_flush_work must not charge outbound stats before spawning"
+        );
+        let wire_sample = prepared_n1.batch_tasks[0].wire.clone();
         for _ in 0..WAVE2_FLUSH_MAX_CONCURRENT_SENDS {
             in_flight.spawn(async move {
                 std::future::pending::<()>().await;
@@ -40657,11 +40782,6 @@ mod wave1_136_tests {
                 }
             });
         }
-        let ihave_msgs_before = host
-            .stage_stats()
-            .outbound_by_kind
-            .get("ihave")
-            .map_or(0, |m| m.msgs);
         PlumtreePubSub::spawn_wave2_work_into(
             &mut in_flight,
             &mut in_flight_normal_peers,
@@ -40672,31 +40792,32 @@ mod wave1_136_tests {
             &host.signing_key,
             &host.stage_stats,
             &host.wave2_stats,
-            &host.egress_limiter,
+            &n1_limiter,
             &send_path,
-            PreparedWave2Work {
-                due_grafts: Vec::new(),
-                batch_tasks: vec![Wave2BatchSendTask {
-                    peer: w2.peer_id,
-                    primary_topic: topic,
-                    wire: wire_sample.clone(),
-                    op_count: 1,
-                    is_critical: false,
-                    local_origin: true,
-                    weights: vec![(topic, "IHAVE", wire_sample.len())],
-                    topic_batches: Vec::new(),
-                }],
-            },
+            prepared_n1,
         );
-        let ihave_msgs_after = host
-            .stage_stats()
-            .outbound_by_kind
-            .get("ihave")
-            .map_or(0, |m| m.msgs);
+        assert_eq!(in_flight.len(), WAVE2_FLUSH_MAX_CONCURRENT_SENDS);
         assert_eq!(
-            ihave_msgs_after, ihave_msgs_before,
+            n1_limiter.snapshot().demanded_bytes,
+            0,
+            "N1: cap-skipped batch task must take zero egress reservation"
+        );
+        assert_eq!(
+            n1_limiter.snapshot().charged_bytes,
+            0,
+            "N1: cap-skipped batch task must charge zero egress bytes"
+        );
+        assert_eq!(
+            host.stage_stats()
+                .outbound_by_kind
+                .get("ihave")
+                .map_or(0, |m| m.msgs),
+            ihave_msgs_before,
             "N1: cap-skipped batch task must not inflate outbound IHAVE stats"
         );
+        assert!(in_flight_normal_peers.is_empty());
+        assert!(in_flight_normal_tasks.is_empty());
+
         // Fill remaining 32 Critical headroom slots -> Critical task skips & re-arms flag!
         for _ in 0..32 {
             in_flight.spawn(async move {
@@ -40720,7 +40841,7 @@ mod wave1_136_tests {
             &host.signing_key,
             &host.stage_stats,
             &host.wave2_stats,
-            &host.egress_limiter,
+            &n1_limiter,
             &send_path,
             PreparedWave2Work {
                 due_grafts: Vec::new(),
@@ -40743,20 +40864,72 @@ mod wave1_136_tests {
         in_flight.abort_all();
         while in_flight.join_next().await.is_some() {}
 
-        // N6: JoinError (aborted task) releases in_flight_normal_peers refcount cleanly.
-        let mut abort_set: tokio::task::JoinSet<Wave2SendCompletion> = tokio::task::JoinSet::new();
-        let handle = abort_set.spawn(async move {
-            std::future::pending::<()>().await;
-            Wave2SendCompletion::BatchSent {
-                peer: w2.peer_id,
-                topic_batches: Vec::new(),
-                sent: false,
-            }
-        });
-        *in_flight_normal_peers.entry(w2.peer_id).or_insert(0) += 1;
-        in_flight_normal_tasks.insert(handle.id(), w2.peer_id);
-        handle.abort();
-        let completed = abort_set.join_next_with_id().await.expect("join result");
+        // N1 positive control + N6 real-spawner abort cleanup:
+        // With a free slot, `spawn_wave2_work_into` spawns the Normal batch,
+        // charges egress budget & outbound stats, and registers its AbortHandle
+        // ID in `in_flight_normal_tasks` + `in_flight_normal_peers`. Aborting
+        // that spawned task before it runs yields `JoinError`, and
+        // `release_in_flight_normal_task` clears BOTH maps cleanly.
+        let prepared_n1_ok = PlumtreePubSub::prepare_wave2_flush_work(
+            &host.topics,
+            &host.transport,
+            &host.key_cache,
+            &host.stage_stats,
+            &send_path,
+            &host.confirmed_wave2_sessions,
+            &host.wave2_graft_timers_pending,
+            &host.wave2_critical_ihave_pending,
+            &in_flight_normal_peers,
+            32,
+            now,
+            true,
+            1,
+        )
+        .await;
+        assert_eq!(prepared_n1_ok.batch_tasks.len(), 1);
+        PlumtreePubSub::spawn_wave2_work_into(
+            &mut in_flight,
+            &mut in_flight_normal_peers,
+            &mut in_flight_normal_tasks,
+            &host.wave2_critical_ihave_pending,
+            &host.transport,
+            &host.key_cache,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.wave2_stats,
+            &n1_limiter,
+            &send_path,
+            prepared_n1_ok,
+        );
+        assert_eq!(
+            in_flight.len(),
+            1,
+            "N1 positive control: free slot must spawn the Wave-2 batch task"
+        );
+        assert!(
+            n1_limiter.snapshot().charged_bytes > 0,
+            "N1 positive control: spawned batch task must reserve egress bytes"
+        );
+        assert_eq!(
+            host.stage_stats()
+                .outbound_by_kind
+                .get("ihave")
+                .map_or(0, |m| m.msgs),
+            ihave_msgs_before + 1,
+            "N1 positive control: spawned batch task must record outbound IHAVE stat"
+        );
+        assert_eq!(
+            in_flight_normal_peers.get(&w2.peer_id),
+            Some(&1),
+            "N6: spawn_wave2_work_into must increment in_flight_normal_peers"
+        );
+        assert_eq!(
+            in_flight_normal_tasks.len(),
+            1,
+            "N6: spawn_wave2_work_into must register task id in in_flight_normal_tasks"
+        );
+        in_flight.abort_all();
+        let completed = in_flight.join_next_with_id().await.expect("join result");
         let err = completed.err().expect("aborted task yields JoinError");
         PlumtreePubSub::<RecordingTransport>::release_in_flight_normal_task(
             err.id(),
@@ -40767,6 +40940,16 @@ mod wave1_136_tests {
             in_flight_normal_peers.is_empty(),
             "N6: JoinError must release in_flight_normal_peers refcount"
         );
+        assert!(
+            in_flight_normal_tasks.is_empty(),
+            "N6: JoinError must remove task id from in_flight_normal_tasks"
+        );
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.get_mut(&topic).expect("topic");
+            state.pending_ihave.clear();
+            state.lazy_peers.remove(&w2.peer_id);
+        }
 
         // N2: take_due_graft_timers_at(now, 1) leaves excess due GRAFT timers armed.
         {
@@ -40933,5 +41116,268 @@ mod wave1_136_tests {
                 "N5: mixed-target retained_announce must resolve cleanly without stalling on legacy peer"
             );
         }
+
+        // N4 MEDIUM (#143 review): partitioned mixed v2+v3 batch under enforcing
+        // `BytePolicy::ShedNormal`. When partition 1 (cb_only_peer) succeeds and
+        // partition 2 (legacy) is budget-deferred, partition 1 MUST NOT consume
+        // `pending_ihave` or wipe `ihave_advertised` until BOTH partitions finish.
+        let n4_shed_topic = TopicId::new([0x82; 32]);
+        let mut shed_hdr_v3 = MessageHeader::new(n4_shed_topic, MessageKind::Eager, 10);
+        shed_hdr_v3.seal_content_bound_v3(Some(&payload_v3), created_at);
+        let shed_id_v3 = shed_hdr_v3.msg_id;
+        let mut shed_hdr_v2 = MessageHeader::new(n4_shed_topic, MessageKind::Eager, 10);
+        shed_hdr_v2.seal_payload_hash(Some(&payload_v2));
+        let shed_id_v2 = shed_hdr_v2.msg_id;
+        {
+            let mut guard = host.topics.write_topic(&n4_shed_topic).await;
+            let state = guard
+                .entry(n4_shed_topic)
+                .or_insert_with(|| host.new_topic_state());
+            state.cache_message(shed_id_v3, payload_v3.clone(), shed_hdr_v3, false);
+            state.cache_message(shed_id_v2, payload_v2.clone(), shed_hdr_v2, false);
+            state.lazy_peers.insert(cb_only_peer);
+            state.lazy_peers.insert(legacy.peer_id);
+            state.push_pending_ihave(shed_id_v3);
+            state.push_pending_ihave(shed_id_v2);
+        }
+        let cb_ihaves_before_shed = host_tr
+            .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+            .len();
+        let legacy_ihaves_before_shed = host_tr
+            .sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave)
+            .len();
+        // Size the ShedNormal burst so partition 1 (one signed IHAVE frame,
+        // ~3.4–5.5 KB depending on key-cache ref) fits, while partition 2
+        // (a second signed IHAVE frame) is budget-deferred.
+        let shed_limiter = Arc::new(egress::LeafEgressLimiter::disabled());
+        assert!(shed_limiter.configure(Some(LeafEgressConfig {
+            soft_bytes_per_second: 0,
+            hard_bytes_per_second: 1,
+            burst_bytes: 5_800,
+            max_serialized_frame_bytes: 5_800,
+            policy: BytePolicy::ShedNormal,
+        })));
+        shed_limiter.advance_virtual_clock_for_test(Duration::ZERO);
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &shed_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+                .len(),
+            cb_ihaves_before_shed + 1,
+            "N4 ShedNormal tick 1: CB-only partition must send its IHAVE"
+        );
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave)
+                .len(),
+            legacy_ihaves_before_shed,
+            "N4 ShedNormal tick 1: legacy partition must be budget-deferred"
+        );
+        {
+            let guard = host.topics.read_topic(&n4_shed_topic).await;
+            let state = guard.get(&n4_shed_topic).expect("n4_shed_topic");
+            assert!(
+                state.pending_ihave.contains(&shed_id_v2)
+                    && state.pending_ihave.contains(&shed_id_v3),
+                "N4 ShedNormal tick 1: completing CB partition must NOT consume pending_ihave while legacy partition is deferred"
+            );
+            assert!(
+                !state.ihave_target_pending(&[shed_id_v3, shed_id_v2], cb_only_peer),
+                "N4 ShedNormal tick 1: CB partition handoff must remain recorded in ihave_advertised"
+            );
+            assert!(
+                state.ihave_target_pending(&[shed_id_v2], legacy.peer_id),
+                "N4 ShedNormal tick 1: legacy partition must still be pending for shared v2 ID"
+            );
+        }
+        // Refill budget and run tick 2: legacy partition gets ONLY shed_id_v2,
+        // CB-only peer gets ZERO duplicates, and pending_ihave consumes cleanly.
+        shed_limiter.advance_virtual_clock_for_test(Duration::from_secs(10_000));
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &shed_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+                .len(),
+            cb_ihaves_before_shed + 1,
+            "N4 ShedNormal tick 2: already-handed-off CB peer must not receive duplicate IHAVE"
+        );
+        let legacy_ihaves_after_shed =
+            host_tr.sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave);
+        assert_eq!(
+            legacy_ihaves_after_shed.len(),
+            legacy_ihaves_before_shed + 1,
+            "N4 ShedNormal tick 2: deferred legacy partition must receive its v2-only IHAVE once budget refills"
+        );
+        let legacy_frame = legacy_ihaves_after_shed.last().expect("legacy ihave");
+        let legacy_payload_bytes = if key_cache::is_v3(legacy_frame) {
+            match key_cache::decode(legacy_frame).expect("decode sg76 ihave") {
+                key_cache::Decoded::Full(msg, _) => msg.payload.expect("full ihave payload"),
+                key_cache::Decoded::Ref(msg, _) => msg.payload.expect("ref ihave payload"),
+            }
+        } else {
+            let msg: GossipMessage = postcard::from_bytes(legacy_frame).expect("decode ihave");
+            msg.payload.expect("raw ihave payload")
+        };
+        let legacy_ids: Vec<MessageIdType> =
+            postcard::from_bytes(&legacy_payload_bytes).expect("ihave ids");
+        assert_eq!(
+            legacy_ids,
+            vec![shed_id_v2],
+            "N4 ShedNormal tick 2: legacy IHAVE must contain only the v2 ID"
+        );
+        {
+            let guard = host.topics.read_topic(&n4_shed_topic).await;
+            assert!(
+                guard
+                    .get(&n4_shed_topic)
+                    .expect("n4_shed_topic")
+                    .pending_ihave
+                    .is_empty(),
+                "N4 ShedNormal tick 2: pending_ihave must consume cleanly once both partitions complete"
+            );
+        }
+
+        // N5 HIGH (#143 review): periodic background AE loop (`run_periodic_anti_entropy_tick`)
+        // MUST filter cached v3 IDs per selected peer — legacy peers receive only v2 IDs
+        // (and 0 frames for v3-only topics), while Wave-2 peers receive both v3 and v2 IDs.
+        {
+            // Clear peers on earlier test topics so this periodic tick only targets
+            // our three dedicated AE test topics below.
+            for t in [topic, n4_shed_topic] {
+                let mut guard = host.topics.write_topic(&t).await;
+                if let Some(state) = guard.get_mut(&t) {
+                    state.eager_peers.clear();
+                    state.lazy_peers.clear();
+                }
+            }
+        }
+        let ae_legacy_mixed = TopicId::new([0x83; 32]);
+        let ae_legacy_v3_only = TopicId::new([0x84; 32]);
+        let ae_w2_mixed = TopicId::new([0x85; 32]);
+        let mut ae_lm_v3 = MessageHeader::new(ae_legacy_mixed, MessageKind::Eager, 10);
+        ae_lm_v3.seal_content_bound_v3(Some(&payload_v3), created_at);
+        let mut ae_lm_v2 = MessageHeader::new(ae_legacy_mixed, MessageKind::Eager, 10);
+        ae_lm_v2.seal_payload_hash(Some(&payload_v2));
+        let mut ae_lv_v3 = MessageHeader::new(ae_legacy_v3_only, MessageKind::Eager, 10);
+        ae_lv_v3.seal_content_bound_v3(Some(&payload_v3), created_at);
+        let mut ae_w2_v3 = MessageHeader::new(ae_w2_mixed, MessageKind::Eager, 10);
+        ae_w2_v3.seal_content_bound_v3(Some(&payload_v3), created_at);
+        let mut ae_w2_v2 = MessageHeader::new(ae_w2_mixed, MessageKind::Eager, 10);
+        ae_w2_v2.seal_payload_hash(Some(&payload_v2));
+        {
+            let mut g = host.topics.write_topic(&ae_legacy_mixed).await;
+            let st = g
+                .entry(ae_legacy_mixed)
+                .or_insert_with(|| host.new_topic_state());
+            st.eager_peers.insert(legacy.peer_id);
+            st.cache_message(ae_lm_v3.msg_id, payload_v3.clone(), ae_lm_v3.clone(), true);
+            st.cache_message(ae_lm_v2.msg_id, payload_v2.clone(), ae_lm_v2.clone(), true);
+        }
+        {
+            let mut g = host.topics.write_topic(&ae_legacy_v3_only).await;
+            let st = g
+                .entry(ae_legacy_v3_only)
+                .or_insert_with(|| host.new_topic_state());
+            st.eager_peers.insert(legacy.peer_id);
+            st.cache_message(ae_lv_v3.msg_id, payload_v3.clone(), ae_lv_v3.clone(), true);
+        }
+        {
+            let mut g = host.topics.write_topic(&ae_w2_mixed).await;
+            let st = g
+                .entry(ae_w2_mixed)
+                .or_insert_with(|| host.new_topic_state());
+            st.eager_peers.insert(w2.peer_id);
+            st.cache_message(ae_w2_v3.msg_id, payload_v3.clone(), ae_w2_v3.clone(), true);
+            st.cache_message(ae_w2_v2.msg_id, payload_v2.clone(), ae_w2_v2.clone(), true);
+        }
+        let legacy_ae_before = host_tr
+            .sent_frames_of_kind_to(legacy.peer_id, MessageKind::AntiEntropy)
+            .len();
+        PlumtreePubSub::run_periodic_anti_entropy_tick(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            &host.egress_limiter,
+            &send_path,
+        )
+        .await;
+        let legacy_ae_after =
+            host_tr.sent_frames_of_kind_to(legacy.peer_id, MessageKind::AntiEntropy);
+        assert_eq!(
+            legacy_ae_after.len(),
+            legacy_ae_before + 1,
+            "N5 periodic AE: legacy peer must get exactly 1 digest (for mixed topic) and 0 for v3-only topic"
+        );
+        let periodic_legacy_frame = legacy_ae_after.last().expect("periodic legacy ae");
+        let periodic_legacy_payload = if key_cache::is_v3(periodic_legacy_frame) {
+            match key_cache::decode(periodic_legacy_frame).expect("decode sg76 periodic ae") {
+                key_cache::Decoded::Full(msg, _) => msg.payload.expect("full periodic ae"),
+                key_cache::Decoded::Ref(msg, _) => msg.payload.expect("ref periodic ae"),
+            }
+        } else {
+            let msg: GossipMessage =
+                postcard::from_bytes(periodic_legacy_frame).expect("decode periodic ae");
+            msg.payload.expect("raw periodic ae")
+        };
+        match postcard::from_bytes::<AntiEntropyPayload>(&periodic_legacy_payload)
+            .expect("periodic ae body")
+        {
+            AntiEntropyPayload::Digest { msg_ids } => {
+                assert!(
+                    msg_ids.contains(&ae_lm_v2.msg_id),
+                    "N5 periodic AE: legacy digest must keep v2 ID"
+                );
+                assert!(
+                    !msg_ids.contains(&ae_lm_v3.msg_id),
+                    "N5 periodic AE: legacy digest must exclude cached v3 ID"
+                );
+            }
+            other => panic!("expected periodic AE Digest, got {other:?}"),
+        }
+        let w2_ae_ids: Vec<MessageIdType> = host_tr
+            .sent_frames()
+            .into_iter()
+            .filter(|(p, _, wire)| *p == w2.peer_id && control_batch::is_control_batch(wire))
+            .filter_map(|(_, _, wire)| control_batch::decode_control_batch(&wire).ok())
+            .flat_map(|batch| batch.ops.into_iter())
+            .find_map(|op| match op {
+                control_batch::HopControlOp::AntiEntropyDigest { topic, msg_ids }
+                    if topic == ae_w2_mixed =>
+                {
+                    Some(msg_ids)
+                }
+                _ => None,
+            })
+            .expect("N5 periodic AE: Wave-2 peer must receive unsigned AntiEntropyDigest");
+        assert!(
+            w2_ae_ids.contains(&ae_w2_v3.msg_id) && w2_ae_ids.contains(&ae_w2_v2.msg_id),
+            "N5 periodic AE: Wave-2 peer digest must include both cached v3 and v2 IDs"
+        );
     }
 }

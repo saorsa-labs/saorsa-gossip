@@ -12,6 +12,7 @@ use saorsa_gossip_types::{PeerId, TopicId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,20 @@ const PENDING_TTL: Duration = Duration::from_secs(5);
 /// while still bounding control traffic against DoS.
 const CONTROL_BURST: f64 = 8.0;
 const CONTROL_REFILL_PER_SEC: f64 = 4.0;
+
+/// Wave 2 (#137): wire `PRUNE` & `GRAFT` + 80 ms / 40 ms GRAFT timers.
+pub(crate) const CAP_WIRE_PRUNE_GRAFT: u64 = 1 << 0;
+/// Wave 2 (#137): GossipSub v1.2 `IDONTWANT` for messages >= 1 KiB.
+pub(crate) const CAP_IDONTWANT: u64 = 1 << 1;
+/// Wave 2 (#137): unsigned coalesced 1-hop control frames over mutual
+/// ML-DSA-65 + ML-KEM-768 QUIC sessions.
+pub(crate) const CAP_UNSIGNED_CONTROL_V1: u64 = 1 << 2;
+/// Wave 2 (#137, P2c): content-bound `msg_id` (`MessageHeader` v3 with signed
+/// freshness timestamp).
+pub(crate) const CAP_CONTENT_BOUND_MSG_ID: u64 = 1 << 3;
+/// Full Wave 2 capability bitmask advertised by this build.
+pub(crate) const LOCAL_WAVE2_CAPS: u64 =
+    CAP_WIRE_PRUNE_GRAFT | CAP_IDONTWANT | CAP_UNSIGNED_CONTROL_V1 | CAP_CONTENT_BOUND_MSG_ID;
 
 pub(crate) fn control_topic() -> TopicId {
     TopicId::from_entity(CONTROL_DOMAIN)
@@ -271,10 +286,31 @@ pub(crate) struct ControlPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Control {
-    Hello { key_ref_version: u8 },
-    Ack { key_ids: Vec<PeerId> },
-    Request { key_ids: Vec<PeerId> },
-    Response { entries: Vec<(PeerId, Vec<u8>)> },
+    Hello {
+        key_ref_version: u8,
+    },
+    Ack {
+        key_ids: Vec<PeerId>,
+    },
+    Request {
+        key_ids: Vec<PeerId>,
+    },
+    Response {
+        entries: Vec<(PeerId, Vec<u8>)>,
+    },
+    /// Wave 2 (#137): additive session capability bitmask exchanged per
+    /// authenticated session generation AFTER `Hello { key_ref_version: 1 }`.
+    /// Legacy `<= 0.5.97` peers still negotiate SG76 via `Hello` and never
+    /// reply with `Capabilities`, so mutual Wave 2 capability remains false.
+    ///
+    /// Outbound Wave 2 activation requires two-phase confirmation: once a peer
+    /// receives our `flags`, it echoes them back in `acked_peer_flags`. This
+    /// prevents one-way capability desync if an initial `Capabilities` frame
+    /// is lost or dropped in flight.
+    Capabilities {
+        flags: u64,
+        acked_peer_flags: Option<u64>,
+    },
 }
 
 pub(crate) fn encode_control(body: Control) -> Result<Bytes> {
@@ -330,6 +366,7 @@ fn validate_control(control: &Control) -> Result<()> {
                 );
             }
         }
+        Control::Capabilities { .. } => {}
     }
     Ok(())
 }
@@ -409,6 +446,14 @@ struct SessionState {
     hello_sent: bool,
     hello_pending: bool,
     hello_received: bool,
+    caps_sent: bool,
+    caps_pending: bool,
+    caps_received: bool,
+    caps_ack_queued: bool,
+    caps_ack_sent: bool,
+    caps_ack_pending: bool,
+    peer_acked_our_caps: bool,
+    peer_caps: u64,
     queued_acks: HashSet<PeerId>,
     queued_requests: HashSet<PeerId>,
     queued_responses: HashSet<PeerId>,
@@ -423,6 +468,14 @@ impl SessionState {
             hello_sent: false,
             hello_pending: false,
             hello_received: false,
+            caps_sent: false,
+            caps_pending: false,
+            caps_received: false,
+            caps_ack_queued: false,
+            caps_ack_sent: false,
+            caps_ack_pending: false,
+            peer_acked_our_caps: false,
+            peer_caps: 0,
             queued_acks: HashSet::new(),
             queued_requests: HashSet::new(),
             queued_responses: HashSet::new(),
@@ -445,6 +498,14 @@ impl SessionState {
         self.tokens -= 1.0;
         true
     }
+    fn is_wave2_confirmed(&self, local_caps: u64) -> bool {
+        local_caps != 0
+            && self.hello_sent
+            && self.hello_received
+            && self.caps_received
+            && self.peer_acked_our_caps
+            && (local_caps & self.peer_caps) != 0
+    }
 }
 
 pub(crate) struct KeyCache {
@@ -455,6 +516,10 @@ pub(crate) struct KeyCache {
     pending: HashMap<(PeerId, u64, PeerId), PendingKey>,
     pending_frames: usize,
     pending_bytes: usize,
+    local_caps: u64,
+    /// Lock-free count of active sessions with confirmed mutual Wave 2
+    /// capabilities, kept in sync on every session/capability state transition.
+    confirmed_wave2_sessions: Arc<AtomicUsize>,
     stats: KeyCacheSnapshot,
 }
 
@@ -478,6 +543,8 @@ impl Default for KeyCache {
             pending: HashMap::new(),
             pending_frames: 0,
             pending_bytes: 0,
+            local_caps: LOCAL_WAVE2_CAPS,
+            confirmed_wave2_sessions: Arc::new(AtomicUsize::new(0)),
             stats: KeyCacheSnapshot::default(),
         }
     }
@@ -498,6 +565,26 @@ impl KeyCache {
             self.sessions
                 .insert(session.peer, SessionState::new(session.generation, now));
         }
+    }
+
+    fn sync_confirmed_wave2_sessions(&self) {
+        let count = if self.local_caps == 0 {
+            0
+        } else {
+            self.sessions
+                .values()
+                .filter(|state| state.is_wave2_confirmed(self.local_caps))
+                .count()
+        };
+        self.confirmed_wave2_sessions
+            .store(count, Ordering::Release);
+    }
+
+    /// Lock-free shared counter of active sessions with confirmed mutual Wave 2
+    /// capabilities, read by background flusher ticks without acquiring the
+    /// `KeyCache` mutex.
+    pub(crate) fn confirmed_wave2_sessions_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.confirmed_wave2_sessions)
     }
 
     fn clear_peer(&mut self, peer: PeerId) {
@@ -527,6 +614,7 @@ impl KeyCache {
         for key in inbound_keys {
             self.announced_inbound.pop(&key);
         }
+        self.sync_confirmed_wave2_sessions();
     }
 
     pub(crate) fn forget_stale(&mut self, session: AuthenticatedSession) {
@@ -554,12 +642,101 @@ impl KeyCache {
         })
     }
 
+    pub(crate) fn set_local_caps(&mut self, caps: u64) {
+        self.local_caps = caps;
+        self.sync_confirmed_wave2_sessions();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_caps(&self) -> u64 {
+        self.local_caps
+    }
+
+    /// True iff `session` has completed confirmed mutual `Hello` +
+    /// `Capabilities` on this exact session generation (the remote peer has
+    /// advertised `cap` AND explicitly echoed our exact `local_caps` back in
+    /// `acked_peer_flags`). Use this for ALL outbound Wave 2 egress decisions.
+    pub(crate) fn supports_cap(&self, session: AuthenticatedSession, cap: u64) -> bool {
+        cap != 0
+            && self.sessions.get(&session.peer).is_some_and(|state| {
+                state.generation == session.generation
+                    && state.hello_sent
+                    && state.hello_received
+                    && state.caps_received
+                    && state.peer_acked_our_caps
+                    && (self.local_caps & state.peer_caps & cap) == cap
+            })
+    }
+
+    /// True iff `session` has completed mutual `Hello` and we have received
+    /// the peer's `Capabilities` advertising `cap` on this exact session
+    /// generation (even if our peer's echo of our own ack is still in flight).
+    /// Use this for inbound Wave 2 ingress admission so a 1-RTT ack race or
+    /// lost reverse ack never rejects valid Wave 2 frames from an already-confirmed peer.
+    pub(crate) fn can_accept_cap(&self, session: AuthenticatedSession, cap: u64) -> bool {
+        cap != 0
+            && self.sessions.get(&session.peer).is_some_and(|state| {
+                state.generation == session.generation
+                    && state.hello_sent
+                    && state.hello_received
+                    && state.caps_received
+                    && (self.local_caps & state.peer_caps & cap) == cap
+            })
+    }
+
+    /// Fast lock-free check for whether at least one active session has
+    /// confirmed mutual Wave 2 capabilities.
+    #[cfg(test)]
+    pub(crate) fn has_any_wave2_peer(&self) -> bool {
+        self.confirmed_wave2_sessions.load(Ordering::Acquire) > 0
+    }
+
+    /// Record a peer's `Control::Capabilities` advertisement (and optional
+    /// confirmation echo of our `local_caps`) for `session`.
+    /// Capabilities are immutable per session generation: an identical repeat
+    /// is idempotent, whereas a differing bitmask or mismatched echo on the
+    /// same generation is rejected as malformed to eliminate mid-session
+    /// protocol oscillation.
+    pub(crate) fn received_capabilities(
+        &mut self,
+        session: AuthenticatedSession,
+        flags: u64,
+        acked_peer_flags: Option<u64>,
+    ) -> Result<()> {
+        if let Some(state) = self.sessions.get_mut(&session.peer) {
+            if state.generation == session.generation {
+                if state.caps_received {
+                    ensure!(
+                        state.peer_caps == flags,
+                        "conflicting Wave 2 capability re-advertisement on same session"
+                    );
+                } else {
+                    state.peer_caps = flags;
+                    state.caps_received = true;
+                }
+                if let Some(acked) = acked_peer_flags {
+                    ensure!(
+                        acked == self.local_caps,
+                        "mismatched Wave 2 capability confirmation on same session"
+                    );
+                    state.peer_acked_our_caps = true;
+                }
+                if self.local_caps != 0 && !state.caps_ack_sent {
+                    state.caps_ack_queued = true;
+                }
+            }
+        }
+        self.sync_confirmed_wave2_sessions();
+        Ok(())
+    }
+
     pub(crate) fn received_hello(&mut self, session: AuthenticatedSession) {
         if let Some(state) = self.sessions.get_mut(&session.peer) {
             if state.generation == session.generation {
                 state.hello_received = true;
             }
         }
+        self.sync_confirmed_wave2_sessions();
     }
 
     pub(crate) fn acknowledge(&mut self, session: AuthenticatedSession, keys: &[PeerId]) {
@@ -872,6 +1049,30 @@ impl KeyCache {
             let key_ids = take_ids(&mut state.queued_acks);
             return Some(Control::Ack { key_ids });
         }
+        if self.local_caps != 0
+            && state.caps_ack_queued
+            && !state.caps_ack_sent
+            && !state.caps_ack_pending
+        {
+            if !state.consume_token(now) {
+                return None;
+            }
+            state.caps_ack_pending = true;
+            return Some(Control::Capabilities {
+                flags: self.local_caps,
+                acked_peer_flags: Some(state.peer_caps),
+            });
+        }
+        if self.local_caps != 0 && !state.caps_sent && !state.caps_pending {
+            if !state.consume_token(now) {
+                return None;
+            }
+            state.caps_pending = true;
+            return Some(Control::Capabilities {
+                flags: self.local_caps,
+                acked_peer_flags: None,
+            });
+        }
         None
     }
 
@@ -892,6 +1093,26 @@ impl KeyCache {
                 state.hello_pending = false;
                 if sent {
                     state.hello_sent = true;
+                }
+            }
+            Control::Capabilities {
+                acked_peer_flags: Some(_),
+                ..
+            } => {
+                state.caps_ack_pending = false;
+                if sent {
+                    state.caps_ack_sent = true;
+                    state.caps_ack_queued = false;
+                    state.caps_sent = true;
+                }
+            }
+            Control::Capabilities {
+                acked_peer_flags: None,
+                ..
+            } => {
+                state.caps_pending = false;
+                if sent {
+                    state.caps_sent = true;
                 }
             }
             Control::Ack { key_ids } if !sent => {
@@ -917,6 +1138,7 @@ impl KeyCache {
             }
             _ => {}
         }
+        self.sync_confirmed_wave2_sessions();
     }
 
     pub(crate) fn sessions(&self) -> Vec<AuthenticatedSession> {
@@ -1221,6 +1443,11 @@ mod tests {
         assert!(
             matches!(cache.next_control(session, now), Some(Control::Request { key_ids }) if key_ids == vec![author])
         );
+        // Drain the one-shot Wave 2 Capabilities advertisement; no second
+        // Request is emitted while the miss is still pending.
+        let caps = cache.next_control(session, now).expect("wave2 caps");
+        assert!(matches!(caps, Control::Capabilities { .. }));
+        cache.control_result(session, &caps, true);
         assert!(cache.next_control(session, now).is_none());
         cache.expire(now + PENDING_TTL);
         assert_eq!(cache.pending_frames, 0);
@@ -1273,6 +1500,9 @@ mod tests {
             let hello = cache.next_control(s, now).expect("hello");
             cache.control_result(s, &hello, true);
             cache.received_hello(s);
+            let caps = cache.next_control(s, now).expect("wave2 caps");
+            assert!(matches!(caps, Control::Capabilities { .. }));
+            cache.control_result(s, &caps, true);
         }
 
         let known_key = vec![0x42; KEY_BYTES];
@@ -1300,5 +1530,177 @@ mod tests {
             cache.next_control(s2, now),
             Some(Control::Ack { key_ids }) if key_ids == vec![known_id]
         ));
+    }
+
+    #[test]
+    fn wave2_capabilities_are_mutual_immutable_per_generation_and_legacy_safe() {
+        let now = Instant::now();
+        let mut cache = KeyCache::default();
+        assert_eq!(cache.local_caps(), LOCAL_WAVE2_CAPS);
+        let s1 = session(1, 1);
+        cache.observe_session(s1, now);
+
+        // Hello always goes out first (0.5.97 compatible).
+        let hello = cache.next_control(s1, now).expect("hello");
+        assert!(matches!(hello, Control::Hello { key_ref_version: 1 }));
+        cache.control_result(s1, &hello, true);
+        cache.received_hello(s1);
+        assert!(cache.supports_v3(s1));
+        // Before Capabilities exchange, all Wave 2 caps are false (A15).
+        assert!(!cache.supports_cap(s1, CAP_WIRE_PRUNE_GRAFT));
+        assert!(!cache.supports_cap(s1, CAP_UNSIGNED_CONTROL_V1));
+
+        // Local Capabilities advertisement emits once after Hello.
+        let caps = cache.next_control(s1, now).expect("caps");
+        assert!(matches!(
+            caps,
+            Control::Capabilities {
+                flags,
+                acked_peer_flags: None
+            } if flags == LOCAL_WAVE2_CAPS
+        ));
+        let encoded = encode_control(caps.clone()).expect("encode caps");
+        assert!(matches!(
+            decode_control(&encoded).expect("decode caps"),
+            Control::Capabilities {
+                flags,
+                acked_peer_flags: None
+            } if flags == LOCAL_WAVE2_CAPS
+        ));
+        cache.control_result(s1, &caps, true);
+        // Peer has not advertised yet -> still false.
+        assert!(!cache.supports_cap(s1, CAP_WIRE_PRUNE_GRAFT));
+        assert!(!cache.can_accept_cap(s1, CAP_WIRE_PRUNE_GRAFT));
+
+        // Peer advertises a subset + an unknown future bit WITHOUT echoing our
+        // flags yet -> we can ACCEPT peer's subset, MUST queue our confirmation
+        // echo, and MUST NOT activate outbound `supports_cap` until confirmed!
+        let subset = CAP_WIRE_PRUNE_GRAFT | CAP_IDONTWANT | (1 << 60);
+        cache
+            .received_capabilities(s1, subset, None)
+            .expect("accept initial peer caps");
+        assert!(cache.can_accept_cap(s1, CAP_WIRE_PRUNE_GRAFT));
+        assert!(!cache.supports_cap(s1, CAP_WIRE_PRUNE_GRAFT));
+        assert!(!cache.has_any_wave2_peer());
+
+        // Confirmation echo queues with `acked_peer_flags == Some(subset)`.
+        let ack = cache.next_control(s1, now).expect("caps confirmation ack");
+        assert!(matches!(
+            ack,
+            Control::Capabilities {
+                flags,
+                acked_peer_flags: Some(acked)
+            } if flags == LOCAL_WAVE2_CAPS && acked == subset
+        ));
+        cache.control_result(s1, &ack, true);
+        assert!(cache.next_control(s1, now).is_none());
+
+        // Mismatched confirmation echo is rejected and leaves outbound off.
+        assert!(cache
+            .received_capabilities(s1, subset, Some(CAP_WIRE_PRUNE_GRAFT))
+            .is_err());
+        assert!(!cache.supports_cap(s1, CAP_WIRE_PRUNE_GRAFT));
+
+        // Exact confirmation echo activates outbound mutual intersection.
+        cache
+            .received_capabilities(s1, subset, Some(LOCAL_WAVE2_CAPS))
+            .expect("accept confirmed peer caps");
+        assert!(cache.has_any_wave2_peer());
+        assert!(cache.supports_cap(s1, CAP_WIRE_PRUNE_GRAFT));
+        assert!(cache.supports_cap(s1, CAP_IDONTWANT));
+        assert!(!cache.supports_cap(s1, CAP_UNSIGNED_CONTROL_V1));
+        assert!(!cache.supports_cap(s1, CAP_CONTENT_BOUND_MSG_ID));
+        assert!(!cache.supports_cap(s1, 1 << 60));
+
+        // Identical repeat is idempotent; conflicting re-advertisement fails.
+        cache
+            .received_capabilities(s1, subset, Some(LOCAL_WAVE2_CAPS))
+            .expect("idempotent repeat");
+        assert!(cache
+            .received_capabilities(s1, LOCAL_WAVE2_CAPS, Some(LOCAL_WAVE2_CAPS))
+            .is_err());
+
+        // Dropped initial Capabilities self-heals via confirmation without
+        // ever allowing one-way unsigned batch desync (Opus Major #9).
+        let mut a = KeyCache::default();
+        let mut b = KeyCache::default();
+        let sa = session(10, 1);
+        let sb = session(11, 1);
+        a.observe_session(sa, now);
+        b.observe_session(sb, now);
+        for (c, s) in [(&mut a, sa), (&mut b, sb)] {
+            let h = c.next_control(s, now).expect("hello");
+            c.control_result(s, &h, true);
+            c.received_hello(s);
+        }
+        // A's initial Capabilities is sent and LOST in transit.
+        let a_init = a.next_control(sa, now).expect("a init caps");
+        a.control_result(sa, &a_init, true);
+        // B's initial Capabilities arrives at A.
+        let b_init = b.next_control(sb, now).expect("b init caps");
+        b.control_result(sb, &b_init, true);
+        let Control::Capabilities {
+            flags: bf,
+            acked_peer_flags: ba,
+        } = b_init
+        else {
+            panic!("expected caps");
+        };
+        a.received_capabilities(sa, bf, ba).expect("a receives b");
+        // Critical safety check: A MUST NOT send unsigned batches yet because B
+        // never received A's initial frame!
+        assert!(!a.supports_cap(sa, CAP_UNSIGNED_CONTROL_V1));
+        assert!(!b.supports_cap(sb, CAP_UNSIGNED_CONTROL_V1));
+        // A replies with confirmation carrying BOTH A's flags and B's echo.
+        let a_ack = a.next_control(sa, now).expect("a ack");
+        a.control_result(sa, &a_ack, true);
+        let Control::Capabilities {
+            flags: af,
+            acked_peer_flags: aa,
+        } = a_ack
+        else {
+            panic!("expected ack");
+        };
+        b.received_capabilities(sb, af, aa)
+            .expect("b receives a ack");
+        // B is now confirmed AND A can already accept B's unsigned batches!
+        assert!(b.supports_cap(sb, CAP_UNSIGNED_CONTROL_V1));
+        assert!(a.can_accept_cap(sa, CAP_UNSIGNED_CONTROL_V1));
+        // B sends its confirmation back -> both sides fully active!
+        let b_ack = b.next_control(sb, now).expect("b ack");
+        b.control_result(sb, &b_ack, true);
+        let Control::Capabilities {
+            flags: bf2,
+            acked_peer_flags: ba2,
+        } = b_ack
+        else {
+            panic!("expected b ack");
+        };
+        a.received_capabilities(sa, bf2, ba2)
+            .expect("a receives b ack");
+        assert!(a.supports_cap(sa, CAP_UNSIGNED_CONTROL_V1));
+        assert!(b.supports_cap(sb, CAP_UNSIGNED_CONTROL_V1));
+        // Exchange terminates cleanly with no further control frames.
+        assert!(a.next_control(sa, now).is_none());
+        assert!(b.next_control(sb, now).is_none());
+
+        // Session reconnect (new generation) resets all negotiated caps.
+        let s2 = session(1, 2);
+        cache.observe_session(s2, now);
+        assert!(!cache.supports_cap(s2, CAP_WIRE_PRUNE_GRAFT));
+        assert!(!cache.supports_v3(s2));
+
+        // Legacy mode (local_caps == 0) emits only Hello, never Capabilities.
+        let mut legacy = KeyCache::default();
+        legacy.set_local_caps(0);
+        let ls = session(2, 1);
+        legacy.observe_session(ls, now);
+        let lhello = legacy.next_control(ls, now).expect("legacy hello");
+        legacy.control_result(ls, &lhello, true);
+        legacy.received_hello(ls);
+        assert!(legacy.next_control(ls, now).is_none());
+        assert!(legacy.supports_v3(ls));
+        assert!(!legacy.supports_cap(ls, CAP_WIRE_PRUNE_GRAFT));
+        assert!(!legacy.has_any_wave2_peer());
     }
 }

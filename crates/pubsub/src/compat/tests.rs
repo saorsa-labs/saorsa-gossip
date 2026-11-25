@@ -169,6 +169,7 @@ fn message(
     let mut header = MessageHeader {
         version: 1,
         payload_hash: None,
+        created_at_secs: None,
         topic,
         msg_id: [id; 32],
         kind,

@@ -26,6 +26,7 @@
 
 pub mod admission;
 pub mod compat;
+mod control_batch;
 mod key_cache;
 pub mod peer_scoring;
 pub mod timing;
@@ -47,7 +48,6 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-#[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
@@ -143,8 +143,76 @@ const MAX_IHAVE_BATCH_SIZE: usize = 1024;
 /// (after send completion).
 const MAX_PENDING_IHAVE: usize = MAX_IHAVE_BATCH_SIZE;
 
-/// IHAVE flush interval (100ms)
+/// IHAVE flush interval (100ms) for legacy peers and recovery ticks
 const IHAVE_FLUSH_INTERVAL_MS: u64 = 100;
+
+/// Wave 2 (#137): fast flush tick for Critical topics (`<= 25 ms` under A06)
+/// and iroh-gossip-style GRAFT timers (80 ms primary / 40 ms fallback).
+const WAVE2_FAST_TICK_MS: u64 = 20;
+
+/// Wave 2 (#137): cross-topic 1-hop control coalescing interval for
+/// Normal/Bulk topics on Wave-2-capable peers (blueprint target: 250–500 ms).
+const WAVE2_NORMAL_COALESCE_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Wave 2 (#137): capped/sampled lazy fanout (`D_lazy`) for Normal/Bulk
+/// cross-topic IHAVE advertisements so control traffic stays O(D_lazy) as
+/// mesh size grows.
+const WAVE2_D_LAZY_CAP: usize = 6;
+
+/// Wave 2 (#137): iroh-gossip-style primary GRAFT timer armed when an IHAVE
+/// arrives for an unseen message from a Wave-2-capable peer.
+const GRAFT_PRIMARY_DELAY: Duration = Duration::from_millis(80);
+
+/// Wave 2 (#137): fallback GRAFT timer armed after primary GRAFT expires when
+/// additional IHAVE advertisers are queued. Sized above typical WAN RTT (120 ms)
+/// to avoid spurious multi-pull while keeping repair latency low.
+const GRAFT_FALLBACK_DELAY: Duration = Duration::from_millis(120);
+
+/// Maximum fallback advertisers retained per pending GRAFT timer.
+const MAX_GRAFT_FALLBACK_PEERS: usize = 8;
+
+/// Wave 2 (#137): TTL for `ihave_excluded_peers` entries so IDs that never
+/// enter `pending_ihave` expire cleanly alongside LRU eviction.
+const IHAVE_EXCLUSION_TTL: Duration = Duration::from_secs(15);
+
+/// Wave 2 (#137): maximum concurrent detached `IDONTWANT` send tasks so
+/// high-rate large-payload traffic cannot spawn unbounded background tasks.
+const IDONTWANT_MAX_CONCURRENT_SENDS: usize = 128;
+
+/// Wave 2 (#137): maximum concurrent non-blocking Wave 2 control flush sends.
+const WAVE2_FLUSH_MAX_CONCURRENT_SENDS: usize = 64;
+
+/// Wave 2 (#137): minimum EAGER payload size (`1 KiB`) that triggers immediate
+/// `IDONTWANT(msg_id)` emission to eager mesh peers (GossipSub v1.2 pattern).
+const IDONTWANT_MIN_PAYLOAD_BYTES: usize = 1_024;
+
+/// Wave 2 (#137): short TTL for per-peer `IDONTWANT` duplicate-push suppression.
+const IDONTWANT_TTL: Duration = Duration::from_secs(10);
+
+/// Bounded capacity of per-topic `IDONTWANT` suppression LRU (lazily allocated).
+const MAX_IDONTWANT_ENTRIES_PER_TOPIC: usize = 4_096;
+
+/// Wave 2 (#137, P2c): signed freshness window for content-bound `MessageHeader`
+/// v3 messages (`±5 min` past window, `+60 s` future clock-skew allowance).
+const CONTENT_BOUND_FRESHNESS_WINDOW_SECS: u64 = 300;
+const CONTENT_BOUND_MAX_FUTURE_SKEW_SECS: u64 = 60;
+
+/// Wave 2 (#137, P2c): seen-ID TTL strictly covering the entire signed
+/// freshness window (`300 s + 60 s = 360 s`) so no v3 message can expire from
+/// the seen cache while still accepted by the freshness window (up to
+/// `V3_SEEN_CACHE_CAPACITY / V3_SEEN_TTL_SECS ≈ 91 msg/s/topic` sustained).
+const V3_SEEN_TTL_SECS: u64 =
+    CONTENT_BOUND_FRESHNESS_WINDOW_SECS + CONTENT_BOUND_MAX_FUTURE_SKEW_SECS;
+
+/// Bounded capacity of lightweight 32-byte-ID-only v3 seen cache per topic
+/// (lazily allocated on first v3 message; 0 bytes for non-v3 topics).
+const V3_SEEN_CACHE_CAPACITY: usize = 32_768;
+
+/// Wave 2 (#137, P2c): per-signer duplicate token bucket bounds on a topic so
+/// duplicate floods are `IGNORE`d without CPU or control-plane amplification.
+const SIGNER_DUP_BUCKET_CAPACITY: usize = 512;
+const SIGNER_DUP_BURST: f64 = 64.0;
+const SIGNER_DUP_REFILL_PER_SEC: f64 = 32.0;
 
 /// Issue #42: single shared deadline bounding every task join in
 /// [`PlumtreePubSub::shutdown`]. A background task that misses it (e.g. a
@@ -379,15 +447,21 @@ enum OutboundWireKind {
     Iwant,
     AntiEntropy,
     KeyCacheControl,
+    Prune,
+    Graft,
+    IDontWant,
 }
 
 impl OutboundWireKind {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 8] = [
         Self::Eager,
         Self::Ihave,
         Self::Iwant,
         Self::AntiEntropy,
         Self::KeyCacheControl,
+        Self::Prune,
+        Self::Graft,
+        Self::IDontWant,
     ];
 
     fn from_op(op: &'static str) -> Self {
@@ -396,6 +470,9 @@ impl OutboundWireKind {
             "IHAVE" => Self::Ihave,
             "IWANT" => Self::Iwant,
             "KEY_CACHE_CONTROL" => Self::KeyCacheControl,
+            "PRUNE" => Self::Prune,
+            "GRAFT" => Self::Graft,
+            "IDONTWANT" => Self::IDontWant,
             _ => Self::AntiEntropy,
         }
     }
@@ -407,6 +484,9 @@ impl OutboundWireKind {
             Self::Iwant => "iwant",
             Self::AntiEntropy => "anti_entropy",
             Self::KeyCacheControl => "key_cache_control",
+            Self::Prune => "prune",
+            Self::Graft => "graft",
+            Self::IDontWant => "idontwant",
         }
     }
 
@@ -417,6 +497,9 @@ impl OutboundWireKind {
             Self::Iwant => 2,
             Self::AntiEntropy => 3,
             Self::KeyCacheControl => 4,
+            Self::Prune => 5,
+            Self::Graft => 6,
+            Self::IDontWant => 7,
         }
     }
 }
@@ -425,8 +508,8 @@ impl OutboundWireKind {
 /// the send path; no allocation beyond the one map entry per topic.
 #[derive(Debug, Default)]
 struct OutboundTopicMeter {
-    msgs: [AtomicU64; 5],
-    bytes: [AtomicU64; 5],
+    msgs: [AtomicU64; 8],
+    bytes: [AtomicU64; 8],
 }
 
 /// x0x #380: bounded per-topic outbound meters. Topics beyond the fixed cap
@@ -809,8 +892,162 @@ impl PubSubMessageKindStats {
     }
 }
 
-/// Number of [`MessageKind`] variants (`to_u8()` ranges `0..=8`).
-const MESSAGE_KIND_VARIANT_COUNT: usize = 9;
+/// Number of [`MessageKind`] variants (`to_u8()` ranges `0..=11`).
+const MESSAGE_KIND_VARIANT_COUNT: usize = 12;
+
+/// Wave 2 (#137, P2c): outbound/inbound policy for content-bound `msg_id`
+/// (`MessageHeader` v3 with signed freshness timestamp).
+///
+/// Because `MessageHeader` v3 is signed end-to-end by the origin publisher and
+/// cannot be downgraded by intermediate relays, `PublishV3` / `RequireV3` must
+/// only be enabled once the fleet confirms `CAP_CONTENT_BOUND_MSG_ID` across
+/// reachable hops (e.g. x0x capability bits 23+). As defense-in-depth, all
+/// outbound v3 EAGER egress (publish, relay forward, IWANT/GRAFT reply, and
+/// anti-entropy push) is gated per-peer on `CAP_CONTENT_BOUND_MSG_ID` so v3
+/// frames never leak to `<= 0.5.97` neighbours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContentBoundMsgIdPolicy {
+    /// Default during mixed-fleet upgrades with `<= 0.5.97` peers: accept and
+    /// strictly validate inbound v3 content-bound messages while continuing to
+    /// publish v2 headers so multi-hop forwarding reaches `<= 0.5.97` hops.
+    #[default]
+    AcceptOnly,
+    /// Always publish v3 content-bound headers (enabled once the fleet
+    /// capability gate — x0x capability bits 23+ — confirms Wave 2 support).
+    /// Continues accepting inbound v2 during transition.
+    PublishV3,
+    /// Always publish v3 content-bound headers and silently drop legacy v1/v2
+    /// EAGER headers on inbound (without penalizing honest forwarders' scores).
+    RequireV3,
+}
+
+/// Process-local Wave 2 (#137) protocol telemetry counters.
+#[derive(Debug, Default)]
+struct Wave2Stats {
+    wire_prune_sent: AtomicU64,
+    wire_prune_received: AtomicU64,
+    wire_graft_sent: AtomicU64,
+    wire_graft_received: AtomicU64,
+    graft_timer_armed: AtomicU64,
+    graft_timer_cancelled_by_eager: AtomicU64,
+    graft_timer_primary_fired: AtomicU64,
+    graft_timer_fallback_fired: AtomicU64,
+    idontwant_sent: AtomicU64,
+    idontwant_received: AtomicU64,
+    idontwant_eager_suppressed: AtomicU64,
+    unsigned_control_batches_sent: AtomicU64,
+    unsigned_control_batches_received: AtomicU64,
+    unsigned_control_ops_sent: AtomicU64,
+    unsigned_control_ops_received: AtomicU64,
+    unsigned_control_bytes_sent: AtomicU64,
+    unsigned_control_bytes_received: AtomicU64,
+    v3_content_bound_published: AtomicU64,
+    v3_content_bound_accepted: AtomicU64,
+    v3_content_bound_forged_rejected: AtomicU64,
+    v3_content_bound_stale_rejected: AtomicU64,
+    v3_policy_rejected: AtomicU64,
+    v3_egress_skipped_legacy: AtomicU64,
+    duplicate_rate_limited: AtomicU64,
+}
+
+/// JSON-friendly snapshot of Wave 2 (#137) protocol counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct Wave2StatsSnapshot {
+    /// Wire `PRUNE` ops emitted to Wave-2-capable peers.
+    pub wire_prune_sent: u64,
+    /// Wire `PRUNE` ops received from authenticated peers.
+    pub wire_prune_received: u64,
+    /// Wire `GRAFT` ops emitted to Wave-2-capable peers.
+    pub wire_graft_sent: u64,
+    /// Wire `GRAFT` ops received from authenticated peers.
+    pub wire_graft_received: u64,
+    /// Primary 80 ms GRAFT timers armed on Wave-2 `IHAVE` receipt.
+    pub graft_timer_armed: u64,
+    /// Pending GRAFT timers cancelled because `EAGER` arrived before expiry.
+    pub graft_timer_cancelled_by_eager: u64,
+    /// Primary 80 ms GRAFT timers that expired and emitted `GRAFT`.
+    pub graft_timer_primary_fired: u64,
+    /// Fallback 120 ms GRAFT timers that expired and emitted `GRAFT`.
+    pub graft_timer_fallback_fired: u64,
+    /// `IDONTWANT` ops emitted for `>= 1 KiB` messages.
+    pub idontwant_sent: u64,
+    /// `IDONTWANT` ops received from authenticated peers.
+    pub idontwant_received: u64,
+    /// Outbound EAGER pushes skipped because the target sent `IDONTWANT`.
+    pub idontwant_eager_suppressed: u64,
+    /// Unsigned 1-hop control batch frames transmitted.
+    pub unsigned_control_batches_sent: u64,
+    /// Unsigned 1-hop control batch frames received and accepted.
+    pub unsigned_control_batches_received: u64,
+    /// Individual 1-hop control ops sent inside unsigned batches.
+    pub unsigned_control_ops_sent: u64,
+    /// Individual 1-hop control ops received inside unsigned batches.
+    pub unsigned_control_ops_received: u64,
+    /// Total wire bytes transmitted in unsigned 1-hop control batches.
+    pub unsigned_control_bytes_sent: u64,
+    /// Total wire bytes received in unsigned 1-hop control batches.
+    pub unsigned_control_bytes_received: u64,
+    /// Locally published `MessageHeader` v3 content-bound EAGER messages.
+    pub v3_content_bound_published: u64,
+    /// Verified novel `MessageHeader` v3 content-bound EAGER messages accepted.
+    pub v3_content_bound_accepted: u64,
+    /// Inbound v3 EAGER frames rejected for forged/mismatched `msg_id` or `payload_hash`.
+    pub v3_content_bound_forged_rejected: u64,
+    /// Inbound v3 EAGER frames rejected because `created_at_secs` fell outside the freshness window.
+    pub v3_content_bound_stale_rejected: u64,
+    /// Inbound v1/v2 EAGER frames dropped under `RequireV3` policy (no peer-score penalty).
+    pub v3_policy_rejected: u64,
+    /// Outbound v3 EAGER sends skipped because the target peer lacks `CAP_CONTENT_BOUND_MSG_ID`.
+    pub v3_egress_skipped_legacy: u64,
+    /// Duplicate EAGER frames silently ignored due to per-sender duplicate rate limiting.
+    pub duplicate_rate_limited: u64,
+}
+
+impl Wave2Stats {
+    fn snapshot(&self) -> Wave2StatsSnapshot {
+        Wave2StatsSnapshot {
+            wire_prune_sent: self.wire_prune_sent.load(Ordering::Relaxed),
+            wire_prune_received: self.wire_prune_received.load(Ordering::Relaxed),
+            wire_graft_sent: self.wire_graft_sent.load(Ordering::Relaxed),
+            wire_graft_received: self.wire_graft_received.load(Ordering::Relaxed),
+            graft_timer_armed: self.graft_timer_armed.load(Ordering::Relaxed),
+            graft_timer_cancelled_by_eager: self
+                .graft_timer_cancelled_by_eager
+                .load(Ordering::Relaxed),
+            graft_timer_primary_fired: self.graft_timer_primary_fired.load(Ordering::Relaxed),
+            graft_timer_fallback_fired: self.graft_timer_fallback_fired.load(Ordering::Relaxed),
+            idontwant_sent: self.idontwant_sent.load(Ordering::Relaxed),
+            idontwant_received: self.idontwant_received.load(Ordering::Relaxed),
+            idontwant_eager_suppressed: self.idontwant_eager_suppressed.load(Ordering::Relaxed),
+            unsigned_control_batches_sent: self
+                .unsigned_control_batches_sent
+                .load(Ordering::Relaxed),
+            unsigned_control_batches_received: self
+                .unsigned_control_batches_received
+                .load(Ordering::Relaxed),
+            unsigned_control_ops_sent: self.unsigned_control_ops_sent.load(Ordering::Relaxed),
+            unsigned_control_ops_received: self
+                .unsigned_control_ops_received
+                .load(Ordering::Relaxed),
+            unsigned_control_bytes_sent: self.unsigned_control_bytes_sent.load(Ordering::Relaxed),
+            unsigned_control_bytes_received: self
+                .unsigned_control_bytes_received
+                .load(Ordering::Relaxed),
+            v3_content_bound_published: self.v3_content_bound_published.load(Ordering::Relaxed),
+            v3_content_bound_accepted: self.v3_content_bound_accepted.load(Ordering::Relaxed),
+            v3_content_bound_forged_rejected: self
+                .v3_content_bound_forged_rejected
+                .load(Ordering::Relaxed),
+            v3_content_bound_stale_rejected: self
+                .v3_content_bound_stale_rejected
+                .load(Ordering::Relaxed),
+            v3_policy_rejected: self.v3_policy_rejected.load(Ordering::Relaxed),
+            v3_egress_skipped_legacy: self.v3_egress_skipped_legacy.load(Ordering::Relaxed),
+            duplicate_rate_limited: self.duplicate_rate_limited.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Cumulative ML-DSA verify counters for one [`MessageKind`].
 ///
@@ -1120,8 +1357,8 @@ pub struct PubSubStageStats {
     /// [`OutboundTopicMeters`]).
     outbound_by_topic: OutboundTopicMeters,
     /// x0x #380: aggregate outbound wire msgs+bytes per kind.
-    outbound_kind_msgs: [AtomicU64; 5],
-    outbound_kind_bytes: [AtomicU64; 5],
+    outbound_kind_msgs: [AtomicU64; 8],
+    outbound_kind_bytes: [AtomicU64; 8],
     /// x0x #380: EAGER publish traffic split local vs relay.
     outbound_publish_origin: OutboundPublishOriginMeters,
     /// x0x #1964: outbound EAGER sends split by the code path that caused them.
@@ -3295,6 +3532,11 @@ pub struct GossipMessage {
 /// messages. The peek is only worth doing under pressure; do not call it on the
 /// steady-state hot path.
 pub fn peek_message_kind(frame: &[u8]) -> Option<MessageKind> {
+    if control_batch::is_control_batch(frame) {
+        let body = frame.strip_prefix(control_batch::CONTROL_BATCH_MARKER)?;
+        control_batch::preflight_control_batch(body).ok()?;
+        return Some(MessageKind::Ping);
+    }
     let frame = frame.strip_prefix(key_cache::WIRE_MARKER).unwrap_or(frame);
     postcard::take_from_bytes::<MessageHeader>(frame)
         .ok()
@@ -3302,10 +3544,10 @@ pub fn peek_message_kind(frame: &[u8]) -> Option<MessageKind> {
 }
 
 /// Unauthenticated topic/kind inspection of a structurally complete legacy
-/// or SG key-cache v3 PubSub frame. Intended only for pre-dispatch routing,
-/// accounting, and Leaf/relay gates; it never verifies the signature or
-/// authorizes the topic. Always pass accepted bytes to the normal verified
-/// message handler afterward.
+/// or SG key-cache v3 PubSub frame (or Wave 2 unsigned 1-hop control batch).
+/// Intended only for pre-dispatch routing, accounting, and Leaf/relay gates;
+/// it never verifies the signature or authorizes the topic. Always pass
+/// accepted bytes to the normal verified message handler afterward.
 ///
 /// The parser skips payload bytes without allocating them, checks fixed
 /// signature/key sizes and exact v3 framing, and applies the existing
@@ -3318,14 +3560,24 @@ pub struct InspectedMessageHeader {
     pub topic: TopicId,
     /// Unverified message kind from the signed header.
     pub kind: MessageKind,
-    /// Reserved SG key-cache control topic; consumers must leave its handling
-    /// to SG rather than registering it as an application relay topic.
+    /// Reserved SG key-cache control topic or Wave 2 hop-local control batch;
+    /// consumers must leave its handling to SG rather than registering it as
+    /// an application relay topic.
     pub hop_local_control: bool,
 }
 
 /// Inspect the topic and kind without copying or exposing the v3 wire marker.
 #[must_use]
 pub fn inspect_message_header(frame: &[u8]) -> Option<InspectedMessageHeader> {
+    if control_batch::is_control_batch(frame) {
+        let body = frame.strip_prefix(control_batch::CONTROL_BATCH_MARKER)?;
+        control_batch::preflight_control_batch(body).ok()?;
+        return Some(InspectedMessageHeader {
+            topic: key_cache::control_topic(),
+            kind: MessageKind::Ping,
+            hop_local_control: true,
+        });
+    }
     let (header, hop_local_control) = key_cache::inspect_header(frame).ok()?;
     Some(InspectedMessageHeader {
         topic: header.topic,
@@ -4495,11 +4747,104 @@ struct IhaveFlushWork {
     retained_announce: bool,
 }
 
+struct DueGraftTask {
+    topic: TopicId,
+    peer: PeerId,
+    msg_id: MessageIdType,
+    is_fallback: bool,
+    has_more_fallbacks: bool,
+    retry_count: u8,
+}
+
+struct Wave2BatchSendTask {
+    peer: PeerId,
+    primary_topic: TopicId,
+    wire: Bytes,
+    op_count: usize,
+    is_critical: bool,
+    reservation: Option<egress::ByteReservation>,
+    topic_batches: Vec<(TopicId, Vec<MessageIdType>, Vec<PeerId>)>,
+}
+
+#[derive(Default)]
+struct PreparedWave2Work {
+    due_grafts: Vec<DueGraftTask>,
+    batch_tasks: Vec<Wave2BatchSendTask>,
+}
+
+enum Wave2SendCompletion {
+    BatchSent {
+        peer: PeerId,
+        is_critical: bool,
+        topic_batches: Vec<(TopicId, Vec<MessageIdType>, Vec<PeerId>)>,
+        sent: bool,
+    },
+    GraftSent {
+        topic: TopicId,
+        peer: PeerId,
+        msg_id: MessageIdType,
+        has_more_fallbacks: bool,
+        retry_count: u8,
+        outcome: Option<PeerSendOutcome>,
+    },
+}
+
 /// One bounded payload replay entry. Keep refusal with the payload digest so
 /// a fresh outer ID cannot turn rejected bytes into a serveable cache entry.
 struct PayloadReplayEntry {
     inserted_at: Instant,
     refused: bool,
+}
+
+/// Wave 2 (#137): iroh-gossip-style pending GRAFT timer for one unseen
+/// `msg_id` advertised via `IHAVE` by a Wave-2-capable peer.
+///
+/// Armed at `now + 80 ms` (`GRAFT_PRIMARY_DELAY`). If EAGER arrives first, the
+/// timer is cancelled with zero repair traffic. On expiry, we emit
+/// `GRAFT(topic, Some(msg_id))` to `current_peer`; if fallback advertisers are
+/// queued, the timer re-arms at `now + 120 ms` (`GRAFT_FALLBACK_DELAY`).
+struct PendingGraftTimer {
+    deadline: Instant,
+    current_peer: PeerId,
+    fallback_peers: VecDeque<PeerId>,
+    attempted_primary: bool,
+    retry_count: u8,
+}
+
+/// Wave 2 (#137, P2c): per-signer duplicate token bucket so repeated
+/// duplicates are `IGNORE`d without CPU or control-plane amplification.
+struct SignerDupBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl SignerDupBucket {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: SIGNER_DUP_BURST,
+            last_refill: now,
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * SIGNER_DUP_REFILL_PER_SEC).min(SIGNER_DUP_BURST);
+        self.last_refill = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+const fn nonzero_capacity(capacity: usize) -> NonZeroUsize {
+    match NonZeroUsize::new(capacity) {
+        Some(n) => n,
+        None => NonZeroUsize::MIN,
+    }
 }
 
 struct TopicState {
@@ -4603,6 +4948,28 @@ struct TopicState {
     /// `ZERO_FANOUT_WARN_INTERVAL` throttling. `None` until the first one, so
     /// the first zero-fan-out publish on a topic always logs.
     last_zero_fanout_warn: Option<Instant>,
+    /// Wave 2 (#137): iroh-gossip-style pending GRAFT timers (80 ms primary /
+    /// 120 ms fallback) keyed by unseen `msg_id`, bounded at `MAX_IHAVE_BATCH_SIZE`.
+    pending_graft_timers: HashMap<MessageIdType, PendingGraftTimer>,
+    /// Wave 2 (#137): lazily allocated bounded short-TTL suppression table
+    /// recording `(peer, msg_id)` pairs for which `peer` sent `IDONTWANT(msg_id)`.
+    peer_dont_want: Option<LruCache<(PeerId, MessageIdType), Instant>>,
+    /// Wave 2 (#137): lazily allocated bounded dedupe table of `msg_id`s for
+    /// which we already emitted `IDONTWANT`.
+    sent_idontwant: Option<LruCache<MessageIdType, Instant>>,
+    /// Wave 2 (#137): lazily allocated bounded LRU+TTL map of peers already
+    /// known to hold `msg_id` (sender of EAGER or IHAVE advertiser) skipped
+    /// during IHAVE flush. Evicts oldest on cap and expires after `IHAVE_EXCLUSION_TTL`.
+    ihave_excluded_peers: Option<LruCache<MessageIdType, (Instant, HashSet<PeerId>)>>,
+    /// Wave 2 (#137, P2c): lazily allocated lightweight 32-byte-ID-only seen
+    /// cache for content-bound `MessageHeader` v3 frames with TTL `V3_SEEN_TTL_SECS`.
+    v3_seen_ids: Option<LruCache<MessageIdType, (Instant, bool)>>,
+    /// Wave 2 (#137, P2c): lazily allocated bounded per-authenticated-peer
+    /// duplicate rate-limit buckets.
+    signer_dup_buckets: Option<LruCache<PeerId, SignerDupBucket>>,
+    /// Wave 2 (#137): short cooldown (1 s, hard-capped at 256 entries) preventing
+    /// wire `PRUNE` bursts when an asymmetric peer sends duplicate EAGER frames.
+    last_wire_prune_sent: HashMap<PeerId, Instant>,
 }
 
 impl TopicState {
@@ -4933,6 +5300,13 @@ impl TopicState {
             last_opportunistic_graft: None,
             zero_fanout_publishes: 0,
             last_zero_fanout_warn: None,
+            pending_graft_timers: HashMap::new(),
+            peer_dont_want: None,
+            sent_idontwant: None,
+            ihave_excluded_peers: None,
+            v3_seen_ids: None,
+            signer_dup_buckets: None,
+            last_wire_prune_sent: HashMap::new(),
         }
     }
 
@@ -5061,11 +5435,320 @@ impl TopicState {
             .is_some_and(|(dropped_at, refused)| dropped_at.elapsed() < self.replay_ttl && *refused)
     }
 
-    /// Check if message is already known (cached or recently dropped as a
-    /// live payload replay). Never serves unverified IDs — all serve paths
-    /// read `message_cache` directly via `get_message`.
+    /// Check if message is already known (cached, seen as a live Wave 2 v3
+    /// content-bound ID within its freshness window, or recently dropped as a
+    /// legacy live payload replay). Never serves unverified IDs — all serve
+    /// paths read `message_cache` directly via `get_message`.
     fn has_message(&self, msg_id: &MessageIdType) -> bool {
-        self.message_cache.contains(msg_id) || self.has_live_replay_dropped_id(msg_id)
+        self.message_cache.contains(msg_id)
+            || self.has_live_v3_seen_id(msg_id)
+            || self.has_live_replay_dropped_id(msg_id)
+    }
+
+    /// Wave 2 (#137, P2c): record a verified content-bound v3 `msg_id` in the
+    /// lazily-allocated 32-byte-ID-only seen cache (`V3_SEEN_TTL_SECS = 360 s`,
+    /// strictly covering the `300 s + 60 s` signed freshness window).
+    fn record_v3_seen_id(&mut self, msg_id: MessageIdType, refused: bool, now: Instant) {
+        self.v3_seen_ids
+            .get_or_insert_with(|| LruCache::new(nonzero_capacity(V3_SEEN_CACHE_CAPACITY)))
+            .put(msg_id, (now, refused));
+    }
+
+    fn has_live_v3_seen_id(&self, msg_id: &MessageIdType) -> bool {
+        let Some(cache) = self.v3_seen_ids.as_ref() else {
+            return false;
+        };
+        let ttl = Duration::from_secs(V3_SEEN_TTL_SECS);
+        cache
+            .peek(msg_id)
+            .is_some_and(|(seen_at, _)| seen_at.elapsed() < ttl)
+    }
+
+    /// Wave 2 (#137, P2c): per-authenticated-peer duplicate token bucket so
+    /// duplicate floods from a neighbor are silently `IGNORE`d without CPU or
+    /// control amplification, and one peer cannot drain another peer's bucket.
+    fn allow_duplicate_from_peer(&mut self, from: PeerId, now: Instant) -> bool {
+        let buckets = self
+            .signer_dup_buckets
+            .get_or_insert_with(|| LruCache::new(nonzero_capacity(SIGNER_DUP_BUCKET_CAPACITY)));
+        if let Some(bucket) = buckets.get_mut(&from) {
+            return bucket.allow(now);
+        }
+        let mut bucket = SignerDupBucket::new(now);
+        let allowed = bucket.allow(now);
+        buckets.put(from, bucket);
+        allowed
+    }
+
+    /// Wave 2 (#137): record that `peer` already holds `msg_id` via `IDONTWANT`.
+    /// Stored solely in `peer_dont_want` (which has its own 10 s TTL + LRU cap)
+    /// so `IDONTWANT` traffic never evicts `ihave_excluded_peers`.
+    fn record_peer_dont_want(&mut self, peer: PeerId, msg_id: MessageIdType, now: Instant) {
+        self.peer_dont_want
+            .get_or_insert_with(|| LruCache::new(nonzero_capacity(MAX_IDONTWANT_ENTRIES_PER_TOPIC)))
+            .put((peer, msg_id), now);
+    }
+
+    /// Wave 2 (#137): true iff `peer` recently sent `IDONTWANT(msg_id)` within
+    /// `IDONTWANT_TTL` so outbound EAGER / IHAVE should skip `peer`.
+    fn peer_does_not_want(&self, peer: PeerId, msg_id: &MessageIdType, now: Instant) -> bool {
+        self.peer_dont_want
+            .as_ref()
+            .and_then(|cache| cache.peek(&(peer, *msg_id)))
+            .is_some_and(|recorded_at| now.saturating_duration_since(*recorded_at) < IDONTWANT_TTL)
+    }
+
+    /// Wave 2 (#137): mark `msg_id` as having emitted `IDONTWANT` once per TTL
+    /// window; returns `true` iff this caller should emit `IDONTWANT`.
+    fn claim_idontwant_emit(&mut self, msg_id: MessageIdType, now: Instant) -> bool {
+        let cache = self.sent_idontwant.get_or_insert_with(|| {
+            LruCache::new(nonzero_capacity(MAX_IDONTWANT_ENTRIES_PER_TOPIC))
+        });
+        if cache
+            .peek(&msg_id)
+            .is_some_and(|sent_at| now.saturating_duration_since(*sent_at) < IDONTWANT_TTL)
+        {
+            return false;
+        }
+        cache.put(msg_id, now);
+        true
+    }
+
+    /// Wave 2 (#137): record a peer that already sent us or advertised `msg_id`
+    /// so we never echo `IHAVE(msg_id)` back to that peer. Bounded by LRU
+    /// eviction (`MAX_PENDING_IHAVE`) and `IHAVE_EXCLUSION_TTL` so unseen IDs
+    /// can never leak or disable exclusion.
+    fn exclude_peer_from_ihave(&mut self, msg_id: MessageIdType, peer: PeerId, now: Instant) {
+        let cache = self
+            .ihave_excluded_peers
+            .get_or_insert_with(|| LruCache::new(nonzero_capacity(MAX_PENDING_IHAVE)));
+        if let Some((recorded_at, peers)) = cache.get_mut(&msg_id) {
+            if now.saturating_duration_since(*recorded_at) >= IHAVE_EXCLUSION_TTL {
+                peers.clear();
+            }
+            *recorded_at = now;
+            if peers.len() < 32 {
+                peers.insert(peer);
+            }
+        } else {
+            let mut peers = HashSet::with_capacity(4);
+            peers.insert(peer);
+            cache.put(msg_id, (now, peers));
+        }
+    }
+
+    fn is_peer_excluded_from_ihave(
+        &self,
+        msg_id: &MessageIdType,
+        peer: PeerId,
+        now: Instant,
+    ) -> bool {
+        self.ihave_excluded_peers
+            .as_ref()
+            .and_then(|cache| cache.peek(msg_id))
+            .is_some_and(|(recorded_at, peers)| {
+                now.saturating_duration_since(*recorded_at) < IHAVE_EXCLUSION_TTL
+                    && peers.contains(&peer)
+            })
+            || self.peer_does_not_want(peer, msg_id, now)
+    }
+
+    /// Wave 2 (#137): arm an 80 ms primary GRAFT timer for an unseen `msg_id`
+    /// advertised via `IHAVE` by a Wave-2 peer, or enqueue `peer` as a 40 ms
+    /// fallback advertiser if a timer is already pending. Returns `true` when
+    /// a new primary timer was armed.
+    fn schedule_graft_timer_at(
+        &mut self,
+        msg_id: MessageIdType,
+        peer: PeerId,
+        now: Instant,
+    ) -> bool {
+        if self.has_message(&msg_id) {
+            return false;
+        }
+        if let Some(timer) = self.pending_graft_timers.get_mut(&msg_id) {
+            if timer.current_peer != peer
+                && !timer.fallback_peers.contains(&peer)
+                && timer.fallback_peers.len() < MAX_GRAFT_FALLBACK_PEERS
+            {
+                timer.fallback_peers.push_back(peer);
+            }
+            return false;
+        }
+        if self.pending_graft_timers.len() >= MAX_IHAVE_BATCH_SIZE {
+            return false;
+        }
+        self.pending_graft_timers.insert(
+            msg_id,
+            PendingGraftTimer {
+                deadline: now + GRAFT_PRIMARY_DELAY,
+                current_peer: peer,
+                fallback_peers: VecDeque::new(),
+                attempted_primary: false,
+                retry_count: 0,
+            },
+        );
+        true
+    }
+
+    /// Cancel a pending GRAFT timer when `EAGER` arrives before expiry.
+    fn cancel_graft_timer(&mut self, msg_id: &MessageIdType) -> bool {
+        self.pending_graft_timers.remove(msg_id).is_some()
+    }
+
+    /// Drain all pending GRAFT timers whose deadline has arrived (`<= now`).
+    /// Returns `(peer, msg_id, is_fallback, has_more_fallbacks, retry_count)`
+    /// tuples. If fallback advertisers remain, re-arms the timer for `120 ms`
+    /// (`GRAFT_FALLBACK_DELAY`); otherwise removes the timer once fired.
+    fn take_due_graft_timers_at(
+        &mut self,
+        now: Instant,
+    ) -> Vec<(PeerId, MessageIdType, bool, bool, u8)> {
+        if self.pending_graft_timers.is_empty() {
+            return Vec::new();
+        }
+        let due_ids: Vec<MessageIdType> = self
+            .pending_graft_timers
+            .iter()
+            .filter_map(|(&id, timer)| (timer.deadline <= now).then_some(id))
+            .collect();
+        let mut fired = Vec::new();
+        for msg_id in due_ids {
+            if self.has_message(&msg_id) {
+                self.pending_graft_timers.remove(&msg_id);
+                continue;
+            }
+            let Some(timer) = self.pending_graft_timers.get_mut(&msg_id) else {
+                continue;
+            };
+            let target = timer.current_peer;
+            let is_fallback = timer.attempted_primary;
+            let retry_count = timer.retry_count;
+            if let Some(next_peer) = timer.fallback_peers.pop_front() {
+                timer.current_peer = next_peer;
+                timer.attempted_primary = true;
+                timer.deadline = now + GRAFT_FALLBACK_DELAY;
+                fired.push((target, msg_id, is_fallback, true, retry_count));
+            } else {
+                self.pending_graft_timers.remove(&msg_id);
+                fired.push((target, msg_id, is_fallback, false, retry_count));
+            }
+        }
+        fired
+    }
+
+    /// Wave 2 (#137): deterministically sample up to `cap` (`D_lazy`) lazy
+    /// peers for a Normal/Bulk IHAVE round so lazy advertisement traffic stays
+    /// `O(D_lazy)` regardless of mesh size.
+    fn sample_lazy_peers_for_wave2(&self, topic: TopicId, tick: u64, cap: usize) -> Vec<PeerId> {
+        if self.lazy_peers.len() <= cap {
+            return self.lazy_peers.iter().copied().collect();
+        }
+        let mut ranked: Vec<([u8; 32], PeerId)> = self
+            .lazy_peers
+            .iter()
+            .copied()
+            .map(|peer| {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"sg-wave2-dlazy");
+                hasher.update(topic.as_bytes());
+                hasher.update(&tick.to_le_bytes());
+                hasher.update(peer.as_bytes());
+                (*hasher.finalize().as_bytes(), peer)
+            })
+            .collect();
+        ranked.sort_unstable_by_key(|(rank, _)| *rank);
+        ranked.into_iter().take(cap).map(|(_, peer)| peer).collect()
+    }
+
+    /// Wave 2 (#137): handle an inbound wire `PRUNE(topic)` from `peer`.
+    /// Demotes `peer` eager -> lazy with `DUPLICATE_PRUNE_BACKOFF` (10 s),
+    /// promoting the best eligible lazy peer if `peer` was the last eager peer
+    /// so the topic never stalls at 0 eager peers.
+    fn should_send_wire_prune_for_duplicate_at(&mut self, peer: PeerId, now: Instant) -> bool {
+        if self.is_pinned_preferred_eager_at(peer, now) {
+            return false;
+        }
+        // Only send a duplicate-triggered wire PRUNE when `peer` is in our
+        // lazy set (either just demoted or already lazy asymmetrically while
+        // still pushing EAGER to us), rate-limited to 1 per second per peer.
+        if !self.lazy_peers.contains(&peer) {
+            return false;
+        }
+        if self
+            .last_wire_prune_sent
+            .get(&peer)
+            .is_some_and(|&last| now.saturating_duration_since(last) < Duration::from_secs(1))
+        {
+            return false;
+        }
+        if self.last_wire_prune_sent.len() >= 128 && !self.last_wire_prune_sent.contains_key(&peer)
+        {
+            self.last_wire_prune_sent
+                .retain(|_, &mut t| now.saturating_duration_since(t) < Duration::from_secs(1));
+        }
+        if self.last_wire_prune_sent.len() >= 256 && !self.last_wire_prune_sent.contains_key(&peer)
+        {
+            if let Some((&oldest_peer, _)) =
+                self.last_wire_prune_sent.iter().min_by_key(|(_, &t)| t)
+            {
+                self.last_wire_prune_sent.remove(&oldest_peer);
+            }
+        }
+        self.last_wire_prune_sent.insert(peer, now);
+        true
+    }
+
+    fn apply_wire_prune_at(&mut self, peer: PeerId, now: Instant) -> bool {
+        if !self.eager_peers.contains(&peer) {
+            return false;
+        }
+        if self.eager_peers.len() <= 1 && !self.lazy_peers.is_empty() {
+            // Try to promote an eligible replacement before demoting our last
+            // eager peer so we never drop to 0 eager peers.
+            let replacement = self
+                .lazy_peers
+                .iter()
+                .copied()
+                .filter(|&candidate| candidate != peer && self.can_graft_peer_at(candidate, now))
+                .max_by(|a, b| {
+                    self.peer_score_at(*a, now)
+                        .total_cmp(&self.peer_score_at(*b, now))
+                });
+            let Some(replacement) = replacement else {
+                return false;
+            };
+            self.prune_peer(peer);
+            self.prune_backoff
+                .insert(peer, now + DUPLICATE_PRUNE_BACKOFF);
+            let _ = self.graft_peer_at(replacement, now);
+            return true;
+        }
+        if self.prune_peer(peer) {
+            self.prune_backoff
+                .insert(peer, now + DUPLICATE_PRUNE_BACKOFF);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Wave 2 (#137): handle a wire `GRAFT(topic)` promotion request for `peer`.
+    /// Security & churn invariants:
+    /// - NEVER injects a non-member into the topic (`peer` must already be in
+    ///   `lazy_peers`), preventing unsubscribed neighbors from hijacking a
+    ///   topic's payload stream via GRAFT.
+    /// - NEVER clears local `prune_backoff` (preventing GRAFT/PRUNE mesh churn).
+    /// - Enforces cooling, `prune_backoff`, score eligibility
+    ///   (`is_score_eligible_for_eager_at`), and `max_eager_degree`.
+    fn apply_wire_graft_at(&mut self, peer: PeerId, now: Instant) -> bool {
+        if self.eager_peers.contains(&peer) || !self.lazy_peers.contains(&peer) {
+            return false;
+        }
+        if !self.is_score_eligible_for_eager_at(peer, now) {
+            return false;
+        }
+        self.graft_peer_at(peer, now)
     }
 
     /// Queue a self-IHAVE for a stranded publish (x0x #613): `peers` were
@@ -5199,6 +5882,9 @@ impl TopicState {
         while self.pending_ihave.len() >= MAX_PENDING_IHAVE {
             if let Some(expired) = self.pending_ihave.pop_front() {
                 self.ihave_advertised.remove(&expired);
+                if let Some(excluded) = self.ihave_excluded_peers.as_mut() {
+                    excluded.pop(&expired);
+                }
             }
             dropped += 1;
         }
@@ -5457,6 +6143,11 @@ impl TopicState {
         let ids: HashSet<MessageIdType> = batch.iter().copied().collect();
         self.pending_ihave.retain(|id| !ids.contains(id));
         self.ihave_advertised.retain(|id, _| !ids.contains(id));
+        if let Some(excluded) = self.ihave_excluded_peers.as_mut() {
+            for id in batch {
+                excluded.pop(id);
+            }
+        }
         self.lazy_withheld
             .retain(|entry| !ids.contains(&entry.msg_id) || entry.has_unresolved_retained_target());
     }
@@ -7436,6 +8127,9 @@ impl ShardedTopicMap {
 type FanoutSendFuture<'a> =
     Pin<Box<dyn Future<Output = (PeerId, (Result<PeerSendOutcome>, FanoutPeerStage))> + Send + 'a>>;
 
+/// Per-topic inbound acceptance filter for multi-topic Wave 2 unsigned control batches.
+pub type InboundTopicFilter = Arc<dyn Fn(&TopicId) -> bool + Send + Sync>;
+
 /// Plumtree pub/sub implementation
 pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// Per-topic state — sharded (issue #27) to eliminate the single
@@ -7513,6 +8207,40 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// rejected). The fleet-level rate of this counter schedules the
     /// [`SignaturePolicy::RejectV1`] flip.
     v1_receipts: std::sync::atomic::AtomicU64,
+    /// Wave 2 (#137): process-local counters for wire PRUNE/GRAFT, GRAFT
+    /// timers, IDONTWANT, unsigned control batches, and v3 content-bound IDs.
+    wave2_stats: Arc<Wave2Stats>,
+    /// Wave 2 (#137, P2c): policy controlling outbound/inbound v3 content-bound
+    /// `MessageHeader` usage. Defaults to [`ContentBoundMsgIdPolicy::AcceptOnly`]
+    /// so mixed-fleet multi-hop forwarding never breaks `<= 0.5.97` peers.
+    content_bound_policy: StdRwLock<ContentBoundMsgIdPolicy>,
+    /// Wave 2 (#137): optional per-topic inbound acceptance filter consulted
+    /// per operation inside multi-topic [`control_batch::UnsignedControlBatch`]
+    /// frames so Leaf consumers can reject unsubscribed topics cleanly without
+    /// creating phantom `TopicState` entries.
+    inbound_topic_filter: Arc<StdRwLock<Option<InboundTopicFilter>>>,
+    /// Wave 2 (#137): immediate wake signal for `Critical`-priority topic
+    /// `IHAVE`s (`<= 25 ms` under A06) so revocation digests never wait for a
+    /// coarse timer tick.
+    critical_flush_notify: Arc<tokio::sync::Notify>,
+    /// Wave 2 (#137): immediate wake signal for the key-cache control flusher
+    /// when `Hello` or `Capabilities` arrives so 2-phase capability confirmation
+    /// completes in ~1 RTT instead of waiting multiple 250 ms poll ticks
+    /// (still strictly rate-limited by `SessionState::consume_token`).
+    key_cache_control_notify: Arc<tokio::sync::Notify>,
+    /// Wave 2 (#137): lock-free count of active sessions with confirmed mutual
+    /// Wave 2 capabilities (shared with `KeyCache`), read without taking the
+    /// `key_cache` mutex on background flusher ticks.
+    confirmed_wave2_sessions: Arc<AtomicUsize>,
+    /// Wave 2 (#137): lock-free count of active pending GRAFT timers across all
+    /// topics so the 20 ms fast tick skips `topics.write_all()` when idle.
+    wave2_graft_timers_pending: Arc<AtomicUsize>,
+    /// Wave 2 (#137): lock-free flag set when a `Critical` topic queues
+    /// `pending_ihave` so idle/all-legacy fleets take zero extra `write_all()` locks.
+    wave2_critical_ihave_pending: Arc<AtomicBool>,
+    /// Wave 2 (#137): bounded concurrency semaphore for detached `IDONTWANT`
+    /// sends so large-payload bursts cannot spawn unbounded background tasks.
+    idontwant_spawn_permits: Arc<tokio::sync::Semaphore>,
     /// Issue #42: shutdown signal for the background tasks spawned at
     /// construction (IHAVE flusher, cache cleaner, degree maintainer,
     /// anti-entropy, connected-peers refresher). Setting the value wakes
@@ -7680,6 +8408,101 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .unwrap_or_default()
     }
 
+    /// Snapshot of Wave 2 (#137) capability-gated wire counters.
+    pub fn wave2_stats(&self) -> Wave2StatsSnapshot {
+        self.wave2_stats.snapshot()
+    }
+
+    /// Number of currently active peer sessions with confirmed two-phase
+    /// Wave 2 (`Control::Capabilities`) negotiation. Lock-free O(1) read.
+    pub fn confirmed_wave2_session_count(&self) -> usize {
+        self.confirmed_wave2_sessions.load(Ordering::Acquire)
+    }
+
+    /// Configure the Wave 2 (P2c) content-bound `msg_id` (`MessageHeader` v3)
+    /// outbound/inbound policy.
+    pub fn set_content_bound_msg_id_policy(&self, policy: ContentBoundMsgIdPolicy) {
+        if let Ok(mut guard) = self.content_bound_policy.write() {
+            *guard = policy;
+        }
+    }
+
+    /// Current Wave 2 (P2c) content-bound `msg_id` policy.
+    pub fn content_bound_msg_id_policy(&self) -> ContentBoundMsgIdPolicy {
+        self.content_bound_policy
+            .read()
+            .map(|guard| *guard)
+            .unwrap_or_default()
+    }
+
+    /// Enable or disable advertising Wave 2 session capabilities in
+    /// `Control::Capabilities`. Disabling reproduces `0.5.97` Wave 1 wire
+    /// behavior for mixed-version interop tests and before/after benchmarks.
+    pub fn set_wave2_capabilities_enabled(&self, enabled: bool) {
+        if let Ok(mut cache) = self.key_cache.lock() {
+            cache.set_local_caps(if enabled {
+                key_cache::LOCAL_WAVE2_CAPS
+            } else {
+                0
+            });
+        }
+    }
+
+    /// Install an optional per-topic inbound acceptance filter consulted for
+    /// each operation in a multi-topic Wave 2 unsigned control batch (e.g.
+    /// Leaf mode skipping unsubscribed topics without creating topic state).
+    pub fn set_inbound_topic_filter(&self, filter: Option<InboundTopicFilter>) {
+        if let Ok(mut guard) = self.inbound_topic_filter.write() {
+            *guard = filter;
+        }
+    }
+
+    fn inbound_topic_accepted(&self, topic: &TopicId) -> bool {
+        self.inbound_topic_filter
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|f| f(topic)))
+            .unwrap_or(true)
+    }
+
+    fn peer_supports_cap(&self, peer: PeerId, cap: u64) -> bool {
+        let Some(session) = self.transport.authenticated_session(peer) else {
+            return false;
+        };
+        self.key_cache
+            .lock()
+            .is_ok_and(|cache| cache.supports_cap(session, cap))
+    }
+
+    fn peer_can_accept_cap_session(
+        &self,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+        cap: u64,
+    ) -> bool {
+        let Some(session) = session else {
+            return false;
+        };
+        self.key_cache
+            .lock()
+            .is_ok_and(|cache| cache.can_accept_cap(session, cap))
+    }
+
+    fn decrement_graft_timers_pending(counter: &AtomicUsize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        loop {
+            let current = counter.load(Ordering::Acquire);
+            let next = current.saturating_sub(count);
+            if counter
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
     /// Encode before byte admission so every peer is charged for the frame it
     /// can actually receive. Unknown and granted-legacy peers keep old bytes.
     fn wire_bytes_for_peer(&self, peer: PeerId, bytes: &Bytes, priority: TopicPriority) -> Bytes {
@@ -7692,6 +8515,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let signing_key = Arc::clone(&self.signing_key);
         let egress_limiter = Arc::clone(&self.egress_limiter);
         let stage_stats = Arc::clone(&self.stage_stats);
+        let control_notify = Arc::clone(&self.key_cache_control_notify);
         let mut shutdown = self.shutdown_tx.subscribe();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let task = runtime.spawn(async move {
@@ -7699,6 +8523,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 loop {
                     tokio::select! {
                         _ = tick.tick() => {},
+                        _ = control_notify.notified() => {},
                         changed = shutdown.changed() => {
                             if changed.is_err() || *shutdown.borrow() { break; }
                             continue;
@@ -7829,7 +8654,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 }
             }
         })?;
-        let replay = {
+        let (replay, wake_control_flusher) = {
             let mut cache = self
                 .key_cache
                 .lock()
@@ -7838,15 +8663,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             match control {
                 key_cache::Control::Hello { .. } => {
                     cache.received_hello(session);
-                    Vec::new()
+                    (Vec::new(), true)
+                }
+                key_cache::Control::Capabilities {
+                    flags,
+                    acked_peer_flags,
+                } => {
+                    if let Err(error) =
+                        cache.received_capabilities(session, flags, acked_peer_flags)
+                    {
+                        cache.malformed_control();
+                        return Err(error);
+                    }
+                    (Vec::new(), true)
                 }
                 key_cache::Control::Ack { key_ids } => {
                     cache.acknowledge(session, &key_ids);
-                    Vec::new()
+                    (Vec::new(), false)
                 }
                 key_cache::Control::Request { key_ids } => {
                     cache.queue_responses(session, &key_ids);
-                    Vec::new()
+                    (Vec::new(), true)
                 }
                 key_cache::Control::Response { entries } => {
                     let mut frames = Vec::new();
@@ -7859,10 +8696,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             frames.extend(cache.take_pending(session, key_id));
                         }
                     }
-                    frames
+                    (frames, false)
                 }
             }
         };
+        if wake_control_flusher {
+            self.key_cache_control_notify.notify_one();
+        }
         for frame in replay {
             let success = Box::pin(self.dispatch_message(from, Some(session), frame))
                 .await
@@ -7968,6 +8808,39 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 session.peer == from && self.transport.authenticated_session(from) == Some(session),
                 "stale authenticated receive session"
             );
+        }
+        // Wave 2 (#137): unsigned coalesced 1-hop control batches are strictly
+        // gated on a live mutually-authenticated ML-DSA-65 + ML-KEM-768 QUIC
+        // session that has negotiated `CAP_UNSIGNED_CONTROL_V1`. Never stored
+        // in `message_cache`, never delivered to subscribers, and never
+        // forwarded to any third peer.
+        if control_batch::is_control_batch(&data) {
+            let session = session
+                .ok_or_else(|| anyhow!("unsigned control batch requires authenticated session"))?;
+            let cap_ok = self.key_cache.lock().is_ok_and(|cache| {
+                cache.can_accept_cap(session, key_cache::CAP_UNSIGNED_CONTROL_V1)
+            });
+            anyhow::ensure!(
+                cap_ok,
+                "unsigned control batch rejected: peer has not negotiated CAP_UNSIGNED_CONTROL_V1"
+            );
+            let decode_started = Instant::now();
+            let batch = control_batch::decode_control_batch(&data).inspect_err(|_| {
+                self.stage_stats.record_decode_failed();
+            })?;
+            self.record_stage(PubSubStage::Decode, decode_started);
+            self.wave2_stats
+                .unsigned_control_batches_received
+                .fetch_add(1, Ordering::Relaxed);
+            self.wave2_stats
+                .unsigned_control_bytes_received
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.wave2_stats
+                .unsigned_control_ops_received
+                .fetch_add(batch.ops.len() as u64, Ordering::Relaxed);
+            return self
+                .handle_unsigned_control_batch(from, session, batch)
+                .await;
         }
         // Bound registered migration frames before allocating their envelopes.
         if let Ok((header, _)) = postcard::take_from_bytes::<MessageHeader>(&data) {
@@ -8170,6 +9043,123 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 self.handle_anti_entropy_admitted(from, topic_id, message, session)
                     .await
             }
+            MessageKind::Prune => {
+                anyhow::ensure!(
+                    !self.transport.migration.registered(topic_id),
+                    "wire PRUNE forbidden on registered legacy-compat topic"
+                );
+                anyhow::ensure!(
+                    self.peer_can_accept_cap_session(session, key_cache::CAP_WIRE_PRUNE_GRAFT),
+                    "signed wire PRUNE rejected: peer has not negotiated CAP_WIRE_PRUNE_GRAFT"
+                );
+                if !self.inbound_topic_accepted(&topic_id) {
+                    return Ok(());
+                }
+                if !self.verify_message_signature(&message) {
+                    warn!(peer_id = %LogPeerId::from(from), "PRUNE: invalid signature, dropping");
+                    self.peer_scoring.record_invalid_message(topic_id, from);
+                    return Err(anyhow!("Invalid signature on PRUNE message"));
+                }
+                anyhow::ensure!(
+                    PeerId::from_pubkey(&message.public_key) == from,
+                    "PRUNE signer is not adjacent peer"
+                );
+                self.note_verified_inbound_key(&message, session);
+                self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
+                    .await;
+                self.handle_prune_admitted(from, topic_id).await
+            }
+            MessageKind::Graft => {
+                anyhow::ensure!(
+                    !self.transport.migration.registered(topic_id),
+                    "wire GRAFT forbidden on registered legacy-compat topic"
+                );
+                anyhow::ensure!(
+                    self.peer_can_accept_cap_session(session, key_cache::CAP_WIRE_PRUNE_GRAFT),
+                    "signed wire GRAFT rejected: peer has not negotiated CAP_WIRE_PRUNE_GRAFT"
+                );
+                if !self.inbound_topic_accepted(&topic_id) {
+                    return Ok(());
+                }
+                if !self.verify_message_signature(&message) {
+                    warn!(peer_id = %LogPeerId::from(from), "GRAFT: invalid signature, dropping");
+                    self.peer_scoring.record_invalid_message(topic_id, from);
+                    return Err(anyhow!("Invalid signature on GRAFT message"));
+                }
+                anyhow::ensure!(
+                    PeerId::from_pubkey(&message.public_key) == from,
+                    "GRAFT signer is not adjacent peer"
+                );
+                self.note_verified_inbound_key(&message, session);
+                self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
+                    .await;
+                let graft_msg_id: Option<MessageIdType> = match &message.payload {
+                    Some(payload) if !payload.is_empty() => {
+                        let decode_started = Instant::now();
+                        let decoded: std::result::Result<(Option<MessageIdType>, &[u8]), _> =
+                            postcard::take_from_bytes(payload);
+                        self.record_stage(PubSubStage::Decode, decode_started);
+                        match decoded {
+                            Ok((id, &[])) => id,
+                            _ => {
+                                self.stage_stats.record_decode_failed();
+                                return Err(anyhow!("Failed to deserialize GRAFT payload"));
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                self.handle_graft_admitted(from, topic_id, graft_msg_id)
+                    .await
+            }
+            MessageKind::IDontWant => {
+                anyhow::ensure!(
+                    !self.transport.migration.registered(topic_id),
+                    "IDONTWANT forbidden on registered legacy-compat topic"
+                );
+                anyhow::ensure!(
+                    self.peer_can_accept_cap_session(session, key_cache::CAP_IDONTWANT),
+                    "signed IDONTWANT rejected: peer has not negotiated CAP_IDONTWANT"
+                );
+                if !self.inbound_topic_accepted(&topic_id) {
+                    return Ok(());
+                }
+                if !self.verify_message_signature(&message) {
+                    warn!(peer_id = %LogPeerId::from(from), "IDONTWANT: invalid signature, dropping");
+                    self.peer_scoring.record_invalid_message(topic_id, from);
+                    return Err(anyhow!("Invalid signature on IDONTWANT message"));
+                }
+                anyhow::ensure!(
+                    PeerId::from_pubkey(&message.public_key) == from,
+                    "IDONTWANT signer is not adjacent peer"
+                );
+                self.note_verified_inbound_key(&message, session);
+                self.record_verified_inbound_from_peer(topic_id, from, msg_kind)
+                    .await;
+                let payload = message
+                    .payload
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("IDONTWANT message missing payload"))?;
+                let decode_started = Instant::now();
+                let decoded: std::result::Result<(Vec<MessageIdType>, &[u8]), _> =
+                    postcard::take_from_bytes(payload);
+                self.record_stage(PubSubStage::Decode, decode_started);
+                let msg_ids = match decoded {
+                    Ok((ids, trailing))
+                        if trailing.is_empty()
+                            && !ids.is_empty()
+                            && ids.len() <= control_batch::MAX_IDS_PER_CONTROL_OP =>
+                    {
+                        ids
+                    }
+                    _ => {
+                        self.stage_stats.record_decode_failed();
+                        return Err(anyhow!("Failed to deserialize IDONTWANT payload"));
+                    }
+                };
+                self.handle_idontwant_admitted(from, topic_id, msg_ids)
+                    .await
+            }
             // Other message kinds (Ping, Ack, Find, Presence, Shuffle) are not handled by PubSub
             _ => {
                 self.transport.migration.ingress(from, session, &message)?;
@@ -8340,6 +9330,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let own_public_key: Arc<[u8]> = key_cache_state
             .lookup_arc(signing_key.peer_id())
             .unwrap_or_else(|| Arc::from(signing_key.public_key()));
+        let confirmed_wave2_sessions = key_cache_state.confirmed_wave2_sessions_counter();
         let key_cache = Arc::new(Mutex::new(key_cache_state));
         let transport = Arc::new(PolicyTransport::new_with_key_cache(
             transport,
@@ -8371,6 +9362,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             peer_scoring: Arc::new(peer_scoring::PeerScoring::new()),
             signature_policy: StdRwLock::new(SignaturePolicy::AcceptV1),
             v1_receipts: std::sync::atomic::AtomicU64::new(0),
+            wave2_stats: Arc::new(Wave2Stats::default()),
+            content_bound_policy: StdRwLock::new(ContentBoundMsgIdPolicy::AcceptOnly),
+            inbound_topic_filter: Arc::new(StdRwLock::new(None)),
+            critical_flush_notify: Arc::new(tokio::sync::Notify::new()),
+            key_cache_control_notify: Arc::new(tokio::sync::Notify::new()),
+            confirmed_wave2_sessions,
+            wave2_graft_timers_pending: Arc::new(AtomicUsize::new(0)),
+            wave2_critical_ihave_pending: Arc::new(AtomicBool::new(false)),
+            idontwant_spawn_permits: Arc::new(tokio::sync::Semaphore::new(
+                IDONTWANT_MAX_CONCURRENT_SENDS,
+            )),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             background_tasks: Mutex::new(Vec::new()),
         };
@@ -8938,8 +9940,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
     fn verify_message_signature(&self, message: &GossipMessage) -> bool {
         let verify_started = Instant::now();
         if !matches!(
-            (message.header.version, message.header.payload_hash),
-            (1, None) | (2, Some(_))
+            (
+                message.header.version,
+                message.header.payload_hash,
+                message.header.created_at_secs
+            ),
+            (1, None, None) | (2, Some(_), None) | (3, Some(_), Some(_))
         ) {
             return false;
         }
@@ -8965,6 +9971,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Some(expected) => {
                 let actual = blake3::hash(message.payload.as_deref().unwrap_or(&[]));
                 if actual.as_bytes() == &expected[..] {
+                    if message.header.version == 3 {
+                        let expected_msg_id = MessageHeader::calculate_content_bound_msg_id(
+                            &message.header.topic,
+                            &expected,
+                        );
+                        if message.header.msg_id != expected_msg_id {
+                            warn!(
+                                topic = ?message.header.topic,
+                                msg_id = ?message.header.msg_id,
+                                "v3 content-bound msg_id mismatch, dropping"
+                            );
+                            return false;
+                        }
+                    }
                     true
                 } else {
                     self.transport.migration.record_payload_mismatch();
@@ -10812,6 +11832,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         Ok(TargetedFanoutCounts { fanout, target })
     }
 
+    fn current_unix_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn should_publish_v3_for_topic(&self, topic: &TopicId) -> bool {
+        if self.transport.migration.registered(*topic) {
+            return false;
+        }
+        matches!(
+            self.content_bound_msg_id_policy(),
+            ContentBoundMsgIdPolicy::PublishV3 | ContentBoundMsgIdPolicy::RequireV3
+        )
+    }
+
+    fn peer_can_receive_v3_header(&self, peer: PeerId) -> bool {
+        self.peer_supports_cap(peer, key_cache::CAP_CONTENT_BOUND_MSG_ID)
+    }
+
     async fn publish_local_with_optional_target(
         &self,
         topic: TopicId,
@@ -10819,20 +11860,31 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         target: Option<(PeerId, Duration)>,
     ) -> Result<(FanoutCounts, Option<TargetedPublishOutcome>)> {
         let inner_proof = self.transport.migration.verify_inner(topic, &payload)?;
-        let msg_id = self.calculate_msg_id(&topic, &payload);
-
+        let publish_v3 = self.should_publish_v3_for_topic(&topic);
         let mut header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
-            msg_id,
+            msg_id: [0u8; 32],
             kind: MessageKind::Eager,
             hop: 0,
             ttl: 10,
         };
-        // ADR-012: the published payload is covered by the sealed header
-        // hash; the signature over the header now authenticates it.
-        header.seal_payload_hash(Some(&payload));
+        if publish_v3 {
+            // Wave 2 (#137, P2c): deterministic content-bound msg_id paired
+            // with a signed Unix timestamp for freshness-window enforcement.
+            header.seal_content_bound_v3(Some(&payload), Self::current_unix_secs());
+            self.wave2_stats
+                .v3_content_bound_published
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            header.msg_id = self.calculate_msg_id(&topic, &payload);
+            // ADR-012: the published payload is covered by the sealed header
+            // hash; the signature over the header now authenticates it.
+            header.seal_payload_hash(Some(&payload));
+        }
+        let msg_id = header.msg_id;
 
         let signature = self.sign_message(&header);
         // `sign_message` returns an empty buffer on failure — do not proceed
@@ -10903,8 +11955,17 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             signature: message.signature,
             public_key: Arc::clone(&self.own_public_key),
         };
-        if state.cache_message_with_auth(msg_id, payload.clone(), header, true, Some(origin_auth)) {
+        if state.cache_message_with_auth(
+            msg_id,
+            payload.clone(),
+            header.clone(),
+            true,
+            Some(origin_auth),
+        ) {
             state.set_inner_proof(msg_id, inner_proof);
+        }
+        if header.version == 3 {
+            state.record_v3_seen_id(msg_id, false, Instant::now());
         }
 
         // Seed the replay cache so network echoes of our own publish are
@@ -10925,8 +11986,23 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             );
         }
 
-        // Send EAGER to eager_peers
-        let eager_peers: Vec<PeerId> = state.eager_peers.iter().copied().collect();
+        // Send EAGER to eager_peers (per-peer v3 egress gate: never leak v3
+        // headers to peers that have not negotiated CAP_CONTENT_BOUND_MSG_ID).
+        let eager_peers: Vec<PeerId> = if publish_v3 {
+            let mut capable = Vec::new();
+            for &peer in &state.eager_peers {
+                if self.peer_can_receive_v3_header(peer) {
+                    capable.push(peer);
+                } else {
+                    self.wave2_stats
+                        .v3_egress_skipped_legacy
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            capable
+        } else {
+            state.eager_peers.iter().copied().collect()
+        };
 
         // Local subscribers receive only after admission, serialization,
         // cache, and replay state are ready, but before remote send awaits.
@@ -10961,6 +12037,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         );
         let targeted = async {
             let (peer, deadline) = target?;
+            if publish_v3 && !self.peer_can_receive_v3_header(peer) {
+                self.wave2_stats
+                    .v3_egress_skipped_legacy
+                    .fetch_add(1, Ordering::Relaxed);
+                return Some(TargetedPublishOutcome::Failed);
+            }
             let outcome = tokio::time::timeout(
                 deadline,
                 self.send_to_peer_bounded_outcome_caused(
@@ -11034,6 +12116,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
             let dropped = state.push_pending_ihave(msg_id);
             self.stage_stats.record_pending_ihave_dropped(dropped);
+            if self.admission.registry().priority_for(&topic) == TopicPriority::Critical {
+                self.wave2_critical_ihave_pending
+                    .store(true, Ordering::Release);
+                self.critical_flush_notify.notify_one();
+            }
 
             // x0x #613 mitigation 1: queue a self-IHAVE to the attempted
             // peers so the 100 ms flush advertises this id regardless of
@@ -11144,7 +12231,47 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             message.header.topic == topic && message.header.kind == MessageKind::Eager,
             "EAGER header mismatch"
         );
+        // Wave 2 (#137, P2c): enforce content-bound `msg_id` derivation on
+        // `MessageHeader` v3 BEFORE touching any cache or spending ML-DSA CPU.
+        let is_v3 = message.header.version == 3;
+        if !is_v3 && self.content_bound_msg_id_policy() == ContentBoundMsgIdPolicy::RequireV3 {
+            self.wave2_stats
+                .v3_policy_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                peer_id = %LogPeerId::from(from),
+                topic = %LogTopicId::from(topic),
+                header_version = message.header.version,
+                "dropping legacy v1/v2 EAGER under RequireV3 policy without peer-score penalty"
+            );
+            return Ok(());
+        }
+        if is_v3 {
+            let Some(payload_bytes) = message.payload.as_deref() else {
+                self.peer_scoring.record_invalid_message(topic, from);
+                self.wave2_stats
+                    .v3_content_bound_forged_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(anyhow!("v3 EAGER missing payload"));
+            };
+            let actual_hash = *blake3::hash(payload_bytes).as_bytes();
+            let expected_msg_id =
+                MessageHeader::calculate_content_bound_msg_id(&topic, &actual_hash);
+            if message.header.payload_hash != Some(actual_hash)
+                || message.header.msg_id != expected_msg_id
+                || message.header.created_at_secs.is_none()
+            {
+                self.peer_scoring.record_invalid_message(topic, from);
+                self.wave2_stats
+                    .v3_content_bound_forged_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(anyhow!(
+                    "v3 content-bound EAGER header mismatch (forged msg_id, payload_hash, or missing timestamp)"
+                ));
+            }
+        }
         let msg_id = message.header.msg_id;
+        let payload_len = message.payload.as_ref().map_or(0, Bytes::len);
 
         // x0x #674 (Design B): dedup BEFORE the ML-DSA-65 verify. The
         // bounded, TTL'd msg_id cache is the verify memo — a cached msg_id
@@ -11230,11 +12357,37 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     .get_mut(&topic)
                     .filter(|state| state.has_message(&msg_id))
                 {
+                    let now = Instant::now();
+                    if !state.allow_duplicate_from_peer(from, now) {
+                        // Still emit at most 1/s wire PRUNE so a fast asymmetric
+                        // duplicate stream gets pruned even while rate-limited.
+                        let send_wire_prune =
+                            state.should_send_wire_prune_for_duplicate_at(from, now);
+                        self.wave2_stats
+                            .duplicate_rate_limited
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.stage_stats.record_eager_duplicate_dropped_pre_verify();
+                        self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+                        drop(topics);
+                        if send_wire_prune {
+                            self.send_wire_prune_if_capable(topic, from).await;
+                        }
+                        return Ok(());
+                    }
                     state.touch();
+                    state.exclude_peer_from_ihave(msg_id, from, now);
+                    if state.cancel_graft_timer(&msg_id) {
+                        Self::decrement_graft_timers_pending(&self.wave2_graft_timers_pending, 1);
+                        self.wave2_stats
+                            .graft_timer_cancelled_by_eager
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     // Wave 1 (#136): cap non-prunable healthy preferred eager
                     // slots to min(preferred_count, 1) and apply a 10 s prune
                     // backoff on duplicate-triggered demotion.
-                    let now = Instant::now();
+                    // Wave 2 (#137): also emit wire PRUNE to Wave-2 peers
+                    // (including asymmetric peers already in `lazy_peers` that
+                    // still have us in their eager set!).
                     if !state.is_pinned_preferred_eager_at(from, now)
                         && state.prune_peer_for_duplicate_at(from, now)
                     {
@@ -11243,8 +12396,30 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         // delivery deficit — sticky across a later re-graft.
                         self.peer_scoring.record_mesh_pruned(topic, from);
                     }
+                    let send_wire_prune = state.should_send_wire_prune_for_duplicate_at(from, now);
+                    let idontwant_targets: Vec<PeerId> = if payload_len
+                        >= IDONTWANT_MIN_PAYLOAD_BYTES
+                        && state.message_cache.contains(&msg_id)
+                        && state.claim_idontwant_emit(msg_id, now)
+                    {
+                        state
+                            .eager_peers
+                            .iter()
+                            .copied()
+                            .filter(|&p| p != from)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     self.stage_stats.record_eager_duplicate_dropped_pre_verify();
                     self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+                    drop(topics);
+                    if send_wire_prune {
+                        self.send_wire_prune_if_capable(topic, from).await;
+                    }
+                    if !idontwant_targets.is_empty() {
+                        self.spawn_wire_idontwant_if_capable(topic, idontwant_targets, msg_id);
+                    }
                     return Ok(());
                 }
             } else if payload_replay {
@@ -11255,11 +12430,13 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // 1. Record `msg_id` (plus any #116 refusal mark) in the
                 //    bounded dedupe-only `replay_dropped_ids` LRU (never
                 //    touching `message_cache`), so IHAVE and anti-entropy
-                //    rounds never re-pull this replay ID.
-                // 2. Settle any `outstanding_iwants` / `deferred_iwants`
-                //    claim for `msg_id` without booking a peer failure, so
-                //    honest repair peers are not penalized and the 1024-slot
-                //    IHAVE cap is not starved.
+                //    rounds never re-pull this replay ID. For Wave 2 v3
+                //    content-bound frames, `msg_id` is already recomputed
+                //    from `(topic, BLAKE3(payload))` and lands in `v3_seen_ids`.
+                // 2. Settle any `outstanding_iwants` / `deferred_iwants` /
+                //    `pending_graft_timers` claim for `msg_id` without booking
+                //    a peer failure, so honest repair peers are not penalized
+                //    and the 1024-slot IHAVE cap is not starved.
                 // 3. Increment `payload_replay_dropped` without mixing the
                 //    adjacent forwarder into `top_signers`.
                 let lock_started = Instant::now();
@@ -11270,7 +12447,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     if let Some(payload_bytes) = message.payload.as_deref() {
                         if state.has_live_payload_replay(payload_bytes) {
                             let refused = state.payload_replay_was_refused(payload_bytes);
-                            state.record_replay_dropped_id(msg_id, refused);
+                            if is_v3 {
+                                state.record_v3_seen_id(msg_id, refused, Instant::now());
+                            } else {
+                                state.record_replay_dropped_id(msg_id, refused);
+                            }
+                            if state.cancel_graft_timer(&msg_id) {
+                                Self::decrement_graft_timers_pending(
+                                    &self.wave2_graft_timers_pending,
+                                    1,
+                                );
+                                self.wave2_stats
+                                    .graft_timer_cancelled_by_eager
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             if let Some(entry) = state.outstanding_iwants.remove(&msg_id) {
                                 // Only credit `from` when `from` actually owned
                                 // the in-flight IWANT claim; otherwise settle
@@ -11306,6 +12496,36 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             // instrumentation) and the verify is pure CPU with no await.
         }
 
+        // Wave 2 (#137, P2c): enforce the signed freshness window on novel v3
+        // content-bound EAGER frames before spending ML-DSA-65 verification
+        // CPU. `v3_seen_ids` retains seen IDs for `V3_SEEN_TTL_SECS` (360 s),
+        // strictly covering `[now - 300 s, now + 60 s]`.
+        if is_v3 {
+            let created_at = message
+                .header
+                .created_at_secs
+                .ok_or_else(|| anyhow!("v3 EAGER missing signed timestamp"))?;
+            let now_secs = Self::current_unix_secs();
+            if now_secs.saturating_sub(created_at) > CONTENT_BOUND_FRESHNESS_WINDOW_SECS
+                || created_at.saturating_sub(now_secs) > CONTENT_BOUND_MAX_FUTURE_SKEW_SECS
+            {
+                self.wave2_stats
+                    .v3_content_bound_stale_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    peer_id = %LogPeerId::from(from),
+                    topic = %LogTopicId::from(topic),
+                    created_at_secs = created_at,
+                    now_secs,
+                    skew_secs = (created_at as i128) - (now_secs as i128),
+                    "rejecting v3 content-bound EAGER outside signed freshness window"
+                );
+                return Err(anyhow!(
+                    "v3 content-bound EAGER outside signed freshness window"
+                ));
+            }
+        }
+
         if !self.verify_message_signature(&message) {
             warn!(peer_id = %LogPeerId::from(from), msg_id = ?msg_id, "Invalid signature, dropping");
             // X0X-0071 P4: a bad signature is the canonical invalid-message
@@ -11331,18 +12551,37 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             .get_mut(&topic)
             .filter(|state| state.has_message(&msg_id))
         {
+            let now = Instant::now();
+            if !state.allow_duplicate_from_peer(from, now) {
+                let send_wire_prune = state.should_send_wire_prune_for_duplicate_at(from, now);
+                self.wave2_stats
+                    .duplicate_rate_limited
+                    .fetch_add(1, Ordering::Relaxed);
+                self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+                drop(topics);
+                if send_wire_prune {
+                    self.send_wire_prune_if_capable(topic, from).await;
+                }
+                return Ok(());
+            }
             state.touch();
+            state.exclude_peer_from_ihave(msg_id, from, now);
+            if state.cancel_graft_timer(&msg_id) {
+                Self::decrement_graft_timers_pending(&self.wave2_graft_timers_pending, 1);
+                self.wave2_stats
+                    .graft_timer_cancelled_by_eager
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             Self::record_inbound_peer_activity_for_state(
                 self.stage_stats.as_ref(),
                 topic,
                 from,
                 state,
-                Instant::now(),
+                now,
                 message.header.kind,
             );
             // Wave 1 (#136): cap non-prunable healthy preferred eager slots to
             // min(preferred_count, 1) and apply a 10 s prune backoff.
-            let now = Instant::now();
             if !state.is_pinned_preferred_eager_at(from, now)
                 && state.prune_peer_for_duplicate_at(from, now)
             {
@@ -11351,7 +12590,28 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 // deficit — sticky across a later re-graft.
                 self.peer_scoring.record_mesh_pruned(topic, from);
             }
+            let send_wire_prune = state.should_send_wire_prune_for_duplicate_at(from, now);
+            let idontwant_targets: Vec<PeerId> = if payload_len >= IDONTWANT_MIN_PAYLOAD_BYTES
+                && state.message_cache.contains(&msg_id)
+                && state.claim_idontwant_emit(msg_id, now)
+            {
+                state
+                    .eager_peers
+                    .iter()
+                    .copied()
+                    .filter(|&p| p != from)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
+            drop(topics);
+            if send_wire_prune {
+                self.send_wire_prune_if_capable(topic, from).await;
+            }
+            if !idontwant_targets.is_empty() {
+                self.spawn_wire_idontwant_if_capable(topic, idontwant_targets, msg_id);
+            }
             return Ok(());
         }
 
@@ -11405,6 +12665,19 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Some(origin_auth),
         ) {
             state.set_inner_proof(msg_id, inner_proof);
+        }
+        if is_v3 {
+            state.record_v3_seen_id(msg_id, false, Instant::now());
+            self.wave2_stats
+                .v3_content_bound_accepted
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        state.exclude_peer_from_ihave(msg_id, from, Instant::now());
+        if state.cancel_graft_timer(&msg_id) {
+            Self::decrement_graft_timers_pending(&self.wave2_graft_timers_pending, 1);
+            self.wave2_stats
+                .graft_timer_cancelled_by_eager
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         // Update peer score for the sender
@@ -11467,6 +12740,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             );
             state.mark_message_dropped(&msg_id);
             state.refuse_payload_replays(&payload);
+            if is_v3 {
+                state.record_v3_seen_id(msg_id, true, Instant::now());
+            }
             self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
             return Ok(());
         }
@@ -11506,11 +12782,40 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             Vec::new()
         };
         let eager_peers: Vec<PeerId> = if validator_action == ValidationAction::ForwardAndDeliver {
+            let mut filtered = Vec::new();
+            for &peer in &state.eager_peers {
+                if peer == from {
+                    continue;
+                }
+                if is_v3 && !self.peer_can_receive_v3_header(peer) {
+                    self.wave2_stats
+                        .v3_egress_skipped_legacy
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if state.peer_does_not_want(peer, &msg_id, now) {
+                    self.wave2_stats
+                        .idontwant_eager_suppressed
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                filtered.push(peer);
+            }
+            filtered
+        } else {
+            Vec::new()
+        };
+        // Wave 2 (#137): emit lightweight IDONTWANT(msg_id) to eager mesh
+        // peers (except `from`) immediately upon receiving messages >= 1 KiB
+        // so concurrent in-flight duplicate pushes are cancelled.
+        let idontwant_targets: Vec<PeerId> = if payload_len >= IDONTWANT_MIN_PAYLOAD_BYTES
+            && state.claim_idontwant_emit(msg_id, now)
+        {
             state
                 .eager_peers
                 .iter()
-                .filter(|&&p| p != from)
                 .copied()
+                .filter(|&p| p != from)
                 .collect()
         } else {
             Vec::new()
@@ -11530,12 +12835,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // verdict withholds this — lazy peers must not be teased with a
         // digest this node refuses to serve. LazyForward keeps it (the
         // message stays serveable, so the digest is honest).
+        let mut notify_critical_flush = false;
         if matches!(
             validator_action,
             ValidationAction::ForwardAndDeliver | ValidationAction::LazyForward
         ) {
             let dropped = state.push_pending_ihave(msg_id);
             self.stage_stats.record_pending_ihave_dropped(dropped);
+            if self.admission.registry().priority_for(&topic) == TopicPriority::Critical {
+                notify_critical_flush = true;
+            }
         }
         self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
 
@@ -11563,6 +12872,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         );
 
         drop(topics); // Release lock
+
+        if notify_critical_flush {
+            self.wave2_critical_ihave_pending
+                .store(true, Ordering::Release);
+            self.critical_flush_notify.notify_one();
+        }
+        if !idontwant_targets.is_empty() {
+            self.spawn_wire_idontwant_if_capable(topic, idontwant_targets, msg_id);
+        }
 
         let republish_started = Instant::now();
         // x0x #323: do not launder suspect zero-tail payloads to peers. The
@@ -11640,6 +12958,9 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         topic: TopicId,
         msg_ids: Vec<MessageIdType>,
     ) -> Result<()> {
+        if !self.inbound_topic_accepted(&topic) {
+            return Ok(());
+        }
         let lock_started = Instant::now();
         let mut topics = self.topics.write_topic(&topic).await;
         self.record_stage(PubSubStage::DedupeLockAcquire, lock_started);
@@ -11650,11 +12971,26 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         state.touch();
         state.prune_deferred_iwants(Instant::now());
 
+        let now = Instant::now();
+        let use_graft_timers = !self.transport.migration.registered(topic)
+            && self.peer_supports_cap(from, key_cache::CAP_WIRE_PRUNE_GRAFT);
         let mut requested = Vec::new();
+        let mut armed_graft_timers: u64 = 0;
 
         for msg_id in msg_ids {
+            state.exclude_peer_from_ihave(msg_id, from, now);
             // Skip if we have it
             if state.has_message(&msg_id) {
+                continue;
+            }
+
+            if use_graft_timers {
+                // Wave 2 (#137): arm iroh-gossip-style 80 ms primary / 40 ms
+                // fallback GRAFT timers instead of firing an immediate IWANT,
+                // avoiding duplicate pulls when EAGER arrives right behind IHAVE.
+                if state.schedule_graft_timer_at(msg_id, from, now) {
+                    armed_graft_timers = armed_graft_timers.saturating_add(1);
+                }
                 continue;
             }
 
@@ -11725,45 +13061,81 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         drop(topics); // Release lock
 
+        if armed_graft_timers > 0 {
+            self.wave2_graft_timers_pending
+                .fetch_add(armed_graft_timers as usize, Ordering::AcqRel);
+            self.wave2_stats
+                .graft_timer_armed
+                .fetch_add(armed_graft_timers, Ordering::Relaxed);
+        }
+
         if !requested.is_empty() {
             let republish_started = Instant::now();
             debug!(peer_id = %from, count = requested.len(), "Sending IWANT");
-            // Create IWANT message
-            let iwant_payload = match postcard::to_stdvec(&requested) {
-                Ok(payload) => Bytes::from(payload),
-                Err(e) => {
-                    self.record_stage(PubSubStage::Republish, republish_started);
-                    return Err(anyhow!("Serialization failed: {}", e));
-                }
-            };
-            // ADR-012: the IWANT payload (the requested msg ids) is covered
-            // by the header signature via the sealed payload hash.
-            let mut iwant_header = MessageHeader {
-                version: 1,
-                payload_hash: None,
-                topic,
-                msg_id: requested[0], // Use first ID as header
-                kind: MessageKind::IWant,
-                hop: 0,
-                ttl: 10,
-            };
-            iwant_header.seal_payload_hash(Some(iwant_payload.as_ref()));
-            let iwant_signature = self.sign_message(&iwant_header);
-            let iwant_msg = GossipMessage {
-                header: iwant_header,
-                payload: Some(iwant_payload),
-                signature: iwant_signature,
-                public_key: self.signing_key.public_key().to_vec(),
-            };
-            let bytes = match postcard::to_stdvec(&iwant_msg) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    self.record_stage(PubSubStage::Republish, republish_started);
-                    return Err(anyhow!("Serialization failed: {}", e));
-                }
-            };
-            let send_result = self
-                .send_to_peer_bounded_outcome(
+            let use_unsigned = !self.transport.migration.registered(topic)
+                && self.peer_supports_cap(from, key_cache::CAP_UNSIGNED_CONTROL_V1);
+            let send_result = if use_unsigned {
+                let wire = control_batch::encode_control_batch(vec![
+                    control_batch::HopControlOp::IWant {
+                        topic,
+                        msg_ids: requested.clone(),
+                    },
+                ])?;
+                self.wave2_stats
+                    .unsigned_control_batches_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                self.wave2_stats
+                    .unsigned_control_ops_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                self.wave2_stats
+                    .unsigned_control_bytes_sent
+                    .fetch_add(wire.len() as u64, Ordering::Relaxed);
+                self.send_to_peer_bounded_outcome(
+                    topic,
+                    from,
+                    GossipStreamType::PubSub,
+                    wire,
+                    "IWANT",
+                    false,
+                )
+                .await
+            } else {
+                // Create signed IWANT message for legacy peers / registered topics
+                let iwant_payload = match postcard::to_stdvec(&requested) {
+                    Ok(payload) => Bytes::from(payload),
+                    Err(e) => {
+                        self.record_stage(PubSubStage::Republish, republish_started);
+                        return Err(anyhow!("Serialization failed: {}", e));
+                    }
+                };
+                // ADR-012: the IWANT payload (the requested msg ids) is covered
+                // by the header signature via the sealed payload hash.
+                let mut iwant_header = MessageHeader {
+                    version: 1,
+                    payload_hash: None,
+                    created_at_secs: None,
+                    topic,
+                    msg_id: requested[0], // Use first ID as header
+                    kind: MessageKind::IWant,
+                    hop: 0,
+                    ttl: 10,
+                };
+                iwant_header.seal_payload_hash(Some(iwant_payload.as_ref()));
+                let iwant_signature = self.sign_message(&iwant_header);
+                let iwant_msg = GossipMessage {
+                    header: iwant_header,
+                    payload: Some(iwant_payload),
+                    signature: iwant_signature,
+                    public_key: self.signing_key.public_key().to_vec(),
+                };
+                let bytes = match postcard::to_stdvec(&iwant_msg) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        self.record_stage(PubSubStage::Republish, republish_started);
+                        return Err(anyhow!("Serialization failed: {}", e));
+                    }
+                };
+                self.send_to_peer_bounded_outcome(
                     topic,
                     from,
                     GossipStreamType::PubSub,
@@ -11772,7 +13144,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     // Requesting a message we do not hold.
                     false,
                 )
-                .await;
+                .await
+            };
             self.record_stage(PubSubStage::Republish, republish_started);
             match &send_result {
                 Ok(PeerSendOutcome::Sent { .. }) => {
@@ -12045,6 +13418,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         if !forwardable_payload("iwant_serve", &msg_id, &cached.payload) {
             return Ok(EagerReplyOutcome::Failed);
         }
+        if cached.header.version == 3 && !self.peer_can_receive_v3_header(from) {
+            self.wave2_stats
+                .v3_egress_skipped_legacy
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(EagerReplyOutcome::Failed);
+        }
         debug!(peer_id = %from, msg_id = ?msg_id, "Sending EAGER in response to IWANT");
         debug!(
             target: "sg.payload.trace",
@@ -12131,6 +13510,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         };
 
+        self.handle_anti_entropy_payload_admitted(from, topic, ae_payload)
+            .await
+    }
+
+    async fn handle_anti_entropy_payload_admitted(
+        &self,
+        from: PeerId,
+        topic: TopicId,
+        ae_payload: AntiEntropyPayload,
+    ) -> Result<()> {
         match ae_payload {
             AntiEntropyPayload::Digest { msg_ids } => {
                 debug!(
@@ -12197,6 +13586,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     ) {
                         continue;
                     }
+                    if cached.header.version == 3 && !self.peer_can_receive_v3_header(from) {
+                        self.wave2_stats
+                            .v3_egress_skipped_legacy
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     debug!(
                         target: "sg.payload.trace",
                         stage = "anti_entropy_serve",
@@ -12234,38 +13629,71 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         count = ids_we_need.len(),
                         "Anti-entropy: requesting missing messages via IWANT"
                     );
-                    let iwant_payload: Bytes = postcard::to_stdvec(&ids_we_need)
-                        .map_err(|e| anyhow!("Serialization failed: {}", e))?
-                        .into();
-                    // ADR-012: the IWANT payload is covered by the sealed
-                    // header hash.
-                    let mut iwant_header = MessageHeader {
-                        version: 1,
-                        payload_hash: None,
-                        topic,
-                        msg_id: ids_we_need[0],
-                        kind: MessageKind::IWant,
-                        hop: 0,
-                        ttl: 10,
-                    };
-                    iwant_header.seal_payload_hash(Some(iwant_payload.as_ref()));
-                    let iwant_signature = self.sign_message(&iwant_header);
-                    let iwant_msg = GossipMessage {
-                        header: iwant_header,
-                        payload: Some(iwant_payload),
-                        signature: iwant_signature,
-                        public_key: self.signing_key.public_key().to_vec(),
-                    };
-                    if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
-                        let _ = self
-                            .send_to_peer_bounded(
-                                topic,
-                                from,
-                                GossipStreamType::PubSub,
-                                bytes.into(),
-                                "IWANT",
-                            )
-                            .await;
+                    if !self.transport.migration.registered(topic)
+                        && self.peer_supports_cap(from, key_cache::CAP_UNSIGNED_CONTROL_V1)
+                    {
+                        for chunk in ids_we_need.chunks(control_batch::MAX_IDS_PER_CONTROL_OP) {
+                            if let Ok(wire) = control_batch::encode_control_batch(vec![
+                                control_batch::HopControlOp::IWant {
+                                    topic,
+                                    msg_ids: chunk.to_vec(),
+                                },
+                            ]) {
+                                self.wave2_stats
+                                    .unsigned_control_batches_sent
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.wave2_stats
+                                    .unsigned_control_ops_sent
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.wave2_stats
+                                    .unsigned_control_bytes_sent
+                                    .fetch_add(wire.len() as u64, Ordering::Relaxed);
+                                let _ = self
+                                    .send_to_peer_bounded(
+                                        topic,
+                                        from,
+                                        GossipStreamType::PubSub,
+                                        wire,
+                                        "IWANT",
+                                    )
+                                    .await;
+                            }
+                        }
+                    } else {
+                        let iwant_payload: Bytes = postcard::to_stdvec(&ids_we_need)
+                            .map_err(|e| anyhow!("Serialization failed: {}", e))?
+                            .into();
+                        // ADR-012: the IWANT payload is covered by the sealed
+                        // header hash.
+                        let mut iwant_header = MessageHeader {
+                            version: 1,
+                            payload_hash: None,
+                            created_at_secs: None,
+                            topic,
+                            msg_id: ids_we_need[0],
+                            kind: MessageKind::IWant,
+                            hop: 0,
+                            ttl: 10,
+                        };
+                        iwant_header.seal_payload_hash(Some(iwant_payload.as_ref()));
+                        let iwant_signature = self.sign_message(&iwant_header);
+                        let iwant_msg = GossipMessage {
+                            header: iwant_header,
+                            payload: Some(iwant_payload),
+                            signature: iwant_signature,
+                            public_key: self.signing_key.public_key().to_vec(),
+                        };
+                        if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
+                            let _ = self
+                                .send_to_peer_bounded(
+                                    topic,
+                                    from,
+                                    GossipStreamType::PubSub,
+                                    bytes.into(),
+                                    "IWANT",
+                                )
+                                .await;
+                        }
                     }
                 }
                 self.record_stage(PubSubStage::Republish, republish_started);
@@ -12311,38 +13739,71 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         count = ids_to_request.len(),
                         "Anti-entropy response: sending IWANT for missing IDs"
                     );
-                    let iwant_payload: Bytes = postcard::to_stdvec(&ids_to_request)
-                        .map_err(|e| anyhow!("Serialization failed: {}", e))?
-                        .into();
-                    // ADR-012: the IWANT payload is covered by the sealed
-                    // header hash.
-                    let mut iwant_header = MessageHeader {
-                        version: 1,
-                        payload_hash: None,
-                        topic,
-                        msg_id: ids_to_request[0],
-                        kind: MessageKind::IWant,
-                        hop: 0,
-                        ttl: 10,
-                    };
-                    iwant_header.seal_payload_hash(Some(iwant_payload.as_ref()));
-                    let iwant_signature = self.sign_message(&iwant_header);
-                    let iwant_msg = GossipMessage {
-                        header: iwant_header,
-                        payload: Some(iwant_payload),
-                        signature: iwant_signature,
-                        public_key: self.signing_key.public_key().to_vec(),
-                    };
-                    if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
-                        let _ = self
-                            .send_to_peer_bounded(
-                                topic,
-                                from,
-                                GossipStreamType::PubSub,
-                                bytes.into(),
-                                "IWANT",
-                            )
-                            .await;
+                    if !self.transport.migration.registered(topic)
+                        && self.peer_supports_cap(from, key_cache::CAP_UNSIGNED_CONTROL_V1)
+                    {
+                        for chunk in ids_to_request.chunks(control_batch::MAX_IDS_PER_CONTROL_OP) {
+                            if let Ok(wire) = control_batch::encode_control_batch(vec![
+                                control_batch::HopControlOp::IWant {
+                                    topic,
+                                    msg_ids: chunk.to_vec(),
+                                },
+                            ]) {
+                                self.wave2_stats
+                                    .unsigned_control_batches_sent
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.wave2_stats
+                                    .unsigned_control_ops_sent
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.wave2_stats
+                                    .unsigned_control_bytes_sent
+                                    .fetch_add(wire.len() as u64, Ordering::Relaxed);
+                                let _ = self
+                                    .send_to_peer_bounded(
+                                        topic,
+                                        from,
+                                        GossipStreamType::PubSub,
+                                        wire,
+                                        "IWANT",
+                                    )
+                                    .await;
+                            }
+                        }
+                    } else {
+                        let iwant_payload: Bytes = postcard::to_stdvec(&ids_to_request)
+                            .map_err(|e| anyhow!("Serialization failed: {}", e))?
+                            .into();
+                        // ADR-012: the IWANT payload is covered by the sealed
+                        // header hash.
+                        let mut iwant_header = MessageHeader {
+                            version: 1,
+                            payload_hash: None,
+                            created_at_secs: None,
+                            topic,
+                            msg_id: ids_to_request[0],
+                            kind: MessageKind::IWant,
+                            hop: 0,
+                            ttl: 10,
+                        };
+                        iwant_header.seal_payload_hash(Some(iwant_payload.as_ref()));
+                        let iwant_signature = self.sign_message(&iwant_header);
+                        let iwant_msg = GossipMessage {
+                            header: iwant_header,
+                            payload: Some(iwant_payload),
+                            signature: iwant_signature,
+                            public_key: self.signing_key.public_key().to_vec(),
+                        };
+                        if let Ok(bytes) = postcard::to_stdvec(&iwant_msg) {
+                            let _ = self
+                                .send_to_peer_bounded(
+                                    topic,
+                                    from,
+                                    GossipStreamType::PubSub,
+                                    bytes.into(),
+                                    "IWANT",
+                                )
+                                .await;
+                        }
                     }
                 }
                 self.record_stage(PubSubStage::Republish, republish_started);
@@ -12350,6 +13811,541 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         }
 
         Ok(())
+    }
+
+    /// Wave 2 (#137): dispatch a validated unsigned 1-hop control batch
+    /// received over a live mutually-authenticated ML-DSA-65 + ML-KEM-768
+    /// QUIC session.
+    ///
+    /// Security invariant (Pin 1): ops in this batch NEVER enter
+    /// `message_cache`, NEVER reach `subscribers`, NEVER forward to any third
+    /// peer, and NEVER trigger per-frame ML-DSA-65 verification.
+    async fn handle_unsigned_control_batch(
+        &self,
+        from: PeerId,
+        session: saorsa_gossip_transport::AuthenticatedSession,
+        batch: control_batch::UnsignedControlBatch,
+    ) -> Result<()> {
+        for op in &batch.ops {
+            anyhow::ensure!(
+                !self.transport.migration.registered(op.topic()),
+                "unsigned control batch forbidden on registered legacy-compat topic"
+            );
+        }
+        for op in batch.ops {
+            let topic = op.topic();
+            if !self.inbound_topic_accepted(&topic) {
+                continue;
+            }
+            // Enforce per-op capability bits symmetrically with the signed ingress path.
+            let required_op_cap = match &op {
+                control_batch::HopControlOp::Prune { .. }
+                | control_batch::HopControlOp::Graft { .. } => {
+                    Some(key_cache::CAP_WIRE_PRUNE_GRAFT)
+                }
+                control_batch::HopControlOp::IDontWant { .. } => Some(key_cache::CAP_IDONTWANT),
+                _ => None,
+            };
+            if let Some(cap) = required_op_cap {
+                if !self.peer_can_accept_cap_session(Some(session), cap) {
+                    debug!(
+                        peer_id = %LogPeerId::from(from),
+                        topic = %LogTopicId::from(topic),
+                        kind = ?op.message_kind(),
+                        "skipping unsigned control op without negotiated op capability"
+                    );
+                    continue;
+                }
+            }
+            let kind = op.message_kind();
+            self.stage_stats.record_message_kind(kind);
+            // Only refresh peer cooling when the topic already exists or the op
+            // legitimately creates topic state (IHave/IWant/AntiEntropy).
+            if matches!(
+                op,
+                control_batch::HopControlOp::IHave { .. }
+                    | control_batch::HopControlOp::IWant { .. }
+                    | control_batch::HopControlOp::AntiEntropyDigest { .. }
+                    | control_batch::HopControlOp::AntiEntropyResponse { .. }
+            ) {
+                self.record_verified_inbound_from_peer(topic, from, kind)
+                    .await;
+            }
+            let op_result = match op {
+                control_batch::HopControlOp::IHave { topic, msg_ids } => {
+                    self.handle_ihave_admitted(from, topic, msg_ids).await
+                }
+                control_batch::HopControlOp::IWant { topic, msg_ids } => {
+                    self.handle_iwant_admitted(from, topic, msg_ids).await
+                }
+                control_batch::HopControlOp::Prune { topic } => {
+                    self.handle_prune_admitted(from, topic).await
+                }
+                control_batch::HopControlOp::Graft { topic, msg_id } => {
+                    self.handle_graft_admitted(from, topic, msg_id).await
+                }
+                control_batch::HopControlOp::IDontWant { topic, msg_ids } => {
+                    self.handle_idontwant_admitted(from, topic, msg_ids).await
+                }
+                control_batch::HopControlOp::AntiEntropyDigest { topic, msg_ids } => {
+                    self.handle_anti_entropy_payload_admitted(
+                        from,
+                        topic,
+                        AntiEntropyPayload::Digest { msg_ids },
+                    )
+                    .await
+                }
+                control_batch::HopControlOp::AntiEntropyResponse { topic, missing_ids } => {
+                    self.handle_anti_entropy_payload_admitted(
+                        from,
+                        topic,
+                        AntiEntropyPayload::Response { missing_ids },
+                    )
+                    .await
+                }
+            };
+            if let Err(error) = op_result {
+                debug!(
+                    peer_id = %LogPeerId::from(from),
+                    topic = %LogTopicId::from(topic),
+                    kind = ?kind,
+                    "unsigned control batch op failed; continuing remaining ops: {error}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Wave 2 (#137): handle an authenticated 1-hop wire `PRUNE(topic)`.
+    async fn handle_prune_admitted(&self, from: PeerId, topic: TopicId) -> Result<()> {
+        self.wave2_stats
+            .wire_prune_received
+            .fetch_add(1, Ordering::Relaxed);
+        let mut topics = self.topics.write_topic(&topic).await;
+        let Some(state) = topics.get_mut(&topic) else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        state.touch();
+        Self::record_inbound_peer_activity_for_state(
+            self.stage_stats.as_ref(),
+            topic,
+            from,
+            state,
+            now,
+            MessageKind::Prune,
+        );
+        if state.apply_wire_prune_at(from, now) {
+            self.stage_stats.record_prune();
+            self.peer_scoring.record_mesh_pruned(topic, from);
+        }
+        Ok(())
+    }
+
+    /// Wave 2 (#137): handle an authenticated 1-hop wire `GRAFT(topic, msg_id)`.
+    /// Security invariant: only existing topic members (`eager_peers` or
+    /// `lazy_peers`) may GRAFT or pull cached payloads; unknown neighbors are
+    /// ignored without membership injection. Eligible lazy members promote to
+    /// eager while respecting `prune_backoff`, cooling, peer score, and
+    /// `max_eager_degree`.
+    async fn handle_graft_admitted(
+        &self,
+        from: PeerId,
+        topic: TopicId,
+        msg_id: Option<MessageIdType>,
+    ) -> Result<()> {
+        self.wave2_stats
+            .wire_graft_received
+            .fetch_add(1, Ordering::Relaxed);
+        let serve = {
+            let mut topics = self.topics.write_topic(&topic).await;
+            let Some(state) = topics.get_mut(&topic) else {
+                return Ok(());
+            };
+            let is_member = state.eager_peers.contains(&from) || state.lazy_peers.contains(&from);
+            if !is_member {
+                debug!(
+                    peer_id = %LogPeerId::from(from),
+                    topic = %LogTopicId::from(topic),
+                    "ignoring wire GRAFT from non-member peer"
+                );
+                return Ok(());
+            }
+            let now = Instant::now();
+            state.touch();
+            Self::record_inbound_peer_activity_for_state(
+                self.stage_stats.as_ref(),
+                topic,
+                from,
+                state,
+                now,
+                MessageKind::Graft,
+            );
+            if state.apply_wire_graft_at(from, now) {
+                self.stage_stats.record_grafts(1);
+                self.peer_scoring.note_mesh_join(topic, from);
+            }
+            if let Some(id) = msg_id {
+                state
+                    .get_message(&id)
+                    .filter(|cached| !cached.dropped)
+                    .and_then(|cached| {
+                        state
+                            .claim_eager_reply_for_iwant(from, id, now)
+                            .map(|token| (id, token, cached))
+                    })
+            } else {
+                None
+            }
+        };
+
+        if let Some((id, token, cached)) = serve {
+            let completion = EagerReplyCompletion {
+                peer: from,
+                msg_id: id,
+                token,
+                own_custody: None,
+            };
+            let result = self
+                .send_claimed_iwant_reply(topic, completion, &cached, false)
+                .await;
+            let outcome = match &result {
+                Ok(outcome) => *outcome,
+                Err(_) => EagerReplyOutcome::Failed,
+            };
+            let mut topics = self.topics.write_topic(&topic).await;
+            if let Some(state) = topics.get_mut(&topic) {
+                state.settle_eager_reply(from, id, token, outcome, None, Instant::now());
+            }
+        }
+        Ok(())
+    }
+
+    /// Wave 2 (#137): handle an authenticated 1-hop `IDONTWANT(topic, msg_ids)`.
+    async fn handle_idontwant_admitted(
+        &self,
+        from: PeerId,
+        topic: TopicId,
+        msg_ids: Vec<MessageIdType>,
+    ) -> Result<()> {
+        self.wave2_stats
+            .idontwant_received
+            .fetch_add(1, Ordering::Relaxed);
+        let mut topics = self.topics.write_topic(&topic).await;
+        let Some(state) = topics.get_mut(&topic) else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        state.touch();
+        Self::record_inbound_peer_activity_for_state(
+            self.stage_stats.as_ref(),
+            topic,
+            from,
+            state,
+            now,
+            MessageKind::IDontWant,
+        );
+        for msg_id in msg_ids
+            .into_iter()
+            .take(control_batch::MAX_IDS_PER_CONTROL_OP)
+        {
+            state.record_peer_dont_want(from, msg_id, now);
+        }
+        Ok(())
+    }
+
+    /// Wave 2 (#137): emit wire `PRUNE(topic)` to `peer` if `peer` negotiated
+    /// `CAP_WIRE_PRUNE_GRAFT` (unsigned batch when `CAP_UNSIGNED_CONTROL_V1`
+    /// is also negotiated; signed `MessageKind::Prune` otherwise).
+    async fn send_wire_prune_if_capable(&self, topic: TopicId, peer: PeerId) {
+        if self.transport.migration.registered(topic)
+            || !self.peer_supports_cap(peer, key_cache::CAP_WIRE_PRUNE_GRAFT)
+        {
+            return;
+        }
+        let wire = if self.peer_supports_cap(peer, key_cache::CAP_UNSIGNED_CONTROL_V1) {
+            let Ok(bytes) =
+                control_batch::encode_control_batch(vec![control_batch::HopControlOp::Prune {
+                    topic,
+                }])
+            else {
+                return;
+            };
+            self.wave2_stats
+                .unsigned_control_batches_sent
+                .fetch_add(1, Ordering::Relaxed);
+            self.wave2_stats
+                .unsigned_control_ops_sent
+                .fetch_add(1, Ordering::Relaxed);
+            self.wave2_stats
+                .unsigned_control_bytes_sent
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            bytes
+        } else {
+            let mut header = MessageHeader::new(topic, MessageKind::Prune, 1);
+            header.seal_payload_hash(None);
+            let signature = self.sign_message(&header);
+            let msg = GossipMessage {
+                header,
+                payload: None,
+                signature,
+                public_key: self.signing_key.public_key().to_vec(),
+            };
+            match postcard::to_stdvec(&msg) {
+                Ok(bytes) => bytes.into(),
+                Err(_) => return,
+            }
+        };
+        if self
+            .send_to_peer_bounded(topic, peer, GossipStreamType::PubSub, wire, "PRUNE")
+            .await
+            .is_ok()
+        {
+            self.wave2_stats
+                .wire_prune_sent
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Wave 2 (#137): emit wire `IDONTWANT(topic, [msg_id])` to eager mesh
+    /// peers that negotiated `CAP_IDONTWANT`. Detached onto bounded background
+    /// tasks (`idontwant_spawn_permits`) so a slow peer NEVER delays EAGER
+    /// forwarding on the hot path.
+    fn spawn_wire_idontwant_if_capable(
+        &self,
+        topic: TopicId,
+        peers: Vec<PeerId>,
+        msg_id: MessageIdType,
+    ) {
+        if self.transport.migration.registered(topic) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut unsigned_wire: Option<Bytes> = None;
+        let mut signed_wire: Option<Bytes> = None;
+        let priority = self.admission.registry().priority_for(&topic);
+        for peer in peers {
+            if !self.peer_supports_cap(peer, key_cache::CAP_IDONTWANT) {
+                continue;
+            }
+            let Ok(permit) = Arc::clone(&self.idontwant_spawn_permits).try_acquire_owned() else {
+                break;
+            };
+            let wire = if self.peer_supports_cap(peer, key_cache::CAP_UNSIGNED_CONTROL_V1) {
+                let bytes = match &unsigned_wire {
+                    Some(cached) => cached.clone(),
+                    None => {
+                        let Ok(encoded) = control_batch::encode_control_batch(vec![
+                            control_batch::HopControlOp::IDontWant {
+                                topic,
+                                msg_ids: vec![msg_id],
+                            },
+                        ]) else {
+                            continue;
+                        };
+                        unsigned_wire = Some(encoded.clone());
+                        encoded
+                    }
+                };
+                self.wave2_stats
+                    .unsigned_control_batches_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                self.wave2_stats
+                    .unsigned_control_ops_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                self.wave2_stats
+                    .unsigned_control_bytes_sent
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                bytes
+            } else {
+                match &signed_wire {
+                    Some(cached) => cached.clone(),
+                    None => {
+                        let Ok(payload) = postcard::to_stdvec(&vec![msg_id]) else {
+                            continue;
+                        };
+                        let payload = Bytes::from(payload);
+                        let mut header = MessageHeader::new(topic, MessageKind::IDontWant, 1);
+                        header.msg_id = msg_id;
+                        header.seal_payload_hash(Some(&payload));
+                        let signature = self.sign_message(&header);
+                        let msg = GossipMessage {
+                            header,
+                            payload: Some(payload),
+                            signature,
+                            public_key: self.signing_key.public_key().to_vec(),
+                        };
+                        let Ok(encoded) = postcard::to_stdvec(&msg) else {
+                            continue;
+                        };
+                        let encoded: Bytes = encoded.into();
+                        signed_wire = Some(encoded.clone());
+                        encoded
+                    }
+                }
+            };
+            let transport = Arc::clone(&self.transport);
+            let egress_limiter = Arc::clone(&self.egress_limiter);
+            let stage_stats = Arc::clone(&self.stage_stats);
+            let wave2_stats = Arc::clone(&self.wave2_stats);
+            let rtt_tracker = Arc::clone(&self.peer_rtt_tracker);
+            let wire = transport.wire_bytes_for_peer(peer, &wire, priority);
+            let (mut reserved, _) = Self::reserve_recovery_targets(
+                &egress_limiter,
+                topic,
+                vec![peer],
+                "IDONTWANT",
+                &wire,
+                false,
+                priority,
+            );
+            let Some((_, reservation)) = reserved.pop() else {
+                continue;
+            };
+            stage_stats.record_outbound(topic, "IDONTWANT", wire.len(), 1);
+            runtime.spawn(async move {
+                let _permit = permit;
+                if Self::send_to_peer_with_timeout(
+                    transport,
+                    egress_limiter,
+                    stage_stats,
+                    rtt_tracker,
+                    PeerSendRequest {
+                        reservation,
+                        topic,
+                        peer,
+                        stream_type: GossipStreamType::PubSub,
+                        bytes: wire,
+                        op: "IDONTWANT",
+                        send_timeout: Some(Duration::from_millis(500)),
+                    },
+                )
+                .await
+                .is_ok_and(|o| matches!(o, PeerSendOutcome::Sent { .. }))
+                {
+                    wave2_stats.idontwant_sent.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    }
+
+    /// Wave 2 (#137): emit wire `GRAFT(topic, msg_id)` from background timer
+    /// expiration or explicit test trigger, returning `Some(outcome)` for real
+    /// transport/limiter attempts or `None` for permanent/non-retryable skips
+    /// (registered topic, missing session, missing capability, or encode failure).
+    #[allow(clippy::too_many_arguments)]
+    async fn send_wire_graft_static(
+        transport: &Arc<PolicyTransport<T>>,
+        key_cache: &Arc<Mutex<key_cache::KeyCache>>,
+        signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
+        stage_stats: &Arc<PubSubStageStats>,
+        wave2_stats: &Arc<Wave2Stats>,
+        egress_limiter: &Arc<egress::LeafEgressLimiter>,
+        send_path: &SendPathContext,
+        topic: TopicId,
+        peer: PeerId,
+        msg_id: Option<MessageIdType>,
+    ) -> Option<PeerSendOutcome> {
+        if transport.migration.registered(topic) {
+            return None;
+        }
+        let session = transport.authenticated_session(peer)?;
+        let (supports_graft, supports_unsigned) = match key_cache.lock() {
+            Ok(cache) => (
+                cache.supports_cap(session, key_cache::CAP_WIRE_PRUNE_GRAFT),
+                cache.supports_cap(session, key_cache::CAP_UNSIGNED_CONTROL_V1),
+            ),
+            Err(_) => (false, false),
+        };
+        if !supports_graft {
+            return None;
+        }
+        let wire = if supports_unsigned {
+            let Ok(bytes) =
+                control_batch::encode_control_batch(vec![control_batch::HopControlOp::Graft {
+                    topic,
+                    msg_id,
+                }])
+            else {
+                return None;
+            };
+            wave2_stats
+                .unsigned_control_batches_sent
+                .fetch_add(1, Ordering::Relaxed);
+            wave2_stats
+                .unsigned_control_ops_sent
+                .fetch_add(1, Ordering::Relaxed);
+            wave2_stats
+                .unsigned_control_bytes_sent
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            bytes
+        } else {
+            let Ok(payload) = postcard::to_stdvec(&msg_id) else {
+                return None;
+            };
+            let payload = Bytes::from(payload);
+            let mut header = MessageHeader::new(topic, MessageKind::Graft, 1);
+            if let Some(id) = msg_id {
+                header.msg_id = id;
+            }
+            header.seal_payload_hash(Some(&payload));
+            let signature = match postcard::to_stdvec(&header) {
+                Ok(h) => signing_key.sign(&h).unwrap_or_default(),
+                Err(_) => return None,
+            };
+            let msg = GossipMessage {
+                header,
+                payload: Some(payload),
+                signature,
+                public_key: signing_key.public_key().to_vec(),
+            };
+            match postcard::to_stdvec(&msg) {
+                Ok(bytes) => bytes.into(),
+                Err(_) => return None,
+            }
+        };
+        let priority = send_path.admission.registry().priority_for(&topic);
+        let wire = transport.wire_bytes_for_peer(peer, &wire, priority);
+        let (mut reserved, _) = Self::reserve_recovery_targets(
+            egress_limiter,
+            topic,
+            vec![peer],
+            "GRAFT",
+            &wire,
+            false,
+            priority,
+        );
+        let Some((_, reservation)) = reserved.pop() else {
+            return Some(PeerSendOutcome::Deferred);
+        };
+        stage_stats.record_outbound(topic, "GRAFT", wire.len(), 1);
+        match Self::send_to_peer_with_timeout(
+            Arc::clone(transport),
+            Arc::clone(egress_limiter),
+            Arc::clone(stage_stats),
+            Arc::clone(&send_path.rtt_tracker),
+            PeerSendRequest {
+                reservation,
+                topic,
+                peer,
+                stream_type: GossipStreamType::PubSub,
+                bytes: wire,
+                op: "GRAFT",
+                send_timeout: None,
+            },
+        )
+        .await
+        {
+            Ok(outcome) => {
+                if matches!(outcome, PeerSendOutcome::Sent { .. }) {
+                    wave2_stats.wire_graft_sent.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(outcome)
+            }
+            Err(_) => Some(PeerSendOutcome::NotConnected),
+        }
     }
 
     /// Send an anti-entropy digest for a specific topic to a specific peer
@@ -12372,6 +14368,42 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             return Ok(());
         }
 
+        if !self.transport.migration.registered(topic)
+            && self.peer_supports_cap(peer, key_cache::CAP_UNSIGNED_CONTROL_V1)
+        {
+            for chunk in msg_ids.chunks(control_batch::MAX_IDS_PER_CONTROL_OP) {
+                let wire = control_batch::encode_control_batch(vec![
+                    control_batch::HopControlOp::AntiEntropyDigest {
+                        topic,
+                        msg_ids: chunk.to_vec(),
+                    },
+                ])?;
+                self.wave2_stats
+                    .unsigned_control_batches_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                self.wave2_stats
+                    .unsigned_control_ops_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                self.wave2_stats
+                    .unsigned_control_bytes_sent
+                    .fetch_add(wire.len() as u64, Ordering::Relaxed);
+                self.send_to_peer_bounded(
+                    topic,
+                    peer,
+                    GossipStreamType::PubSub,
+                    wire,
+                    "ANTI_ENTROPY",
+                )
+                .await?;
+            }
+            debug!(
+                peer_id = %peer,
+                topic = ?topic,
+                "Sent unsigned Wave 2 anti-entropy digest"
+            );
+            return Ok(());
+        }
+
         let ae_payload = AntiEntropyPayload::Digest { msg_ids };
         let payload_bytes = postcard::to_stdvec(&ae_payload)
             .map_err(|e| anyhow!("Failed to serialize anti-entropy payload: {}", e))?;
@@ -12381,6 +14413,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let mut header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -12483,51 +14516,114 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         report
     }
 
-    /// Spawn background task to flush IHAVE batches
+    /// Spawn background task to flush IHAVE batches, Wave 2 unsigned coalesced
+    /// 1-hop control frames (`Critical <= 25 ms`, `Normal`/`Bulk` 300 ms), and
+    /// iroh-gossip-style GRAFT timers (`80 ms` primary / `120 ms` fallback).
+    ///
+    /// All Wave 2 per-peer sends run concurrently in a bounded `JoinSet` polled
+    /// inside `tokio::select!` via a synchronous non-blocking spawner (with
+    /// per-peer in-flight deduplication and dedicated Critical/GRAFT headroom),
+    /// so slow Normal/Bulk peers NEVER stall `Critical` notifications, GRAFT
+    /// deadlines, or legacy 100 ms flushes. All-legacy fleets take zero
+    /// `topics.write_all()` locks and zero `key_cache` mutexes on Wave 2 ticks.
     fn spawn_ihave_flusher(&self) {
         let topics = self.topics.clone();
         let transport = self.transport.clone();
+        let key_cache = Arc::clone(&self.key_cache);
         let signing_key = self.signing_key.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
+        let wave2_stats = Arc::clone(&self.wave2_stats);
         let outbound_budgets = Arc::clone(&self.outbound_budgets);
         let egress_limiter = Arc::clone(&self.egress_limiter);
         let send_path = self.send_path_context();
+        let critical_notify = Arc::clone(&self.critical_flush_notify);
+        let confirmed_wave2_sessions = Arc::clone(&self.confirmed_wave2_sessions);
+        let graft_timers_pending = Arc::clone(&self.wave2_graft_timers_pending);
+        let critical_ihave_pending = Arc::clone(&self.wave2_critical_ihave_pending);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let initial_jitter = deterministic_jitter(
             self.peer_id,
             b"pubsub-ihave-flush",
-            Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS),
+            Duration::from_millis(WAVE2_FAST_TICK_MS),
         );
-        // Review r3: flusher-local late-offer rotation state (previously a
-        // process-global cursor). Moved into the task so the bounded
-        // under-lock selection needs no synchronization and concurrent
-        // pubsub instances cannot disturb each other's rotation.
         let mut late_rotation = LateOfferRotation::default();
 
-        // Issue #42: select on the shutdown token at every await point so
-        // the flusher terminates on shutdown instead of spinning on
-        // failing sends after transport close.
         let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = shutdown_rx.changed() => return,
                 _ = time::sleep(initial_jitter) => {}
             }
-            let mut interval = time::interval(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS));
-            interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            let mut fast_interval = time::interval(Duration::from_millis(WAVE2_FAST_TICK_MS));
+            fast_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            let mut legacy_interval =
+                time::interval(Duration::from_millis(IHAVE_FLUSH_INTERVAL_MS));
+            legacy_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            let mut normal_coalesce_interval = time::interval(WAVE2_NORMAL_COALESCE_INTERVAL);
+            normal_coalesce_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            let mut coalesce_tick: u64 = 0;
+            let mut wave2_in_flight: tokio::task::JoinSet<Wave2SendCompletion> =
+                tokio::task::JoinSet::new();
+            let mut in_flight_normal_peers: HashMap<PeerId, usize> = HashMap::new();
 
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         debug!("PubSub IHAVE flusher stopping for shutdown: running one final flush");
-                        // Issue #42 round 2: flush once on the shutdown
-                        // signal before exiting. Since `ValidationAction::
-                        // LazyForward` the IHAVE flusher is the relay's
-                        // delivery path (the eager send is withheld and the
-                        // msg_id announced instead), so without this the
-                        // trailing interval's batch would be dropped even
-                        // on a live transport. The flush is abort-safe: an
-                        // abort past the shutdown grace leaves the batch
-                        // pending instead of losing it.
+                        let now = Instant::now();
+                        coalesce_tick = coalesce_tick.wrapping_add(1);
+                        let work = Self::prepare_wave2_flush_work(
+                            &topics,
+                            &transport,
+                            &key_cache,
+                            &stage_stats,
+                            &egress_limiter,
+                            &send_path,
+                            &confirmed_wave2_sessions,
+                            &graft_timers_pending,
+                            &critical_ihave_pending,
+                            &in_flight_normal_peers,
+                            now,
+                            true,
+                            coalesce_tick,
+                        )
+                        .await;
+                        Self::spawn_wave2_work_into(
+                            &mut wave2_in_flight,
+                            &mut in_flight_normal_peers,
+                            &transport,
+                            &key_cache,
+                            &signing_key,
+                            &stage_stats,
+                            &wave2_stats,
+                            &egress_limiter,
+                            &send_path,
+                            work,
+                        );
+                        // Give the final Wave-2 flush a short bounded window to complete
+                        // on healthy links before aborting stragglers (stays well within
+                        // BACKGROUND_SHUTDOWN_GRACE = 1 s).
+                        let _ = tokio::time::timeout(Duration::from_millis(250), async {
+                            while let Some(completed) = wave2_in_flight.join_next().await {
+                                if let Ok(completion) = completed {
+                                    if let Wave2SendCompletion::BatchSent { peer, is_critical: false, .. } = &completion {
+                                        if let Some(count) = in_flight_normal_peers.get_mut(peer) {
+                                            *count = count.saturating_sub(1);
+                                            if *count == 0 {
+                                                in_flight_normal_peers.remove(peer);
+                                            }
+                                        }
+                                    }
+                                    Self::apply_wave2_send_completion(
+                                        &topics,
+                                        &graft_timers_pending,
+                                        completion,
+                                    )
+                                    .await;
+                                }
+                            }
+                        })
+                        .await;
+                        wave2_in_flight.abort_all();
                         Self::flush_ihave_batches(
                             &topics,
                             &transport,
@@ -12543,7 +14639,117 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         debug!("PubSub IHAVE flusher stopped by shutdown signal");
                         break;
                     }
-                    _ = interval.tick() => {
+                    Some(completed) = wave2_in_flight.join_next(), if !wave2_in_flight.is_empty() => {
+                        if let Ok(completion) = completed {
+                            if let Wave2SendCompletion::BatchSent { peer, is_critical: false, .. } = &completion {
+                                if let Some(count) = in_flight_normal_peers.get_mut(peer) {
+                                    *count = count.saturating_sub(1);
+                                    if *count == 0 {
+                                        in_flight_normal_peers.remove(peer);
+                                    }
+                                }
+                            }
+                            Self::apply_wave2_send_completion(
+                                &topics,
+                                &graft_timers_pending,
+                                completion,
+                            )
+                            .await;
+                        }
+                    }
+                    _ = critical_notify.notified() => {
+                        // Immediate Critical-topic flush (<= 25 ms under A06).
+                        let work = Self::prepare_wave2_flush_work(
+                            &topics,
+                            &transport,
+                            &key_cache,
+                            &stage_stats,
+                            &egress_limiter,
+                            &send_path,
+                            &confirmed_wave2_sessions,
+                            &graft_timers_pending,
+                            &critical_ihave_pending,
+                            &in_flight_normal_peers,
+                            Instant::now(),
+                            false,
+                            coalesce_tick,
+                        )
+                        .await;
+                        Self::spawn_wave2_work_into(
+                            &mut wave2_in_flight,
+                            &mut in_flight_normal_peers,
+                            &transport,
+                            &key_cache,
+                            &signing_key,
+                            &stage_stats,
+                            &wave2_stats,
+                            &egress_limiter,
+                            &send_path,
+                            work,
+                        );
+                    }
+                    _ = fast_interval.tick() => {
+                        let work = Self::prepare_wave2_flush_work(
+                            &topics,
+                            &transport,
+                            &key_cache,
+                            &stage_stats,
+                            &egress_limiter,
+                            &send_path,
+                            &confirmed_wave2_sessions,
+                            &graft_timers_pending,
+                            &critical_ihave_pending,
+                            &in_flight_normal_peers,
+                            Instant::now(),
+                            false,
+                            coalesce_tick,
+                        )
+                        .await;
+                        Self::spawn_wave2_work_into(
+                            &mut wave2_in_flight,
+                            &mut in_flight_normal_peers,
+                            &transport,
+                            &key_cache,
+                            &signing_key,
+                            &stage_stats,
+                            &wave2_stats,
+                            &egress_limiter,
+                            &send_path,
+                            work,
+                        );
+                    }
+                    _ = normal_coalesce_interval.tick() => {
+                        coalesce_tick = coalesce_tick.wrapping_add(1);
+                        let work = Self::prepare_wave2_flush_work(
+                            &topics,
+                            &transport,
+                            &key_cache,
+                            &stage_stats,
+                            &egress_limiter,
+                            &send_path,
+                            &confirmed_wave2_sessions,
+                            &graft_timers_pending,
+                            &critical_ihave_pending,
+                            &in_flight_normal_peers,
+                            Instant::now(),
+                            true,
+                            coalesce_tick,
+                        )
+                        .await;
+                        Self::spawn_wave2_work_into(
+                            &mut wave2_in_flight,
+                            &mut in_flight_normal_peers,
+                            &transport,
+                            &key_cache,
+                            &signing_key,
+                            &stage_stats,
+                            &wave2_stats,
+                            &egress_limiter,
+                            &send_path,
+                            work,
+                        );
+                    }
+                    _ = legacy_interval.tick() => {
                         Self::flush_ihave_batches(
                             &topics,
                             &transport,
@@ -12561,6 +14767,680 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             }
         });
         self.retain_background_task(handle);
+    }
+
+    /// Wave 2 (#137): snapshot due GRAFT timers and cross-topic per-peer
+    /// unsigned control batches without awaiting any network I/O.
+    ///
+    /// Lock-free fast path: checks atomics only (ZERO `key_cache` mutexes and
+    /// ZERO `topics.write_all()` locks) when there are no pending GRAFT timers
+    /// and no confirmed Wave-2 sessions (or no pending Critical IHAVE on a
+    /// 20 ms fast tick).
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_wave2_flush_work(
+        topics: &Arc<ShardedTopicMap>,
+        transport: &Arc<PolicyTransport<T>>,
+        key_cache: &Arc<Mutex<key_cache::KeyCache>>,
+        stage_stats: &Arc<PubSubStageStats>,
+        egress_limiter: &Arc<egress::LeafEgressLimiter>,
+        send_path: &SendPathContext,
+        confirmed_wave2_sessions: &Arc<AtomicUsize>,
+        graft_timers_pending: &Arc<AtomicUsize>,
+        critical_ihave_pending: &Arc<AtomicBool>,
+        in_flight_normal_peers: &HashMap<PeerId, usize>,
+        now: Instant,
+        include_normal_bulk: bool,
+        coalesce_tick: u64,
+    ) -> PreparedWave2Work {
+        let has_wave2 = confirmed_wave2_sessions.load(Ordering::Acquire) > 0;
+        let has_grafts = graft_timers_pending.load(Ordering::Acquire) > 0;
+        let has_crit = critical_ihave_pending.load(Ordering::Acquire);
+        if !include_normal_bulk {
+            if !has_grafts && !(has_wave2 && has_crit) {
+                return PreparedWave2Work::default();
+            }
+        } else if !has_grafts && !has_wave2 {
+            return PreparedWave2Work::default();
+        }
+        if has_wave2 && has_crit {
+            critical_ihave_pending.store(false, Ordering::Release);
+        }
+
+        // Snapshot peers with live confirmed CAP_UNSIGNED_CONTROL_V1, pruning
+        // any disconnected/superseded sessions so `confirmed_wave2_sessions`
+        // drops immediately to 0 once all Wave-2 peers disconnect.
+        let unsigned_peers: HashSet<PeerId> = if has_wave2 {
+            let candidates: Vec<saorsa_gossip_transport::AuthenticatedSession> = key_cache
+                .lock()
+                .map(|cache| cache.sessions())
+                .unwrap_or_default();
+            let mut set = HashSet::new();
+            let mut stale = Vec::new();
+            for session in candidates {
+                if transport.authenticated_session(session.peer) == Some(session) {
+                    if key_cache.lock().is_ok_and(|cache| {
+                        cache.supports_cap(session, key_cache::CAP_UNSIGNED_CONTROL_V1)
+                    }) {
+                        set.insert(session.peer);
+                    }
+                } else {
+                    stale.push(session);
+                }
+            }
+            if !stale.is_empty() {
+                if let Ok(mut cache) = key_cache.lock() {
+                    for session in stale {
+                        cache.forget_stale(session);
+                    }
+                }
+            }
+            set
+        } else {
+            HashSet::new()
+        };
+        if unsigned_peers.is_empty() && !has_grafts {
+            return PreparedWave2Work::default();
+        }
+
+        struct PeerTopicIhaveOp {
+            topic: TopicId,
+            msg_ids: Vec<MessageIdType>,
+            full_batch: Vec<MessageIdType>,
+            unsampled_wave2: Vec<PeerId>,
+            is_critical: bool,
+            local_origin: bool,
+        }
+        struct ChunkTopicMeta {
+            topic: TopicId,
+            full_batch: Vec<MessageIdType>,
+            unsampled_wave2: Vec<PeerId>,
+            is_critical: bool,
+            local_origin: bool,
+        }
+        struct ControlBatchChunk {
+            ops: Vec<control_batch::HopControlOp>,
+            topics: Vec<ChunkTopicMeta>,
+        }
+
+        let mut due_grafts: Vec<DueGraftTask> = Vec::new();
+        let mut per_peer_ops: HashMap<PeerId, Vec<PeerTopicIhaveOp>> = HashMap::new();
+        let mut remaining_graft_timers: usize = 0;
+
+        {
+            let mut topics_guard = topics.write_all().await;
+            for shard in topics_guard.iter_mut() {
+                for (&topic_id, state) in shard.iter_mut() {
+                    // Expire due GRAFT timers (80 ms primary / 120 ms fallback).
+                    let fired = state.take_due_graft_timers_at(now);
+                    remaining_graft_timers =
+                        remaining_graft_timers.saturating_add(state.pending_graft_timers.len());
+                    for (peer, msg_id, is_fallback, has_more_fallbacks, retry_count) in fired {
+                        if state.apply_wire_graft_at(peer, now) {
+                            stage_stats.record_grafts(1);
+                        }
+                        due_grafts.push(DueGraftTask {
+                            topic: topic_id,
+                            peer,
+                            msg_id,
+                            is_fallback,
+                            has_more_fallbacks,
+                            retry_count,
+                        });
+                    }
+
+                    if unsigned_peers.is_empty()
+                        || state.pending_ihave.is_empty()
+                        || transport.migration.registered(topic_id)
+                    {
+                        continue;
+                    }
+                    let priority = send_path.admission.registry().priority_for(&topic_id);
+                    let is_critical = priority == TopicPriority::Critical;
+                    if !is_critical && !include_normal_bulk {
+                        continue;
+                    }
+
+                    let batch: Vec<MessageIdType> = state
+                        .pending_ihave
+                        .iter()
+                        .take(MAX_IHAVE_BATCH_SIZE)
+                        .copied()
+                        .collect();
+
+                    let mut all_selected = state.stranded_ihave_targets_for(&batch);
+                    for peer in state.lazy_withheld_targets_for(&batch) {
+                        if !all_selected.contains(&peer) {
+                            all_selected.push(peer);
+                        }
+                    }
+                    let lazy_selected: Vec<PeerId> = if is_critical {
+                        state.lazy_peers.iter().copied().collect()
+                    } else {
+                        state.sample_lazy_peers_for_wave2(topic_id, coalesce_tick, WAVE2_D_LAZY_CAP)
+                    };
+                    let selected_set: HashSet<PeerId> = lazy_selected.iter().copied().collect();
+                    let unsampled_wave2: Vec<PeerId> = state
+                        .lazy_peers
+                        .iter()
+                        .copied()
+                        .filter(|p| unsigned_peers.contains(p) && !selected_set.contains(p))
+                        .collect();
+                    for peer in lazy_selected {
+                        if !all_selected.contains(&peer) {
+                            all_selected.push(peer);
+                        }
+                    }
+                    if all_selected.is_empty() {
+                        continue;
+                    }
+
+                    let local_origin = batch.iter().any(|id| {
+                        state
+                            .message_cache
+                            .lru
+                            .peek(id)
+                            .is_some_and(|cached| cached.message.local_origin)
+                    });
+                    let mut queued_any_wave2 = false;
+                    let mut any_wave2_target = false;
+                    let mut skipped_in_flight = false;
+                    for &peer in &all_selected {
+                        if !unsigned_peers.contains(&peer) {
+                            continue;
+                        }
+                        any_wave2_target = true;
+                        // Avoid re-packing duplicate Normal/Bulk batches to a slow
+                        // peer that already has one batch in flight.
+                        if !is_critical && in_flight_normal_peers.contains_key(&peer) {
+                            skipped_in_flight = true;
+                            continue;
+                        }
+                        let filtered_ids: Vec<MessageIdType> = batch
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                !state.is_peer_excluded_from_ihave(id, peer, now)
+                                    && !state
+                                        .ihave_advertised
+                                        .get(id)
+                                        .is_some_and(|adv| adv.contains(&peer))
+                            })
+                            .collect();
+                        if filtered_ids.is_empty() {
+                            state.record_ihave_handoff(&batch, peer);
+                        } else {
+                            queued_any_wave2 = true;
+                            per_peer_ops
+                                .entry(peer)
+                                .or_default()
+                                .push(PeerTopicIhaveOp {
+                                    topic: topic_id,
+                                    msg_ids: filtered_ids,
+                                    full_batch: batch.clone(),
+                                    unsampled_wave2: unsampled_wave2.clone(),
+                                    is_critical,
+                                    local_origin,
+                                });
+                        }
+                    }
+                    if any_wave2_target && !queued_any_wave2 && !skipped_in_flight {
+                        for u in &unsampled_wave2 {
+                            state.record_ihave_handoff(&batch, *u);
+                        }
+                        if Self::all_ihave_targets_done(state, &batch) {
+                            state.consume_flushed_ihave_batch(&batch);
+                        }
+                    }
+                }
+            }
+            // Exact re-sync under the all-shard write lock prevents any drift
+            // from topic reaping or unsubscribe.
+            graft_timers_pending.store(remaining_graft_timers, Ordering::Release);
+        }
+
+        let mut batch_tasks: Vec<Wave2BatchSendTask> = Vec::new();
+        for (peer, topic_ops) in per_peer_ops {
+            let mut chunk_ops: Vec<control_batch::HopControlOp> = Vec::new();
+            let mut chunk_topics: Vec<ChunkTopicMeta> = Vec::new();
+            let mut chunk_ids: usize = 0;
+            let mut chunk_bytes: usize = control_batch::CONTROL_BATCH_MARKER.len() + 4;
+
+            let mut batches_to_send: Vec<ControlBatchChunk> = Vec::new();
+            for PeerTopicIhaveOp {
+                topic: topic_id,
+                msg_ids,
+                full_batch,
+                unsampled_wave2,
+                is_critical,
+                local_origin,
+            } in topic_ops
+            {
+                let op_bytes = 1 + 32 + 4 + msg_ids.len() * 32;
+                if !chunk_ops.is_empty()
+                    && (chunk_ops.len() >= control_batch::MAX_CONTROL_BATCH_OPS
+                        || chunk_ids.saturating_add(msg_ids.len())
+                            > control_batch::MAX_TOTAL_IDS_PER_BATCH
+                        || chunk_bytes.saturating_add(op_bytes)
+                            > control_batch::MAX_CONTROL_BATCH_BYTES)
+                {
+                    batches_to_send.push(ControlBatchChunk {
+                        ops: std::mem::take(&mut chunk_ops),
+                        topics: std::mem::take(&mut chunk_topics),
+                    });
+                    chunk_ids = 0;
+                    chunk_bytes = control_batch::CONTROL_BATCH_MARKER.len() + 4;
+                }
+                chunk_ids = chunk_ids.saturating_add(msg_ids.len());
+                chunk_bytes = chunk_bytes.saturating_add(op_bytes);
+                chunk_ops.push(control_batch::HopControlOp::IHave {
+                    topic: topic_id,
+                    msg_ids,
+                });
+                chunk_topics.push(ChunkTopicMeta {
+                    topic: topic_id,
+                    full_batch,
+                    unsampled_wave2,
+                    is_critical,
+                    local_origin,
+                });
+            }
+            if !chunk_ops.is_empty() {
+                batches_to_send.push(ControlBatchChunk {
+                    ops: chunk_ops,
+                    topics: chunk_topics,
+                });
+            }
+
+            for ControlBatchChunk { ops, topics: meta } in batches_to_send {
+                let any_critical = meta.iter().any(|m| m.is_critical);
+                let any_local = meta.iter().any(|m| m.local_origin);
+                let primary_topic = meta[0].topic;
+                let op_count = ops.len();
+                let weights: Vec<(TopicId, &'static str, usize)> = ops
+                    .iter()
+                    .map(|op| (op.topic(), op.op_label(), op.weight_bytes()))
+                    .collect();
+                let Ok(wire) = control_batch::encode_control_batch(ops) else {
+                    continue;
+                };
+                let wire_len = wire.len();
+                let priority = if any_critical {
+                    TopicPriority::Critical
+                } else {
+                    TopicPriority::Normal
+                };
+                let (mut reserved, _) = Self::reserve_recovery_targets(
+                    egress_limiter,
+                    primary_topic,
+                    vec![peer],
+                    "IHAVE",
+                    &wire,
+                    any_local,
+                    priority,
+                );
+                let Some((_, reservation)) = reserved.pop() else {
+                    continue;
+                };
+                let total_weight: usize = weights.iter().map(|(_, _, w)| *w).sum::<usize>().max(1);
+                let mut attributed_sum = 0usize;
+                for (idx, (t, label, weight)) in weights.iter().enumerate() {
+                    let share = if idx + 1 == weights.len() {
+                        wire_len.saturating_sub(attributed_sum)
+                    } else {
+                        let s = (wire_len * *weight) / total_weight;
+                        attributed_sum = attributed_sum.saturating_add(s);
+                        s
+                    };
+                    stage_stats.record_outbound(*t, label, share, 1);
+                }
+                let topic_batches = meta
+                    .into_iter()
+                    .map(|m| (m.topic, m.full_batch, m.unsampled_wave2))
+                    .collect();
+                batch_tasks.push(Wave2BatchSendTask {
+                    peer,
+                    primary_topic,
+                    wire,
+                    op_count,
+                    is_critical: any_critical,
+                    reservation,
+                    topic_batches,
+                });
+            }
+        }
+
+        PreparedWave2Work {
+            due_grafts,
+            batch_tasks,
+        }
+    }
+
+    fn all_ihave_targets_done(state: &TopicState, batch: &[MessageIdType]) -> bool {
+        let mut any = false;
+        for peer in state
+            .lazy_peers
+            .iter()
+            .copied()
+            .chain(state.stranded_ihave_targets_for(batch))
+            .chain(state.lazy_withheld_targets_for(batch))
+        {
+            any = true;
+            if state.ihave_target_pending(batch, peer) {
+                return false;
+            }
+        }
+        any
+    }
+
+    /// Synchronous, non-blocking spawner for Wave 2 GRAFT and coalesced batch
+    /// sends. Never awaits inside `tokio::select!`; Critical batches and GRAFTs
+    /// receive dedicated headroom (`+32`) above the Normal/Bulk cap (`64`).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_wave2_work_into(
+        in_flight: &mut tokio::task::JoinSet<Wave2SendCompletion>,
+        in_flight_normal_peers: &mut HashMap<PeerId, usize>,
+        transport: &Arc<PolicyTransport<T>>,
+        key_cache: &Arc<Mutex<key_cache::KeyCache>>,
+        signing_key: &Arc<saorsa_gossip_identity::MlDsaKeyPair>,
+        stage_stats: &Arc<PubSubStageStats>,
+        wave2_stats: &Arc<Wave2Stats>,
+        egress_limiter: &Arc<egress::LeafEgressLimiter>,
+        send_path: &SendPathContext,
+        work: PreparedWave2Work,
+    ) {
+        let critical_cap = WAVE2_FLUSH_MAX_CONCURRENT_SENDS + 32;
+        for task in work.due_grafts {
+            if in_flight.len() >= critical_cap {
+                break;
+            }
+            if task.is_fallback {
+                wave2_stats
+                    .graft_timer_fallback_fired
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                wave2_stats
+                    .graft_timer_primary_fired
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let transport = Arc::clone(transport);
+            let key_cache = Arc::clone(key_cache);
+            let signing_key = Arc::clone(signing_key);
+            let stage_stats = Arc::clone(stage_stats);
+            let wave2_stats = Arc::clone(wave2_stats);
+            let egress_limiter = Arc::clone(egress_limiter);
+            let send_path = send_path.clone();
+            in_flight.spawn(async move {
+                let outcome = Self::send_wire_graft_static(
+                    &transport,
+                    &key_cache,
+                    &signing_key,
+                    &stage_stats,
+                    &wave2_stats,
+                    &egress_limiter,
+                    &send_path,
+                    task.topic,
+                    task.peer,
+                    Some(task.msg_id),
+                )
+                .await;
+                Wave2SendCompletion::GraftSent {
+                    topic: task.topic,
+                    peer: task.peer,
+                    msg_id: task.msg_id,
+                    has_more_fallbacks: task.has_more_fallbacks,
+                    retry_count: task.retry_count,
+                    outcome,
+                }
+            });
+        }
+
+        for task in work.batch_tasks {
+            let cap = if task.is_critical {
+                critical_cap
+            } else {
+                WAVE2_FLUSH_MAX_CONCURRENT_SENDS
+            };
+            if in_flight.len() >= cap {
+                // Never block `tokio::select!`; pending_ihave remains intact
+                // and drains on the next tick once in-flight slots open.
+                continue;
+            }
+            if !task.is_critical {
+                *in_flight_normal_peers.entry(task.peer).or_insert(0) += 1;
+            }
+            let wire_len = task.wire.len();
+            wave2_stats
+                .unsigned_control_batches_sent
+                .fetch_add(1, Ordering::Relaxed);
+            wave2_stats
+                .unsigned_control_ops_sent
+                .fetch_add(task.op_count as u64, Ordering::Relaxed);
+            wave2_stats
+                .unsigned_control_bytes_sent
+                .fetch_add(wire_len as u64, Ordering::Relaxed);
+            let transport = Arc::clone(transport);
+            let egress_limiter = Arc::clone(egress_limiter);
+            let stage_stats = Arc::clone(stage_stats);
+            let rtt_tracker = Arc::clone(&send_path.rtt_tracker);
+            in_flight.spawn(async move {
+                let sent = Self::send_to_peer_with_timeout(
+                    transport,
+                    egress_limiter,
+                    stage_stats,
+                    rtt_tracker,
+                    PeerSendRequest {
+                        reservation: task.reservation,
+                        topic: task.primary_topic,
+                        peer: task.peer,
+                        stream_type: GossipStreamType::PubSub,
+                        bytes: task.wire,
+                        op: "IHAVE",
+                        send_timeout: None,
+                    },
+                )
+                .await
+                .is_ok_and(|o| matches!(o, PeerSendOutcome::Sent { .. }));
+                Wave2SendCompletion::BatchSent {
+                    peer: task.peer,
+                    is_critical: task.is_critical,
+                    topic_batches: task.topic_batches,
+                    sent,
+                }
+            });
+        }
+    }
+
+    async fn apply_wave2_send_completion(
+        topics: &Arc<ShardedTopicMap>,
+        graft_timers_pending: &Arc<AtomicUsize>,
+        completion: Wave2SendCompletion,
+    ) {
+        match completion {
+            Wave2SendCompletion::BatchSent {
+                peer,
+                topic_batches,
+                sent,
+                ..
+            } => {
+                if !sent {
+                    return;
+                }
+                for (topic, batch, unsampled_wave2) in topic_batches {
+                    let mut guard = topics.write_topic(&topic).await;
+                    let Some(state) = guard.get_mut(&topic) else {
+                        continue;
+                    };
+                    state.record_lazy_withheld_advertised(&batch, &[peer]);
+                    state.record_ihave_handoff(&batch, peer);
+                    state.record_stranded_ihave_advertised(&batch, peer);
+                    for u in unsampled_wave2 {
+                        state.record_ihave_handoff(&batch, u);
+                    }
+                    if Self::all_ihave_targets_done(state, &batch) {
+                        state.consume_flushed_ihave_batch(&batch);
+                    }
+                }
+            }
+            Wave2SendCompletion::GraftSent {
+                topic,
+                peer,
+                msg_id,
+                has_more_fallbacks,
+                retry_count,
+                outcome,
+            } => {
+                if has_more_fallbacks {
+                    return;
+                }
+                let Some(outcome) = outcome else {
+                    // Permanent/non-retryable skip (missing session/cap or registered topic).
+                    return;
+                };
+                let mut guard = topics.write_topic(&topic).await;
+                let Some(state) = guard.get_mut(&topic) else {
+                    return;
+                };
+                if state.has_message(&msg_id) || state.pending_graft_timers.contains_key(&msg_id) {
+                    return;
+                }
+                let now = Instant::now();
+                match outcome {
+                    PeerSendOutcome::Deferred => {
+                        if state.outstanding_iwants.len() < MAX_IHAVE_BATCH_SIZE {
+                            state.outstanding_iwants.insert(
+                                msg_id,
+                                OutstandingIwant {
+                                    peer,
+                                    requested_at: now,
+                                    retry_pending: true,
+                                    failures: retry_count,
+                                    retry_not_before: None,
+                                },
+                            );
+                            let _ = state.retain_deferred_iwant(peer, &[msg_id], now);
+                        }
+                    }
+                    PeerSendOutcome::TimedOut => {
+                        let next_retry = retry_count.saturating_add(1);
+                        let backoff = iwant_retry_backoff(next_retry);
+                        if state.outstanding_iwants.len() < MAX_IHAVE_BATCH_SIZE
+                            || state.outstanding_iwants.contains_key(&msg_id)
+                        {
+                            state.outstanding_iwants.insert(
+                                msg_id,
+                                OutstandingIwant {
+                                    peer,
+                                    requested_at: now,
+                                    retry_pending: false,
+                                    failures: next_retry,
+                                    retry_not_before: Some(now + backoff),
+                                },
+                            );
+                        }
+                        // Hard-bounded by `PendingGraftTimer.retry_count < 2`
+                        // independent of `outstanding_iwants` capacity.
+                        if retry_count < 2
+                            && state.pending_graft_timers.len() < MAX_IHAVE_BATCH_SIZE
+                        {
+                            state.pending_graft_timers.insert(
+                                msg_id,
+                                PendingGraftTimer {
+                                    deadline: now + backoff,
+                                    current_peer: peer,
+                                    fallback_peers: VecDeque::new(),
+                                    attempted_primary: true,
+                                    retry_count: next_retry,
+                                },
+                            );
+                            graft_timers_pending.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    PeerSendOutcome::NotConnected => {
+                        // Record backoff so another advertiser can take over,
+                        // without spinning retry timers against a disconnected peer.
+                        let next_retry = retry_count.saturating_add(1);
+                        let backoff = iwant_retry_backoff(next_retry);
+                        if state.outstanding_iwants.len() < MAX_IHAVE_BATCH_SIZE
+                            || state.outstanding_iwants.contains_key(&msg_id)
+                        {
+                            state.outstanding_iwants.insert(
+                                msg_id,
+                                OutstandingIwant {
+                                    peer,
+                                    requested_at: now,
+                                    retry_pending: false,
+                                    failures: next_retry,
+                                    retry_not_before: Some(now + backoff),
+                                },
+                            );
+                        }
+                    }
+                    PeerSendOutcome::Sent { .. } => {
+                        if state.outstanding_iwants.len() < MAX_IHAVE_BATCH_SIZE
+                            && !state.outstanding_iwants.contains_key(&msg_id)
+                        {
+                            state.outstanding_iwants.insert(
+                                msg_id,
+                                OutstandingIwant {
+                                    peer,
+                                    requested_at: now,
+                                    retry_pending: false,
+                                    failures: retry_count,
+                                    retry_not_before: Some(now + Duration::from_millis(500)),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Test/diagnostic driver for deterministic Wave 2 GRAFT timer and
+    /// unsigned coalesced control flush ticks.
+    #[cfg(test)]
+    async fn drive_wave2_flush_at(&self, now: Instant, include_normal_bulk: bool, tick: u64) {
+        let send_path = self.send_path_context();
+        let mut in_flight_normal_peers = HashMap::new();
+        let work = Self::prepare_wave2_flush_work(
+            &self.topics,
+            &self.transport,
+            &self.key_cache,
+            &self.stage_stats,
+            &self.egress_limiter,
+            &send_path,
+            &self.confirmed_wave2_sessions,
+            &self.wave2_graft_timers_pending,
+            &self.wave2_critical_ihave_pending,
+            &in_flight_normal_peers,
+            now,
+            include_normal_bulk,
+            tick,
+        )
+        .await;
+        let mut in_flight = tokio::task::JoinSet::new();
+        Self::spawn_wave2_work_into(
+            &mut in_flight,
+            &mut in_flight_normal_peers,
+            &self.transport,
+            &self.key_cache,
+            &self.signing_key,
+            &self.stage_stats,
+            &self.wave2_stats,
+            &self.egress_limiter,
+            &send_path,
+            work,
+        );
+        while let Some(completed) = in_flight.join_next().await {
+            if let Ok(completion) = completed {
+                Self::apply_wave2_send_completion(
+                    &self.topics,
+                    &self.wave2_graft_timers_pending,
+                    completion,
+                )
+                .await;
+            }
+        }
     }
     async fn flush_ihave_batches(
         topics: &Arc<ShardedTopicMap>,
@@ -12638,49 +15518,110 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 ihave_targets.push(peer);
                             }
                         }
-                        // Only meaningful when an advert could have been
-                        // byte-deferred, i.e. under ShedNormal.
-                        if env.egress_limiter.enforcing() {
-                            ihave_targets.retain(|peer| state.ihave_target_pending(&batch, *peer));
+                        // Wave 2 (#137): peers with negotiated unsigned 1-hop
+                        // control are served by `prepare_wave2_flush_work`
+                        // (<= 20 ms for Critical, 300 ms coalesced cross-topic
+                        // for Normal/Bulk); keep signed 100 ms legacy IHAVEs
+                        // strictly for non-Wave-2 peers or registered topics.
+                        let unregistered = !transport.migration.registered(*topic_id);
+                        if unregistered {
+                            ihave_targets
+                                .retain(|peer| !transport.supports_unsigned_control_v1(*peer));
                         }
-                        let local_origin = batch.iter().any(|id| {
-                            state
-                                .message_cache
-                                .lru
-                                .peek(id)
-                                .is_some_and(|cached| cached.message.local_origin)
-                        });
-                        work.push(IhaveFlushWork {
-                            topic: *topic_id,
-                            batch,
-                            targets: ihave_targets,
-                            late_offer: None,
-                            kind: MessageKind::IHave,
-                            local_origin,
-                            retained_announce: false,
-                        });
+                        // Never advertise cached v3 content-bound IDs to legacy
+                        // peers lacking CAP_CONTENT_BOUND_MSG_ID (they cannot
+                        // decode v3 headers and would waste IWANT pulls).
+                        let mut legacy_batch = batch.clone();
+                        if unregistered && !ihave_targets.is_empty() {
+                            let mut v3_ids = Vec::new();
+                            legacy_batch.retain(|id| {
+                                let is_v3 = state
+                                    .message_cache
+                                    .lru
+                                    .peek(id)
+                                    .is_some_and(|cached| cached.message.header.version == 3);
+                                if is_v3 {
+                                    v3_ids.push(*id);
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                            if !v3_ids.is_empty() {
+                                for &peer in &ihave_targets {
+                                    if !transport.supports_content_bound_msg_id(peer) {
+                                        state.record_ihave_handoff(&v3_ids, peer);
+                                    }
+                                }
+                            }
+                        }
+                        // Only meaningful when an advert could have been
+                        // byte-deferred or partially handed off across passes.
+                        if env.egress_limiter.enforcing() || unregistered {
+                            ihave_targets
+                                .retain(|peer| state.ihave_target_pending(&legacy_batch, *peer));
+                        }
+                        if unregistered
+                            && (ihave_targets.is_empty() || legacy_batch.is_empty())
+                            && Self::all_ihave_targets_done(state, &batch)
+                        {
+                            state.consume_flushed_ihave_batch(&batch);
+                        } else if !legacy_batch.is_empty() {
+                            let local_origin = legacy_batch.iter().any(|id| {
+                                state
+                                    .message_cache
+                                    .lru
+                                    .peek(id)
+                                    .is_some_and(|cached| cached.message.local_origin)
+                            });
+                            work.push(IhaveFlushWork {
+                                topic: *topic_id,
+                                batch: legacy_batch,
+                                targets: ihave_targets,
+                                late_offer: None,
+                                kind: MessageKind::IHave,
+                                local_origin,
+                                retained_announce: false,
+                            });
+                        }
                     }
 
                     // Issue #104 (PR #106 review r1): retained announce
                     // targets whose batch was already consumed get their own
                     // IHAVE until each handoff succeeds or the entry expires.
-                    if let Some((batch, targets)) = state.retained_announce_work() {
-                        let local_origin = batch.iter().any(|id| {
-                            state
-                                .message_cache
-                                .lru
-                                .peek(id)
-                                .is_some_and(|cached| cached.message.local_origin)
-                        });
-                        work.push(IhaveFlushWork {
-                            topic: *topic_id,
-                            batch,
-                            targets,
-                            late_offer: None,
-                            kind: MessageKind::IHave,
-                            local_origin,
-                            retained_announce: true,
-                        });
+                    if let Some((mut batch, targets)) = state.retained_announce_work() {
+                        if !transport.migration.registered(*topic_id) {
+                            let all_legacy = targets
+                                .iter()
+                                .all(|peer| !transport.supports_content_bound_msg_id(*peer));
+                            if all_legacy {
+                                batch.retain(|id| {
+                                    !state
+                                        .message_cache
+                                        .lru
+                                        .peek(id)
+                                        .is_some_and(|cached| cached.message.header.version == 3)
+                                });
+                            }
+                        }
+                        if !batch.is_empty() {
+                            let local_origin = batch.iter().any(|id| {
+                                state
+                                    .message_cache
+                                    .lru
+                                    .peek(id)
+                                    .is_some_and(|cached| cached.message.local_origin)
+                            });
+                            work.push(IhaveFlushWork {
+                                topic: *topic_id,
+                                batch,
+                                targets,
+                                late_offer: None,
+                                kind: MessageKind::IHave,
+                                local_origin,
+                                retained_announce: true,
+                            });
+                        }
                     }
 
                     // S3 bounds: offers under a failure backoff are
@@ -12835,6 +15776,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             let mut ihave_header = MessageHeader {
                 version: 1,
                 payload_hash: None,
+                created_at_secs: None,
                 topic: topic_id,
                 msg_id: batch[0],
                 kind,
@@ -13051,10 +15993,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             state.record_ihave_handoff(&batch, peer);
                             state.record_stranded_ihave_advertised(&batch, peer);
                         }
-                        let all_handed_off = !env.egress_limiter.enforcing()
-                            || intended_targets
-                                .iter()
-                                .all(|peer| !state.ihave_target_pending(&batch, *peer));
+                        let wave2_still_pending = !transport.migration.registered(topic_id)
+                            && state.lazy_peers.iter().copied().any(|peer| {
+                                transport.supports_unsigned_control_v1(peer)
+                                    && state.ihave_target_pending(&batch, peer)
+                            });
+                        let all_handed_off = !wave2_still_pending
+                            && (!env.egress_limiter.enforcing()
+                                || intended_targets
+                                    .iter()
+                                    .all(|peer| !state.ihave_target_pending(&batch, *peer)));
                         if budget_deferred.is_empty() && all_handed_off {
                             state.consume_flushed_ihave_batch(&batch);
                         }
@@ -13151,6 +16099,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     continue;
                 };
                 state.prune_deferred_eager_replies(Instant::now());
+                if state.peer_does_not_want(entry.peer, &entry.msg_id, Instant::now()) {
+                    state
+                        .deferred_eager_replies
+                        .retain(|e| e.peer != entry.peer || e.msg_id != entry.msg_id);
+                    continue;
+                }
                 if !state.deferred_eager_replies.contains(&entry)
                     || state.eager_reply_claimed(entry.peer, entry.msg_id)
                 {
@@ -13184,15 +16138,16 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             {
                 continue;
             }
-            if transport
-                .migration
-                .admit_cache_serve(
-                    topic,
-                    cached.payload.len()
-                        + MESSAGE_CRYPTO_OVERHEAD_BYTES
-                        + MESSAGE_HEADER_OVERHEAD_BYTES,
-                )
-                .is_err()
+            if (cached.header.version == 3 && !transport.supports_content_bound_msg_id(entry.peer))
+                || transport
+                    .migration
+                    .admit_cache_serve(
+                        topic,
+                        cached.payload.len()
+                            + MESSAGE_CRYPTO_OVERHEAD_BYTES
+                            + MESSAGE_HEADER_OVERHEAD_BYTES,
+                    )
+                    .is_err()
                 || !forwardable_payload("iwant_serve", &entry.msg_id, &cached.payload)
             {
                 let mut guard = topics.write_topic(&topic).await;
@@ -13479,11 +16434,15 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     return;
                 }
                 let served = state.stranded_ihave_served_peers(&msg_id).to_vec();
+                let is_v3 = bytes.first() == Some(&3);
                 let retry_targets: Vec<PeerId> = state
                     .eager_peers
                     .iter()
                     .copied()
-                    .filter(|peer| !served.contains(peer))
+                    .filter(|peer| {
+                        !served.contains(peer)
+                            && (!is_v3 || ctx.transport.supports_content_bound_msg_id(*peer))
+                    })
                     .collect();
                 let retry_already_delivered = state
                     .stranded_ihave
@@ -13762,6 +16721,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         let topics = self.topics.clone();
         let stage_stats = Arc::clone(&self.stage_stats);
         let peer_scoring = Arc::clone(&self.peer_scoring);
+        let graft_timers_pending = Arc::clone(&self.wave2_graft_timers_pending);
         let topic_idle_ttl = Duration::from_secs(TOPIC_IDLE_TTL_SECS);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -13784,12 +16744,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 let cleanup_now = Instant::now();
                 let mut removed_suppressions = 0;
                 let mut idle_topics = Vec::new();
+                let mut remaining_graft_timers = 0usize;
                 let mut topics_guard = topics.write_all().await;
                 for shard in topics_guard.iter_mut() {
                     removed_suppressions +=
                         clean_expired_peer_cooling(shard, &stage_stats, cleanup_now);
                     idle_topics.extend(clean_and_reap_topic_ids(shard, topic_idle_ttl));
+                    remaining_graft_timers = remaining_graft_timers.saturating_add(
+                        shard
+                            .values()
+                            .map(|s| s.pending_graft_timers.len())
+                            .sum::<usize>(),
+                    );
                 }
+                graft_timers_pending.store(remaining_graft_timers, Ordering::Release);
                 let idle_count = idle_topics.len();
                 let after_suppression_len = stage_stats.suppressed_peer_count();
                 drop(topics_guard);
@@ -13985,48 +16953,62 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
                 // Send digests without holding the lock
                 for (topic_id, peer, msg_ids) in work {
-                    let ae_payload = AntiEntropyPayload::Digest { msg_ids };
-                    let payload_bytes = match postcard::to_stdvec(&ae_payload) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            warn!("Anti-entropy: failed to serialize payload: {}", e);
-                            continue;
-                        }
+                    let priority = send_path.admission.registry().priority_for(&topic_id);
+                    let wire_bytes: Option<Bytes> = if !transport.migration.registered(topic_id)
+                        && transport.supports_unsigned_control_v1(peer)
+                    {
+                        let mut capped = msg_ids;
+                        capped.truncate(control_batch::MAX_IDS_PER_CONTROL_OP);
+                        control_batch::encode_control_batch(vec![
+                            control_batch::HopControlOp::AntiEntropyDigest {
+                                topic: topic_id,
+                                msg_ids: capped,
+                            },
+                        ])
+                        .ok()
+                    } else {
+                        let ae_payload = AntiEntropyPayload::Digest { msg_ids };
+                        let payload_bytes = match postcard::to_stdvec(&ae_payload) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                warn!("Anti-entropy: failed to serialize payload: {}", e);
+                                continue;
+                            }
+                        };
+
+                        // ADR-012: the AE payload is covered by the sealed
+                        // header hash.
+                        let mut header = MessageHeader {
+                            version: 1,
+                            payload_hash: None,
+                            created_at_secs: None,
+                            topic: topic_id,
+                            msg_id: [0u8; 32],
+                            kind: MessageKind::AntiEntropy,
+                            hop: 0,
+                            ttl: 1,
+                        };
+                        let ae_payload_bytes: Bytes = payload_bytes.into();
+                        header.seal_payload_hash(Some(ae_payload_bytes.as_ref()));
+
+                        let signature = match postcard::to_stdvec(&header) {
+                            Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
+                            Err(_) => Vec::new(),
+                        };
+
+                        let message = GossipMessage {
+                            header,
+                            payload: Some(ae_payload_bytes),
+                            signature,
+                            public_key: signing_key.public_key().to_vec(),
+                        };
+
+                        postcard::to_stdvec(&message)
+                            .ok()
+                            .map(|b| transport.wire_bytes_for_peer(peer, &Bytes::from(b), priority))
                     };
 
-                    // ADR-012: the AE payload is covered by the sealed
-                    // header hash.
-                    let mut header = MessageHeader {
-                        version: 1,
-                        payload_hash: None,
-                        topic: topic_id,
-                        msg_id: [0u8; 32],
-                        kind: MessageKind::AntiEntropy,
-                        hop: 0,
-                        ttl: 1,
-                    };
-                    let ae_payload_bytes: Bytes = payload_bytes.into();
-                    header.seal_payload_hash(Some(ae_payload_bytes.as_ref()));
-
-                    let signature = match postcard::to_stdvec(&header) {
-                        Ok(bytes) => signing_key.sign(&bytes).unwrap_or_default(),
-                        Err(_) => Vec::new(),
-                    };
-
-                    let message = GossipMessage {
-                        header,
-                        payload: Some(ae_payload_bytes),
-                        signature,
-                        public_key: signing_key.public_key().to_vec(),
-                    };
-
-                    if let Ok(bytes) = postcard::to_stdvec(&message) {
-                        let bytes: Bytes = bytes.into();
-                        let bytes = transport.wire_bytes_for_peer(
-                            peer,
-                            &bytes,
-                            send_path.admission.registry().priority_for(&topic_id),
-                        );
+                    if let Some(bytes) = wire_bytes {
                         let (mut budgeted, _) = Self::reserve_recovery_targets(
                             &egress_limiter,
                             topic_id,
@@ -14035,7 +17017,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                             &bytes,
                             // A digest of ids: no payload custody to protect.
                             false,
-                            send_path.admission.registry().priority_for(&topic_id),
+                            priority,
                         );
                         let Some((_, reservation)) = budgeted.pop() else {
                             continue;
@@ -14476,7 +17458,12 @@ impl<T: GossipTransport + 'static> PubSub for PlumtreePubSub<T> {
 
     async fn unsubscribe(&self, topic: TopicId) -> Result<()> {
         let mut topics = self.topics.write_topic(&topic).await;
-        topics.remove(&topic);
+        if let Some(removed) = topics.remove(&topic) {
+            Self::decrement_graft_timers_pending(
+                &self.wave2_graft_timers_pending,
+                removed.pending_graft_timers.len(),
+            );
+        }
         drop(topics);
         self.stage_stats.clear_topic_suppressions(topic);
         Ok(())
@@ -14578,6 +17565,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -14604,6 +17592,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind,
@@ -15720,6 +18709,7 @@ mod tests {
             header: MessageHeader {
                 version: 1,
                 payload_hash: None,
+                created_at_secs: None,
                 topic,
                 msg_id,
                 kind,
@@ -15746,6 +18736,7 @@ mod tests {
         MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -15987,7 +18978,11 @@ mod tests {
             );
         }
 
-        fn send_count_to(&self, peer: PeerId) -> usize {
+        pub(super) fn clear_session(&self, peer: PeerId) {
+            self.sessions.lock().expect("sessions lock").remove(&peer);
+        }
+
+        pub(super) fn send_count_to(&self, peer: PeerId) -> usize {
             self.send_counts
                 .lock()
                 .expect("send counts lock")
@@ -15997,7 +18992,7 @@ mod tests {
         }
 
         /// All recorded outbound frames, in send order (#59).
-        fn sent_frames(&self) -> Vec<(PeerId, GossipStreamType, Bytes)> {
+        pub(super) fn sent_frames(&self) -> Vec<(PeerId, GossipStreamType, Bytes)> {
             self.frames.lock().expect("sent frames lock").clone()
         }
 
@@ -20845,6 +23840,7 @@ mod tests {
         let mut header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::IHave,
@@ -22642,6 +25638,7 @@ mod tests {
         let mut header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -22734,6 +25731,7 @@ mod tests {
         let mut header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: claimed_id,
             kind: MessageKind::Eager,
@@ -23606,6 +26604,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -23632,6 +26631,7 @@ mod tests {
         let bad_header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: bad_msg_id,
             kind: MessageKind::Eager,
@@ -23724,6 +26724,7 @@ mod tests {
         let mut header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -23788,6 +26789,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -23834,6 +26836,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -26165,6 +29168,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -26213,6 +29217,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -26791,6 +29796,7 @@ mod tests {
         let mut header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: [0x55; 32],
             kind,
@@ -28615,6 +31621,7 @@ mod tests {
         let mut header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: id,
             kind: MessageKind::IHave,
@@ -29030,6 +32037,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -29298,6 +32306,7 @@ mod tests {
             let header = MessageHeader {
                 version: 1,
                 payload_hash: None,
+                created_at_secs: None,
                 topic,
                 msg_id,
                 kind: MessageKind::Eager,
@@ -29398,6 +32407,7 @@ mod tests {
             let header = MessageHeader {
                 version: 1,
                 payload_hash: None,
+                created_at_secs: None,
                 topic,
                 msg_id: known_msg_id,
                 kind: MessageKind::Eager,
@@ -29440,6 +32450,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::Eager,
@@ -29476,6 +32487,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: [1u8; 32],
             kind: MessageKind::Eager,
@@ -29523,6 +32535,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::Eager,
@@ -29665,6 +32678,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -29713,6 +32727,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -29754,6 +32769,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -29793,6 +32809,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -29830,6 +32847,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: [0u8; 32],
             kind: MessageKind::AntiEntropy,
@@ -30131,6 +33149,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -30212,6 +33231,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: unknown_msg_id,
             kind: MessageKind::Eager,
@@ -31635,6 +34655,7 @@ mod tests {
         let header1 = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: msg_id_1,
             kind: MessageKind::Eager,
@@ -31666,6 +34687,7 @@ mod tests {
         let header2 = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id: msg_id_2,
             kind: MessageKind::Eager,
@@ -31754,6 +34776,7 @@ mod tests {
         let header = MessageHeader {
             version: 1,
             payload_hash: None,
+            created_at_secs: None,
             topic,
             msg_id,
             kind: MessageKind::Eager,
@@ -33073,6 +36096,7 @@ mod tests {
             let header = MessageHeader {
                 version: 1,
                 payload_hash: None,
+                created_at_secs: None,
                 topic,
                 msg_id,
                 kind: MessageKind::Eager,
@@ -33234,6 +36258,7 @@ mod tests {
             let mut header = MessageHeader {
                 version: 1,
                 payload_hash: None,
+                created_at_secs: None,
                 topic,
                 msg_id,
                 kind: MessageKind::Eager,
@@ -33517,6 +36542,7 @@ mod tests {
             let mut header = MessageHeader {
                 version: 1,
                 payload_hash: None,
+                created_at_secs: None,
                 topic,
                 msg_id,
                 kind: MessageKind::Eager,
@@ -35520,6 +38546,1784 @@ mod wave1_136_tests {
                 .expect("kc")
                 .supports_ref(s2_rev, author_id),
             "peer2 can now compress author_id frames to 32 B references"
+        );
+    }
+
+    /// Helper: complete mutual `Hello` + `Capabilities` handshake between two
+    /// `PlumtreePubSub<RecordingTransport>` nodes for session generation `gen`.
+    async fn negotiate_wave2_pair(
+        a: &PlumtreePubSub<RecordingTransport>,
+        a_transport: &RecordingTransport,
+        b: &PlumtreePubSub<RecordingTransport>,
+        b_transport: &RecordingTransport,
+        gen: u64,
+        now: Instant,
+    ) {
+        a_transport.set_session(b.peer_id, gen);
+        b_transport.set_session(a.peer_id, gen);
+        let sa = saorsa_gossip_transport::AuthenticatedSession {
+            peer: b.peer_id,
+            generation: gen,
+        };
+        let sb = saorsa_gossip_transport::AuthenticatedSession {
+            peer: a.peer_id,
+            generation: gen,
+        };
+        a.key_cache.lock().expect("kc").observe_session(sa, now);
+        b.key_cache.lock().expect("kc").observe_session(sb, now);
+        for _ in 0..4 {
+            // Drain Hello, Capabilities, and Capabilities confirmation echo in both directions.
+            let a_ctrl = a.key_cache.lock().expect("kc").next_control(sa, now);
+            if let Some(ctrl) = a_ctrl {
+                PlumtreePubSub::<RecordingTransport>::send_key_cache_control(
+                    &a.transport,
+                    &a.signing_key,
+                    &a.egress_limiter,
+                    &a.stage_stats,
+                    sa,
+                    ctrl.clone(),
+                )
+                .await
+                .expect("a control send");
+                a.key_cache
+                    .lock()
+                    .expect("kc")
+                    .control_result(sa, &ctrl, true);
+                let wire = a_transport.sent_frames().last().expect("frame").2.clone();
+                let _ = b.handle_authenticated_message(sb, wire).await;
+            }
+            let b_ctrl = b.key_cache.lock().expect("kc").next_control(sb, now);
+            if let Some(ctrl) = b_ctrl {
+                PlumtreePubSub::<RecordingTransport>::send_key_cache_control(
+                    &b.transport,
+                    &b.signing_key,
+                    &b.egress_limiter,
+                    &b.stage_stats,
+                    sb,
+                    ctrl.clone(),
+                )
+                .await
+                .expect("b control send");
+                b.key_cache
+                    .lock()
+                    .expect("kc")
+                    .control_result(sb, &ctrl, true);
+                let wire = b_transport.sent_frames().last().expect("frame").2.clone();
+                let _ = a.handle_authenticated_message(sa, wire).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wave2_wire_prune_demotes_sender_with_backoff_and_respects_legacy_gating() {
+        let now = Instant::now();
+        let a_key = test_signing_key();
+        let b_key = test_signing_key();
+        let c_key = test_signing_key();
+        let legacy_key = test_signing_key();
+        let author_key = test_signing_key();
+
+        let a_tr = RecordingTransport::new(a_key.peer_id());
+        let b_tr = RecordingTransport::new(b_key.peer_id());
+        let legacy_tr = RecordingTransport::new(legacy_key.peer_id());
+
+        let a =
+            PlumtreePubSub::new_with_task_control(a_key.peer_id(), Arc::clone(&a_tr), a_key, false);
+        let b =
+            PlumtreePubSub::new_with_task_control(b_key.peer_id(), Arc::clone(&b_tr), b_key, false);
+        let legacy = PlumtreePubSub::new_with_task_control(
+            legacy_key.peer_id(),
+            Arc::clone(&legacy_tr),
+            legacy_key,
+            false,
+        );
+        legacy.set_wave2_capabilities_enabled(false);
+
+        negotiate_wave2_pair(&a, &a_tr, &b, &b_tr, 1, now).await;
+        negotiate_wave2_pair(&a, &a_tr, &legacy, &legacy_tr, 1, now).await;
+
+        assert!(a.peer_supports_cap(b.peer_id, key_cache::CAP_WIRE_PRUNE_GRAFT));
+        assert!(a.peer_supports_cap(b.peer_id, key_cache::CAP_UNSIGNED_CONTROL_V1));
+        assert!(
+            !a.peer_supports_cap(legacy.peer_id, key_cache::CAP_WIRE_PRUNE_GRAFT),
+            "legacy 0.5.97 peer must never gain Wave 2 capability"
+        );
+
+        let topic = TopicId::new([0x51; 32]);
+        {
+            let mut guard = a.topics.write_topic(&topic).await;
+            let state = guard.entry(topic).or_insert_with(|| a.new_topic_state());
+            state.eager_peers.insert(b.peer_id);
+            state.eager_peers.insert(c_key.peer_id());
+            state.eager_peers.insert(legacy.peer_id);
+        }
+        {
+            let mut guard = b.topics.write_topic(&topic).await;
+            let state = guard.entry(topic).or_insert_with(|| b.new_topic_state());
+            state.eager_peers.insert(a.peer_id);
+            state.eager_peers.insert(c_key.peer_id());
+        }
+
+        // First copy from c_key caches the message on A.
+        let msg = key_cache_eager(&author_key, topic, 1, b"small-dup");
+        let wire: Bytes = postcard::to_stdvec(&msg).expect("wire").into();
+        a.handle_eager(c_key.peer_id(), topic, msg.clone())
+            .await
+            .expect("first delivery");
+
+        // Duplicate from Wave-2 peer B -> A demotes B and emits compact unsigned PRUNE to B.
+        let b_frames_before = a_tr.sent_frames().len();
+        let sb_on_a = saorsa_gossip_transport::AuthenticatedSession {
+            peer: b.peer_id,
+            generation: 1,
+        };
+        a.handle_authenticated_message(sb_on_a, wire.clone())
+            .await
+            .expect("dup from b");
+        let new_frames = &a_tr.sent_frames()[b_frames_before..];
+        let prune_wire = new_frames
+            .iter()
+            .find(|(peer, _, bytes)| *peer == b.peer_id && control_batch::is_control_batch(bytes))
+            .map(|(_, _, bytes)| bytes.clone())
+            .expect("expected unsigned wire PRUNE to Wave-2 peer B");
+        assert!(
+            prune_wire.len() < 64,
+            "unsigned PRUNE should be tiny (<64 B), got {} B",
+            prune_wire.len()
+        );
+        assert_eq!(a.wave2_stats().wire_prune_sent, 1);
+
+        // B receives the unsigned PRUNE with ZERO ML-DSA verify and demotes A eager -> lazy + 10 s backoff.
+        let b_verifies_before = b
+            .verify_by_kind_stats()
+            .for_kind(MessageKind::Prune)
+            .attempts;
+        let sa_on_b = saorsa_gossip_transport::AuthenticatedSession {
+            peer: a.peer_id,
+            generation: 1,
+        };
+        b.handle_authenticated_message(sa_on_b, prune_wire)
+            .await
+            .expect("b handles prune");
+        assert_eq!(
+            b.verify_by_kind_stats()
+                .for_kind(MessageKind::Prune)
+                .attempts,
+            b_verifies_before,
+            "unsigned 1-hop PRUNE must not spend ML-DSA verify CPU"
+        );
+        assert_eq!(b.wave2_stats().wire_prune_received, 1);
+        {
+            let guard = b.topics.read_topic(&topic).await;
+            let state = guard.get(&topic).expect("topic");
+            assert!(!state.eager_peers.contains(&a.peer_id));
+            assert!(state.lazy_peers.contains(&a.peer_id));
+            assert!(
+                state.prune_backoff.contains_key(&a.peer_id),
+                "wire PRUNE must arm 10 s duplicate prune backoff"
+            );
+        }
+
+        // Duplicate from legacy 0.5.97 peer -> local demotion only, ZERO wire PRUNE sent!
+        let frames_before_legacy = a_tr.sent_frames().len();
+        let sl_on_a = saorsa_gossip_transport::AuthenticatedSession {
+            peer: legacy.peer_id,
+            generation: 1,
+        };
+        a.handle_authenticated_message(sl_on_a, wire)
+            .await
+            .expect("dup from legacy");
+        assert_eq!(
+            a_tr.sent_frames()[frames_before_legacy..]
+                .iter()
+                .filter(|(peer, _, _)| *peer == legacy.peer_id)
+                .count(),
+            0,
+            "legacy 0.5.97 peer must never receive Wave 2 wire PRUNE"
+        );
+    }
+
+    #[tokio::test]
+    async fn wave2_graft_timers_80ms_primary_40ms_fallback_and_eager_cancel() {
+        let t0 = Instant::now();
+        let recv_key = test_signing_key();
+        let p1_key = test_signing_key();
+        let p2_key = test_signing_key();
+        let author_key = test_signing_key();
+
+        let recv_tr = RecordingTransport::new(recv_key.peer_id());
+        let p1_tr = RecordingTransport::new(p1_key.peer_id());
+        let p2_tr = RecordingTransport::new(p2_key.peer_id());
+
+        let recv = PlumtreePubSub::new_with_task_control(
+            recv_key.peer_id(),
+            Arc::clone(&recv_tr),
+            recv_key,
+            false,
+        );
+        let p1 = PlumtreePubSub::new_with_task_control(
+            p1_key.peer_id(),
+            Arc::clone(&p1_tr),
+            p1_key,
+            false,
+        );
+        let p2 = PlumtreePubSub::new_with_task_control(
+            p2_key.peer_id(),
+            Arc::clone(&p2_tr),
+            p2_key,
+            false,
+        );
+
+        negotiate_wave2_pair(&recv, &recv_tr, &p1, &p1_tr, 1, t0).await;
+        negotiate_wave2_pair(&recv, &recv_tr, &p2, &p2_tr, 1, t0).await;
+
+        let topic = TopicId::new([0x52; 32]);
+        // Seed P2 with a cached EAGER message (with origin auth) so GRAFT repair serves verbatim.
+        let msg_repair = key_cache_eager(&author_key, topic, 2, b"graft-repaired-payload");
+        let id_repair = msg_repair.header.msg_id;
+        p2.handle_eager(author_key.peer_id(), topic, msg_repair.clone())
+            .await
+            .expect("seed p2");
+        {
+            let mut guard = p2.topics.write_topic(&topic).await;
+            let state = guard.get_mut(&topic).expect("topic");
+            state.eager_peers.remove(&recv.peer_id);
+            state.lazy_peers.insert(recv.peer_id);
+        }
+
+        // Case 1: IHAVE arrives from P1, then EAGER arrives before 80 ms -> timer cancelled, ZERO GRAFT!
+        let msg_fast = key_cache_eager(&author_key, topic, 1, b"eager-arrived-fast");
+        let id_fast = msg_fast.header.msg_id;
+        let frames_before = recv_tr.sent_frames().len();
+        recv.handle_ihave_admitted(p1.peer_id, topic, vec![id_fast])
+            .await
+            .expect("ihave fast");
+        assert_eq!(recv.wave2_stats().graft_timer_armed, 1);
+        assert_eq!(
+            recv_tr.sent_frames().len(),
+            frames_before,
+            "Wave-2 IHAVE must arm 80 ms GRAFT timer instead of immediate IWANT"
+        );
+        recv.handle_eager(p1.peer_id, topic, msg_fast)
+            .await
+            .expect("eager cancels timer");
+        assert_eq!(recv.wave2_stats().graft_timer_cancelled_by_eager, 1);
+        recv.drive_wave2_flush_at(t0 + Duration::from_millis(200), false, 1)
+            .await;
+        assert_eq!(recv.wave2_stats().wire_graft_sent, 0);
+
+        // Case 2: IHAVE(id_repair) arrives from P1 (primary) then P2 (fallback).
+        let base = Instant::now();
+        recv.handle_ihave_admitted(p1.peer_id, topic, vec![id_repair])
+            .await
+            .expect("ihave primary");
+        recv.handle_ihave_admitted(p2.peer_id, topic, vec![id_repair])
+            .await
+            .expect("ihave fallback");
+        assert_eq!(recv.wave2_stats().graft_timer_armed, 2);
+
+        // Before 80 ms: nothing fires.
+        recv.drive_wave2_flush_at(base + Duration::from_millis(70), false, 2)
+            .await;
+        assert_eq!(recv.wave2_stats().graft_timer_primary_fired, 0);
+
+        // At 80 ms: primary GRAFT fires to P1; fallback re-arms for +120 ms (above WAN RTT).
+        let before_primary = recv_tr.sent_frames().len();
+        recv.drive_wave2_flush_at(base + Duration::from_millis(85), false, 3)
+            .await;
+        assert_eq!(recv.wave2_stats().graft_timer_primary_fired, 1);
+        assert_eq!(recv.wave2_stats().graft_timer_fallback_fired, 0);
+        assert!(recv_tr.sent_frames()[before_primary..]
+            .iter()
+            .any(|(peer, _, wire)| *peer == p1.peer_id && control_batch::is_control_batch(wire)));
+
+        // At +100 ms after primary (185 ms): fallback has not fired yet.
+        recv.drive_wave2_flush_at(base + Duration::from_millis(185), false, 4)
+            .await;
+        assert_eq!(recv.wave2_stats().graft_timer_fallback_fired, 0);
+
+        // At +120 ms after primary (210 ms): fallback GRAFT fires to P2.
+        let before_fallback = recv_tr.sent_frames().len();
+        recv.drive_wave2_flush_at(base + Duration::from_millis(210), false, 5)
+            .await;
+        assert_eq!(recv.wave2_stats().graft_timer_fallback_fired, 1);
+        let graft_to_p2 = recv_tr.sent_frames()[before_fallback..]
+            .iter()
+            .find(|(peer, _, wire)| *peer == p2.peer_id && control_batch::is_control_batch(wire))
+            .map(|(_, _, wire)| wire.clone())
+            .expect("fallback GRAFT to P2");
+
+        // P2 handles GRAFT -> promotes recv lazy -> eager AND serves cached EAGER verbatim.
+        let p2_sent_before = p2_tr.sent_frames().len();
+        let s_recv_on_p2 = saorsa_gossip_transport::AuthenticatedSession {
+            peer: recv.peer_id,
+            generation: 1,
+        };
+        p2.handle_authenticated_message(s_recv_on_p2, graft_to_p2)
+            .await
+            .expect("p2 handles graft");
+        assert_eq!(p2.wave2_stats().wire_graft_received, 1);
+        {
+            let guard = p2.topics.read_topic(&topic).await;
+            let state = guard.get(&topic).expect("topic");
+            assert!(
+                state.eager_peers.contains(&recv.peer_id),
+                "GRAFT must promote requester from lazy to eager"
+            );
+        }
+        let repaired_eager = p2_tr.sent_frames()[p2_sent_before..]
+            .iter()
+            .find(|(peer, _, _)| *peer == recv.peer_id)
+            .map(|(_, _, wire)| wire.clone())
+            .expect("P2 must serve cached EAGER on GRAFT(msg_id)");
+        let s_p2_on_recv = saorsa_gossip_transport::AuthenticatedSession {
+            peer: p2.peer_id,
+            generation: 1,
+        };
+        recv.handle_authenticated_message(s_p2_on_recv, repaired_eager)
+            .await
+            .expect("recv accepts repaired eager");
+        assert!(recv
+            .topics
+            .read_topic(&topic)
+            .await
+            .get(&topic)
+            .expect("topic")
+            .has_message(&id_repair));
+    }
+
+    #[tokio::test]
+    async fn wave2_idontwant_emits_for_large_payloads_and_suppresses_duplicate_eager_push() {
+        let now = Instant::now();
+        let a_key = test_signing_key();
+        let b_key = test_signing_key();
+        let c_key = test_signing_key();
+        let d_key = test_signing_key();
+        let author_key = test_signing_key();
+
+        let a_tr = RecordingTransport::new(a_key.peer_id());
+        let b_tr = RecordingTransport::new(b_key.peer_id());
+        let c_tr = RecordingTransport::new(c_key.peer_id());
+        let d_tr = RecordingTransport::new(d_key.peer_id());
+
+        let a =
+            PlumtreePubSub::new_with_task_control(a_key.peer_id(), Arc::clone(&a_tr), a_key, false);
+        let b =
+            PlumtreePubSub::new_with_task_control(b_key.peer_id(), Arc::clone(&b_tr), b_key, false);
+        let c =
+            PlumtreePubSub::new_with_task_control(c_key.peer_id(), Arc::clone(&c_tr), c_key, false);
+        let d =
+            PlumtreePubSub::new_with_task_control(d_key.peer_id(), Arc::clone(&d_tr), d_key, false);
+
+        negotiate_wave2_pair(&b, &b_tr, &c, &c_tr, 1, now).await;
+        negotiate_wave2_pair(&b, &b_tr, &d, &d_tr, 1, now).await;
+
+        let topic = TopicId::new([0x53; 32]);
+        for node in [&b, &c] {
+            let mut guard = node.topics.write_topic(&topic).await;
+            let state = guard.entry(topic).or_insert_with(|| node.new_topic_state());
+            state.eager_peers.insert(a.peer_id);
+            state.eager_peers.insert(b.peer_id);
+            state.eager_peers.insert(c.peer_id);
+            state.eager_peers.insert(d.peer_id);
+            state.eager_peers.remove(&node.peer_id);
+        }
+
+        // Small (< 1 KiB) message must NOT emit IDONTWANT.
+        let small = key_cache_eager(&author_key, topic, 10, &[0x11; 512]);
+        b.handle_eager(a.peer_id, topic, small)
+            .await
+            .expect("small eager");
+        assert_eq!(b.wave2_stats().idontwant_sent, 0);
+
+        // Large (>= 1 KiB) message immediately emits IDONTWANT to eager peers C & D (skipping A).
+        const LARGE_PAYLOAD: [u8; 2048] = [0x22u8; 2048];
+        let large = key_cache_eager(&author_key, topic, 11, &LARGE_PAYLOAD);
+        let b_frames_before = b_tr.sent_frames().len();
+        b.handle_eager(a.peer_id, topic, large.clone())
+            .await
+            .expect("large eager");
+        // IDONTWANT is detached onto bounded background tasks so slow peers
+        // never delay EAGER forwarding; yield briefly for local RecordingTransport.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(b.wave2_stats().idontwant_sent, 2);
+        let idw_to_c = b_tr.sent_frames()[b_frames_before..]
+            .iter()
+            .find(|(peer, _, wire)| *peer == c.peer_id && control_batch::is_control_batch(wire))
+            .map(|(_, _, wire)| wire.clone())
+            .expect("IDONTWANT emitted to C");
+
+        // C receives B's IDONTWANT BEFORE C forwards `large` from A -> C MUST skip B and still forward to D!
+        let sb_on_c = saorsa_gossip_transport::AuthenticatedSession {
+            peer: b.peer_id,
+            generation: 1,
+        };
+        c.handle_authenticated_message(sb_on_c, idw_to_c)
+            .await
+            .expect("c handles idontwant");
+        assert_eq!(c.wave2_stats().idontwant_received, 1);
+
+        let c_frames_before = c_tr.sent_frames().len();
+        c.handle_eager(a.peer_id, topic, large)
+            .await
+            .expect("c handles large eager");
+        assert_eq!(
+            c.wave2_stats().idontwant_eager_suppressed,
+            1,
+            "C must suppress duplicate EAGER forward to B after B's IDONTWANT"
+        );
+        // `handle_eager` detaches the parallel forward send task; give it a
+        // tick to record the outbound EAGER frame to D.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let c_sent = &c_tr.sent_frames()[c_frames_before..];
+        let eager_to_b = c_sent
+            .iter()
+            .filter(|(peer, _, wire)| {
+                *peer == b.peer_id && peek_message_kind(wire) == Some(MessageKind::Eager)
+            })
+            .count();
+        let eager_to_d = c_sent
+            .iter()
+            .filter(|(peer, _, wire)| {
+                *peer == d.peer_id && peek_message_kind(wire) == Some(MessageKind::Eager)
+            })
+            .count();
+        assert_eq!(eager_to_b, 0, "EAGER push to B must be cancelled");
+        assert_eq!(eager_to_d, 1, "EAGER push to D must still proceed");
+    }
+
+    #[tokio::test]
+    async fn wave2_unsigned_control_batch_pin1_no_third_party_evidence_and_session_gate() {
+        let now = Instant::now();
+        let a_key = test_signing_key();
+        let b_key = test_signing_key();
+        let c_key = test_signing_key();
+
+        let a_tr = RecordingTransport::new(a_key.peer_id());
+        let b_tr = RecordingTransport::new(b_key.peer_id());
+
+        let a =
+            PlumtreePubSub::new_with_task_control(a_key.peer_id(), Arc::clone(&a_tr), a_key, false);
+        let b =
+            PlumtreePubSub::new_with_task_control(b_key.peer_id(), Arc::clone(&b_tr), b_key, false);
+
+        let subscribed_topic = TopicId::new([0x54; 32]);
+        let unsubscribed_topic = TopicId::new([0x55; 32]);
+        let mut rx = b.subscribe(subscribed_topic);
+
+        let batch_wire = control_batch::encode_control_batch(vec![
+            control_batch::HopControlOp::IHave {
+                topic: subscribed_topic,
+                msg_ids: vec![[0xaa; 32]],
+            },
+            control_batch::HopControlOp::Prune {
+                topic: subscribed_topic,
+            },
+            control_batch::HopControlOp::IDontWant {
+                topic: subscribed_topic,
+                msg_ids: vec![[0xbb; 32]],
+            },
+            control_batch::HopControlOp::IHave {
+                topic: unsubscribed_topic,
+                msg_ids: vec![[0xcc; 32]],
+            },
+        ])
+        .expect("encode batch");
+
+        // inspect_message_header reports hop_local_control=true (never registered as app relay topic).
+        let inspected = inspect_message_header(&batch_wire).expect("inspect batch");
+        assert!(inspected.hop_local_control);
+        assert_eq!(inspected.kind, MessageKind::Ping);
+
+        // 1. Unauthenticated handle_message MUST reject unsigned batch.
+        assert!(b
+            .handle_message(a.peer_id, batch_wire.clone())
+            .await
+            .is_err());
+
+        // 2. Authenticated session WITHOUT negotiated CAP_UNSIGNED_CONTROL_V1 MUST reject.
+        b_tr.set_session(a.peer_id, 1);
+        let sa = saorsa_gossip_transport::AuthenticatedSession {
+            peer: a.peer_id,
+            generation: 1,
+        };
+        assert!(b
+            .handle_authenticated_message(sa, batch_wire.clone())
+            .await
+            .is_err());
+
+        // 3. Negotiate Wave 2 + install Leaf topic filter accepting only `subscribed_topic`.
+        negotiate_wave2_pair(&a, &a_tr, &b, &b_tr, 1, now).await;
+        b.set_inbound_topic_filter(Some(Arc::new(move |t| *t == subscribed_topic)));
+        {
+            let mut guard = b.topics.write_topic(&subscribed_topic).await;
+            let state = guard
+                .entry(subscribed_topic)
+                .or_insert_with(|| b.new_topic_state());
+            state.eager_peers.insert(a.peer_id);
+            state.eager_peers.insert(c_key.peer_id());
+        }
+
+        let b_frames_before = b_tr.sent_frames().len();
+        let verifies_before = b.verify_by_kind_stats();
+        b.handle_authenticated_message(sa, batch_wire)
+            .await
+            .expect("negotiated unsigned batch accepted");
+
+        // Pin 1 assertions (no third-party evidence, zero ML-DSA verify):
+        assert_eq!(
+            b.verify_by_kind_stats(),
+            verifies_before,
+            "unsigned 1-hop control batch must perform ZERO ML-DSA-65 verifications"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "1-hop control ops must NEVER deliver to local subscribers"
+        );
+        {
+            let guard = b.topics.read_topic(&subscribed_topic).await;
+            let state = guard.get(&subscribed_topic).expect("topic");
+            assert!(
+                state.cached_message_ids().is_empty(),
+                "1-hop control ops must NEVER enter message_cache"
+            );
+        }
+        assert!(
+            b.topics
+                .read_topic(&unsubscribed_topic)
+                .await
+                .get(&unsubscribed_topic)
+                .is_none(),
+            "Leaf topic filter must prevent creating phantom TopicState for unsubscribed topics"
+        );
+        assert_eq!(
+            b_tr.sent_frames()[b_frames_before..]
+                .iter()
+                .filter(|(peer, _, _)| *peer == c_key.peer_id())
+                .count(),
+            0,
+            "1-hop control ops must NEVER be forwarded to a 3rd peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn wave2_critical_flushes_immediately_while_normal_bulk_coalesces_cross_topic_with_dlazy()
+    {
+        let now = Instant::now();
+        let sender_key = test_signing_key();
+        let sender_tr = RecordingTransport::new(sender_key.peer_id());
+        let sender = PlumtreePubSub::new_with_task_control(
+            sender_key.peer_id(),
+            Arc::clone(&sender_tr),
+            sender_key,
+            false,
+        );
+
+        // Create 10 Wave-2 lazy peers to test D_lazy = 6 sampling + cross-topic coalescing + skip-sender.
+        let mut peers = Vec::new();
+        for _ in 0..10 {
+            let pk = test_signing_key();
+            let tr = RecordingTransport::new(pk.peer_id());
+            let node =
+                PlumtreePubSub::new_with_task_control(pk.peer_id(), Arc::clone(&tr), pk, false);
+            negotiate_wave2_pair(&sender, &sender_tr, &node, &tr, 1, now).await;
+            peers.push((node, tr));
+        }
+        let origin_peer = peers[0].0.peer_id;
+
+        let crit_topic = TopicId::new([0x60; 32]);
+        let norm_topic_1 = TopicId::new([0x61; 32]);
+        let norm_topic_2 = TopicId::new([0x62; 32]);
+        let bulk_topic = TopicId::new([0x63; 32]);
+        sender
+            .admission()
+            .registry()
+            .register(crit_topic, TopicPriority::Critical);
+        sender
+            .admission()
+            .registry()
+            .register(norm_topic_1, TopicPriority::Normal);
+        sender
+            .admission()
+            .registry()
+            .register(norm_topic_2, TopicPriority::Normal);
+        sender
+            .admission()
+            .registry()
+            .register(bulk_topic, TopicPriority::Bulk);
+
+        let crit_id = [0xa1; 32];
+        let n1_id = [0xb1; 32];
+        let n2_id = [0xb2; 32];
+        let bulk_id = [0xc1; 32];
+
+        for (topic, id) in [
+            (crit_topic, crit_id),
+            (norm_topic_1, n1_id),
+            (norm_topic_2, n2_id),
+            (bulk_topic, bulk_id),
+        ] {
+            let mut guard = sender.topics.write_topic(&topic).await;
+            let state = guard
+                .entry(topic)
+                .or_insert_with(|| sender.new_topic_state());
+            for (p, _) in &peers {
+                state.lazy_peers.insert(p.peer_id);
+            }
+            state.push_pending_ihave(id);
+            // Exclude `origin_peer` (simulating having received `id` from `origin_peer`).
+            state.exclude_peer_from_ihave(id, origin_peer, now);
+        }
+        sender
+            .wave2_critical_ihave_pending
+            .store(true, Ordering::Release);
+
+        // Fast tick (`include_normal_bulk = false`, <= 20 ms): ONLY Critical flushes!
+        let before_crit = sender_tr.sent_frames().len();
+        sender.drive_wave2_flush_at(now, false, 1).await;
+        let crit_frames = &sender_tr.sent_frames()[before_crit..];
+        // All 9 non-origin lazy peers get Critical IHAVE immediately (origin skipped, no D_lazy drop on Critical).
+        assert_eq!(crit_frames.len(), 9);
+        assert!(
+            crit_frames.iter().all(|(p, _, _)| *p != origin_peer),
+            "sender of msg_id must be skipped on Critical IHAVE"
+        );
+        for (_, _, wire) in crit_frames {
+            let batch = control_batch::decode_control_batch(wire).expect("batch");
+            assert_eq!(batch.ops.len(), 1);
+            assert_eq!(batch.ops[0].topic(), crit_topic);
+            assert!(wire.len() < 80, "unsigned Critical IHAVE must stay <80 B");
+        }
+        // Normal/Bulk topics still pending until coalesce interval.
+        assert!(!sender
+            .topics
+            .read_topic(&norm_topic_1)
+            .await
+            .get(&norm_topic_1)
+            .expect("n1")
+            .pending_ihave
+            .is_empty());
+
+        // Coalesce tick (`include_normal_bulk = true`, 300 ms): Normal/Bulk coalesce cross-topic + cap D_lazy = 6!
+        let before_norm = sender_tr.sent_frames().len();
+        sender
+            .drive_wave2_flush_at(now + WAVE2_NORMAL_COALESCE_INTERVAL, true, 1)
+            .await;
+        let norm_frames = &sender_tr.sent_frames()[before_norm..];
+        assert!(
+            !norm_frames.is_empty(),
+            "Normal/Bulk coalesced batches must emit"
+        );
+        assert!(
+            norm_frames.iter().all(|(p, _, _)| *p != origin_peer),
+            "origin_peer must never receive echo IHAVE"
+        );
+        // Each topic selected at most D_lazy = 6 peers.
+        let mut peers_per_topic: HashMap<TopicId, usize> = HashMap::new();
+        let mut any_coalesced_multi_topic = false;
+        let mut total_bytes = 0usize;
+        for (_, _, wire) in norm_frames {
+            total_bytes += wire.len();
+            let batch = control_batch::decode_control_batch(wire).expect("batch");
+            if batch.ops.len() >= 2 {
+                any_coalesced_multi_topic = true;
+            }
+            for op in batch.ops {
+                *peers_per_topic.entry(op.topic()).or_default() += 1;
+            }
+        }
+        assert!(
+            any_coalesced_multi_topic,
+            "multiple Normal/Bulk topics must coalesce into ONE frame per peer"
+        );
+        for topic in [norm_topic_1, norm_topic_2, bulk_topic] {
+            let count = peers_per_topic.get(&topic).copied().unwrap_or(0);
+            assert!(
+                (1..=WAVE2_D_LAZY_CAP).contains(&count),
+                "topic {topic:?} advertised to {count} peers, expected 1..={WAVE2_D_LAZY_CAP}"
+            );
+        }
+        // Legacy would have sent 3 topics × 10 peers × ~5,400 B = ~162,000 B!
+        assert!(
+            total_bytes < 2_500,
+            "coalesced unsigned Normal/Bulk IHAVEs should be <2.5 KiB total (got {total_bytes} B)"
+        );
+    }
+
+    #[tokio::test]
+    async fn wave2_content_bound_v3_msg_id_closes_replay_tombstone_freshness_and_rate_limit() {
+        let now = Instant::now();
+        let pub_key = test_signing_key();
+        let dup_signer_key = test_signing_key();
+        let recv_key = test_signing_key();
+        let legacy_key = test_signing_key();
+        let pub_tr = RecordingTransport::new(pub_key.peer_id());
+        let recv_tr = RecordingTransport::new(recv_key.peer_id());
+        let legacy_tr = RecordingTransport::new(legacy_key.peer_id());
+
+        let publisher = PlumtreePubSub::new_with_task_control(
+            pub_key.peer_id(),
+            Arc::clone(&pub_tr),
+            pub_key.clone(),
+            false,
+        );
+        let receiver = PlumtreePubSub::new_with_task_control(
+            recv_key.peer_id(),
+            Arc::clone(&recv_tr),
+            recv_key,
+            false,
+        );
+        let legacy = PlumtreePubSub::new_with_task_control(
+            legacy_key.peer_id(),
+            Arc::clone(&legacy_tr),
+            legacy_key,
+            false,
+        );
+        legacy.set_wave2_capabilities_enabled(false);
+        negotiate_wave2_pair(&publisher, &pub_tr, &receiver, &recv_tr, 1, now).await;
+        negotiate_wave2_pair(&publisher, &pub_tr, &legacy, &legacy_tr, 1, now).await;
+        publisher.set_content_bound_msg_id_policy(ContentBoundMsgIdPolicy::PublishV3);
+
+        let topic = TopicId::new([0x70; 32]);
+        {
+            let mut guard = publisher.topics.write_topic(&topic).await;
+            let state = guard
+                .entry(topic)
+                .or_insert_with(|| publisher.new_topic_state());
+            state.eager_peers.insert(receiver.peer_id);
+            state.eager_peers.insert(legacy.peer_id);
+        }
+        let mut rx = receiver.subscribe(topic);
+
+        let payload = Bytes::from_static(b"pure-pqc-content-bound-payload");
+        let frames_before_pub = pub_tr.sent_frames().len();
+        publisher
+            .publish_local(topic, payload.clone())
+            .await
+            .expect("publish v3");
+        assert_eq!(publisher.wave2_stats().v3_content_bound_published, 1);
+        assert_eq!(
+            publisher.wave2_stats().v3_egress_skipped_legacy,
+            1,
+            "v3 EAGER egress must skip legacy peers lacking CAP_CONTENT_BOUND_MSG_ID"
+        );
+        let pub_sent = &pub_tr.sent_frames()[frames_before_pub..];
+        assert!(
+            pub_sent.iter().all(|(peer, _, _)| *peer != legacy.peer_id),
+            "v3 header must never be transmitted to a legacy 0.5.97 peer"
+        );
+        let wire = pub_sent
+            .iter()
+            .find(|(peer, _, _)| *peer == receiver.peer_id)
+            .expect("sent v3 to capable receiver")
+            .2
+            .clone();
+        let valid_v3: GossipMessage = if key_cache::is_v3(&wire) {
+            match key_cache::decode(&wire).expect("decode sg76 v3") {
+                key_cache::Decoded::Full(msg, _) => msg,
+                key_cache::Decoded::Ref(mut msg, key_id) => {
+                    msg.public_key = receiver
+                        .key_cache
+                        .lock()
+                        .expect("kc")
+                        .lookup(key_id)
+                        .unwrap_or_else(|| pub_key.public_key().to_vec());
+                    msg
+                }
+            }
+        } else {
+            postcard::from_bytes(&wire).expect("decode v3")
+        };
+        assert_eq!(valid_v3.header.version, 3);
+        let expected_hash = *blake3::hash(&payload).as_bytes();
+        let expected_id = MessageHeader::calculate_content_bound_msg_id(&topic, &expected_hash);
+        assert_eq!(valid_v3.header.msg_id, expected_id);
+        assert!(valid_v3.header.created_at_secs.is_some());
+
+        // 1. Forged msg_id (claiming wrong msg_id for payload) is REJECTED pre-verify.
+        let mut forged = valid_v3.clone();
+        forged.header.msg_id[0] ^= 0xff;
+        let verifies_before = receiver
+            .verify_by_kind_stats()
+            .for_kind(MessageKind::Eager)
+            .attempts;
+        assert!(receiver
+            .handle_eager(publisher.peer_id, topic, forged)
+            .await
+            .is_err());
+        assert_eq!(receiver.wave2_stats().v3_content_bound_forged_rejected, 1);
+        assert_eq!(
+            receiver
+                .verify_by_kind_stats()
+                .for_kind(MessageKind::Eager)
+                .attempts,
+            verifies_before,
+            "forged v3 msg_id must reject before ML-DSA verify"
+        );
+
+        // 2. Stale (old) and far-future timestamps are REJECTED pre-verify.
+        let now_secs = PlumtreePubSub::<RecordingTransport>::current_unix_secs();
+        let mut stale = valid_v3.clone();
+        stale.header.created_at_secs = Some(now_secs.saturating_sub(600));
+        assert!(receiver
+            .handle_eager(publisher.peer_id, topic, stale)
+            .await
+            .is_err());
+        let mut future = valid_v3.clone();
+        future.header.created_at_secs = Some(now_secs.saturating_add(600));
+        assert!(receiver
+            .handle_eager(publisher.peer_id, topic, future)
+            .await
+            .is_err());
+        assert_eq!(receiver.wave2_stats().v3_content_bound_stale_rejected, 2);
+
+        // 3. Valid v3 EAGER is accepted, delivered, and recorded in v3_seen_ids.
+        receiver
+            .handle_eager(publisher.peer_id, topic, valid_v3.clone())
+            .await
+            .expect("accept valid v3");
+        assert_eq!(receiver.wave2_stats().v3_content_bound_accepted, 1);
+        assert_eq!(rx.try_recv().expect("delivered").1, payload);
+
+        // 4. Re-signed duplicate from a DIFFERENT signer with fresh timestamp maps to the
+        //    EXACT SAME content-bound msg_id -> IGNORED (Ok, 0 verify, 0 replay_dropped_ids!).
+        let mut dup_header = MessageHeader::new(topic, MessageKind::Eager, 10);
+        dup_header.seal_content_bound_v3(Some(&payload), now_secs);
+        assert_eq!(dup_header.msg_id, expected_id);
+        let dup_sig = dup_signer_key
+            .sign(&postcard::to_stdvec(&dup_header).expect("hdr"))
+            .expect("sign");
+        let dup_msg = GossipMessage {
+            header: dup_header,
+            payload: Some(payload.clone()),
+            signature: dup_sig,
+            public_key: dup_signer_key.public_key().to_vec(),
+        };
+        let verifies_after_accept = receiver
+            .verify_by_kind_stats()
+            .for_kind(MessageKind::Eager)
+            .attempts;
+        receiver
+            .handle_eager(dup_signer_key.peer_id(), topic, dup_msg.clone())
+            .await
+            .expect("duplicate must be IGNORED (Ok), not REJECTED");
+        assert_eq!(
+            receiver
+                .verify_by_kind_stats()
+                .for_kind(MessageKind::Eager)
+                .attempts,
+            verifies_after_accept,
+            "content-bound duplicate must drop pre-verify"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate must not re-deliver to subscriber"
+        );
+        {
+            let guard = receiver.topics.read_topic(&topic).await;
+            let state = guard.get(&topic).expect("topic");
+            assert!(
+                state.replay_dropped_ids.is_empty(),
+                "P2c v3 content-bound dedupe must never need unverified replay_dropped_ids tombstones"
+            );
+        }
+
+        // 5. Evicting payload from 60 s `message_cache` STILL catches replays via 360 s `v3_seen_ids`.
+        {
+            let mut guard = receiver.topics.write_topic(&topic).await;
+            guard
+                .get_mut(&topic)
+                .expect("topic")
+                .message_cache
+                .lru
+                .clear();
+        }
+        receiver
+            .handle_eager(dup_signer_key.peer_id(), topic, dup_msg.clone())
+            .await
+            .expect("v3_seen_ids still ignores replay after message_cache eviction");
+        assert!(rx.try_recv().is_err());
+
+        // 6. Flooding > SIGNER_DUP_BURST duplicates triggers per-peer duplicate rate limit (IGNORE).
+        for _ in 0..80 {
+            receiver
+                .handle_eager(dup_signer_key.peer_id(), topic, dup_msg.clone())
+                .await
+                .expect("rate-limited duplicate still returns Ok (IGNORE)");
+        }
+        assert!(
+            receiver.wave2_stats().duplicate_rate_limited > 0,
+            "per-peer duplicate rate limiter must engage on duplicate floods"
+        );
+
+        // 7. RequireV3 drops legacy v2 EAGER without penalizing honest forwarders.
+        receiver.set_content_bound_msg_id_policy(ContentBoundMsgIdPolicy::RequireV3);
+        let legacy_v2 = key_cache_eager(&pub_key, topic, 99, b"honest-legacy-v2");
+        let topic_str = topic.to_string();
+        let pub_str = publisher.peer_id.to_string();
+        let invalid_before = receiver
+            .peer_scoring
+            .snapshot()
+            .into_iter()
+            .find(|row| row.topic_id == topic_str && row.peer_id == pub_str)
+            .map_or(0.0, |row| row.p4_invalid_messages);
+        receiver
+            .handle_eager(publisher.peer_id, topic, legacy_v2)
+            .await
+            .expect("RequireV3 drops v2 cleanly with Ok(())");
+        assert_eq!(receiver.wave2_stats().v3_policy_rejected, 1);
+        let invalid_after = receiver
+            .peer_scoring
+            .snapshot()
+            .into_iter()
+            .find(|row| row.topic_id == topic_str && row.peer_id == pub_str)
+            .map_or(0.0, |row| row.p4_invalid_messages);
+        assert!(
+            invalid_after <= invalid_before,
+            "RequireV3 policy drop must not penalize honest forwarders (before={invalid_before}, after={invalid_after})"
+        );
+    }
+
+    #[tokio::test]
+    async fn wave2_graft_blocks_non_member_injection_respects_backoff_and_gates_signed_ingress() {
+        let now = Instant::now();
+        let host_key = test_signing_key();
+        let outsider_key = test_signing_key();
+        let member_key = test_signing_key();
+        let uncap_key = test_signing_key();
+        let author_key = test_signing_key();
+
+        let host_tr = RecordingTransport::new(host_key.peer_id());
+        let outsider_tr = RecordingTransport::new(outsider_key.peer_id());
+        let member_tr = RecordingTransport::new(member_key.peer_id());
+        let uncap_tr = RecordingTransport::new(uncap_key.peer_id());
+
+        let host = PlumtreePubSub::new_with_task_control(
+            host_key.peer_id(),
+            Arc::clone(&host_tr),
+            host_key,
+            false,
+        );
+        let outsider = PlumtreePubSub::new_with_task_control(
+            outsider_key.peer_id(),
+            Arc::clone(&outsider_tr),
+            outsider_key.clone(),
+            false,
+        );
+        let member = PlumtreePubSub::new_with_task_control(
+            member_key.peer_id(),
+            Arc::clone(&member_tr),
+            member_key,
+            false,
+        );
+        let uncap = PlumtreePubSub::new_with_task_control(
+            uncap_key.peer_id(),
+            Arc::clone(&uncap_tr),
+            uncap_key.clone(),
+            false,
+        );
+        uncap.set_wave2_capabilities_enabled(false);
+
+        negotiate_wave2_pair(&host, &host_tr, &outsider, &outsider_tr, 1, now).await;
+        negotiate_wave2_pair(&host, &host_tr, &member, &member_tr, 1, now).await;
+        negotiate_wave2_pair(&host, &host_tr, &uncap, &uncap_tr, 1, now).await;
+
+        let topic = TopicId::new([0x71; 32]);
+        let secret_msg = key_cache_eager(&author_key, topic, 1, b"topic-member-only-secret");
+        let secret_id = secret_msg.header.msg_id;
+        host.handle_eager(author_key.peer_id(), topic, secret_msg)
+            .await
+            .expect("seed host");
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.get_mut(&topic).expect("topic");
+            state.lazy_peers.insert(member.peer_id);
+            state
+                .prune_backoff
+                .insert(member.peer_id, Instant::now() + Duration::from_secs(10));
+        }
+
+        // 1. Authenticated Wave-2 NON-MEMBER sending GRAFT(topic, Some(secret_id))
+        //    must NEVER be injected into eager/lazy sets OR served cached payloads!
+        let outsider_frames_before = host_tr.sent_frames().len();
+        let graft_batch =
+            control_batch::encode_control_batch(vec![control_batch::HopControlOp::Graft {
+                topic,
+                msg_id: Some(secret_id),
+            }])
+            .expect("encode graft");
+        let s_outsider = saorsa_gossip_transport::AuthenticatedSession {
+            peer: outsider.peer_id,
+            generation: 1,
+        };
+        host.handle_authenticated_message(s_outsider, graft_batch.clone())
+            .await
+            .expect("batch handled");
+        {
+            let guard = host.topics.read_topic(&topic).await;
+            let state = guard.get(&topic).expect("topic");
+            assert!(!state.eager_peers.contains(&outsider.peer_id));
+            assert!(!state.lazy_peers.contains(&outsider.peer_id));
+        }
+        assert_eq!(
+            host_tr.sent_frames()[outsider_frames_before..]
+                .iter()
+                .filter(|(p, _, _)| *p == outsider.peer_id)
+                .count(),
+            0,
+            "non-member must never pull cached topic payloads via GRAFT"
+        );
+
+        // 2. Existing lazy member under active prune_backoff is NOT promoted by GRAFT.
+        let s_member = saorsa_gossip_transport::AuthenticatedSession {
+            peer: member.peer_id,
+            generation: 1,
+        };
+        host.handle_authenticated_message(s_member, graft_batch)
+            .await
+            .expect("member graft handled");
+        {
+            let guard = host.topics.read_topic(&topic).await;
+            let state = guard.get(&topic).expect("topic");
+            assert!(
+                !state.eager_peers.contains(&member.peer_id),
+                "inbound GRAFT must NOT clear local prune_backoff"
+            );
+            assert!(state.lazy_peers.contains(&member.peer_id));
+        }
+
+        // 3. Signed GRAFT from a peer without CAP_WIRE_PRUNE_GRAFT is rejected on ingress.
+        let mut header = MessageHeader::new(topic, MessageKind::Graft, 1);
+        header.seal_payload_hash(None);
+        let sig = uncap_key
+            .sign(&postcard::to_stdvec(&header).expect("hdr"))
+            .expect("sign");
+        let signed_graft = GossipMessage {
+            header,
+            payload: None,
+            signature: sig,
+            public_key: uncap_key.public_key().to_vec(),
+        };
+        let signed_wire: Bytes = postcard::to_stdvec(&signed_graft).expect("wire").into();
+        let s_uncap = saorsa_gossip_transport::AuthenticatedSession {
+            peer: uncap.peer_id,
+            generation: 1,
+        };
+        assert!(
+            host.handle_authenticated_message(s_uncap, signed_wire)
+                .await
+                .is_err(),
+            "signed GRAFT from non-Wave-2 peer must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn wave2_coalesced_batch_splits_by_wire_byte_budget_for_two_full_topics() {
+        let now = Instant::now();
+        let sender_key = test_signing_key();
+        let peer_key = test_signing_key();
+        let sender_tr = RecordingTransport::new(sender_key.peer_id());
+        let peer_tr = RecordingTransport::new(peer_key.peer_id());
+
+        let sender = PlumtreePubSub::new_with_task_control(
+            sender_key.peer_id(),
+            Arc::clone(&sender_tr),
+            sender_key,
+            false,
+        );
+        let peer = PlumtreePubSub::new_with_task_control(
+            peer_key.peer_id(),
+            Arc::clone(&peer_tr),
+            peer_key,
+            false,
+        );
+        negotiate_wave2_pair(&sender, &sender_tr, &peer, &peer_tr, 1, now).await;
+
+        let t1 = TopicId::new([0x72; 32]);
+        let t2 = TopicId::new([0x73; 32]);
+        for (idx, topic) in [t1, t2].into_iter().enumerate() {
+            let mut guard = sender.topics.write_topic(&topic).await;
+            let state = guard
+                .entry(topic)
+                .or_insert_with(|| sender.new_topic_state());
+            state.lazy_peers.insert(peer.peer_id);
+            for i in 0..MAX_IHAVE_BATCH_SIZE {
+                let mut id = [0u8; 32];
+                id[0] = idx as u8;
+                id[1..3].copy_from_slice(&(i as u16).to_le_bytes());
+                state.push_pending_ihave(id);
+            }
+        }
+
+        let frames_before = sender_tr.sent_frames().len();
+        sender.drive_wave2_flush_at(now, true, 1).await;
+        let sent = &sender_tr.sent_frames()[frames_before..];
+        let batch_frames: Vec<&Bytes> = sent
+            .iter()
+            .filter(|(p, _, w)| *p == peer.peer_id && control_batch::is_control_batch(w))
+            .map(|(_, _, w)| w)
+            .collect();
+        assert_eq!(
+            batch_frames.len(),
+            2,
+            "2 topics × 1,024 IDs (>65,536 B combined) must split into 2 valid batches"
+        );
+        let mut total_ids = 0usize;
+        for wire in batch_frames {
+            assert!(wire.len() <= control_batch::MAX_CONTROL_BATCH_BYTES);
+            let decoded = control_batch::decode_control_batch(wire).expect("valid batch");
+            for op in decoded.ops {
+                if let control_batch::HopControlOp::IHave { msg_ids, .. } = op {
+                    total_ids += msg_ids.len();
+                }
+            }
+        }
+        assert_eq!(total_ids, 2 * MAX_IHAVE_BATCH_SIZE);
+        for topic in [t1, t2] {
+            let guard = sender.topics.read_topic(&topic).await;
+            assert!(
+                guard.get(&topic).expect("topic").pending_ihave.is_empty(),
+                "pending_ihave must drain completely after byte-split flush"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wave2_all_legacy_zero_locks_ihave_exclusion_eviction_and_graft_retry_on_failure() {
+        let now = Instant::now();
+        let node_key = test_signing_key();
+        let peer_key = test_signing_key();
+        let node_tr = RecordingTransport::new(node_key.peer_id());
+        let peer_tr = RecordingTransport::new(peer_key.peer_id());
+
+        let node = PlumtreePubSub::new_with_task_control(
+            node_key.peer_id(),
+            Arc::clone(&node_tr),
+            node_key,
+            false,
+        );
+        let peer = PlumtreePubSub::new_with_task_control(
+            peer_key.peer_id(),
+            Arc::clone(&peer_tr),
+            peer_key,
+            false,
+        );
+        peer.set_wave2_capabilities_enabled(false);
+        negotiate_wave2_pair(&node, &node_tr, &peer, &peer_tr, 1, now).await;
+
+        // 1. All-legacy fleet: Wave 2 fast + coalesce ticks take ZERO write_all() locks!
+        node.topics
+            .reset_topic_contention_instrumentation_for_test();
+        node.drive_wave2_flush_at(now, false, 1).await;
+        node.drive_wave2_flush_at(now + WAVE2_NORMAL_COALESCE_INTERVAL, true, 2)
+            .await;
+        assert_eq!(
+            node.topics
+                .contention
+                .write_all_takes
+                .load(Ordering::Relaxed),
+            0,
+            "all-legacy fleet must take zero topics.write_all() locks on Wave 2 ticks"
+        );
+
+        // 2. ihave_excluded_peers LRU eviction + IDONTWANT isolation (Opus Major #8).
+        let topic = TopicId::new([0x74; 32]);
+        {
+            let mut guard = node.topics.write_topic(&topic).await;
+            let state = guard.entry(topic).or_insert_with(|| node.new_topic_state());
+            // Lazy allocation check: Wave-2 maps start at None (0 heap bytes).
+            assert!(state.v3_seen_ids.is_none());
+            assert!(state.peer_dont_want.is_none());
+            assert!(state.ihave_excluded_peers.is_none());
+
+            // Flood > MAX_PENDING_IHAVE IDs -> oldest evicted, newest STILL excluded!
+            for i in 0..(MAX_PENDING_IHAVE + 32) {
+                let mut id = [0u8; 32];
+                id[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                state.exclude_peer_from_ihave(id, peer.peer_id, now);
+            }
+            let mut newest = [0u8; 32];
+            newest[..4].copy_from_slice(&((MAX_PENDING_IHAVE + 31) as u32).to_le_bytes());
+            assert!(
+                state.is_peer_excluded_from_ihave(&newest, peer.peer_id, now),
+                "newest ID must remain excluded after LRU eviction"
+            );
+            // Hostile IDONTWANT flood must NOT evict ihave_excluded_peers!
+            for i in 0..2048u32 {
+                let mut id = [0xee; 32];
+                id[..4].copy_from_slice(&i.to_le_bytes());
+                state.record_peer_dont_want(peer.peer_id, id, now);
+            }
+            assert!(
+                state.is_peer_excluded_from_ihave(&newest, peer.peer_id, now),
+                "IDONTWANT flood must not evict ihave_excluded_peers"
+            );
+        }
+
+        // 3. GRAFT outcome handling: permanent skips (no cap) never spin timers;
+        // TimedOut retries strictly up to 2 times even when outstanding_iwants
+        // is at capacity; NotConnected records backoff without spinning;
+        // Deferred retains deferred_iwants (Opus Major #6 / Minor 1).
+        let msg_id_nocap = [0x91; 32];
+        {
+            let mut guard = node.topics.write_topic(&topic).await;
+            let state = guard.get_mut(&topic).expect("topic");
+            assert!(state.schedule_graft_timer_at(msg_id_nocap, peer.peer_id, now));
+        }
+        node.wave2_graft_timers_pending
+            .fetch_add(1, Ordering::AcqRel);
+        // Peer has no Wave-2 cap -> send_wire_graft_static returns None -> NO retry spin!
+        node.drive_wave2_flush_at(now + Duration::from_millis(100), false, 3)
+            .await;
+        {
+            let guard = node.topics.read_topic(&topic).await;
+            let state = guard.get(&topic).expect("topic");
+            assert!(
+                !state.pending_graft_timers.contains_key(&msg_id_nocap),
+                "permanent skip (missing Wave-2 cap) must NOT re-arm a GRAFT retry timer"
+            );
+            assert_eq!(node.wave2_graft_timers_pending.load(Ordering::Acquire), 0);
+        }
+
+        // Fill `outstanding_iwants` to capacity and verify `TimedOut` retry bound
+        // is still enforced via `PendingGraftTimer::retry_count` (0 -> 1 -> 2 -> stop).
+        let msg_id_timeout = [0x92; 32];
+        {
+            let mut guard = node.topics.write_topic(&topic).await;
+            let state = guard.get_mut(&topic).expect("topic");
+            for i in 0..MAX_IHAVE_BATCH_SIZE {
+                let mut fill_id = [0xaa; 32];
+                fill_id[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                state.outstanding_iwants.insert(
+                    fill_id,
+                    OutstandingIwant {
+                        peer: peer.peer_id,
+                        requested_at: now,
+                        retry_pending: false,
+                        failures: 0,
+                        retry_not_before: None,
+                    },
+                );
+            }
+        }
+        for (attempt, expect_rearmed) in [(0u8, true), (1u8, true), (2u8, false)] {
+            PlumtreePubSub::<RecordingTransport>::apply_wave2_send_completion(
+                &node.topics,
+                &node.wave2_graft_timers_pending,
+                Wave2SendCompletion::GraftSent {
+                    topic,
+                    peer: peer.peer_id,
+                    msg_id: msg_id_timeout,
+                    has_more_fallbacks: false,
+                    retry_count: attempt,
+                    outcome: Some(PeerSendOutcome::TimedOut),
+                },
+            )
+            .await;
+            let mut guard = node.topics.write_topic(&topic).await;
+            let state = guard.get_mut(&topic).expect("topic");
+            if expect_rearmed {
+                let timer = state
+                    .pending_graft_timers
+                    .remove(&msg_id_timeout)
+                    .expect("TimedOut attempt < 2 must arm retry timer");
+                assert_eq!(timer.retry_count, attempt + 1);
+            } else {
+                assert!(
+                    !state.pending_graft_timers.contains_key(&msg_id_timeout),
+                    "TimedOut at retry_count == 2 must stop retrying even when outstanding_iwants is full"
+                );
+            }
+        }
+
+        // NotConnected records backoff without re-arming a retry timer;
+        // Deferred retains deferred_iwants.
+        let msg_id_disc = [0x93; 32];
+        let msg_id_def = [0x94; 32];
+        {
+            let mut guard = node.topics.write_topic(&topic).await;
+            guard
+                .get_mut(&topic)
+                .expect("topic")
+                .outstanding_iwants
+                .clear();
+        }
+        PlumtreePubSub::<RecordingTransport>::apply_wave2_send_completion(
+            &node.topics,
+            &node.wave2_graft_timers_pending,
+            Wave2SendCompletion::GraftSent {
+                topic,
+                peer: peer.peer_id,
+                msg_id: msg_id_disc,
+                has_more_fallbacks: false,
+                retry_count: 0,
+                outcome: Some(PeerSendOutcome::NotConnected),
+            },
+        )
+        .await;
+        PlumtreePubSub::<RecordingTransport>::apply_wave2_send_completion(
+            &node.topics,
+            &node.wave2_graft_timers_pending,
+            Wave2SendCompletion::GraftSent {
+                topic,
+                peer: peer.peer_id,
+                msg_id: msg_id_def,
+                has_more_fallbacks: false,
+                retry_count: 0,
+                outcome: Some(PeerSendOutcome::Deferred),
+            },
+        )
+        .await;
+        {
+            let guard = node.topics.read_topic(&topic).await;
+            let state = guard.get(&topic).expect("topic");
+            assert!(state.outstanding_iwants.contains_key(&msg_id_disc));
+            assert!(
+                !state.pending_graft_timers.contains_key(&msg_id_disc),
+                "NotConnected must NOT spin retry timers"
+            );
+            assert!(
+                state
+                    .deferred_iwants
+                    .iter()
+                    .any(|d| d.peer == peer.peer_id && d.msg_ids.contains(&msg_id_def)),
+                "Deferred GRAFT must retain deferred_iwants entry"
+            );
+            assert!(state.outstanding_iwants.contains_key(&msg_id_def));
+        }
+    }
+
+    #[tokio::test]
+    async fn wave2_v3_choke_point_blocks_stranded_deferred_retries_unsubscribe_and_op_caps() {
+        let now = Instant::now();
+        let host_key = test_signing_key();
+        let w2_key = test_signing_key();
+        let legacy_key = test_signing_key();
+        let partial_key = test_signing_key();
+
+        let host_tr = RecordingTransport::new(host_key.peer_id());
+        let w2_tr = RecordingTransport::new(w2_key.peer_id());
+        let legacy_tr = RecordingTransport::new(legacy_key.peer_id());
+
+        let host = PlumtreePubSub::new_with_task_control(
+            host_key.peer_id(),
+            Arc::clone(&host_tr),
+            host_key.clone(),
+            false,
+        );
+        let w2 = PlumtreePubSub::new_with_task_control(
+            w2_key.peer_id(),
+            Arc::clone(&w2_tr),
+            w2_key,
+            false,
+        );
+        let legacy = PlumtreePubSub::new_with_task_control(
+            legacy_key.peer_id(),
+            Arc::clone(&legacy_tr),
+            legacy_key,
+            false,
+        );
+        legacy.set_wave2_capabilities_enabled(false);
+
+        negotiate_wave2_pair(&host, &host_tr, &w2, &w2_tr, 1, now).await;
+        negotiate_wave2_pair(&host, &host_tr, &legacy, &legacy_tr, 1, now).await;
+        assert_eq!(host.confirmed_wave2_session_count(), 1);
+
+        let topic = TopicId::new([0x77; 32]);
+        let payload = Bytes::from_static(b"v3-choke-point-payload");
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let mut header = MessageHeader::new(topic, MessageKind::Eager, 10);
+        header.seal_content_bound_v3(Some(&payload), created_at);
+        let msg_id = header.msg_id;
+        let sig = host_key
+            .sign(&postcard::to_stdvec(&header).expect("hdr"))
+            .expect("sign");
+        let v3_msg = GossipMessage {
+            header: header.clone(),
+            payload: Some(payload.clone()),
+            signature: sig,
+            public_key: host_key.public_key().to_vec(),
+        };
+        let raw_v3_wire: Bytes = postcard::to_stdvec(&v3_msg).expect("v3 wire").into();
+
+        // 1. Single transport choke point: raw MessageHeader v3 to legacy peer MUST fail!
+        let legacy_frames_before = host_tr.send_count_to(legacy.peer_id);
+        assert!(
+            host.transport
+                .send_to_peer(
+                    legacy.peer_id,
+                    GossipStreamType::PubSub,
+                    raw_v3_wire.clone()
+                )
+                .await
+                .is_err(),
+            "PolicyTransport::send_to_peer must reject raw MessageHeader v3 to legacy peer"
+        );
+        assert_eq!(host_tr.send_count_to(legacy.peer_id), legacy_frames_before);
+
+        // SG76-wrapped MessageHeader v3 to legacy peer MUST also fail!
+        let sg76_v3_wire = key_cache::encode(&v3_msg, false).expect("sg76 v3");
+        assert!(
+            host.transport
+                .send_to_peer(legacy.peer_id, GossipStreamType::PubSub, sg76_v3_wire)
+                .await
+                .is_err(),
+            "PolicyTransport::send_to_peer must reject SG76-wrapped MessageHeader v3 to legacy peer"
+        );
+        assert_eq!(host_tr.send_count_to(legacy.peer_id), legacy_frames_before);
+
+        // 2. Stranded-publish retry skips legacy peer for v3 wire bytes, sends only to Wave-2 peer.
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.entry(topic).or_insert_with(|| host.new_topic_state());
+            state.eager_peers.insert(w2.peer_id);
+            state.eager_peers.insert(legacy.peer_id);
+            state.cache_message(msg_id, payload.clone(), header.clone(), true);
+            state.queue_stranded_ihave(msg_id, &[w2.peer_id, legacy.peer_id]);
+        }
+        let w2_before = host_tr.send_count_to(w2.peer_id);
+        let ctx = StrandedRetryContext {
+            topics: host.topics.clone(),
+            transport: host.transport.clone(),
+            stage_stats: Arc::clone(&host.stage_stats),
+            outbound_budgets: Arc::clone(&host.outbound_budgets),
+            egress_limiter: Arc::clone(&host.egress_limiter),
+            send_path: host.send_path_context(),
+        };
+        PlumtreePubSub::retry_stranded_publish(&ctx, topic, msg_id, raw_v3_wire.clone()).await;
+        assert_eq!(
+            host_tr.send_count_to(legacy.peer_id),
+            legacy_frames_before,
+            "stranded retry must never send v3 bytes to legacy peer"
+        );
+        assert!(
+            host_tr.send_count_to(w2.peer_id) > w2_before,
+            "stranded retry must still deliver v3 bytes to Wave-2 peer"
+        );
+
+        // 3. Deferred IWANT reply retry drops v3 entry targeting a legacy peer.
+        let deferred_entry = DeferredEagerReply {
+            id: 1,
+            peer: legacy.peer_id,
+            msg_id,
+            requested_at: now,
+        };
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            guard
+                .get_mut(&topic)
+                .expect("topic")
+                .deferred_eager_replies
+                .push(deferred_entry);
+        }
+        let mut late_rotation = LateOfferRotation::default();
+        let send_path = host.send_path_context();
+        let mut flush_env = IhaveFlushEnv {
+            send_path: &send_path,
+            egress_limiter: &host.egress_limiter,
+            late_rotation: &mut late_rotation,
+        };
+        PlumtreePubSub::flush_deferred_eager_replies(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            &mut flush_env,
+            vec![(topic, deferred_entry)],
+        )
+        .await;
+        assert_eq!(
+            host_tr.send_count_to(legacy.peer_id),
+            legacy_frames_before,
+            "deferred eager reply flush must never leak v3 frame to legacy peer"
+        );
+        {
+            let guard = host.topics.read_topic(&topic).await;
+            assert!(
+                guard
+                    .get(&topic)
+                    .expect("topic")
+                    .deferred_eager_replies
+                    .is_empty(),
+                "legacy-targeted v3 deferred eager reply must be dropped cleanly"
+            );
+        }
+
+        // 4. Unsubscribe decrements `wave2_graft_timers_pending` to 0 so fast
+        // ticks do not permanently scan `topics.write_all()` (Opus Medium b).
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.get_mut(&topic).expect("topic");
+            assert!(state.schedule_graft_timer_at([0xab; 32], w2.peer_id, now));
+        }
+        host.wave2_graft_timers_pending
+            .fetch_add(1, Ordering::AcqRel);
+        host.unsubscribe(topic).await.expect("unsubscribe");
+        assert_eq!(
+            host.wave2_graft_timers_pending.load(Ordering::Acquire),
+            0,
+            "unsubscribe must decrement wave2_graft_timers_pending for removed timers"
+        );
+
+        // 5. Unsigned batch per-op capability check (Opus Minor 3): a peer with
+        // ONLY CAP_UNSIGNED_CONTROL_V1 (no CAP_WIRE_PRUNE_GRAFT / CAP_IDONTWANT)
+        // has Prune/IDontWant ops skipped cleanly while valid IHave still runs.
+        let partial_peer = partial_key.peer_id();
+        let partial_topic = TopicId::new([0x78; 32]);
+        host_tr.set_session(partial_peer, 1);
+        let partial_session = saorsa_gossip_transport::AuthenticatedSession {
+            peer: partial_peer,
+            generation: 1,
+        };
+        {
+            let mut kc = host.key_cache.lock().expect("kc");
+            kc.observe_session(partial_session, now);
+            let h = kc.next_control(partial_session, now).expect("hello");
+            kc.control_result(partial_session, &h, true);
+            kc.received_hello(partial_session);
+            let c = kc.next_control(partial_session, now).expect("caps");
+            kc.control_result(partial_session, &c, true);
+            kc.received_capabilities(
+                partial_session,
+                key_cache::CAP_UNSIGNED_CONTROL_V1,
+                Some(key_cache::LOCAL_WAVE2_CAPS),
+            )
+            .expect("partial caps");
+        }
+        {
+            let mut guard = host.topics.write_topic(&partial_topic).await;
+            let state = guard
+                .entry(partial_topic)
+                .or_insert_with(|| host.new_topic_state());
+            state.eager_peers.insert(partial_peer);
+            state.eager_peers.insert(w2.peer_id);
+        }
+        let batch_wire = control_batch::encode_control_batch(vec![
+            control_batch::HopControlOp::Prune {
+                topic: partial_topic,
+            },
+            control_batch::HopControlOp::IDontWant {
+                topic: partial_topic,
+                msg_ids: vec![[0xcd; 32]],
+            },
+            control_batch::HopControlOp::IHave {
+                topic: partial_topic,
+                msg_ids: vec![[0xde; 32]],
+            },
+        ])
+        .expect("encode partial batch");
+        host.handle_authenticated_message(partial_session, batch_wire)
+            .await
+            .expect("unauthorized op must be skipped without aborting batch");
+        {
+            let guard = host.topics.read_topic(&partial_topic).await;
+            let state = guard.get(&partial_topic).expect("partial topic");
+            assert!(
+                state.eager_peers.contains(&partial_peer),
+                "Prune op without CAP_WIRE_PRUNE_GRAFT must be skipped"
+            );
+            assert!(
+                !state.peer_does_not_want(partial_peer, &[0xcd; 32], now),
+                "IDontWant op without CAP_IDONTWANT must be skipped"
+            );
+        }
+
+        // 6. Disconnecting all Wave-2 peers drops `confirmed_wave2_session_count()`
+        // to 0 on the next Wave-2 tick so subsequent ticks take ZERO write_all() locks.
+        host_tr.clear_session(w2.peer_id);
+        host_tr.clear_session(partial_peer);
+        host.drive_wave2_flush_at(now + WAVE2_NORMAL_COALESCE_INTERVAL, true, 4)
+            .await;
+        assert_eq!(
+            host.confirmed_wave2_session_count(),
+            0,
+            "disconnecting all Wave-2 peers must reset confirmed_wave2_session_count to 0"
+        );
+        host.topics
+            .reset_topic_contention_instrumentation_for_test();
+        host.drive_wave2_flush_at(now + WAVE2_NORMAL_COALESCE_INTERVAL * 2, true, 5)
+            .await;
+        assert_eq!(
+            host.topics
+                .contention
+                .write_all_takes
+                .load(Ordering::Relaxed),
+            0,
+            "after Wave-2 peers disconnect, subsequent ticks must take zero write_all() locks"
+        );
+    }
+
+    #[tokio::test]
+    async fn wave2_slow_peer_does_not_block_critical_flush_under_pin2() {
+        struct DelayedPeerTransport {
+            inner: Arc<RecordingTransport>,
+            slow_peer: PeerId,
+            delay: Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl GossipTransport for DelayedPeerTransport {
+            async fn dial(&self, peer: PeerId, addr: std::net::SocketAddr) -> Result<()> {
+                self.inner.dial(peer, addr).await
+            }
+            async fn dial_bootstrap(&self, addr: std::net::SocketAddr) -> Result<PeerId> {
+                self.inner.dial_bootstrap(addr).await
+            }
+            async fn listen(&self, addr: std::net::SocketAddr) -> Result<()> {
+                self.inner.listen(addr).await
+            }
+            async fn close(&self) -> Result<()> {
+                self.inner.close().await
+            }
+            async fn send_to_peer(
+                &self,
+                peer: PeerId,
+                stream_type: GossipStreamType,
+                data: Bytes,
+            ) -> Result<()> {
+                if peer == self.slow_peer && control_batch::is_control_batch(&data) {
+                    tokio::time::sleep(self.delay).await;
+                }
+                self.inner.send_to_peer(peer, stream_type, data).await
+            }
+            async fn send_to_peer_guarded(
+                &self,
+                peer: PeerId,
+                stream_type: GossipStreamType,
+                admit: saorsa_gossip_transport::SessionAdmission,
+            ) -> Result<()> {
+                let session = self
+                    .inner
+                    .authenticated_session(peer)
+                    .ok_or_else(|| anyhow!("no session"))?;
+                let data = admit(session)?;
+                self.send_to_peer(peer, stream_type, data).await
+            }
+            async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, Bytes)> {
+                self.inner.receive_message().await
+            }
+            async fn connected_peer_ids(&self) -> Vec<PeerId> {
+                self.inner.connected_peer_ids().await
+            }
+            fn local_peer_id(&self) -> PeerId {
+                self.inner.local_peer_id()
+            }
+            fn authenticated_session(
+                &self,
+                peer: PeerId,
+            ) -> Option<saorsa_gossip_transport::AuthenticatedSession> {
+                self.inner.authenticated_session(peer)
+            }
+        }
+
+        let now = Instant::now();
+        let sender_key = test_signing_key();
+        let slow_key = test_signing_key();
+        let fast_key = test_signing_key();
+
+        let inner_tr = RecordingTransport::new(sender_key.peer_id());
+        let delayed_tr = Arc::new(DelayedPeerTransport {
+            inner: Arc::clone(&inner_tr),
+            slow_peer: slow_key.peer_id(),
+            delay: Duration::from_millis(450),
+        });
+        let sender = PlumtreePubSub::new_with_task_control(
+            sender_key.peer_id(),
+            Arc::clone(&delayed_tr),
+            sender_key,
+            true,
+        );
+
+        // Mark both slow_peer and fast_peer as fully confirmed Wave-2 peers.
+        for peer_id in [slow_key.peer_id(), fast_key.peer_id()] {
+            inner_tr.set_session(peer_id, 1);
+            let session = saorsa_gossip_transport::AuthenticatedSession {
+                peer: peer_id,
+                generation: 1,
+            };
+            let mut kc = sender.key_cache.lock().expect("kc");
+            kc.observe_session(session, now);
+            let h = kc.next_control(session, now).expect("hello");
+            kc.control_result(session, &h, true);
+            kc.received_hello(session);
+            let c = kc.next_control(session, now).expect("caps");
+            kc.control_result(session, &c, true);
+            kc.received_capabilities(
+                session,
+                key_cache::LOCAL_WAVE2_CAPS,
+                Some(key_cache::LOCAL_WAVE2_CAPS),
+            )
+            .expect("confirm caps");
+        }
+
+        let norm_topic = TopicId::new([0x75; 32]);
+        let crit_topic = TopicId::new([0x76; 32]);
+        sender
+            .admission()
+            .registry()
+            .register(norm_topic, TopicPriority::Normal);
+        sender
+            .admission()
+            .registry()
+            .register(crit_topic, TopicPriority::Critical);
+        {
+            let mut g = sender.topics.write_topic(&norm_topic).await;
+            let state = g
+                .entry(norm_topic)
+                .or_insert_with(|| sender.new_topic_state());
+            state.lazy_peers.insert(slow_key.peer_id());
+            state.push_pending_ihave([0x11; 32]);
+        }
+        {
+            let mut g = sender.topics.write_topic(&crit_topic).await;
+            let state = g
+                .entry(crit_topic)
+                .or_insert_with(|| sender.new_topic_state());
+            state.lazy_peers.insert(fast_key.peer_id());
+        }
+
+        // Wait just long enough for the 300 ms Normal coalesce tick to kick off
+        // the 450 ms stalled send to `slow_peer`.
+        tokio::time::sleep(Duration::from_millis(340)).await;
+
+        // Now queue a Critical IHAVE for `fast_peer` while `slow_peer` is STILL
+        // blocked for another ~400 ms!
+        let crit_started = Instant::now();
+        {
+            let mut g = sender.topics.write_topic(&crit_topic).await;
+            g.get_mut(&crit_topic)
+                .expect("crit")
+                .push_pending_ihave([0x22; 32]);
+        }
+        sender
+            .wave2_critical_ihave_pending
+            .store(true, Ordering::Release);
+        sender.critical_flush_notify.notify_one();
+
+        let mut fast_delivered_in: Option<Duration> = None;
+        for _ in 0..40 {
+            let found = inner_tr.sent_frames().iter().any(|(peer, _, wire)| {
+                *peer == fast_key.peer_id()
+                    && control_batch::is_control_batch(wire)
+                    && control_batch::decode_control_batch(wire)
+                        .is_ok_and(|b| b.ops.iter().any(|op| op.topic() == crit_topic))
+            });
+            if found {
+                fast_delivered_in = Some(crit_started.elapsed());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = sender.shutdown().await;
+        let elapsed = fast_delivered_in.expect("Critical IHAVE must reach fast_peer");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "Critical IHAVE took {:?} — slow Normal peer (450 ms) must NEVER stall Critical notify!",
+            elapsed
         );
     }
 }

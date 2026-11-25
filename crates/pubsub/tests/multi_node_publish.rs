@@ -614,6 +614,7 @@ async fn leaf_shed_normal_recovers_exact_message_via_ihave_iwant() {
             hop: 0,
             ttl: 10,
             payload_hash: None,
+            created_at_secs: None,
         };
         calibration_header.seal_payload_hash(Some(&calibration));
         let calibration_header_bytes =

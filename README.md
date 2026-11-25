@@ -99,7 +99,7 @@ Most Rust applications should start with the top-level facade crate:
 
 ```toml
 [dependencies]
-saorsa-gossip = "0.5"
+saorsa-gossip = "0.6"
 ```
 
 The `saorsa-gossip` crate re-exports the component crates under predictable
@@ -380,7 +380,7 @@ Add the facade crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-saorsa-gossip = "0.5"
+saorsa-gossip = "0.6"
 ```
 
 For lower-level integrations you can depend on individual component crates such

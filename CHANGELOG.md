@@ -16,7 +16,9 @@ or public-API changes; fully interoperable with 0.6.0 peers.
 - Anti-entropy digests no longer advertise MessageHeader v3 (content-bound
   msg_id) entries to peers that have not negotiated `CAP_CONTENT_BOUND_MSG_ID`:
   the periodic anti-entropy tick now filters topics per selected peer, and
-  digest sends retain only v3-capable entries (#143).
+  digest sends retain only v3-capable entries; receivers now also reject a
+  MessageHeader v3 on a registered legacy-compat topic, enforcing the existing
+  sender rule (#143).
 - Under a non-enforcing egress limiter, a legacy IHAVE sibling no longer
   consumes the full batch while its content-bound partition was skipped before
   handoff (serialize/budget/admission skips or partial claims); the flush now

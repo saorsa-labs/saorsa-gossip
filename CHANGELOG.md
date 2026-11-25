@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-25
+
+Hardening of the 0.6.0 capability-gated pure-PQC wire (Wave 2). No wire-format
+or public-API changes; fully interoperable with 0.6.0 peers.
+
+### Fixed
+- Anti-entropy digests no longer advertise MessageHeader v3 (content-bound
+  msg_id) entries to peers that have not negotiated `CAP_CONTENT_BOUND_MSG_ID`:
+  the periodic anti-entropy tick now filters topics per selected peer, and
+  digest sends retain only v3-capable entries; receivers now also reject a
+  MessageHeader v3 on a registered legacy-compat topic, enforcing the existing
+  sender rule (#143).
+- Under a non-enforcing egress limiter, a legacy IHAVE sibling no longer
+  consumes the full batch while its content-bound partition was skipped before
+  handoff (serialize/budget/admission skips or partial claims); the flush now
+  tracks incomplete content-bound partitions per tick (#145, closes #144).
+- Deferred IWANTs to peers that negotiated `CAP_UNSIGNED_CONTROL_V1` are now
+  sent as unsigned coalesced control batches, matching the immediate IWANT
+  path (#145).
+- Removed a vacuous N1 prepare-egress assertion; limiter behaviour remains
+  covered by the post-spawn assertions (#145).
+
 ## [0.6.0] - 2026-11-25
 
 ### Changed

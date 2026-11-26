@@ -2288,6 +2288,10 @@ struct SendPathContext {
     /// publish path so background IHAVE flush + anti-entropy operations
     /// can filter through the same gate before claiming attempts.
     admission: Arc<admission::AdmissionControl>,
+    /// #147: Wave 2 unsigned control batch telemetry — shared with the
+    /// background IHAVE/IWANT flush path so deferred unsigned IWANT retries
+    /// increment the same counters as direct unsigned control sends.
+    wave2_stats: Arc<Wave2Stats>,
 }
 
 struct PeerSendRequest {
@@ -9410,6 +9414,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             connected_peers_snapshot: Arc::clone(&self.connected_peers_snapshot),
             peer_health_oracle: Arc::clone(&self.peer_health_oracle),
             admission: Arc::clone(&self.admission),
+            wave2_stats: Arc::clone(&self.wave2_stats),
         }
     }
 
@@ -11046,6 +11051,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             connected_peers_snapshot,
             peer_health_oracle,
             admission: Arc::new(admission::AdmissionControl::new()),
+            wave2_stats: Arc::new(Wave2Stats::default()),
         };
         let sent = sent
             .into_iter()
@@ -15994,11 +16000,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             (work, deferred_replies)
         };
 
-        // #144: track topics whose non-final CB partition was scheduled in this
-        // flush and did not complete all its intended targets (e.g. early
-        // `continue` on serialize/budget/admission or empty/partial claims).
-        // Under a non-enforcing limiter, the legacy sibling must not consume
-        // the full batch while its CB sibling was skipped before handoff.
+        // #144 / #147: track topics whose non-final CB partition was scheduled
+        // in this flush and did not successfully hand off to all intended
+        // targets (e.g. early `continue` on serialize/budget/admission, empty/
+        // partial claims, or transport send failure/timeout). Under a
+        // non-enforcing limiter, the legacy sibling must not consume the full
+        // batch while any CB sibling target still failed to hand off.
         let mut incomplete_cb_partitions: HashSet<TopicId> = HashSet::new();
 
         for IhaveFlushWork {
@@ -16186,9 +16193,26 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         1,
                     );
                 }
+                if use_unsigned_iwant {
+                    // #147: keep unsigned control telemetry consistent with
+                    // `flush_wave2_control_batches` and direct unsigned sends.
+                    let count = claims.attempts().len() as u64;
+                    let wire_len = bytes.len() as u64;
+                    env.send_path
+                        .wave2_stats
+                        .unsigned_control_batches_sent
+                        .fetch_add(count, Ordering::Relaxed);
+                    env.send_path
+                        .wave2_stats
+                        .unsigned_control_ops_sent
+                        .fetch_add(count, Ordering::Relaxed);
+                    env.send_path
+                        .wave2_stats
+                        .unsigned_control_bytes_sent
+                        .fetch_add(wire_len.saturating_mul(count), Ordering::Relaxed);
+                }
                 let mut send_tasks = SendTaskSet::with_capacity(op, claims.attempts().len());
                 let attempts = claims.attempts().to_vec();
-                let attempted_count = attempts.len();
                 let permits = claims.take_permits();
                 for (attempt, permit) in attempts.into_iter().zip(permits) {
                     let reservation = reservations.remove(&attempt.peer);
@@ -16223,6 +16247,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                     .iter()
                     .map(|completion| completion.attempt.peer)
                     .collect();
+                let handed_off_count = advertised_peers.len();
                 let failed_peers: HashSet<_> = timed_out
                     .iter()
                     .chain(not_connected.iter())
@@ -16279,7 +16304,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                         }
                         if is_non_final_cb
                             && budget_deferred.is_empty()
-                            && attempted_count == intended_targets.len()
+                            && handed_off_count == intended_targets.len()
                         {
                             incomplete_cb_partitions.remove(&topic_id);
                         }
@@ -16290,8 +16315,8 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                                 }
                                 None => (batch.as_slice(), intended_targets.as_slice(), true),
                             };
-                        let cb_sibling_incomplete =
-                            is_final_partition && incomplete_cb_partitions.contains(&topic_id);
+                        let cb_sibling_incomplete = matches!(partition_union, Some((_, _, true)))
+                            && incomplete_cb_partitions.contains(&topic_id);
                         let wave2_still_pending = !transport.migration.registered(topic_id)
                             && state
                                 .lazy_peers
@@ -19181,6 +19206,10 @@ mod tests {
         /// PR #106 review r4: the next N sends to a peer fail as "peer not
         /// connected" (a connection that dropped under an in-flight send).
         not_connected: Mutex<HashMap<PeerId, usize>>,
+        /// #147: the next N sends to a peer fail with a transient transport
+        /// error (not classified as `not_connected`, so the peer remains in
+        /// topic sets without waiting for a real timeout).
+        transient_failures: Mutex<HashMap<PeerId, usize>>,
     }
 
     /// Issue #42: transport that starts failing every send once closed —
@@ -19273,6 +19302,7 @@ mod tests {
                 frames: Mutex::new(Vec::new()),
                 stalled: Mutex::new(HashMap::new()),
                 not_connected: Mutex::new(HashMap::new()),
+                transient_failures: Mutex::new(HashMap::new()),
             })
         }
 
@@ -19300,6 +19330,14 @@ mod tests {
             self.not_connected
                 .lock()
                 .expect("not-connected lock")
+                .insert(peer, count);
+        }
+
+        /// The next `count` sends to `peer` fail with a transient transport error.
+        pub(super) fn fail_next_sends_transiently_to(&self, peer: PeerId, count: usize) {
+            self.transient_failures
+                .lock()
+                .expect("transient-failures lock")
                 .insert(peer, count);
         }
 
@@ -19410,6 +19448,22 @@ mod tests {
             };
             if fail_not_connected {
                 return Err(anyhow!("peer not connected"));
+            }
+            let fail_transient = {
+                let mut failing = self
+                    .transient_failures
+                    .lock()
+                    .expect("transient-failures lock");
+                match failing.get_mut(&peer) {
+                    Some(remaining) if *remaining > 0 => {
+                        *remaining -= 1;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if fail_transient {
+                return Err(anyhow!("transient send failure"));
             }
             let mut counts = self.send_counts.lock().expect("send counts lock");
             *counts.entry(peer).or_default() += 1;
@@ -27700,6 +27754,7 @@ mod tests {
             connected_peers_snapshot,
             peer_health_oracle,
             admission: Arc::new(admission::AdmissionControl::new()),
+            wave2_stats: Arc::new(Wave2Stats::default()),
         };
         let topic = TopicId::new([57u8; 32]);
         let lazy_peer = test_peer_id(2);
@@ -29154,6 +29209,7 @@ mod tests {
             connected_peers_snapshot: flush_connected_peers_snapshot,
             peer_health_oracle: flush_peer_health_oracle,
             admission: Arc::new(admission::AdmissionControl::new()),
+            wave2_stats: Arc::new(Wave2Stats::default()),
         };
         let flush = tokio::spawn(async move {
             PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
@@ -29237,6 +29293,7 @@ mod tests {
             connected_peers_snapshot: flush_connected_peers_snapshot,
             peer_health_oracle: flush_peer_health_oracle,
             admission: Arc::new(admission::AdmissionControl::new()),
+            wave2_stats: Arc::new(Wave2Stats::default()),
         };
         let flush = tokio::spawn(async move {
             PlumtreePubSub::<BlockingTransport>::flush_ihave_batches(
@@ -29312,6 +29369,7 @@ mod tests {
             connected_peers_snapshot: Arc::new(StdRwLock::new(None)),
             peer_health_oracle: Arc::new(StdRwLock::new(None)),
             admission: Arc::clone(&admission),
+            wave2_stats: Arc::new(Wave2Stats::default()),
         };
 
         // Suppress the lazy peer on the Bulk topic: five Normal-kind
@@ -41625,6 +41683,329 @@ mod wave1_136_tests {
         assert!(
             w2_ae_ids.contains(&ae_w2_v3.msg_id) && w2_ae_ids.contains(&ae_w2_v2.msg_id),
             "N5 periodic AE: Wave-2 peer digest must include both cached v3 and v2 IDs"
+        );
+    }
+
+    /// #147 (LOW-1): under a non-enforcing egress limiter, if the non-final
+    /// content-bound IHAVE partition *claims* all its intended targets
+    /// (`attempted_count == intended_targets.len()`) yet the transport send to
+    /// the CB peer fails (`handed_off_count < intended_targets.len()`),
+    /// `incomplete_cb_partitions` must stay populated so the legacy sibling
+    /// cannot consume `pending_ihave` and strand the CB peer.
+    #[tokio::test]
+    async fn non_enforcing_cb_partition_send_failure_retains_pending_ihave_for_retry() {
+        let now = Instant::now();
+        let host_key = test_signing_key();
+        let legacy_key = test_signing_key();
+        let cb_only_key = test_signing_key();
+
+        let host_tr = RecordingTransport::new(host_key.peer_id());
+        let legacy_tr = RecordingTransport::new(legacy_key.peer_id());
+
+        let host = PlumtreePubSub::new_with_task_control(
+            host_key.peer_id(),
+            Arc::clone(&host_tr),
+            host_key,
+            false,
+        );
+        let legacy = PlumtreePubSub::new_with_task_control(
+            legacy_key.peer_id(),
+            Arc::clone(&legacy_tr),
+            legacy_key,
+            false,
+        );
+        legacy.set_wave2_capabilities_enabled(false);
+        negotiate_wave2_pair(&host, &host_tr, &legacy, &legacy_tr, 1, now).await;
+
+        let cb_only_peer = cb_only_key.peer_id();
+        host_tr.set_session(cb_only_peer, 1);
+        let cb_session = saorsa_gossip_transport::AuthenticatedSession {
+            peer: cb_only_peer,
+            generation: 1,
+        };
+        {
+            let mut kc = host.key_cache.lock().expect("kc");
+            kc.observe_session(cb_session, now);
+            let h = kc.next_control(cb_session, now).expect("hello");
+            kc.control_result(cb_session, &h, true);
+            kc.received_hello(cb_session);
+            let c = kc.next_control(cb_session, now).expect("caps");
+            kc.control_result(cb_session, &c, true);
+            kc.received_capabilities(
+                cb_session,
+                key_cache::CAP_CONTENT_BOUND_MSG_ID,
+                Some(key_cache::LOCAL_WAVE2_CAPS),
+            )
+            .expect("cb-only caps");
+        }
+
+        let topic = TopicId::new([0xA7; 32]);
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let payload_v3 = Bytes::from_static(b"sg147-v3-payload");
+        let payload_v2 = Bytes::from_static(b"sg147-v2-payload");
+        let mut hdr_v3 = MessageHeader::new(topic, MessageKind::Eager, 10);
+        hdr_v3.seal_content_bound_v3(Some(&payload_v3), created_at);
+        let id_v3 = hdr_v3.msg_id;
+        let mut hdr_v2 = MessageHeader::new(topic, MessageKind::Eager, 10);
+        hdr_v2.seal_payload_hash(Some(&payload_v2));
+        let id_v2 = hdr_v2.msg_id;
+
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.entry(topic).or_insert_with(|| host.new_topic_state());
+            state.cache_message(id_v3, payload_v3, hdr_v3, false);
+            state.cache_message(id_v2, payload_v2, hdr_v2, false);
+            state.lazy_peers.insert(cb_only_peer);
+            state.lazy_peers.insert(legacy.peer_id);
+            state.push_pending_ihave(id_v3);
+            state.push_pending_ihave(id_v2);
+        }
+
+        assert!(
+            !host.egress_limiter.enforcing(),
+            "#147 LOW-1: test requires non-enforcing egress_limiter"
+        );
+        // Force the CB peer's first send attempt to fail after being claimed
+        // (attempted_count == 1, handed_off_count == 0).
+        host_tr.fail_next_sends_transiently_to(cb_only_peer, 1);
+
+        let send_path = host.send_path_context();
+        let mut late_rotation = LateOfferRotation::default();
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &host.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+                .len(),
+            0,
+            "#147 LOW-1 tick 1: transient transport failure must prevent CB handoff"
+        );
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave)
+                .len(),
+            1,
+            "#147 LOW-1 tick 1: legacy sibling must still send its v2-only IHAVE"
+        );
+        {
+            let guard = host.topics.read_topic(&topic).await;
+            let state = guard.get(&topic).expect("topic");
+            assert!(
+                state.pending_ihave.contains(&id_v3) && state.pending_ihave.contains(&id_v2),
+                "#147 LOW-1 tick 1: legacy sibling must NOT consume pending_ihave when CB send failed"
+            );
+            assert!(
+                state.ihave_target_pending(&[id_v3, id_v2], cb_only_peer),
+                "#147 LOW-1 tick 1: failed CB peer must remain pending for retry"
+            );
+            assert!(
+                !state.ihave_target_pending(&[id_v2], legacy.peer_id),
+                "#147 LOW-1 tick 1: legacy handoff must stay recorded in ihave_advertised"
+            );
+        }
+
+        // Tick 2: transport recovers for CB peer; CB peer receives v3+v2,
+        // legacy receives zero duplicates, and pending_ihave consumes cleanly.
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &host.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(cb_only_peer, MessageKind::IHave)
+                .len(),
+            1,
+            "#147 LOW-1 tick 2: CB peer must receive the v3+v2 IHAVE on retry"
+        );
+        assert_eq!(
+            host_tr
+                .sent_frames_of_kind_to(legacy.peer_id, MessageKind::IHave)
+                .len(),
+            1,
+            "#147 LOW-1 tick 2: legacy peer must not receive a duplicate IHAVE"
+        );
+        {
+            let guard = host.topics.read_topic(&topic).await;
+            assert!(
+                guard.get(&topic).expect("topic").pending_ihave.is_empty(),
+                "#147 LOW-1 tick 2: pending_ihave must consume once CB handoff succeeds"
+            );
+        }
+    }
+
+    /// #147 (LOW-2): deferred unsigned IWANTs flushed to a confirmed Wave-2
+    /// peer via `flush_ihave_batches` must increment
+    /// `wave2_stats.unsigned_control_{batches,ops,bytes}_sent` on dispatch,
+    /// and leave them untouched if skipped before dispatch (e.g. permit
+    /// saturation).
+    #[tokio::test]
+    async fn deferred_unsigned_iwant_updates_wave2_unsigned_control_stats() {
+        let now = Instant::now();
+        let host_key = test_signing_key();
+        let w2_key = test_signing_key();
+
+        let host_tr = RecordingTransport::new(host_key.peer_id());
+        let w2_tr = RecordingTransport::new(w2_key.peer_id());
+
+        let host = PlumtreePubSub::new_with_task_control(
+            host_key.peer_id(),
+            Arc::clone(&host_tr),
+            host_key,
+            false,
+        );
+        let w2 = PlumtreePubSub::new_with_task_control(
+            w2_key.peer_id(),
+            Arc::clone(&w2_tr),
+            w2_key,
+            false,
+        );
+        negotiate_wave2_pair(&host, &host_tr, &w2, &w2_tr, 1, now).await;
+
+        let topic = TopicId::new([0xA8; 32]);
+        let msg_id = [0x88; 32];
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.entry(topic).or_insert_with(|| host.new_topic_state());
+            state.outstanding_iwants.insert(
+                msg_id,
+                OutstandingIwant {
+                    peer: w2.peer_id,
+                    requested_at: now,
+                    retry_pending: true,
+                    failures: 0,
+                    retry_not_before: None,
+                },
+            );
+            assert!(state.retain_deferred_iwant(w2.peer_id, &[msg_id], now));
+        }
+
+        let send_path = host.send_path_context();
+        let mut late_rotation = LateOfferRotation::default();
+
+        // First, saturate w2's Control permits so claims are empty: counters
+        // must NOT advance when nothing is dispatched.
+        let mut held_permits = Vec::new();
+        while let Some(p) = host.outbound_budgets.try_acquire(
+            w2.peer_id,
+            OutboundSendClass::Control,
+            TopicPriority::Normal,
+            now,
+        ) {
+            held_permits.push(p);
+        }
+        assert!(!held_permits.is_empty());
+
+        let before_skipped = host.wave2_stats();
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &host.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+        let after_skipped = host.wave2_stats();
+        assert_eq!(
+            after_skipped.unsigned_control_batches_sent,
+            before_skipped.unsigned_control_batches_sent,
+            "#147 LOW-2: skipped deferred IWANT must not increment unsigned_control_batches_sent"
+        );
+        assert_eq!(
+            after_skipped.unsigned_control_ops_sent,
+            before_skipped.unsigned_control_ops_sent
+        );
+        assert_eq!(
+            after_skipped.unsigned_control_bytes_sent,
+            before_skipped.unsigned_control_bytes_sent
+        );
+
+        // Release permits and re-queue the deferred IWANT so tick 2 dispatches it.
+        drop(held_permits);
+        {
+            let mut guard = host.topics.write_topic(&topic).await;
+            let state = guard.get_mut(&topic).expect("topic");
+            assert!(state.retain_deferred_iwant(w2.peer_id, &[msg_id], now));
+        }
+
+        let before = host.wave2_stats();
+        PlumtreePubSub::flush_ihave_batches(
+            &host.topics,
+            &host.transport,
+            &host.signing_key,
+            &host.stage_stats,
+            &host.outbound_budgets,
+            IhaveFlushEnv {
+                send_path: &send_path,
+                egress_limiter: &host.egress_limiter,
+                late_rotation: &mut late_rotation,
+            },
+        )
+        .await;
+        let after = host.wave2_stats();
+
+        let sent_wire = host_tr
+            .sent_frames()
+            .into_iter()
+            .filter(|(p, _, wire)| *p == w2.peer_id && control_batch::is_control_batch(wire))
+            .find(|(_, _, wire)| {
+                control_batch::decode_control_batch(wire)
+                    .ok()
+                    .is_some_and(|b| {
+                        b.ops.iter().any(|op| match op {
+                            control_batch::HopControlOp::IWant { topic: t, msg_ids } => {
+                                *t == topic && msg_ids == &vec![msg_id]
+                            }
+                            _ => false,
+                        })
+                    })
+            })
+            .map(|(_, _, wire)| wire)
+            .expect("#147 LOW-2: expected unsigned HopControlOp::IWant frame");
+
+        assert_eq!(
+            after.unsigned_control_batches_sent,
+            before.unsigned_control_batches_sent + 1,
+            "#147 LOW-2: deferred unsigned IWANT must increment unsigned_control_batches_sent"
+        );
+        assert_eq!(
+            after.unsigned_control_ops_sent,
+            before.unsigned_control_ops_sent + 1,
+            "#147 LOW-2: deferred unsigned IWANT must increment unsigned_control_ops_sent"
+        );
+        assert_eq!(
+            after.unsigned_control_bytes_sent,
+            before.unsigned_control_bytes_sent + sent_wire.len() as u64,
+            "#147 LOW-2: deferred unsigned IWANT must increment unsigned_control_bytes_sent by wire length"
         );
     }
 }
